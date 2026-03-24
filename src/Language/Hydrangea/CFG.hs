@@ -47,7 +47,6 @@ module Language.Hydrangea.CFG
   ) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
--- qualified ByteString import not needed in this module
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
