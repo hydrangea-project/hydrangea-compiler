@@ -1,0 +1,5 @@
+let src = generate [8] (let f [i] = i in f)
+let route x = x / 2
+let weight x = (x * 3) + 1
+let keep x = (x / 2) = ((x + 1) / 2)
+let main = scatter_guarded (+) (fill [4] 0) (map route src) (map weight src) (map keep src)

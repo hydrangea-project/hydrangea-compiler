@@ -1,0 +1,67 @@
+let coo =
+  { nrows = 3
+  , ncols = 4
+  , nnz = 8
+  , rows = generate [8] (let f [i] =
+      if i = 0 then 2 else
+      if i = 1 then 0 else
+      if i = 2 then 1 else
+      if i = 3 then 0 else
+      if i = 4 then 2 else
+      if i = 5 then 1 else
+      if i = 6 then 1 else 0 in f)
+  , cols = generate [8] (let f [i] =
+      if i = 0 then 1 else
+      if i = 1 then 3 else
+      if i = 2 then 0 else
+      if i = 3 then 1 else
+      if i = 4 then 0 else
+      if i = 5 then 2 else
+      if i = 6 then 2 else 1 in f)
+  , vals = generate [8] (let f [i] =
+      if i = 0 then 21 else
+      if i = 1 then 3 else
+      if i = 2 then 10 else
+      if i = 3 then 1 else
+      if i = 4 then 20 else
+      if i = 5 then 12 else
+      if i = 6 then 5 else 4 in f)
+  }
+
+let packed_keys =
+  generate [coo.nnz]
+    (let f [i] = index [i] coo.rows * coo.ncols + index [i] coo.cols in f)
+
+let perm = sort_indices packed_keys
+
+let sorted_rows = gather perm coo.rows
+
+let sorted_cols = gather perm coo.cols
+
+let sorted_vals = gather perm coo.vals
+
+let canonical =
+  coo_sum_duplicates coo.nrows coo.ncols coo.nnz sorted_rows sorted_cols sorted_vals
+
+let canonical_nnz = canonical.nnz
+
+let canonical_rows = canonical.rows
+
+let canonical_cols = canonical.cols
+
+let canonical_vals = canonical.vals
+
+let csr =
+  csr_from_sorted_coo
+    canonical.nrows
+    canonical.ncols
+    canonical.nnz
+    canonical.rows
+    canonical.cols
+    canonical.vals
+
+let csr_row_ptr = csr.row_ptr
+
+let csr_col_idx = csr.col_idx
+
+let main = csr.vals

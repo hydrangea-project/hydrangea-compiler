@@ -1,0 +1,5 @@
+let add x y = x + y
+let inc x = x + 1
+let data = read_array [6] "examples/data.csv"
+let mapped = map inc data
+let result = reduce add 0 mapped

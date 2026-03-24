@@ -1,0 +1,7 @@
+let add x y = x + y
+let mul x y = x * y
+let v [i] = i + 1
+let w [i] = i + 2
+let arr1 = generate [3] v
+let arr2 = generate [3] w
+let result = reduce add 0 (zipwith mul arr1 arr2)

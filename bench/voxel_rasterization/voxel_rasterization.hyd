@@ -1,0 +1,40 @@
+(* Sparse voxel / point-cloud rasterization benchmark.
+   Generates a deterministic point cloud, clips it with a simple validity test,
+   deposits point weights into a flattened dense voxel grid with
+   scatter_guarded (+), and returns a scalar checksum so benchmark output stays
+   compact.
+
+   Environment variables:
+     VOX_POINTS       -- number of source points
+     VOX_NX           -- voxel-grid x extent
+     VOX_NY           -- voxel-grid y extent
+     VOX_NZ           -- voxel-grid z extent
+     VOX_KEEP_PERIOD  -- keep every k-th point (models clipping / sparsity)
+*)
+
+let main =
+  let n = get_env_int "VOX_POINTS" in
+  let nx = get_env_int "VOX_NX" in
+  let ny = get_env_int "VOX_NY" in
+  let nz = get_env_int "VOX_NZ" in
+  let keep_period = get_env_int "VOX_KEEP_PERIOD" in
+  let nvox = nx * ny * nz in
+  let points = generate [n] (let point [i] = i in point) in
+  let imod x m = x - ((x / m) * m) in
+  let route p =
+    let x = imod (p * 17 + 3) nx in
+    let y = imod (p * 29 + 5) ny in
+    let z = imod (p * 43 + 7) nz in
+    ((z * ny) + y) * nx + x in
+  let weight p =
+    let x = imod (p * 17 + 3) nx in
+    let y = imod (p * 29 + 5) ny in
+    let z = imod (p * 43 + 7) nz in
+    ((x + 1) * (y + 2)) + (z * 3) + 1 in
+  let keep p = ((p / keep_period) * keep_period) = p in
+  let voxels =
+    scatter_guarded (+) (fill [nvox] 0)
+      (map route points)
+      (map weight points)
+      (map keep points) in
+  index () (reduce (+) 0 voxels)

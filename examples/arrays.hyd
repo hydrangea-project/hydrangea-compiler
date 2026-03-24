@@ -1,0 +1,2 @@
+let arr = fill [3] 5
+let mapped = map (let inc x = x + 1 in inc) arr

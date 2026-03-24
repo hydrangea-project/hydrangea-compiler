@@ -1,0 +1,66 @@
+(* COO/CSR build benchmark.
+   Generates deterministic COO triplets with controlled duplicate runs, then:
+
+   1. sorts them into canonical row-major order via packed keys;
+   2. combines adjacent duplicates;
+   3. converts canonical COO to CSR;
+   4. returns a scalar checksum to keep benchmark output compact.
+
+   Environment variables:
+     COO_NROWS      -- logical row count
+     COO_NCOLS      -- logical column count
+     COO_NNZ        -- input triplet count / backing capacity
+     COO_DUP_PERIOD -- duplicate run length before the logical key changes
+*)
+
+let nrows = get_env_int "COO_NROWS"
+let ncols = get_env_int "COO_NCOLS"
+let nnz = get_env_int "COO_NNZ"
+let dup = get_env_int "COO_DUP_PERIOD"
+
+let imod x m = x - ((x / m) * m)
+
+let group_of [i] = i / dup
+
+let row_of [i] =
+  let g = group_of [i] in
+  imod (g * 17 + 3) nrows
+
+let col_of [i] =
+  let g = group_of [i] in
+  imod (g * 31 + 7) ncols
+
+let val_of [i] =
+  let g = group_of [i] in
+  (g * 13) + i + 1
+
+let rows = generate [nnz] row_of
+let cols = generate [nnz] col_of
+let vals = generate [nnz] val_of
+
+let packed_keys =
+  generate [nnz]
+    (let f [i] = index [i] rows * ncols + index [i] cols in f)
+
+let perm = sort_indices packed_keys
+
+let sorted_rows = gather perm rows
+let sorted_cols = gather perm cols
+let sorted_vals = gather perm vals
+
+let canonical = coo_sum_duplicates nrows ncols nnz sorted_rows sorted_cols sorted_vals
+
+let csr =
+  csr_from_sorted_coo
+    canonical.nrows
+    canonical.ncols
+    canonical.nnz
+    canonical.rows
+    canonical.cols
+    canonical.vals
+
+let row_ptr_sum = index () (reduce (+) 0 csr.row_ptr)
+let col_idx_sum = index () (reduce (+) 0 csr.col_idx)
+let vals_sum = index () (reduce (+) 0 csr.vals)
+
+let main = row_ptr_sum + col_idx_sum + vals_sum + canonical.nnz

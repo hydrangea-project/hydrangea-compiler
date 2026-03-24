@@ -1,0 +1,60 @@
+(* Trilinear voxel splatting benchmark.
+   Generates a deterministic point cloud, expands each point into eight corner
+   contributions with floating-point trilinear weights, deposits them into a
+   flattened dense voxel grid with scatter_guarded (+.), and returns a scalar
+   checksum.
+
+   This benchmark currently relies on `--no-solver-check` because the refinement
+   solver does not yet infer the necessary facts for the fused contribution
+   pipeline.
+
+   Environment variables:
+     VSPLAT_POINTS       -- number of source points
+     VSPLAT_NX           -- voxel-grid x extent
+     VSPLAT_NY           -- voxel-grid y extent
+     VSPLAT_NZ           -- voxel-grid z extent
+     VSPLAT_KEEP_PERIOD  -- keep every k-th point
+*)
+
+let main =
+  let n = get_env_int "VSPLAT_POINTS" in
+  let nx = get_env_int "VSPLAT_NX" in
+  let ny = get_env_int "VSPLAT_NY" in
+  let nz = get_env_int "VSPLAT_NZ" in
+  let keep_period = get_env_int "VSPLAT_KEEP_PERIOD" in
+  let nvox = nx * ny * nz in
+  let contribs = n * 8 in
+  let imod x m = x - ((x / m) * m) in
+  let route_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let x = imod (p * 17 + 3 + bx) nx in
+    let y = imod (p * 29 + 5 + by) ny in
+    let z = imod (p * 43 + 7 + bz) nz in
+    ((z * ny) + y) * nx + x in
+  let weight_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let fx = imod (p * 5 + 1) 4 in
+    let fy = imod (p * 7 + 2) 4 in
+    let fz = imod (p * 11 + 3) 4 in
+    let wx = (1 - bx) * (4 - fx) + bx * fx in
+    let wy = (1 - by) * (4 - fy) + by * fy in
+    let wz = (1 - bz) * (4 - fz) + bz * fz in
+    let base = (p * 3) + 1 in
+    float_of (base * wx * wy * wz) /. 64.0 in
+  let keep_of [i] =
+    let p = i / 8 in
+    ((p / keep_period) * keep_period) = p in
+  let voxels =
+    scatter_guarded (+.) (fill [nvox] 0.0)
+      (generate [contribs] route_of)
+      (generate [contribs] weight_of)
+      (generate [contribs] keep_of) in
+  index () (reduce (+.) 0.0 voxels)

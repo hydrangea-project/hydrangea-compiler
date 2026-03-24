@@ -1,0 +1,10 @@
+(* 1D stencil example: 3-point box blur with clamp boundary. *)
+(* Each output element is the average of the element and its two neighbours. *)
+(* Elements near the boundary repeat the edge value (clamp). *)
+(* *)
+(* Input:  arr = [1, 2, 3, 4, 5] *)
+(* Output: [(1+1+2)/3, (1+2+3)/3, (2+3+4)/3, (3+4+5)/3, (4+5+5)/3] *)
+(*       = [1, 2, 3, 4, 5]  (integer division) *)
+
+let input = generate [5] (let f [i] = i + 1 in f)
+let blur = stencil clamp (fn acc => (acc (-1) + acc 0 + acc 1) / 3) input

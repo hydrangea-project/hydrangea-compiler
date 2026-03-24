@@ -1,0 +1,12 @@
+(* Colliding scatter-add: this is a weighted histogram with repeated routes,
+   so it should take the atomic scatter-add path. *)
+
+let source [i] = i
+let bucket x = x / 2
+let weight x = (x * 3) + 1
+
+let main =
+  let src = generate [8] source in
+  let routes = map bucket src in
+  let vals = map weight src in
+  scatter (+) (fill [4] 0) routes vals

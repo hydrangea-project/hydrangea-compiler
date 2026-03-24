@@ -1,0 +1,45 @@
+(* Graph message-passing benchmark.
+   Builds a deterministic CSR-style graph at runtime, gathers destination-node
+   features, constructs flat per-edge messages, reduces them per source node
+   with segmented_reduce, and returns a scalar checksum.
+
+   Environment variables:
+     GRAPH_NODES   -- number of graph nodes
+     GRAPH_DEGREE  -- fixed out-degree per source node
+*)
+
+let n = get_env_int "GRAPH_NODES"
+let degree = get_env_int "GRAPH_DEGREE"
+let nnz = n * degree
+
+let imod x m = x - ((x / m) * m)
+
+let offsets =
+  generate [n + 1]
+    (let f [i] = i * degree in f)
+
+let dsts =
+  generate [nnz]
+    (let f [i] = i / degree in f)
+
+let edge_vals =
+  generate [nnz]
+    (let f [i] = i + 1 in f)
+
+let node_vals =
+  generate [n]
+    (let f [i] = i + 1 in f)
+
+let dst_features =
+  generate [nnz]
+    (let f [i] =
+      let dst = index [i] dsts in
+      check_index [dst] 0 node_vals in f)
+
+let messages =
+  zipwith (let mul x y = x * y in mul) edge_vals dst_features
+
+let node_out =
+  segmented_reduce (let add acc x = acc + x in add) 0 offsets messages
+
+let main = index () (reduce (+) 0 node_out)

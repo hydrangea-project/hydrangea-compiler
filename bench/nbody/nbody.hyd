@@ -1,0 +1,72 @@
+(* N-body gravitational simulation benchmark (single step).
+   Computes accelerations for N particles and performs one Euler integration step.
+   Parameterized via environment variables:
+     NBODY_N  -- number of particles
+
+   Inputs read from CSV (one value per line):
+     xs.csv, ys.csv, zs.csv -- positions
+     ms.csv                 -- masses
+     vxs.csv, vys.csv, vzs.csv -- velocities
+
+   Uses structure-of-arrays layout for best SIMD:
+   The inner reduce_generate over N particles should vectorize;
+   the outer generate [n] should parallelize.
+*)
+
+let n  = get_env_int "NBODY_N"
+let eps2 = 0.01
+
+let xs  = read_array_float [n] "bench/nbody/xs.csv"
+let ys  = read_array_float [n] "bench/nbody/ys.csv"
+let zs  = read_array_float [n] "bench/nbody/zs.csv"
+let ms  = read_array_float [n] "bench/nbody/ms.csv"
+let vxs = read_array_float [n] "bench/nbody/vxs.csv"
+let vys = read_array_float [n] "bench/nbody/vys.csv"
+let vzs = read_array_float [n] "bench/nbody/vzs.csv"
+
+let g = 6.674e-11
+let dt = 0.01
+
+(* x-component of acceleration on particle i *)
+let acc_x i =
+  reduce_generate (+.) 0.0 [n]
+    (fn [j] =>
+      let dx = index [j] xs -. index [i] xs in
+      let dy = index [j] ys -. index [i] ys in
+      let dz = index [j] zs -. index [i] zs in
+      let r2 = dx *. dx +. dy *. dy +. dz *. dz +. eps2 in
+      let r3 = r2 *. sqrt r2 in
+      g *. index [j] ms *. dx /. r3)
+
+let acc_y i =
+  reduce_generate (+.) 0.0 [n]
+    (fn [j] =>
+      let dx = index [j] xs -. index [i] xs in
+      let dy = index [j] ys -. index [i] ys in
+      let dz = index [j] zs -. index [i] zs in
+      let r2 = dx *. dx +. dy *. dy +. dz *. dz +. eps2 in
+      let r3 = r2 *. sqrt r2 in
+      g *. index [j] ms *. dy /. r3)
+
+let acc_z i =
+  reduce_generate (+.) 0.0 [n]
+    (fn [j] =>
+      let dx = index [j] xs -. index [i] xs in
+      let dy = index [j] ys -. index [i] ys in
+      let dz = index [j] zs -. index [i] zs in
+      let r2 = dx *. dx +. dy *. dy +. dz *. dz +. eps2 in
+      let r3 = r2 *. sqrt r2 in
+      g *. index [j] ms *. dz /. r3)
+
+let new_vxs = generate [n] (fn [i] => index [i] vxs +. index () (acc_x i) *. dt)
+let new_vys = generate [n] (fn [i] => index [i] vys +. index () (acc_y i) *. dt)
+let new_vzs = generate [n] (fn [i] => index [i] vzs +. index () (acc_z i) *. dt)
+
+let new_xs = generate [n] (fn [i] => index [i] xs +. index [i] new_vxs *. dt)
+let new_ys = generate [n] (fn [i] => index [i] ys +. index [i] new_vys *. dt)
+let new_zs = generate [n] (fn [i] => index [i] zs +. index [i] new_vzs *. dt)
+
+let main =
+  let _ = write_array_float new_xs "bench/nbody/out_xs.csv" in
+  let _ = write_array_float new_ys "bench/nbody/out_ys.csv" in
+  write_array_float new_zs "bench/nbody/out_zs.csv"

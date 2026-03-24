@@ -1,0 +1,62 @@
+(* Matrix multiply kernel using fused array operations *)
+(* Computes C = A * B where A is [M, K] and B is [K, N] *)
+(* Each element C[i,j] = sum_k A[i,k] * B[k,j] *)
+
+(* Get dimensions from environment for arbitrary size matrices *)
+let M = get_env_int "MAT_M"
+let N = get_env_int "MAT_N"
+let K = get_env_int "MAT_K"
+
+(* Read input matrices from files *)
+let matA = read_array_float [M, K] "examples/matA_large.csv"
+let matB = read_array_float [K, N] "examples/matB_large.csv"
+
+(* Element-wise operations for float arrays *)
+let add x y = x +. y
+let mul x y = x *. y
+
+(* Function to compute dot product of row i from A and column j from B *)
+(* Uses gather to extract the row and column, then zipWith and reduce *)
+let dotProduct i j = 
+  (* Create array of indices [0, 1, ..., K-1] *)
+  let indices = generate [K] (fun [k] -> k)
+  
+  (* Gather A[i, k] for all k: indices specify which row (i) and column (k) *)
+  let rowIndices = zipwith (fun k -> [i, k]) indices indices
+  let rowElems = gather rowIndices matA
+  
+  (* Gather B[k, j] for all k: indices specify which row (k) and column (j) *)
+  let colIndices = zipwith (fun k -> [k, j]) indices indices
+  let colElems = gather colIndices matB
+  
+  (* Compute dot product: sum of products *)
+  reduce add 0.0 (zipwith mul rowElems colElems)
+
+(* Generate result matrix by computing each element *)
+(* Uses a 2D generate with fused dot product computation *)
+let result = generate [M, N] (fun [i, j] -> dotProduct i j)
+
+(* The above will fuse into a single kernel: *)
+(* Each output element is computed as a reduction over the K dimension *)
+(* The gather operations fuse with the generate, avoiding temporary arrays *)
+(* The zipwith and reduce fuse into reduce_generate *)
+
+(* Alternative approach using explicit loops with better fusion: *)
+(* This version more directly expresses matmul as nested reductions *)
+
+let matMulFused a b m n k =
+  (* Generate each output element *)
+  generate [m, n] (fun [i, j] ->
+    (* For each (i,j), reduce over k dimension *)
+    reduce_generate add 0.0 [k] (fun [idx] ->
+      (* Fused computation: A[i, idx] * B[idx, j] *)
+      let aVal = index [i, idx] a
+      let bVal = index [idx, j] b
+      mul aVal bVal
+    )
+  )
+
+let resultFused = matMulFused matA matB M N K
+
+(* Export the result (last binding is the output) *)
+resultFused

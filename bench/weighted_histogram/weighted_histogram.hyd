@@ -1,0 +1,15 @@
+(* Weighted histogram benchmark.
+   Generates a source stream of length WH_N, routes each element into one of
+   WH_BINS dense bins, accumulates integer weights, and returns a scalar
+   checksum so benchmarking does not spend time printing the whole histogram. *)
+
+let main =
+  let n = get_env_int "WH_N" in
+  let bins = get_env_int "WH_BINS" in
+  let bucket [i] = (i * bins) / n in
+  let weight [i] = (i * 3) + 1 in
+  let hist =
+    scatter (+) (fill [bins] 0)
+      (generate [n] bucket)
+      (generate [n] weight) in
+  index () (reduce (+) 0 hist)

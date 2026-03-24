@@ -1,0 +1,43 @@
+(* Black-Scholes option pricing benchmark.
+   Computes call prices for N European options.
+   Parameterized via environment variables:
+     BS_N  -- number of options
+
+   Inputs read from CSV:
+     spots.csv   -- spot prices S
+     strikes.csv -- strike prices K
+     rates.csv   -- risk-free rates r
+     vols.csv    -- volatilities sigma
+     times.csv   -- times to expiry T
+
+   Expected fusion: single-pass map over N options with no intermediate arrays.
+*)
+
+let n = get_env_int "BS_N"
+
+let spots   = read_array_float [n] "bench/blackscholes/spots.csv"
+let strikes = read_array_float [n] "bench/blackscholes/strikes.csv"
+let rates   = read_array_float [n] "bench/blackscholes/rates.csv"
+let vols    = read_array_float [n] "bench/blackscholes/vols.csv"
+let times   = read_array_float [n] "bench/blackscholes/times.csv"
+
+(* Gaussian CDF via erf: phi(x) = 0.5 * (1 + erf(x / sqrt(2))) *)
+let phi x = 0.5 *. (1.0 +. erf (x /. sqrt 2.0))
+
+(* Black-Scholes call price for a single option *)
+let bs_call s k r sigma t =
+  let d1 = (log (s /. k) +. (r +. 0.5 *. sigma *. sigma) *. t) /. (sigma *. sqrt t) in
+  let d2 = d1 -. sigma *. sqrt t in
+  s *. phi d1 -. k *. expf ((-1.0) *. r *. t) *. phi d2
+
+(* Vectorised over all N options *)
+let call_prices =
+  generate [n]
+    (fn [i] =>
+      bs_call (index [i] spots)
+              (index [i] strikes)
+              (index [i] rates)
+              (index [i] vols)
+              (index [i] times))
+
+let main = write_array_float call_prices "bench/blackscholes/out.csv"

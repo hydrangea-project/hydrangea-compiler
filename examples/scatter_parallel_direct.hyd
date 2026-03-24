@@ -1,0 +1,8 @@
+(* Collision-free scatter: each route is unique, so this should take the
+   direct parallel scatter path. Keep the generators inline so the current
+   direct-scatter analysis can see the route/value structure directly. *)
+
+let main =
+  scatter (+) (fill [8] 0)
+    (generate [8] (let route [i] = i in route))
+    (generate [8] (let weight [i] = (i + 1) * 10 in weight))

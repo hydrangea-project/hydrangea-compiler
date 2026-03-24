@@ -1,0 +1,7 @@
+let f acc e =
+  let re = fst acc in
+  let n  = snd acc in
+  (re +. 1.0, n + 1)
+
+let main =
+  foldl f (0.0, 0) (fill [3] 0)

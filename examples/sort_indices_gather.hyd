@@ -1,0 +1,13 @@
+let keys = generate [5] (let f [i] =
+      if i = 0 then 3 else
+      if i = 1 then 1 else
+      if i = 2 then 3 else
+      if i = 3 then 2 else 1 in f)
+
+let vals = generate [5] (let g [i] = 10 + i in g)
+
+let perm = sort_indices keys
+
+let sorted_keys = gather perm keys
+
+let main = gather perm vals

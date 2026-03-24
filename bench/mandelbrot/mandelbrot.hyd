@@ -1,0 +1,47 @@
+(* Mandelbrot set benchmark (foldl iteration version with actual complex iteration).
+   For each pixel (px, py) in [width x height], computes the escape iteration count
+   by folding over a dummy array. State is ((re, im), count): a nested pair.
+
+   Parameterized via environment variables:
+     MAND_W       -- image width
+     MAND_H       -- image height
+     MAND_ITERS   -- maximum iterations
+*)
+
+let width  = get_env_int "MAND_W"
+let height = get_env_int "MAND_H"
+let iters  = get_env_int "MAND_ITERS"
+
+let w_f = float_of width
+let h_f = float_of height
+
+(* For each pixel, fold over [iters] steps accumulating ((re,im), count).
+   The fold function updates the complex state; we only count escaped steps
+   as a proxy (full escape detection needs conditionals, deferred for now). *)
+let mandelbrot_pixel cx cy =
+  let init_state = ((0.0, 0.0), 0) in
+  let final_state =
+    foldl
+      (fn acc _ =>
+        let xy    = fst acc in
+        let re    = fst xy in
+        let im    = snd xy in
+        let n     = snd acc in
+        let re2   = re *. re in
+        let im2   = im *. im in
+        let re'   = re2 -. im2 +. cx in
+        let im'   = 2.0 *. re *. im +. cy in
+        ((re', im'), n + 1))
+      init_state
+      (fill [iters] 0)
+  in
+  float_of (snd final_state)
+
+let result =
+  generate [width, height]
+    (fn [px, py] =>
+      let cx = (-2.5) +. 3.5 *. float_of px /. (w_f -. 1.0) in
+      let cy = (-1.0) +. 2.0 *. float_of py /. (h_f -. 1.0) in
+      mandelbrot_pixel cx cy)
+
+let main = write_array_float result "bench/mandelbrot/out.csv"

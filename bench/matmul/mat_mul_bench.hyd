@@ -1,0 +1,32 @@
+(* Matrix multiply benchmark for Hydrangea
+   Reads matrices from CSV files and writes result to CSV for verification *)
+
+(* Use small concrete sizes for typechecking/debugging. Switch to
+   environment-driven sizes later once inference succeeds. *)
+let M = get_env_int "MAT_M"
+let K = get_env_int "MAT_K"
+
+let matA = read_array_float [M, K] "bench/matmul/matA.csv"
+let N = get_env_int "MAT_N"
+let matB = read_array_float [K, N] "bench/matmul/matB.csv"
+
+let shapeA = shape_of matA
+let m = proj 0 shapeA
+let k = proj 1 shapeA
+let shapeB = shape_of matB
+let n = proj 1 shapeB
+
+let add x y = x +. y
+let mul x y = x *. y
+
+
+let innerGen i j [idx] = mul (index [i, idx] matA) (index [idx, j] matB)
+
+(* reduce_generate returns an array; for a 1-element reduction it yields a
+   0D array (shape = ()). Project the scalar out with `index ()` to return a
+   float which is the expected element type for `generate`. *)
+let matElem [i, j] = index () (reduce_generate add 0.0 [k] (innerGen i j))
+
+let result = generate [m, n] matElem
+
+let main = write_array_float result "bench/matmul/out.csv"

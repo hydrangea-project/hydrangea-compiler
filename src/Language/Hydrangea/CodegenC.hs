@@ -1,0 +1,1511 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+-- |
+-- Module: Language.Hydrangea.CodegenC
+--
+-- Native C code generation backend for CFG.
+module Language.Hydrangea.CodegenC
+  ( codegenProgram2
+  , codegenProgram2Prune
+  , codegenProgram2WithOptions
+  , codegenProgram2WithOptionsPrune
+  , CodegenArtifacts(..)
+  , CodegenOptions(..)
+  , defaultCodegenOptions
+  , VarKind(..)
+  , ctypeToVarKind
+  ) where
+
+import Data.ByteString.Lazy.Char8 qualified as BS
+import Data.Char (isAlphaNum, toUpper)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as S
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CElemType(..), CType(..), CVar, RHS(..), Redop(..), UnOp(..), ctypeToElemType)
+import Language.Hydrangea.CFG qualified as C2
+import Language.Hydrangea.CFGAnalysis (usedVarsAtom2, usedVarsStmts2)
+import Language.Hydrangea.CFGTyping (inferProgramReturnTypes2, recoverProcTypeEnv2)
+import Prelude hiding ((<>))
+import Text.PrettyPrint.HughesPJClass
+
+data CodegenArtifacts = CodegenArtifacts
+  { codegenSource :: String
+  , codegenHeader :: Maybe String
+  }
+  deriving (Eq, Show)
+
+data CodegenOptions = CodegenOptions
+  { codegenEmitMain :: Bool
+  , codegenExportKernel :: Maybe CVar
+  }
+  deriving (Eq, Show)
+
+defaultCodegenOptions :: CodegenOptions
+defaultCodegenOptions = CodegenOptions
+  { codegenEmitMain = True
+  , codegenExportKernel = Nothing
+  }
+
+data ExportSpec = ExportSpec
+  { exportKernelName :: CVar
+  , exportProcName :: String
+  , exportWrapperName :: String
+  , exportReturnType :: String
+  }
+
+-- | Codegen-oriented classification of CFG variables.
+data VarKind = KScalar | KFloat | KArray | KFloatArray | KTuple | KPair CElemType CElemType | KRecord [(BS.ByteString, CType)]
+  deriving (Eq, Ord, Show)
+
+-- | Classify a 'CType' into a 'VarKind' for codegen.
+ctypeToVarKind :: CType -> Maybe VarKind
+ctypeToVarKind CTInt64          = Just KScalar
+ctypeToVarKind CTDouble         = Just KFloat
+ctypeToVarKind CTBool           = Just KScalar
+ctypeToVarKind CTUnit           = Just KScalar
+ctypeToVarKind CTTuple          = Just KTuple
+ctypeToVarKind (CTArray CTDouble) = Just KFloatArray
+ctypeToVarKind (CTArray _)      = Just KArray
+ctypeToVarKind (CTPair t1 t2)   = do
+  et1 <- ctypeToElemType t1
+  et2 <- ctypeToElemType t2
+  return (KPair et1 et2)
+ctypeToVarKind (CTRecord fields) = Just (KRecord fields)
+
+-- | Derive the classification sets/maps used by genStmts2 from a type environment.
+-- Returns (arrVars, tupVars, pairVars, recordVars, floatVars, floatArrVars).
+typeEnvToVarSets :: Map CVar CType
+                 -> (Set CVar, Set CVar, Map CVar (CElemType, CElemType), Map CVar [(BS.ByteString, CType)], Set CVar, Set CVar)
+typeEnvToVarSets env = Map.foldlWithKey' go (S.empty, S.empty, Map.empty, Map.empty, S.empty, S.empty) env
+  where
+    go acc@(av, tv, pv, rv, fv, fav) var ct = case ct of
+      CTDouble         -> (av, tv, pv, rv, S.insert var fv, fav)
+      CTTuple          -> (av, S.insert var tv, pv, rv, fv, fav)
+      CTArray CTDouble -> (S.insert var av, tv, pv, rv, fv, S.insert var fav)
+      CTArray _        -> (S.insert var av, tv, pv, rv, fv, fav)
+      CTPair t1 t2
+        | Just et1 <- ctypeToElemType t1
+        , Just et2 <- ctypeToElemType t2 -> (av, tv, Map.insert var (et1, et2) pv, rv, fv, fav)
+      CTRecord fields  -> (av, tv, pv, Map.insert var fields rv, fv, fav)
+      _                -> acc
+
+-- | Render a CFG program as C source code.
+codegenProgram2 :: C2.Program -> String
+codegenProgram2 prog =
+  codegenSource $
+    case codegenProgram2WithOptions defaultCodegenOptions prog of
+      Right artifacts -> artifacts
+      Left err -> error err
+
+-- | Codegen with optional dead-proc pruning. When prune=True, remove
+-- top-level procs that are not reachable from zero-arg entry procs via
+-- direct RCall edges. If the program uses indirect calls via "__apply",
+-- pruning is skipped conservatively.
+codegenProgram2Prune :: Bool -> C2.Program -> String
+codegenProgram2Prune prune prog =
+  codegenSource $
+    case codegenProgram2WithOptionsPrune defaultCodegenOptions prune prog of
+      Right artifacts -> artifacts
+      Left err -> error err
+
+codegenProgram2WithOptions :: CodegenOptions -> C2.Program -> Either String CodegenArtifacts
+codegenProgram2WithOptions opts = codegenProgram2WithOptionsPrune opts False
+
+codegenProgram2WithOptionsPrune :: CodegenOptions -> Bool -> C2.Program -> Either String CodegenArtifacts
+codegenProgram2WithOptionsPrune opts prune prog = do
+  let prepared = pruneProgram prune prog
+  genProgram2 opts prepared
+
+pruneProgram :: Bool -> C2.Program -> C2.Program
+pruneProgram False prog = prog
+pruneProgram True prog@(C2.Program procs) =
+  if usesApply then prog else C2.Program keptProcs
+  where
+    -- detect any use of the dynamic apply operator; if present, skip pruning
+    usesApply = any procUsesApply procs
+
+    procUsesApply (C2.Proc { C2.procBody = body }) = any stmtUsesApply body
+    stmtUsesApply st = case st of
+      C2.SAssign _ rhs -> rhsUsesApply rhs
+      C2.SLoop _ body' -> any stmtUsesApply body'
+      C2.SIf _ thn els -> any stmtUsesApply thn || any stmtUsesApply els
+      _ -> False
+    rhsUsesApply (RCall fn _) = fn == "__apply"
+    rhsUsesApply _ = False
+
+    -- build direct call graph (ignore __apply as handled above)
+    callEdges = Map.fromList [(C2.procName p, calledByProc p) | p <- procs]
+
+    calledByProc (C2.Proc { C2.procBody = body }) = foldMap stmtCalledNames body
+
+    stmtCalledNames st = case st of
+      C2.SAssign _ rhs -> rhsCalledNames rhs
+      C2.SLoop _ body' -> foldMap stmtCalledNames body'
+      C2.SIf _ thn els -> foldMap stmtCalledNames thn `S.union` foldMap stmtCalledNames els
+      _ -> S.empty
+
+    rhsCalledNames (RCall fn _) = if fn == "__apply" then S.empty else S.singleton fn
+    rhsCalledNames _ = S.empty
+
+    -- roots: zero-arg procs (entry points)
+    rootNames = S.fromList [C2.procName p | p <- procs, null (C2.procParams p)]
+
+    -- traverse call graph to find reachable procs
+    reachable = closure callEdges rootNames
+
+    keptProcs = [p | p <- procs, C2.procName p `S.member` reachable]
+
+    closure edges roots = go roots S.empty
+      where
+        go frontier visited
+          | S.null frontier = visited
+          | otherwise =
+              let (x, rest) = S.deleteFindMin frontier
+                  visited' = S.insert x visited
+                  succs = Map.findWithDefault S.empty x edges
+                  new = succs `S.difference` visited'
+              in go (rest `S.union` new) visited'
+
+genProgram2 :: CodegenOptions -> C2.Program -> Either String CodegenArtifacts
+genProgram2 opts prog@(C2.Program procs) = do
+  let retKinds = procReturnKinds2 prog
+      retTypes = inferProgramReturnTypes2 prog
+      missingArrayElemVars = collectMissingArrayElemVars retTypes procs
+      needsOmp  = any (\(C2.Proc { C2.procBody = body }) -> hasParallelStmt2 body) procs
+      needsMath = any (\(C2.Proc { C2.procBody = body }) -> hasMathOp body) procs
+      ompInclude  = if needsOmp  then text "#include <omp.h>"   else empty
+      mathInclude = if needsMath then text "#include <math.h>"  else empty
+      pairStructs = genPairStructDefs prog
+      recordStructs = genRecordStructDefs prog
+      structuredArrayPrints = genStructuredArrayPrintDefs retTypes
+      missingArrayElemDoc
+        | null missingArrayElemVars = empty
+        | otherwise =
+             text "#error \"Hydrangea C backend missing monomorphic array element type information for:"
+               <+> hsep (punctuate comma (map text missingArrayElemVars))
+               <> text "\""
+             $$ text ""
+  exportSpec <- traverse (resolveExportSpec retKinds retTypes procs) (codegenExportKernel opts)
+  let sourceDoc =
+        missingArrayElemDoc
+          $$ text "#include \"hydrangea_runtime.h\""
+          $$ ompInclude
+          $$ mathInclude
+          $$ pairStructs
+          $$ recordStructs
+          $$ structuredArrayPrints
+          $$ text ""
+          $$ vcat (punctuate (text "") (map (genProc2 retKinds retTypes) procs))
+          $$ case exportSpec of
+               Nothing -> empty
+               Just spec -> text "" $$ genExportWrapper spec
+          $$ case codegenEmitMain opts of
+               True -> text "" $$ genMain2 retKinds retTypes procs
+               False -> empty
+      headerDoc = fmap (genHeader pairStructs recordStructs) exportSpec
+  pure CodegenArtifacts
+    { codegenSource = render sourceDoc
+    , codegenHeader = render <$> headerDoc
+    }
+
+resolveExportSpec :: Map CVar VarKind -> Map CVar CType -> [C2.Proc] -> CVar -> Either String ExportSpec
+resolveExportSpec retKinds retTypes procs kernelName =
+  case filter (\proc -> C2.procName proc == kernelName) procs of
+    [] ->
+      Left $ "Unknown exported kernel: " ++ BS.unpack kernelName
+    proc : _
+      | not (null (C2.procParams proc)) ->
+          Left $
+            "Exported kernel must be a zero-argument top-level binding: "
+              ++ BS.unpack kernelName
+      | otherwise ->
+          pure ExportSpec
+            { exportKernelName = kernelName
+            , exportProcName = sanitize (C2.procName proc)
+            , exportWrapperName = "hyd_export_" ++ sanitizeExportName kernelName
+            , exportReturnType = procReturnTypeName retKinds retTypes (C2.procName proc)
+            }
+
+procReturnTypeName :: Map CVar VarKind -> Map CVar CType -> CVar -> String
+procReturnTypeName retKinds retTypes name =
+  case Map.lookup name retTypes of
+    Just cty -> cTypeName cty
+    Nothing ->
+      case Map.findWithDefault KScalar name retKinds of
+        KFloatArray -> "hyd_array_t*"
+        KArray -> "hyd_array_t*"
+        KTuple -> "hyd_tuple_t"
+        KPair ct1 ct2 -> pairStructName ct1 ct2
+        KRecord fields -> recordStructName fields
+        KFloat -> "double"
+        KScalar -> "int64_t"
+
+genExportWrapper :: ExportSpec -> Doc
+genExportWrapper spec =
+  text (exportReturnType spec) <+> text (exportWrapperName spec) <> text "(void) {"
+    $$ nest 4
+      (text "return" <+> text (exportProcName spec) <> text "();")
+    $$ text "}"
+
+genHeader :: Doc -> Doc -> ExportSpec -> Doc
+genHeader pairStructs recordStructs spec =
+  let guardName = exportHeaderGuard spec
+  in text "#ifndef" <+> text guardName
+       $$ text "#define" <+> text guardName
+       $$ text ""
+       $$ text "#include \"hydrangea_runtime.h\""
+       $$ text ""
+       $$ text "#ifdef __cplusplus"
+       $$ text "extern \"C\" {"
+       $$ text "#endif"
+       $$ text ""
+       $$ pairStructs
+       $$ recordStructs
+       $$ text (exportReturnType spec) <+> text (exportWrapperName spec) <> text "(void);"
+       $$ text ""
+       $$ text "#ifdef __cplusplus"
+       $$ text "}"
+       $$ text "#endif"
+       $$ text ""
+       $$ text "#endif"
+
+exportHeaderGuard :: ExportSpec -> String
+exportHeaderGuard spec =
+  "HYDRANGEA_EXPORT_" ++ map toUpper (sanitizeExportName (exportKernelName spec)) ++ "_H"
+
+genMain2 :: Map CVar VarKind -> Map CVar CType -> [C2.Proc] -> Doc
+genMain2 retKinds retTypes procs =
+  text "int main(void) {"
+    $$ nest 4 (vcat (map callAndPrint zeroArgProcs))
+    $$ nest 4 (text "return 0;")
+    $$ text "}"
+  where
+    zeroArgProcs = filter (\(C2.Proc { C2.procParams = params }) -> null params) procs
+
+    callAndPrint (C2.Proc { C2.procName = name }) =
+      let cName = sanitize name
+          kind = Map.findWithDefault KScalar name retKinds
+      in case Map.lookup name retTypes of
+        Just (CTArray CTDouble) ->
+          text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+            $$ text "hyd_print_float_array(" <> text (cName ++ "_result") <> text ");"
+        Just (CTArray CTInt64) ->
+          text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+            $$ text "hyd_print_array(" <> text (cName ++ "_result") <> text ");"
+        Just (CTArray CTBool) ->
+          text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+            $$ text "hyd_print_array(" <> text (cName ++ "_result") <> text ");"
+        Just (CTArray CTUnit) ->
+          text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+            $$ text "hyd_print_array(" <> text (cName ++ "_result") <> text ");"
+        Just (CTArray eltTy) | isStructuredPrintableArrayElem eltTy ->
+          text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+            $$ text (structuredArrayPrintName eltTy) <> text "(" <> text (cName ++ "_result") <> text ");"
+        Just (CTArray _) ->
+          text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+            $$ text "(void)" <> parens (text (cName ++ "_result")) <> text ";"
+        _ -> case kind of
+          KFloatArray ->
+            text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+              $$ text "hyd_print_float_array(" <> text (cName ++ "_result") <> text ");"
+          KArray ->
+            text "hyd_array_t*" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+              $$ text "hyd_print_array(" <> text (cName ++ "_result") <> text ");"
+          KTuple ->
+            text "hyd_tuple_t" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+              $$ text "hyd_print_tuple(" <> text (cName ++ "_result") <> text ");"
+          KPair cty1 cty2 ->
+            let sname = pairStructName cty1 cty2
+            in text sname <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+                 $$ text "hyd_print_pair(" <> text (cName ++ "_result") <> text ".fst, " <> text (cName ++ "_result") <> text ".snd);"
+          KRecord fields ->
+            text (recordStructName fields) <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+              $$ text "(void)" <> parens (text (cName ++ "_result")) <> text ";"
+          KFloat ->
+            text "double" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+              $$ text "hyd_print_double(" <> text (cName ++ "_result") <> text ");"
+          KScalar ->
+            text "int64_t" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
+              $$ text "hyd_print_int(" <> text (cName ++ "_result") <> text ");"
+
+genProc2 :: Map CVar VarKind -> Map CVar CType -> C2.Proc -> Doc
+genProc2 retKinds retTypes proc@(C2.Proc { C2.procName = name, C2.procParams = params, C2.procBody = body }) =
+  let typeEnv = recoverProcTypeEnv2 retTypes proc
+      -- Authoritative classification from the recovered type environment.
+      (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) = typeEnvToVarSets typeEnv
+      recoveredArrayElemTypes = inferArrayElemTypesFromStmts retTypes body (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
+      -- Fallback heuristic classification for optimizer-introduced temporaries
+      -- not present in the type env.
+      arrVarsH                       = arrayVarsProc2 proc
+      tupVarsH                       = tupleVarsProc2 proc
+      pairVarsH                      = pairVarsProc2 proc
+      (floatVarsH, floatArrVarsH)    = classifyVarKinds2 retKinds body
+      -- Merge: type env entries take priority (left-biased union for maps).
+      arrVars      = arrVarsTE    `S.union` arrVarsH
+      tupVars      = tupVarsTE    `S.union` tupVarsH
+      pairVars     = pairVarsTE   `Map.union` pairVarsH
+      recordVars   = recordVarsTE
+      floatVars    = floatVarsTE  `S.union` floatVarsH
+      floatArrVars = floatArrVarsTE `S.union` floatArrVarsH
+      arrayElemTypes =
+        recoveredArrayElemTypes
+      procRetKind   = Map.findWithDefault KScalar name retKinds
+      -- Emit the correct C type for each formal parameter.
+      genParam p
+        | p `S.member` floatVars = text "double"       <+> text (sanitize p)
+        | p `S.member` arrVars   = text "hyd_array_t*" <+> text (sanitize p)
+        | p `S.member` tupVars   = text "hyd_tuple_t"  <+> text (sanitize p)
+        | Just (ct1, ct2) <- Map.lookup p pairVars = text (pairStructName ct1 ct2) <+> text (sanitize p)
+        | Just fields <- Map.lookup p recordVars = text (recordStructName fields) <+> text (sanitize p)
+        | otherwise              = text "int64_t"       <+> text (sanitize p)
+      retType = case procRetKind of
+        KFloatArray -> "hyd_array_t*"
+        KArray -> "hyd_array_t*"
+        KTuple -> "hyd_tuple_t"
+        KPair ct1 ct2 -> pairStructName ct1 ct2
+        KRecord fields -> recordStructName fields
+        KFloat -> "double"
+        KScalar -> "int64_t"
+      cName = sanitize name
+      cParams = case params of
+        [] -> text "void"
+        _ -> hsep (punctuate comma (map genParam params))
+      -- Zero-argument array-returning procs are memoized with a static cache
+      -- to prevent O(n) re-reads when called from inside generate loops.
+      useMemo = null params && retType == "hyd_array_t*"
+      cacheVar = text "__cache_" <> text cName
+      (bodyWithoutReturn, finalReturn) = splitFinalReturn body
+      localArrayVars = localArrayVarsProc2 typeEnv proc
+      vecVars = classifyVecVars body
+      returnedArrayVars retAtom =
+        case retAtom of
+          AVar v -> case Map.lookup v typeEnv of
+            Just (CTArray _) -> S.singleton v
+            _ -> S.empty
+          _ -> S.empty
+      cleanupDoc retAtom =
+        let varsToFree =
+              case procRetKind of
+                KArray -> localArrayVars `S.difference` returnedArrayVars retAtom
+                KFloatArray -> localArrayVars `S.difference` returnedArrayVars retAtom
+                KPair _ _ -> S.empty
+                KRecord _ -> S.empty
+                _ -> localArrayVars
+        in cleanupArrayVarsDoc varsToFree
+      returnDoc retAtom = text "return" <+> genAtom retAtom <> text ";"
+      procBodyMemo =
+        case finalReturn of
+          Just retAtom ->
+            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
+              $$ cleanupDoc retAtom
+              $$ cacheVar <+> text "=" <+> genAtom retAtom <> text ";"
+          Nothing ->
+            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty S.empty body
+      procBodyNormal =
+        case finalReturn of
+          Just retAtom ->
+            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
+              $$ cleanupDoc retAtom
+              $$ returnDoc retAtom
+          Nothing ->
+            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty S.empty body
+  in if useMemo
+     then
+        text "static hyd_array_t*" <+> cacheVar <+> text "= NULL;"
+       $$ text retType <+> text cName <> text "(void) {"
+        $$ nest 4 (
+             text "if (" <> cacheVar <+> text "== NULL) {"
+             $$ nest 4 procBodyMemo
+             $$ text "}"
+             $$ text "return hyd_array_reshape_view(" <> cacheVar <> text ", " <> cacheVar <> text "->shape);"
+           )
+       $$ text "}"
+     else
+       text retType <+> text cName <> parens cParams <+> text "{"
+         $$ nest 4 procBodyNormal
+         $$ text "}"
+
+genStmts2 :: Map CVar VarKind -> Map CVar CType -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> Set CVar -> Set CVar -> Set CVar -> [C2.Stmt] -> Doc
+genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared liveAfter stmts =
+  case stmts of
+    [] -> empty
+    stmt : rest ->
+      let stmtLiveAfter = usedVarsStmts2 rest `S.union` liveAfter
+          doc = genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared stmtLiveAfter stmt
+          declared' = case stmt of
+            C2.SAssign _ (RVecStore _ _ _) -> declared
+            C2.SAssign v _ -> S.insert v declared
+            C2.SLoop spec body ->
+              let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars retKinds body
+              in case C2.lsRed spec of
+                   Just r -> S.insert (C2.rsAccVar r) declaredWithHoists
+                   Nothing -> declaredWithHoists
+            C2.SIf _ thn els ->
+              let branchVars = allAssignedVars (thn ++ els) `S.intersection` stmtLiveAfter
+              in declared `S.union` branchVars
+            _ -> declared
+      in doc $$ genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' liveAfter rest
+
+genStmt2 :: Map CVar VarKind -> Map CVar CType -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> Set CVar -> Set CVar -> Set CVar -> C2.Stmt -> Doc
+genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared liveAfter stmt = case stmt of
+  C2.SAssign _ rhs@(RVecStore _ _ _) ->
+    genRHS arrayElemTypes floatArrVars rhs <> text ";"
+  C2.SAssign v rhs
+    | v `S.member` declared -> text (sanitize v) <+> text "=" <+> genAssignRHS rhs <> text ";"
+    | otherwise ->
+        let cv = sanitize v
+            decl = varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
+        in decl <+> text cv <+> text "=" <+> genAssignRHS rhs <> text ";"
+    where
+      genAssignRHS assignedRhs = case assignedRhs of
+        RArrayAlloc shp -> genArrayAllocExpr arrayElemTypes v shp
+        RProj 0 (AVar src) | Map.member src pairVars -> genAtom (AVar src) <> text ".fst"
+        RProj 1 (AVar src) | Map.member src pairVars -> genAtom (AVar src) <> text ".snd"
+        _ -> genRHS arrayElemTypes floatArrVars assignedRhs
+
+  C2.SArrayWrite arr idx val
+    | AVar arrV <- arr, Just eltTy <- Map.lookup arrV arrayElemTypes ->
+        genArrayAccess eltTy arr idx <+> text "=" <+> genAtom val <> text ";"
+    | AVar arrV <- arr, arrV `S.member` floatArrVars ->
+        text "hyd_array_set_float(" <> genAtom arr <> text "," <+> genAtom idx <> text "," <+> genAtom val <> text ");"
+    | otherwise ->
+        genAtom arr <> text "->data[" <> genAtom idx <> text "]" <+> text "=" <+> genAtom val <> text ";"
+
+  C2.SLoop spec body -> genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared spec body
+
+  C2.SIf cond thn els ->
+    let branchRHS = assignedRHSMap (thn ++ els)
+        branchVars =
+          S.toList ((allAssignedVars (thn ++ els) `S.intersection` liveAfter) `S.difference` declared)
+        preDecls =
+          vcat
+            [ case Map.lookup v branchRHS of
+                Just rhs ->
+                  varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
+                    <+> text (sanitize v) <> text ";"
+                Nothing -> empty
+            | v <- branchVars
+            ]
+        declared' = declared `S.union` S.fromList branchVars
+    in preDecls
+       $$ text "if (" <> genAtom cond <> text ") {"
+       $$ nest 4 (genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' liveAfter thn)
+       $$ case els of
+            [] -> text "}"
+            _ -> text "} else {"
+                  $$ nest 4 (genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' liveAfter els)
+                  $$ text "}"
+
+  C2.SReturn a -> text "return" <+> genAtom a <> text ";"
+
+genLoop2 :: Map CVar VarKind -> Map CVar CType -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> Set CVar -> Set CVar -> C2.LoopSpec -> [C2.Stmt] -> Doc
+genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared spec body =
+  let iters = C2.lsIters spec
+      bounds = C2.lsBounds spec
+      red = C2.lsRed spec
+      role = C2.lsRole spec
+      (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls retKinds body
+      hoistedMemoVars =
+        S.fromList [v | C2.SAssign v (RCall _ []) <- hoistedMemoCalls]
+      declaredWithHoisted = declared `S.union` hoistedMemoVars
+      hoistedMemoDoc =
+        genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared (usedVarsStmts2 loopBody) hoistedMemoCalls
+      bodyDoc d = genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars d S.empty loopBody
+      parallelPolicyClause = case C2.lsExec spec of
+        C2.Parallel p ->
+          let strategyComment = case C2.psStrategy p of
+                C2.ParallelGeneric -> empty
+                C2.ParallelScatterDirect -> text " /* scatter-direct */"
+                C2.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
+                C2.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
+                C2.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+          in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (C2.psPolicy p)
+        _ -> empty
+      collapseClause
+        | length iters > 1 = space <> text "collapse(" <> int (length iters) <> text ")"
+        | otherwise = empty
+      parallelPragma extraClauses = text "#pragma omp parallel for" <> parallelPolicyClause <> collapseClause <> extraClauses
+      simdPragma extraClauses = text "#pragma omp simd simdlen(" <> int defaultSimdLen <> text ")" <> extraClauses
+      roleComment = case role of
+        C2.LoopPlain -> text "loop"
+        C2.LoopMap -> text "map loop"
+        C2.LoopReductionWrapper -> text "reduction wrapper loop"
+        C2.LoopReduction -> text "reduction loop"
+        C2.LoopMapReduction -> text "map-reduction outer loop"
+      defaultSimdLen = case C2.lsExec spec of
+        C2.Vector v -> C2.vsWidth v
+        _ -> 1
+      atomicScatterBodyDoc elemTy declared' =
+          case detectAtomicScatterAddLoop loopBody of
+          Just (prefix, mGuard, arr, idx, val) ->
+            let prefixLiveAfter =
+                  maybe S.empty usedVarsAtom2 mGuard
+                    `S.union` usedVarsAtom2 arr
+                    `S.union` usedVarsAtom2 idx
+                    `S.union` usedVarsAtom2 val
+                atomicUpdate =
+                  text "#pragma omp atomic update"
+                    $$ genArrayAccess elemTy arr idx <+> text "+=" <+> genAtom val <> text ";"
+                guardedUpdate =
+                  case mGuard of
+                    Nothing -> atomicUpdate
+                    Just cond ->
+                      text "if (" <> genAtom cond <> text ") {"
+                        $$ nest 4 atomicUpdate
+                        $$ text "}"
+            in genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' prefixLiveAfter prefix
+                 $$ guardedUpdate
+          Nothing ->
+            bodyDoc declared'
+      privatizedScatterLoopDoc declared' iter bound =
+          case detectAtomicScatterAddLoop loopBody of
+          Just (prefix, mGuard, arr, idx, val) ->
+            let arrStem = case arr of
+                  AVar arrV -> sanitize arrV
+                  _ -> "scatter"
+                prefixLiveAfter =
+                  maybe S.empty usedVarsAtom2 mGuard
+                    `S.union` usedVarsAtom2 arr
+                    `S.union` usedVarsAtom2 idx
+                    `S.union` usedVarsAtom2 val
+                sizeVar = text ("__hyd_priv_size_" ++ arrStem)
+                privVar = text ("__hyd_priv_buf_" ++ arrStem)
+                mergeIxName = "__hyd_priv_merge_" ++ arrStem
+                mergeIx = text mergeIxName
+                ci = sanitize iter
+                privUpdate =
+                  privVar <> text "[" <> genAtom idx <> text "]" <+> text "+=" <+> genAtom val <> text ";"
+                guardedPrivUpdate =
+                  case mGuard of
+                    Nothing -> privUpdate
+                    Just cond ->
+                      text "if (" <> genAtom cond <> text ") {"
+                        $$ nest 4 privUpdate
+                        $$ text "}"
+            in
+              text "/* parallel" <+> roleComment <+> text "*/"
+                $$ text "#pragma omp parallel /* scatter-privatized-int-add */"
+                $$ text "{"
+                $$ nest 4
+                    ( text "int64_t" <+> sizeVar <+> text "=" <+> text "hyd_shape_size(" <> genAtom arr <> text "->shape);"
+                      $$ text "int64_t*" <+> privVar <+> text "="
+                           <+> text "(int64_t*)calloc((size_t)" <> sizeVar <> text ", sizeof(int64_t));"
+                      $$ text "if (" <> privVar <+> text "== NULL) {"
+                      $$ nest 4
+                           ( text "fprintf(stderr, \"hydrangea: failed to allocate privatized scatter buffer\\n\");"
+                             $$ text "exit(1);"
+                           )
+                      $$ text "}"
+                      $$ text "#pragma omp for"
+                      $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr bound <> text ";" <+> text ci <> text "++) {"
+                      $$ nest 4
+                            ( genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' prefixLiveAfter prefix
+                               $$ guardedPrivUpdate
+                             )
+                      $$ text "}"
+                      $$ text "#pragma omp critical"
+                      $$ text "{"
+                      $$ nest 4
+                           ( text "for (int64_t" <+> mergeIx <+> text "= 0;" <+> mergeIx <+> text "<" <+> sizeVar <> text ";" <+> mergeIx <> text "++) {"
+                             $$ nest 4 (genArrayAccess CTInt64 arr (AVar (BS.pack mergeIxName)) <+> text "+=" <+> privVar <> text "[" <> mergeIx <> text "];")
+                             $$ text "}"
+                           )
+                      $$ text "}"
+                      $$ text "free(" <> privVar <> text ");"
+                    )
+                $$ text "}"
+          Nothing ->
+            text "/* parallel" <+> roleComment <+> text "*/"
+              $$ parallelPragma empty
+              $$ text "for (int64_t" <+> text (sanitize iter) <+> text "= 0;" <+> text (sanitize iter) <+> text "<" <+> genIndexExpr bound <> text ";" <+> text (sanitize iter) <> text "++) {"
+              $$ nest 4 (bodyDoc declared')
+              $$ text "}"
+  in hoistedMemoDoc $$ case (C2.lsExec spec, red, iters, bounds) of
+    (C2.Serial, Just r, [i], [b]) ->
+      let cacc = sanitize (C2.rsAccVar r)
+          ci = sanitize i
+          declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
+          alreadyDeclared = C2.rsAccVar r `S.member` declared
+          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accInit = if alreadyDeclared
+                      then empty
+                      else text "/* acc */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+      in accInit
+          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+          $$ nest 4 (bodyDoc declared')
+          $$ text "}"
+
+    (C2.Parallel _, Just r, [i], [b]) ->
+      let cacc = sanitize (C2.rsAccVar r)
+          ci = sanitize i
+          declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
+          alreadyDeclared = C2.rsAccVar r `S.member` declared
+          redClause = case C2.rsRedop r of
+            RAdd -> text "reduction(+:" <> text cacc <> text ")"
+            RMul -> text "reduction(*:" <> text cacc <> text ")"
+          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accInit = if alreadyDeclared
+                      then empty
+                      else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+      in accInit
+          $$ parallelPragma (space <> redClause)
+          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+          $$ nest 4 (bodyDoc declared')
+          $$ text "}"
+
+    (C2.Parallel _, Just r, _, _) ->
+      let cacc = sanitize (C2.rsAccVar r)
+          declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
+          alreadyDeclared = C2.rsAccVar r `S.member` declared
+          redClause = case C2.rsRedop r of
+            RAdd -> text "reduction(+:" <> text cacc <> text ")"
+            RMul -> text "reduction(*:" <> text cacc <> text ")"
+          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accInit = if alreadyDeclared
+                      then empty
+                      else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+      in accInit
+          $$ parallelPragma (space <> redClause)
+          $$ genNestedLoops iters bounds (bodyDoc declared')
+
+    (C2.Vector v, Just r, [i], [b]) ->
+      let ci = sanitize i
+          cacc = sanitize (C2.rsAccVar r)
+          declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
+          redClause = case C2.rsRedop r of
+            RAdd -> text " reduction(+:" <> text cacc <> text ")"
+            RMul -> text " reduction(*:" <> text cacc <> text ")"
+          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accInit = if C2.rsAccVar r `S.member` declared
+                      then empty
+                      else text "/* simd reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+          vecComment = case C2.vsTail v of
+            C2.TailNone -> text "/* vectorized reduction loop, width =" <+> int (C2.vsWidth v) <> text " */"
+            _ -> text "/* vectorized reduction loop, width =" <+> int (C2.vsWidth v) <+> text "(compiler handles tail) */"
+      in accInit
+          $$ vecComment
+          $$ simdPragma redClause
+          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+          $$ nest 4 (bodyDoc declared')
+          $$ text "}"
+
+    (C2.Vector v, _, [i], [b]) ->
+      let ci = sanitize i
+          vecComment = case C2.vsTail v of
+            C2.TailNone -> text "/* vectorized loop, width =" <+> int (C2.vsWidth v) <> text " */"
+            _ -> text "/* vectorized loop, width =" <+> int (C2.vsWidth v) <+> text "(compiler handles tail) */"
+      in vecComment
+          $$ simdPragma empty
+          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+          $$ nest 4 (bodyDoc declaredWithHoisted)
+          $$ text "}"
+
+    (C2.Parallel p, _, [i], [b]) | C2.psStrategy p == C2.ParallelScatterPrivatizedIntAdd ->
+      privatizedScatterLoopDoc declaredWithHoisted i b
+
+    (C2.Parallel _, _, [i], [b]) ->
+      let ci = sanitize i
+      in text "/* parallel" <+> roleComment <+> text "*/"
+          $$ parallelPragma empty
+          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+          $$ nest 4 (case C2.lsExec spec of
+                C2.Parallel p
+                  | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
+                _ -> bodyDoc declaredWithHoisted)
+          $$ text "}"
+
+    (C2.Parallel _, _, _, _) ->
+      text "/* parallel" <+> roleComment <+> text "*/"
+          $$ parallelPragma empty
+          $$ genNestedLoops iters bounds
+                (case C2.lsExec spec of
+                    C2.Parallel p
+                      | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
+                    _ -> bodyDoc declaredWithHoisted)
+
+    (_, _, _, _) -> genNestedLoops iters bounds (bodyDoc declaredWithHoisted)
+
+hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> [C2.Stmt] -> ([C2.Stmt], [C2.Stmt])
+hoistMemoizedZeroArgArrayCalls retKinds = foldr step ([], [])
+  where
+    step stmt (hoisted, kept)
+      | isMemoizedZeroArgArrayCall retKinds stmt = (stmt : hoisted, kept)
+      | otherwise = (hoisted, stmt : kept)
+
+memoizedZeroArgArrayCallVars :: Map CVar VarKind -> [C2.Stmt] -> Set CVar
+memoizedZeroArgArrayCallVars retKinds body =
+  S.fromList [v | C2.SAssign v (RCall _ []) <- fst (hoistMemoizedZeroArgArrayCalls retKinds body)]
+
+isMemoizedZeroArgArrayCall :: Map CVar VarKind -> C2.Stmt -> Bool
+isMemoizedZeroArgArrayCall retKinds stmt = case stmt of
+  C2.SAssign _ (RCall f []) ->
+    case Map.findWithDefault KScalar f retKinds of
+      KArray -> True
+      KFloatArray -> True
+      _ -> False
+  _ -> False
+
+genNestedLoops :: [CVar] -> [C2.IndexExpr] -> Doc -> Doc
+genNestedLoops iters bounds body =
+  foldr mk body (zip (map sanitize iters) bounds)
+  where
+    mk (ci, b) inner =
+      text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+        $$ nest 4 inner
+        $$ text "}"
+
+detectAtomicScatterAddLoop :: [C2.Stmt] -> Maybe ([C2.Stmt], Maybe Atom, Atom, Atom, Atom)
+detectAtomicScatterAddLoop body =
+  case reverse body of
+    (C2.SIf cond thn [] : revPrefix) -> do
+      (branchPrefix, arrWrite, idxWrite, val) <- detectAtomicScatterAddCore thn
+      pure (reverse revPrefix ++ branchPrefix, Just cond, arrWrite, idxWrite, val)
+    _ -> do
+      (prefix, arrWrite, idxWrite, val) <- detectAtomicScatterAddCore body
+      pure (prefix, Nothing, arrWrite, idxWrite, val)
+  where
+    detectAtomicScatterAddCore stmts =
+      case reverse stmts of
+        ( C2.SArrayWrite arrWrite idxWrite (AVar newVar)
+          : C2.SAssign newVar' (RBinOp op a b)
+          : C2.SAssign oldVar (RArrayLoad arrRead idxRead)
+          : revPrefix
+          )
+          | newVar == newVar'
+          , isAtomicAddOp op
+          , arrWrite == arrRead
+          , idxWrite == idxRead
+          , Just val <- nonOldOperand oldVar a b ->
+              Just (reverse revPrefix, arrWrite, idxWrite, val)
+        _ -> Nothing
+
+    nonOldOperand oldVar a b = case (a, b) of
+      (AVar oldV, other) | oldV == oldVar -> Just other
+      (other, AVar oldV) | oldV == oldVar -> Just other
+      _ -> Nothing
+
+    isAtomicAddOp op = case op of
+      CAdd -> True
+      CAddF -> True
+      _ -> False
+
+atomicScatterElemType :: C2.ParallelSpec -> Maybe CType
+atomicScatterElemType p = case C2.psStrategy p of
+  C2.ParallelScatterAtomicAddInt -> Just CTInt64
+  C2.ParallelScatterAtomicAddFloat -> Just CTDouble
+  _ -> Nothing
+
+genIndexExpr :: C2.IndexExpr -> Doc
+genIndexExpr expr = case C2.simplifyIndexExpr expr of
+  C2.IVar v -> text (sanitize v)
+  C2.IConst n -> text (show n ++ "LL")
+  C2.IAdd a b -> parens (genIndexExpr a <+> text "+" <+> genIndexExpr b)
+  C2.ISub a b -> parens (genIndexExpr a <+> text "-" <+> genIndexExpr b)
+  C2.IMul a b -> parens (genIndexExpr a <+> text "*" <+> genIndexExpr b)
+  C2.IDiv a b -> parens (genIndexExpr a <+> text "/" <+> genIndexExpr b)
+  C2.INdToFlat nd shp -> text "hyd_nd_to_flat(" <> genIndexExpr nd <> text "," <+> genIndexExpr shp <> text ")"
+  C2.ICall _ _ -> text "0LL"
+  _ -> text "0LL"
+
+hasParallelStmt2 :: [C2.Stmt] -> Bool
+hasParallelStmt2 = any go
+  where
+    go st = case st of
+      C2.SLoop spec body -> case C2.lsExec spec of
+        C2.Parallel _ -> True
+        _ -> hasParallelStmt2 body
+      C2.SIf _ thn els -> hasParallelStmt2 thn || hasParallelStmt2 els
+      _ -> False
+
+-- | Returns True when any statement in the body uses a math-library UnOp
+-- (CSqrt, CExpF, CLog, etc.) so we can conditionally emit @#include \<math.h\>@.
+hasMathOp :: [C2.Stmt] -> Bool
+hasMathOp = any go
+  where
+    go st = case st of
+      C2.SAssign _ rhs    -> rhsHasMath rhs
+      C2.SArrayWrite _ _ a -> atomHasMath a
+      C2.SLoop _ body     -> hasMathOp body
+      C2.SIf _ thn els   -> hasMathOp thn || hasMathOp els
+      _                   -> False
+    rhsHasMath (RUnOp op _) = isMathOp op
+    rhsHasMath _            = False
+    atomHasMath _ = False
+    isMathOp op = op `elem` [CSqrt, CExpF, CLog, CSin, CCos, CAbsF, CFloorF, CCeilF, CErf]
+findReturnVar2 :: [C2.Stmt] -> Maybe CVar
+findReturnVar2 [] = Nothing
+findReturnVar2 stmts = case last stmts of
+  C2.SReturn (AVar v) -> Just v
+  _ -> Nothing
+
+splitFinalReturn :: [C2.Stmt] -> ([C2.Stmt], Maybe Atom)
+splitFinalReturn stmts = case reverse stmts of
+  (C2.SReturn a : rest) -> (reverse rest, Just a)
+  _ -> (stmts, Nothing)
+
+-- | True when a proc body ends with a direct float-literal return,
+-- i.e. the body is just `SReturn (AFloat _)` with no intermediate variable.
+-- This handles top-level float constants like `let g = 6.674e-11`.
+isDirectFloatReturn :: [C2.Stmt] -> Bool
+isDirectFloatReturn stmts = case stmts of
+  [C2.SReturn (AFloat _)] -> True
+  _ -> False
+
+arrayVarsProc2 :: C2.Proc -> Set CVar
+arrayVarsProc2 (C2.Proc { C2.procBody = body }) = arrayVarsStmts2 body
+
+localArrayVarsProc2 :: Map CVar CType -> C2.Proc -> Set CVar
+localArrayVarsProc2 typeEnv (C2.Proc { C2.procBody = body }) =
+  S.fromList
+    [ v
+    | C2.SAssign v rhs <- body
+    , isLocalArray v
+    , ownsArrayHeader rhs
+    ]
+  where
+    isLocalArray v = case Map.lookup v typeEnv of
+      Just (CTArray _) -> True
+      _ -> False
+    ownsArrayHeader rhs = case rhs of
+      RArrayAlloc {} -> True
+      RCall {} -> True
+      _ -> False
+
+arrayVarsStmts2 :: [C2.Stmt] -> Set CVar
+arrayVarsStmts2 = foldMap arrayVarsStmt2
+
+arrayVarsStmt2 :: C2.Stmt -> Set CVar
+arrayVarsStmt2 st = case st of
+  C2.SAssign v rhs -> case rhs of
+    RArrayAlloc {} -> S.singleton v
+    RCall fn _ | fn == "hyd_read_array_csv" -> S.singleton v
+    RCall fn _ | fn == "hyd_read_float_array_csv" -> S.singleton v
+    _ -> S.empty
+  C2.SLoop _ body -> arrayVarsStmts2 body
+  C2.SIf _ thn els -> arrayVarsStmts2 thn `S.union` arrayVarsStmts2 els
+  _ -> S.empty
+
+cleanupArrayVarsDoc :: Set CVar -> Doc
+cleanupArrayVarsDoc vars =
+  vcat [text "hyd_array_free(" <> text (sanitize v) <> text ");" | v <- S.toList vars]
+
+tupleVarsProc2 :: C2.Proc -> Set CVar
+tupleVarsProc2 (C2.Proc { C2.procBody = body }) = tupleVarsStmts2 body
+
+tupleVarsStmts2 :: [C2.Stmt] -> Set CVar
+tupleVarsStmts2 = foldMap tupleVarsStmt2
+
+tupleVarsStmt2 :: C2.Stmt -> Set CVar
+tupleVarsStmt2 st = case st of
+  C2.SAssign v rhs -> case rhs of
+    RTuple {} -> S.singleton v
+    RArrayShape {} -> S.singleton v
+    RShapeInit {} -> S.singleton v
+    RFlatToNd {} -> S.singleton v
+    _ -> S.empty
+  C2.SLoop _ body -> tupleVarsStmts2 body
+  C2.SIf _ thn els -> tupleVarsStmts2 thn `S.union` tupleVarsStmts2 els
+  _ -> S.empty
+
+-- | Collect the variables that hold pair values and their element types.
+pairVarsProc2 :: C2.Proc -> Map CVar (CElemType, CElemType)
+pairVarsProc2 (C2.Proc { C2.procBody = body }) = pairVarsStmts2 Map.empty body
+
+-- | Forward-propagating pass: process statements in order, accumulating
+-- the map of known pair-typed variables. Propagates pair type through
+-- plain @RAtom (AVar src)@ copies (e.g. the foldl accumulator init).
+pairVarsStmts2 :: Map CVar (CElemType, CElemType) -> [C2.Stmt] -> Map CVar (CElemType, CElemType)
+pairVarsStmts2 known = foldl pairVarsStmt2 known
+
+pairVarsStmt2 :: Map CVar (CElemType, CElemType) -> C2.Stmt -> Map CVar (CElemType, CElemType)
+pairVarsStmt2 known st = case st of
+  C2.SAssign v (RPairMake cty1 cty2 _ _) -> Map.insert v (cty1, cty2) known
+  -- Propagate pair type through plain copies (e.g. foldl acc initialisation).
+  C2.SAssign v (RAtom (AVar src))
+    | Just tys <- Map.lookup src known   -> Map.insert v tys known
+  -- RPairFst/RPairSnd carrying a pair CElemType yield another pair variable.
+  C2.SAssign v (RPairFst (CEPair ct1 ct2) _) -> Map.insert v (ct1, ct2) known
+  C2.SAssign v (RPairSnd (CEPair ct1 ct2) _) -> Map.insert v (ct1, ct2) known
+  C2.SLoop _ body  -> pairVarsStmts2 known body
+  C2.SIf _ thn els -> let k1 = pairVarsStmts2 known thn
+                          k2 = pairVarsStmts2 known els
+                      in Map.union k1 k2
+  _ -> known
+
+isFloatArithBinOp :: BinOp -> Bool
+isFloatArithBinOp CAddF = True
+isFloatArithBinOp CSubF = True
+isFloatArithBinOp CMulF = True
+isFloatArithBinOp CDivF = True
+isFloatArithBinOp _ = False
+
+-- | Returns True for UnOps whose result type is always Float (math functions).
+isMathFloatOp :: UnOp -> Bool
+isMathFloatOp op = op `elem` [CSqrt, CExpF, CLog, CSin, CCos, CAbsF, CFloorF, CCeilF, CErf, CFloatOf]
+
+-- | Collect variable names from an atom (empty for literals).
+atomVars :: Atom -> Set CVar
+atomVars (AVar v) = S.singleton v
+atomVars (AVecVar v) = S.singleton v
+atomVars _ = S.empty
+
+isFloatAtom :: Set CVar -> Atom -> Bool
+isFloatAtom _ (AFloat _) = True
+isFloatAtom fv (AVar v) = v `S.member` fv
+isFloatAtom _ _ = False
+
+classifyVarKinds2 :: Map CVar VarKind -> [C2.Stmt] -> (Set CVar, Set CVar)
+classifyVarKinds2 retKinds stmts = fixpoint S.empty (initFloatArrays stmts)
+  where
+    isFloatArrayCall fn =
+      fn == "hyd_read_float_array_csv"
+      || Map.lookup fn retKinds == Just KFloatArray
+    initFloatArrays = foldMap initFloatArray
+    initFloatArray st = case st of
+      C2.SAssign v (RCall fn _) | isFloatArrayCall fn -> S.singleton v
+      C2.SLoop _ body -> foldMap initFloatArray body
+      C2.SIf _ thn els -> foldMap initFloatArray thn `S.union` foldMap initFloatArray els
+      _ -> S.empty
+
+    fixpoint fv fa =
+      let fa' = collectFloatArrayVars fv stmts `S.union` fa
+          fv' = collectFloatVars fv fa' stmts
+      in if fv' == fv && fa' == fa then (fv, fa) else fixpoint fv' fa'
+
+    collectFloatVars fv fa = foldMap (floatVarStmt fv fa)
+    floatVarStmt fv fa st = case st of
+      C2.SAssign v rhs ->
+        let isFloat = case rhs of
+              RAtom a -> isFloatAtom fv a
+              RBinOp op _ _ -> isFloatArithBinOp op
+              RUnOp CNeg a -> isFloatAtom fv a
+              RUnOp op _ -> isMathFloatOp op
+              RArrayLoad (AVar arr) _ -> arr `S.member` fa
+              RVecUnOp {} -> True
+              RVecReduce {} -> True
+              _ -> False
+            -- Backward propagation: variables USED in float operations are floats.
+            -- This is needed to correctly type function parameters (which are never
+            -- assigned in the body, so they can't be discovered by the forward pass).
+            -- Note: CFloatOf converts int→float, so its argument stays an int.
+            usedAsFloat = case rhs of
+              RBinOp op a1 a2 | isFloatArithBinOp op ->
+                atomVars a1 `S.union` atomVars a2
+              RUnOp op a | op `elem` [CSqrt, CExpF, CLog, CSin, CCos, CAbsF, CFloorF, CCeilF, CErf] ->
+                atomVars a
+              RUnOp CNeg a | isFloatAtom fv a -> atomVars a
+              _ -> S.empty
+        in (if isFloat then S.singleton v else S.empty) `S.union` usedAsFloat
+      C2.SLoop _ body -> collectFloatVars fv fa body
+      C2.SIf _ thn els -> collectFloatVars fv fa thn `S.union` collectFloatVars fv fa els
+      _ -> S.empty
+
+    collectFloatArrayVars fv = foldMap (floatArrayVarStmt fv)
+    floatArrayVarStmt fv st = case st of
+      C2.SAssign v (RCall fn _) | isFloatArrayCall fn -> S.singleton v
+      C2.SArrayWrite (AVar arr) _ val | isFloatAtom fv val -> S.singleton arr
+      C2.SLoop _ body -> collectFloatArrayVars fv body
+      C2.SIf _ thn els -> collectFloatArrayVars fv thn `S.union` collectFloatArrayVars fv els
+      _ -> S.empty
+
+classifyVecVars :: [C2.Stmt] -> Set CVar
+classifyVecVars stmts = fixpoint S.empty stmts
+  where
+    fixpoint vv body =
+      let vv' = collectVecVars vv body
+      in if vv' == vv then vv else fixpoint vv' body
+
+    collectVecVars known = foldMap (goStmt known)
+
+    goStmt known st = case st of
+      C2.SAssign v rhs -> case rhs of
+        RVecLoad {} -> S.singleton v
+        RVecBinOp {} -> S.singleton v
+        RVecUnOp {} -> S.singleton v
+        RVecSplat {} -> S.singleton v
+        RAtom (AVecVar src) | src `S.member` known -> S.singleton v
+        _ -> S.empty
+      C2.SLoop _ body -> collectVecVars known body
+      C2.SIf _ thn els -> collectVecVars known thn `S.union` collectVecVars known els
+      _ -> S.empty
+
+procReturnKinds2 :: C2.Program -> Map CVar VarKind
+-- Build return-kind map incrementally so callees are known when their callers
+-- are classified. Procs are emitted in definition order (callees before callers),
+-- so a left fold accumulates enough context by the time each proc is processed.
+procReturnKinds2 prog@(C2.Program procs) = foldl addProc Map.empty procs
+  where
+    callTypes = inferProgramReturnTypes2 prog
+    addProc rk proc@(C2.Proc { C2.procName = name }) = Map.insert name (retKindOf rk proc) rk
+    retKindOf rk proc@(C2.Proc { C2.procBody = body, C2.procTypeEnv = typeEnv }) =
+      let recoveredTypeEnv = recoverProcTypeEnv2 callTypes proc
+          (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) =
+            typeEnvToVarSets (typeEnv `Map.union` recoveredTypeEnv)
+          arrVars      = arrVarsTE    `S.union` arrayVarsProc2 proc
+          tupVars      = tupVarsTE    `S.union` tupleVarsProc2 proc
+          pairVars     = pairVarsTE   `Map.union` pairVarsProc2 proc
+          recordVars   = recordVarsTE
+          (floatVarsH, floatArrVarsH) = classifyVarKinds2 rk body
+          floatVars    = floatVarsTE  `S.union` floatVarsH
+          floatArrVars = floatArrVarsTE `S.union` floatArrVarsH
+      in case findReturnVar2 body of
+        Just rv | rv `S.member` floatArrVars -> KFloatArray
+        Just rv | rv `S.member` arrVars -> KArray
+        Just rv | rv `S.member` tupVars -> KTuple
+        Just rv | Just (ct1, ct2) <- Map.lookup rv pairVars -> KPair ct1 ct2
+        Just rv | Just fields <- Map.lookup rv recordVars -> KRecord fields
+        Just rv | rv `S.member` floatVars -> KFloat
+        Nothing | isDirectFloatReturn body -> KFloat
+        _ -> KScalar
+
+sanitize :: CVar -> String
+sanitize bs = case BS.unpack bs of
+  [] -> "_empty"
+  "main" -> "hyd_main"  -- avoid conflict with C's int main()
+  s -> map (\c -> if isAlphaNum c || c == '_' then c else '_') s
+
+sanitizeExportName :: BS.ByteString -> String
+sanitizeExportName bs = case BS.unpack bs of
+  [] -> "_empty"
+  s -> map (\c -> if isAlphaNum c || c == '_' then c else '_') s
+
+sanitizeFieldName :: BS.ByteString -> String
+sanitizeFieldName bs = case sanitize bs of
+  [] -> "field"
+  s@(c:_)
+    | isAlphaNum c || c == '_' -> s
+    | otherwise -> '_' : s
+
+cTypeTag :: CType -> String
+cTypeTag CTInt64 = "i"
+cTypeTag CTDouble = "f"
+cTypeTag CTBool = "b"
+cTypeTag CTUnit = "u"
+cTypeTag CTTuple = "t"
+cTypeTag (CTArray elt) = "a" ++ cTypeTag elt
+cTypeTag (CTPair t1 t2) = "p" ++ cTypeTag t1 ++ cTypeTag t2
+cTypeTag (CTRecord fields) = "r" ++ concatMap (\(field, fieldTy) -> sanitizeFieldName field ++ "_" ++ cTypeTag fieldTy ++ "_") fields
+
+cTypeName :: CType -> String
+cTypeName CTInt64 = "int64_t"
+cTypeName CTDouble = "double"
+cTypeName CTBool = "int64_t"
+cTypeName CTUnit = "int64_t"
+cTypeName CTTuple = "hyd_tuple_t"
+cTypeName (CTArray _) = "hyd_array_t*"
+cTypeName (CTPair t1 t2)
+  | Just et1 <- ctypeToElemType t1
+  , Just et2 <- ctypeToElemType t2 = pairStructName et1 et2
+  | otherwise = "int64_t"
+cTypeName (CTRecord fields) = recordStructName fields
+
+recordStructName :: [(BS.ByteString, CType)] -> String
+recordStructName fields = "hyd_record_" ++ concatMap (\(field, fieldTy) -> sanitizeFieldName field ++ "_" ++ cTypeTag fieldTy ++ "_") fields ++ "t"
+
+-- | Letter abbreviation for a CElemType, used in struct name mangling.
+-- For nested pairs this recurses: CEPair CEFloat CEInt → "pfi".
+celemTypeLetter :: CElemType -> String
+celemTypeLetter CEInt           = "i"
+celemTypeLetter CEFloat         = "f"
+celemTypeLetter CEBool          = "b"
+celemTypeLetter (CEPair ct1 ct2) = "p" ++ celemTypeLetter ct1 ++ celemTypeLetter ct2
+
+-- | C type string for a CElemType.
+celemTypeCType :: CElemType -> String
+celemTypeCType CEInt            = "int64_t"
+celemTypeCType CEFloat          = "double"
+celemTypeCType CEBool           = "int64_t"
+celemTypeCType (CEPair ct1 ct2) = pairStructName ct1 ct2
+
+-- | Struct typedef name for a pair type, e.g. @hyd_pair_fi_t@.
+pairStructName :: CElemType -> CElemType -> String
+pairStructName ct1 ct2 = "hyd_pair_" ++ celemTypeLetter ct1 ++ celemTypeLetter ct2 ++ "_t"
+
+-- | Emit a typedef for a pair struct.
+genPairStructDef :: CElemType -> CElemType -> Doc
+genPairStructDef ct1 ct2 =
+  text "typedef struct {"
+    <+> text (celemTypeCType ct1) <+> text "fst;"
+    <+> text (celemTypeCType ct2) <+> text "snd;"
+    <+> text "}" <+> text (pairStructName ct1 ct2) <> text ";"
+
+-- | Collect the transitive closure of sub-pair types used by a CElemType.
+-- Returns all (ct1, ct2) pairs that need struct definitions, in dependency order
+-- (innermost pairs first).
+transitivePairTypes :: CElemType -> [(CElemType, CElemType)]
+transitivePairTypes (CEPair ct1 ct2) =
+  transitivePairTypes ct1 ++ transitivePairTypes ct2 ++ [(ct1, ct2)]
+transitivePairTypes _ = []
+
+collectPairTypesFromCType :: CType -> [(CElemType, CElemType)]
+collectPairTypesFromCType (CTPair t1 t2)
+  | Just et1 <- ctypeToElemType t1
+  , Just et2 <- ctypeToElemType t2 = transitivePairTypes (CEPair et1 et2)
+collectPairTypesFromCType (CTArray elt) = collectPairTypesFromCType elt
+collectPairTypesFromCType (CTRecord fields) = concatMap (collectPairTypesFromCType . snd) fields
+collectPairTypesFromCType _ = []
+
+-- | Collect all distinct pair kinds used in the program and emit their struct
+-- typedefs in dependency order (inner structs before outer structs).
+-- Scans both the CFG body (for RPairMake sites) and the procTypeEnv (for pair
+-- parameters/return values that never appear in a make statement).
+genPairStructDefs :: C2.Program -> Doc
+genPairStructDefs (C2.Program procs) =
+  let allPairs = concatMap transitivePairTypes topLevelTypes
+      -- deduplicate while preserving order (first occurrence wins)
+      ordered = nubBy (\a b -> fst a == fst b && snd a == snd b) allPairs
+  in if null ordered then empty
+     else text "" $$ vcat (map (uncurry genPairStructDef) ordered)
+  where
+    topLevelTypes = concatMap collectPairTypesProc procs
+    collectPairKinds (C2.Proc { C2.procBody = body, C2.procTypeEnv = tenv }) =
+      collectPairKindsStmts body `S.union` collectPairKindsTypeEnv tenv
+    collectPairTypesProc proc = map (\(ct1, ct2) -> CEPair ct1 ct2) (S.toList (collectPairKinds proc))
+    -- Collect pairs from RPairMake in the body.
+    collectPairKindsStmts = foldMap collectPairKindsStmt
+    collectPairKindsStmt st = case st of
+      C2.SAssign _ (RPairMake ct1 ct2 _ _) -> S.singleton (ct1, ct2)
+      C2.SLoop _ body -> collectPairKindsStmts body
+      C2.SIf _ thn els -> collectPairKindsStmts thn `S.union` collectPairKindsStmts els
+      _ -> S.empty
+    -- Collect pairs from the type environment (covers pair params/returns).
+    collectPairKindsTypeEnv tenv =
+      S.fromList [ pairTy
+                 | (_, ct) <- Map.toList tenv
+                 , pairTy <- collectPairTypesFromCType ct
+                 ]
+    nubBy _ [] = []
+    nubBy eq (x:xs) = x : nubBy eq (filter (not . eq x) xs)
+
+transitiveRecordTypes :: CType -> [[(BS.ByteString, CType)]]
+transitiveRecordTypes (CTRecord fields) =
+  concatMap (transitiveRecordTypes . snd) fields ++ [fields]
+transitiveRecordTypes (CTArray elt) = transitiveRecordTypes elt
+transitiveRecordTypes (CTPair t1 t2) = transitiveRecordTypes t1 ++ transitiveRecordTypes t2
+transitiveRecordTypes _ = []
+
+genRecordStructDef :: [(BS.ByteString, CType)] -> Doc
+genRecordStructDef fields =
+  text "typedef struct {"
+    $$ nest 2 (vcat [text (cTypeName fieldTy) <+> text (sanitizeFieldName field) <> text ";" | (field, fieldTy) <- fields])
+    $$ text "}" <+> text (recordStructName fields) <> text ";"
+
+genRecordStructDefs :: C2.Program -> Doc
+genRecordStructDefs (C2.Program procs) =
+  let allRecords = concatMap collectProcRecords procs
+      ordered = nubBy (==) allRecords
+  in if null ordered then empty else text "" $$ vcat (map genRecordStructDef ordered)
+  where
+    collectProcRecords (C2.Proc { C2.procTypeEnv = tenv }) =
+      concatMap transitiveRecordTypes (Map.elems tenv)
+    nubBy _ [] = []
+    nubBy eq (x:xs) = x : nubBy eq (filter (not . eq x) xs)
+
+isStructuredPrintableArrayElem :: CType -> Bool
+isStructuredPrintableArrayElem ct = case ct of
+  CTPair {} -> True
+  CTRecord {} -> True
+  _ -> False
+
+structuredArrayPrintName :: CType -> String
+structuredArrayPrintName eltTy = "hyd_print_array_" ++ cTypeTag eltTy
+
+genStructuredArrayPrintDefs :: Map CVar CType -> Doc
+genStructuredArrayPrintDefs retTypes =
+  let arrayElts =
+        nubBy (==)
+          [ eltTy
+          | (_, CTArray eltTy) <- Map.toList retTypes
+          , isStructuredPrintableArrayElem eltTy
+          ]
+  in if null arrayElts then empty else text "" $$ vcat (map genStructuredArrayPrintDef arrayElts)
+  where
+    nubBy _ [] = []
+    nubBy eq (x:xs) = x : nubBy eq (filter (not . eq x) xs)
+
+genStructuredArrayPrintDef :: CType -> Doc
+genStructuredArrayPrintDef eltTy =
+  let fnName = structuredArrayPrintName eltTy
+      eltName = cTypeName eltTy
+  in text "static void" <+> text fnName <> parens (text "hyd_array_t* arr") <+> text "{"
+      $$ nest 4 (
+           text "int64_t size = hyd_shape_size(arr->shape);"
+           $$ text "printf(\"[\");"
+           $$ text "for (int64_t i = 0; i < size; i++) {"
+           $$ nest 4 (
+                text "if (i > 0) printf(\", \");"
+                $$ text eltName <+> text "v = (((" <> text eltName <> text "*)(void*)arr->data)[i]);"
+                $$ genPrintValue eltTy (text "v")
+              )
+           $$ text "}"
+           $$ text "printf(\"] (shape: [\");"
+           $$ text "for (int i = 0; i < arr->shape.ndims; i++) {"
+           $$ nest 4 (
+                text "if (i > 0) printf(\", \");"
+                $$ text "printf(\"%lld\", (long long)arr->shape.elems[i]);"
+              )
+           $$ text "}"
+           $$ text "printf(\"])\\n\");"
+         )
+      $$ text "}"
+
+genPrintValue :: CType -> Doc -> Doc
+genPrintValue ct expr = case ct of
+  CTInt64 -> text "printf(\"%lld\", (long long)(" <> expr <> text "));"
+  CTBool -> text "printf(\"%lld\", (long long)(" <> expr <> text "));"
+  CTUnit -> text "printf(\"%lld\", (long long)(" <> expr <> text "));"
+  CTDouble -> text "printf(\"%.17g\", (double)(" <> expr <> text "));"
+  CTPair _ _ ->
+    text "printf(\"(\");"
+      $$ genPrintValuePairFst ct expr
+      $$ text "printf(\", \");"
+      $$ genPrintValuePairSnd ct expr
+      $$ text "printf(\")\");"
+  CTRecord fields ->
+    text "printf(\"{\");"
+      $$ vcat
+        [ (if ix == 0 then empty else text "printf(\", \");")
+            $$ text "printf(\"" <> text (sanitizeFieldName field ++ " = ") <> text "\");"
+            $$ genPrintValue fieldTy (expr <> text "." <> text (sanitizeFieldName field))
+        | (ix, (field, fieldTy)) <- zip [0 :: Int ..] fields
+        ]
+      $$ text "printf(\"}\");"
+  _ -> text "printf(\"<unprintable>\");"
+  where
+    genPrintValuePairFst (CTPair t1 _) base = genPrintValue t1 (base <> text ".fst")
+    genPrintValuePairFst _ _ = text "printf(\"<unprintable>\");"
+    genPrintValuePairSnd (CTPair _ t2) base = genPrintValue t2 (base <> text ".snd")
+    genPrintValuePairSnd _ _ = text "printf(\"<unprintable>\");"
+
+varDecl :: Map CVar VarKind -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> CVar -> RHS -> Doc
+varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
+  | v `S.member` arrVars = text "hyd_array_t*"
+  | v `S.member` tupVars = text "hyd_tuple_t"
+  | Just (ct1, ct2) <- Map.lookup v pairVars = text (pairStructName ct1 ct2)
+  | Just fields <- Map.lookup v recordVars = text (recordStructName fields)
+  | v `S.member` vecVars = text "hyd_float64x2_t"
+  | v `S.member` floatVars = text "double"
+  | otherwise = case rhs of
+      RAtom (AVar src)
+        | src `S.member` arrVars -> text "hyd_array_t*"
+        | src `S.member` tupVars -> text "hyd_tuple_t"
+        | Just (ct1, ct2) <- Map.lookup src pairVars -> text (pairStructName ct1 ct2)
+        | Just fields <- Map.lookup src recordVars -> text (recordStructName fields)
+        | src `S.member` vecVars -> text "hyd_float64x2_t"
+        | src `S.member` floatVars -> text "double"
+      RAtom (AVecVar _) -> text "hyd_float64x2_t"
+      RArrayAlloc {} -> text "hyd_array_t*"
+      RArrayShape {} -> text "hyd_tuple_t"
+      RShapeInit {} -> text "hyd_tuple_t"
+      RTuple {} -> text "hyd_tuple_t"
+      RFlatToNd {} -> text "hyd_tuple_t"
+      RVecLoad {} -> text "hyd_float64x2_t"
+      RVecBinOp {} -> text "hyd_float64x2_t"
+      RVecUnOp {} -> text "hyd_float64x2_t"
+      RVecSplat {} -> text "hyd_float64x2_t"
+      RVecReduce {} -> text "double"
+      RCall fn _ | fn == "hyd_slice_shape" -> text "hyd_tuple_t"
+      RCall fn _ -> case Map.lookup fn retKinds of
+        Just KArray -> text "hyd_array_t*"
+        Just KFloatArray -> text "hyd_array_t*"
+        Just KTuple -> text "hyd_tuple_t"
+        Just KFloat -> text "double"
+        Just (KPair ct1 ct2) -> text (pairStructName ct1 ct2)
+        Just (KRecord fields) -> text (recordStructName fields)
+        _ -> text "int64_t"
+      RPairMake ct1 ct2 _ _ -> text (pairStructName ct1 ct2)
+      RPairFst ct _         -> text (celemTypeCType ct)
+      RPairSnd ct _         -> text (celemTypeCType ct)
+      _ -> text "int64_t"
+
+genRHS :: Map CVar CType -> Set CVar -> RHS -> Doc
+genRHS _ _ (RAtom a) = genAtom a
+genRHS _ _ (RBinOp op a1 a2) = parens (genAtom a1 <+> genBinOp op <+> genAtom a2)
+genRHS _ _ (RUnOp op a) = case op of
+  CNot  -> parens (text "!" <> genAtom a)
+  CNeg  -> parens (text "-" <> genAtom a)
+  _     -> genUnOp op <> parens (genAtom a)  -- math function call: f(arg)
+genRHS _ _ (RTuple atoms) =
+  text "hyd_tuple_make(" <> int (length atoms)
+    <> (if null atoms then empty else text "," <+> hsep (punctuate (text ",") (map (\a -> text "(int64_t)" <> genAtom a) atoms)))
+    <> text ")"
+genRHS _ _ (RProj i a) = genAtom a <> text ".elems[" <> integer i <> text "]"
+genRHS _ _ (RRecord fields) =
+  text "{"
+    <> hsep (punctuate comma [text "." <> text (sanitizeFieldName field) <+> text "=" <+> genAtom atom | (field, atom) <- fields])
+    <> text "}"
+genRHS _ _ (RRecordProj field a) = genAtom a <> text "." <> text (sanitizeFieldName field)
+genRHS _ _ (RArrayAlloc shp) = text "hyd_array_alloc(" <> genAtom shp <> text ")"
+genRHS arrayElemTypes fa (RArrayLoad arr idx)
+  | AVar v <- arr, Just eltTy <- Map.lookup v arrayElemTypes = genArrayAccess eltTy arr idx
+  | AVar v <- arr, v `S.member` fa = text "hyd_array_get_float(" <> genAtom arr <> text "," <+> genAtom idx <> text ")"
+  | otherwise = genAtom arr <> text "->data[" <> genAtom idx <> text "]"
+genRHS _ _ (RArrayShape arr) = genAtom arr <> text "->shape"
+genRHS _ _ (RShapeSize shp) = text "hyd_shape_size(" <> genAtom shp <> text ")"
+genRHS _ _ (RShapeInit shp) = text "hyd_shape_init(" <> genAtom shp <> text ")"
+genRHS _ _ (RShapeLast shp) = text "hyd_shape_last(" <> genAtom shp <> text ")"
+genRHS _ _ (RFlatToNd flat shp) = text "hyd_flat_to_nd(" <> genAtom flat <> text "," <+> genAtom shp <> text ")"
+genRHS _ _ (RNdToFlat AUnit _) = text "0LL"  -- 0D index always maps to flat position 0
+genRHS _ _ (RNdToFlat nd shp) = text "hyd_nd_to_flat(" <> genAtom nd <> text "," <+> genAtom shp <> text ")"
+genRHS _ _ (R2DToFlat i w) = genAtom i <+> text "*" <+> genAtom w
+genRHS _ _ (RCall fn args)
+  | fn == "hyd_slice_shape" = text "hyd_slice_shape(" <> genArgs <> text ")"
+  | otherwise = text (sanitize fn) <> parens genArgs
+  where
+    genArgs = hsep (punctuate comma (map genAtom args))
+genRHS _ _ (RVecLoad arr idx) =
+  text "hyd_vec_loadu_f64(((double*)(void*)" <> genAtom arr <> text "->data) + " <> genAtom idx <> text ")"
+genRHS _ _ (RVecStore arr idx val) =
+  text "hyd_vec_storeu_f64(((double*)(void*)" <> genAtom arr <> text "->data) + " <> genAtom idx <> text ", " <> genAtom val <> text ")"
+genRHS _ _ (RVecBinOp op v1 v2) = text "hyd_vec_" <> genVecBinOp op <> text "_f64(" <> genAtom v1 <> text ", " <> genAtom v2 <> text ")"
+genRHS _ _ (RVecUnOp op v) = text "hyd_vec_" <> genVecUnOp op <> text "_f64(" <> genAtom v <> text ")"
+genRHS _ _ (RVecSplat a) = text "hyd_vec_set1_f64(" <> genAtom a <> text ")"
+genRHS _ _ (RVecReduce op v) = text "hyd_vec_reduce_" <> genVecBinOp op <> text "_f64(" <> genAtom v <> text ")"
+genRHS _ _ (RPairMake _ _ a1 a2) =
+  text "{.fst =" <+> genAtom a1 <> text ", .snd =" <+> genAtom a2 <> text "}"
+genRHS _ _ (RPairFst _ a) = genAtom a <> text ".fst"
+genRHS _ _ (RPairSnd _ a) = genAtom a <> text ".snd"
+
+genArrayAllocExpr :: Map CVar CType -> CVar -> Atom -> Doc
+genArrayAllocExpr arrayElemTypes arrVar shp =
+  case Map.lookup arrVar arrayElemTypes of
+    Just eltTy ->
+      text "hyd_array_alloc_bytes(" <> genAtom shp <> text ", sizeof(" <> text (cTypeName eltTy) <> text "))"
+    Nothing ->
+      text "hyd_array_alloc(" <> genAtom shp <> text ")"
+
+genArrayAccess :: CType -> Atom -> Atom -> Doc
+genArrayAccess eltTy arr idx =
+  text "(((" <> text (cTypeName eltTy) <> text "*)(void*)" <> genAtom arr <> text "->data)[" <> genAtom idx <> text "])"
+
+inferArrayElemTypesFromStmts :: Map CVar CType -> [C2.Stmt] -> Map CVar CType -> Map CVar CType
+inferArrayElemTypesFromStmts retTypes stmts initial = go initial
+  where
+    go known =
+      let known' = foldl step known stmts
+      in if known' == known then known else go known'
+
+    step known stmt = case stmt of
+      C2.SAssign v (RCall fn _)
+        | Just (CTArray eltTy) <- Map.lookup fn retTypes -> Map.insert v eltTy known
+      C2.SAssign v (RAtom (AVar src))
+        | Just eltTy <- Map.lookup src known -> Map.insert v eltTy known
+      C2.SLoop _ body -> inferArrayElemTypesFromStmts retTypes body known
+      C2.SIf _ thn els ->
+        let knownThn = inferArrayElemTypesFromStmts retTypes thn known
+            knownEls = inferArrayElemTypesFromStmts retTypes els known
+        in Map.union knownThn knownEls
+      _ -> known
+
+collectMissingArrayElemVars :: Map CVar CType -> [C2.Proc] -> [String]
+collectMissingArrayElemVars retTypes procs =
+  map BS.unpack (S.toList (foldMap missingForProc procs))
+  where
+    missingForProc proc =
+      let typeEnv = recoverProcTypeEnv2 retTypes proc
+          arrayElemTypes = inferArrayElemTypesFromStmts retTypes (C2.procBody proc) (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
+      in missingArrayVarsInStmts arrayElemTypes (C2.procBody proc)
+
+    missingArrayVarsInStmts known = foldMap go
+      where
+        go stmt = case stmt of
+          C2.SAssign _ (RArrayLoad (AVar arr) _) ->
+            if Map.member arr known then S.empty else S.singleton arr
+          C2.SAssign _ (RVecLoad (AVar arr) _) ->
+            if Map.member arr known then S.empty else S.singleton arr
+          C2.SAssign _ (RVecStore (AVar arr) _ _) ->
+            if Map.member arr known then S.empty else S.singleton arr
+          C2.SArrayWrite (AVar arr) _ _ ->
+            if Map.member arr known then S.empty else S.singleton arr
+          C2.SLoop _ body -> missingArrayVarsInStmts known body
+          C2.SIf _ thn els -> missingArrayVarsInStmts known thn `S.union` missingArrayVarsInStmts known els
+          _ -> S.empty
+
+genAtom :: Atom -> Doc
+genAtom (AVar v) = text (sanitize v)
+genAtom (AInt n) = text (show n ++ "LL")
+genAtom (AFloat f) = text (show f)
+genAtom (ABool True) = text "1"
+genAtom (ABool False) = text "0"
+genAtom AUnit = text "0"
+genAtom (AString s) = doubleQuotes (text (BS.unpack s))
+genAtom (AVecVar v) = text (sanitize v)
+
+genBinOp :: BinOp -> Doc
+genBinOp CAdd = text "+"
+genBinOp CSub = text "-"
+genBinOp CMul = text "*"
+genBinOp CDiv = text "/"
+genBinOp CEq = text "=="
+genBinOp CNeq = text "!="
+genBinOp CLt = text "<"
+genBinOp CLe = text "<="
+genBinOp CGt = text ">"
+genBinOp CGe = text ">="
+genBinOp CAnd = text "&&"
+genBinOp COr = text "||"
+genBinOp CAddF = text "+"
+genBinOp CSubF = text "-"
+genBinOp CMulF = text "*"
+genBinOp CDivF = text "/"
+genBinOp CEqF = text "=="
+genBinOp CNeqF = text "!="
+genBinOp CLtF = text "<"
+genBinOp CLeF = text "<="
+genBinOp CGtF = text ">"
+genBinOp CGeF = text ">="
+
+genVecBinOp :: BinOp -> Doc
+genVecBinOp CAdd = text "add"
+genVecBinOp CSub = text "sub"
+genVecBinOp CMul = text "mul"
+genVecBinOp CDiv = text "div"
+genVecBinOp CAddF = text "add"
+genVecBinOp CSubF = text "sub"
+genVecBinOp CMulF = text "mul"
+genVecBinOp CDivF = text "div"
+genVecBinOp _ = text "add"
+
+genVecUnOp :: UnOp -> Doc
+genVecUnOp CSqrt = text "sqrt"
+genVecUnOp CExpF = text "exp"
+genVecUnOp CLog = text "log"
+genVecUnOp CErf = text "erf"
+genVecUnOp _ = text "sqrt"
+
+genUnOp :: UnOp -> Doc
+genUnOp CNot    = text "!"
+genUnOp CNeg    = text "-"
+-- Math functions are emitted as C calls: genUnOp is used inside parens as a prefix.
+-- We handle them specially in genRHS below.
+genUnOp CSqrt   = text "sqrt"
+genUnOp CExpF   = text "exp"
+genUnOp CLog    = text "log"
+genUnOp CSin    = text "sin"
+genUnOp CCos    = text "cos"
+genUnOp CAbsF   = text "fabs"
+genUnOp CFloorF = text "floor"
+genUnOp CCeilF  = text "ceil"
+genUnOp CErf    = text "erf"
+genUnOp CFloatOf = text "(double)"
+
+-- | Collect all variables assigned anywhere in a list of statements,
+-- including inside nested SIf and SLoop bodies. Used to hoist variable
+-- declarations before if-blocks to avoid C scoping issues.
+allAssignedVars :: [C2.Stmt] -> Set CVar
+allAssignedVars = foldMap go
+  where
+    go (C2.SAssign v _)    = S.singleton v
+    go (C2.SIf _ thn els)  = allAssignedVars thn `S.union` allAssignedVars els
+    go (C2.SLoop _ body)   = allAssignedVars body
+    go _                   = S.empty
+
+assignedRHSMap :: [C2.Stmt] -> Map CVar RHS
+assignedRHSMap = foldr go Map.empty
+  where
+    go stmt acc = case stmt of
+      C2.SAssign v rhs -> Map.insertWith (\_ existing -> existing) v rhs acc
+      C2.SIf _ thn els -> assignedRHSMap thn `Map.union` assignedRHSMap els `Map.union` acc
+      C2.SLoop _ body -> assignedRHSMap body `Map.union` acc
+      _ -> acc

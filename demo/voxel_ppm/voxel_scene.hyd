@@ -1,0 +1,207 @@
+(* Deterministic trilinear-splat voxel scene for the exported-kernel demo.
+   Uses a fixed point cloud where each point contributes floating-point weight
+   to eight corners, then reshapes the accumulated flat voxel buffer back to
+   [nz, ny, nx]. *)
+
+let voxel_scene =
+  let n = 1080000 in
+  let nx = 224 in
+  let ny = 224 in
+  let nz = 168 in
+  let nvox = nx * ny * nz in
+  let contribs = n * 8 in
+  let imod x m = x - ((x / m) * m) in
+  let absi x = if x < 0 then 0 - x else x in
+  let obj p = imod p 5 in
+  let obj_ix p = p / 5 in
+  let sphere_x p =
+    let q = obj_ix p in
+    imod q 69 - 34 in
+  let sphere_y p =
+    let q = obj_ix p / 69 in
+    imod q 69 - 34 in
+  let sphere_z p =
+    let q = obj_ix p / (69 * 69) in
+    imod q 69 - 34 in
+  let sphere_r2 p =
+    let x = sphere_x p in
+    let y = sphere_y p in
+    let z = sphere_z p in
+    (x * x) + (y * y) + (z * z) in
+  let ring_x p =
+    let q = obj_ix p in
+    imod q 91 - 45 in
+  let ring_y p =
+    let q = obj_ix p / 91 in
+    imod q 91 - 45 in
+  let ring_z p =
+    let q = obj_ix p / (91 * 91) in
+    imod q 23 - 11 in
+  let ring_xy2 p =
+    let x = ring_x p in
+    let y = ring_y p in
+    (x * x) + (y * y) in
+  let tower_x p =
+    let q = obj_ix p in
+    imod q 23 - 11 in
+  let tower_y p =
+    let q = obj_ix p / 23 in
+    imod q 41 - 20 in
+  let tower_z p =
+    let q = obj_ix p / (23 * 41) in
+    imod q 119 - 59 in
+  let cap_r2 p =
+    let q = obj_ix p in
+    let x = imod q 51 - 25 in
+    let y = imod (q / 51) 51 - 25 in
+    (x * x) + (y * y) in
+  let cap_z p =
+    let q = obj_ix p / (51 * 51) in
+    imod q 23 - 11 in
+  let beam_x p =
+    let q = obj_ix p in
+    imod q 119 - 59 in
+  let beam_y p =
+    let q = obj_ix p / 119 in
+    imod q 119 - 59 in
+  let beam_z p =
+    let q = obj_ix p / (119 * 119) in
+    imod q 15 - 7 in
+  let base_x p =
+    if obj p = 0 then
+      64 + sphere_x p
+    else
+      if obj p = 1 then
+        151 + ring_x p
+      else
+        if obj p = 2 then
+          106 + tower_x p
+        else
+          if obj p = 3 then
+            106 + (imod (obj_ix p) 51 - 25)
+          else
+            126 + beam_x p in
+  let base_y p =
+    if obj p = 0 then
+      104 + sphere_y p
+    else
+      if obj p = 1 then
+        126 + ring_y p
+      else
+        if obj p = 2 then
+          70 + tower_y p
+        else
+          if obj p = 3 then
+            70 + (imod (obj_ix p / 51) 51 - 25)
+          else
+            70 + beam_y p in
+  let base_z p =
+    if obj p = 0 then
+      84 + sphere_z p
+    else
+      if obj p = 1 then
+        90 + ring_z p
+      else
+        if obj p = 2 then
+          73 + tower_z p
+        else
+          if obj p = 3 then
+            115 + cap_z p
+          else
+            50 + beam_z p in
+  let keep_point p =
+    if obj p = 0 then
+      sphere_r2 p < 31 * 31
+    else
+      if obj p = 1 then
+        if absi (ring_xy2 p - 36 * 36) < 240 then absi (ring_z p) < 7 else false
+      else
+        if obj p = 2 then
+          if absi (tower_x p) < 10 then
+            if absi (tower_y p) < 20 then absi (tower_z p) < 59 else false
+          else
+            false
+        else
+          if obj p = 3 then
+            if absi (cap_z p) < 11 then cap_r2 p < 25 * 25 else false
+          else
+            if absi (beam_x p + beam_y p) < 7 then
+              if absi (beam_z p) < 6 then absi (beam_x p) < 59 else false
+            else
+              false in
+  let point_weight p =
+    if obj p = 0 then
+      if sphere_r2 p < 31 * 31 then
+        1.25 +. 0.75 *. (1.0 -. float_of (sphere_r2 p) /. float_of (31 * 31))
+      else
+        0.0
+    else
+      if obj p = 1 then
+        if absi (ring_xy2 p - 36 * 36) < 240 then
+          if absi (ring_z p) < 7 then
+            1.2 +. 0.35 *. (1.0 -. float_of (absi (ring_xy2 p - 36 * 36)) /. 240.0)
+          else
+            0.0
+        else
+          0.0
+      else
+        if obj p = 2 then
+          if absi (tower_x p) < 10 then
+            if absi (tower_y p) < 20 then
+              if absi (tower_z p) < 59 then
+                1.35 +. 0.3 *. (1.0 -. float_of (absi (tower_z p)) /. 59.0)
+              else
+                0.0
+            else
+              0.0
+          else
+            0.0
+        else
+          if obj p = 3 then
+            if absi (cap_z p) < 11 then
+              if cap_r2 p < 25 * 25 then 1.1 else 0.0
+            else
+              0.0
+          else
+            if absi (beam_x p + beam_y p) < 7 then
+              if absi (beam_z p) < 6 then
+                if absi (beam_x p) < 59 then
+                  1.45 +. 0.25 *. (1.0 -. float_of (absi (beam_x p)) /. 59.0)
+                else
+                  0.0
+              else
+                0.0
+            else
+              0.0 in
+  let route_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let x = base_x p + bx in
+    let y = base_y p + by in
+    let z = base_z p + bz in
+    ((z * ny) + y) * nx + x in
+  let weight_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let fx = imod (p * 5 + 1) 4 in
+    let fy = imod (p * 7 + 2) 4 in
+    let fz = imod (p * 11 + 3) 4 in
+    let wx = (1 - bx) * (4 - fx) + bx * fx in
+    let wy = (1 - by) * (4 - fy) + by * fy in
+    let wz = (1 - bz) * (4 - fz) + bz * fz in
+    point_weight p *. float_of (wx * wy * wz) /. 64.0 in
+  let keep_of [i] =
+    let p = i / 8 in
+    keep_point p in
+  let voxels =
+    scatter_guarded (+.) (fill [nvox] 0.0)
+      (generate [contribs] route_of)
+      (generate [contribs] weight_of)
+      (generate [contribs] keep_of) in
+  reshape [nz, ny, nx] voxels

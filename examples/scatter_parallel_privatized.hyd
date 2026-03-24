@@ -1,0 +1,8 @@
+(* Dense colliding scatter-add over a small destination. Keeping the route and
+   value producers inline lets the current selector see the constant trip count
+   and choose the privatized scatter-reduce path. *)
+
+let main =
+  scatter (+) (fill [8] 0)
+    (generate [64] (let bucket [i] = i / 8 in bucket))
+    (generate [64] (let one [i] = 1 in one))

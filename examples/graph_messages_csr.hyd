@@ -1,0 +1,33 @@
+let graph =
+  { nsrc = 3
+  , ndst = 4
+  , nnz = 5
+  , offsets = generate [4] (let f [i] =
+      if i = 0 then 0 else
+      if i = 1 then 2 else
+      if i = 2 then 4 else 5 in f)
+  , dsts = generate [5] (let f [i] =
+      if i = 0 then 0 else
+      if i = 1 then 2 else
+      if i = 2 then 1 else
+      if i = 3 then 3 else 1 in f)
+  , edge_vals = generate [5] (let f [i] =
+      if i = 0 then 1 else
+      if i = 1 then 2 else
+      if i = 2 then 3 else
+      if i = 3 then 4 else 5 in f)
+  }
+
+let node_vals =
+  generate [4] (let f [i] =
+    if i = 0 then 2 else
+    if i = 1 then 4 else
+    if i = 2 then 6 else 8 in f)
+
+let dst_features = gather graph.dsts node_vals
+
+let messages =
+  zipwith (let mul x y = x * y in mul) graph.edge_vals dst_features
+
+let main =
+  segmented_reduce (let add acc x = acc + x in add) 0 graph.offsets messages

@@ -1,0 +1,30 @@
+let add x y = x +. y
+let mul x y = x *. y
+let matA = read_array_float [2, 3] "examples/matA.csv"
+let matB = read_array_float [3, 2] "examples/matB.csv"
+
+let row0 = slice [[0,1], All] matA
+let row1 = slice [[1,1], All] matA
+let col0 = slice [All, [0,1]] matB
+let col1 = slice [All, [1,1]] matB
+
+let row0flat = reshape [3] row0
+let row1flat = reshape [3] row1
+let col0flat = reshape [3] col0
+let col1flat = reshape [3] col1
+
+let dot0 = add (add (mul (index [0] row0flat) (index [0] col0flat))
+                     (mul (index [1] row0flat) (index [1] col0flat)))
+                (mul (index [2] row0flat) (index [2] col0flat))
+
+let dot1 = add (add (mul (index [0] row0flat) (index [0] col1flat))
+                     (mul (index [1] row0flat) (index [1] col1flat)))
+                (mul (index [2] row0flat) (index [2] col1flat))
+
+let dot2 = add (add (mul (index [0] row1flat) (index [0] col0flat))
+                     (mul (index [1] row1flat) (index [1] col0flat)))
+                (mul (index [2] row1flat) (index [2] col0flat))
+
+let dot3 = add (add (mul (index [0] row1flat) (index [0] col1flat))
+                     (mul (index [1] row1flat) (index [1] col1flat)))
+                (mul (index [2] row1flat) (index [2] col1flat))

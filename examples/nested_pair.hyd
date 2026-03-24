@@ -1,0 +1,17 @@
+(* Test nested pairs: ((float, float), int) *)
+let step re im cx cy =
+  let re2 = re *. re in
+  let im2 = im *. im in
+  let re' = re2 -. im2 +. cx in
+  let im' = 2.0 *. re *. im +. cy in
+  (re', im')
+
+let main =
+  let cx = 0.25 in
+  let cy = 0.0 in
+  let state = ((0.0, 0.0), 0) in
+  let xy = fst state in
+  let re = fst xy in
+  let im = snd xy in
+  let n  = snd state in
+  ((re +. cx, im +. cy), n + 1)

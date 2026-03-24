@@ -1,0 +1,125 @@
+cabal-version:      3.0
+name:               hydrangea
+version:            0.1.0.0
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             Michael Vollmer
+maintainer:         mike@recurial.com
+category:           Language
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md, README.md
+
+source-repository head
+    type: git
+    location: git@github.com:vollmerm/hydrangea.git
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:          warnings
+    exposed-modules: Language.Hydrangea.Lexer
+                    , Language.Hydrangea.Parser
+                    , Language.Hydrangea.Syntax
+                    , Language.Hydrangea.Prune
+                    , Language.Hydrangea.Predicate
+                    , Language.Hydrangea.Solver
+                    , Language.Hydrangea.Pretty
+                    , Language.Hydrangea.Infer
+                    , Language.Hydrangea.Uniquify
+                     , Language.Hydrangea.Fusion
+                     , Language.Hydrangea.ShapeNormalize
+                     , Language.Hydrangea.CLI
+                      , Language.Hydrangea.Frontend
+                    , Language.Hydrangea.Interpreter
+                    , Language.Hydrangea.Shape
+                    , Language.Hydrangea.CFGCore
+                    , Language.Hydrangea.Lowering
+                    , Language.Hydrangea.CFG
+                    , Language.Hydrangea.CFGAnalysis
+                    , Language.Hydrangea.CFGOpt
+                    , Language.Hydrangea.CFGTyping
+                    , Language.Hydrangea.Tile
+                    , Language.Hydrangea.Vectorize
+                    , Language.Hydrangea.Parallelize
+                    , Language.Hydrangea.CFGPipeline
+                    , Language.Hydrangea.CodegenC
+                    , Language.Hydrangea.Dependence
+                    , Language.Hydrangea.ErrorFormat
+    build-depends:   base  >= 4.17 && < 5
+                    , bytestring
+                    , ansi-terminal
+                    , mtl
+                    , logict
+                    , containers
+                    , array
+                    , pretty
+                    , text
+                    , unification-fd
+                    , deriving-compat
+                    , sbv
+                    , language-c
+    include-dirs:    third_party/simde
+    default-language: GHC2021
+    build-tool-depends: alex:alex, happy:happy
+    default-extensions: OverloadedStrings
+    other-extensions: DeriveFunctor
+                    , DeriveFoldable
+                    , DeriveTraversable
+                    , DeriveAnyClass
+                    , DeriveGeneric
+    hs-source-dirs:  src
+
+executable hydrangea-compiler
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:    base  >= 4.17 && < 5, hydrangea, bytestring, pretty, directory, process, filepath, temporary
+                    , containers
+    hs-source-dirs:   app
+    default-language: GHC2021
+    other-modules:    CBackend
+
+test-suite hydrangea-test
+    import:           warnings
+    main-is:          Spec.hs
+    hs-source-dirs:   test
+    other-modules:
+         Language.Hydrangea.FrontendSpec,
+         Language.Hydrangea.CLISpec,
+         Language.Hydrangea.LexerSpec,
+        Language.Hydrangea.LoweringSpec,
+        Language.Hydrangea.ReduceLoweringSpec,
+        Language.Hydrangea.ParserSpec,
+        Language.Hydrangea.InterpreterSpec,
+        Language.Hydrangea.FusionSpec,
+        Language.Hydrangea.CFGAnalysisSpec,
+         Language.Hydrangea.CFGOptSpec,
+         Language.Hydrangea.TileSpec,
+         Language.Hydrangea.CodegenCSpec,
+         Language.Hydrangea.VectorizeSpec,
+         Language.Hydrangea.EndToEndSpec,
+         Language.Hydrangea.DependenceSpec,
+         Language.Hydrangea.ParallelizeSpec
+         , Language.Hydrangea.MatmulInterpSpec
+         , Language.Hydrangea.PruneSpec
+         , Language.Hydrangea.KernelCheckSpec
+         , Language.Hydrangea.PairSpec
+         , Language.Hydrangea.RecordSpec
+         , Language.Hydrangea.StencilSpec
+    type:             exitcode-stdio-1.0
+    default-language: GHC2021
+    build-depends:
+        base  >= 4.17 && < 5,
+        hydrangea,
+        bytestring,
+        containers,
+        mtl,
+        pretty,
+        directory,
+        filepath,
+        process,
+        temporary,
+        hspec,
+        hspec-discover,
+        QuickCheck
+    build-tool-depends: hspec-discover:hspec-discover >= 2.0

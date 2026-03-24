@@ -1,0 +1,4 @@
+let addOne = (let add x y = x + y in add) 1
+let result = addOne 5
+let arr = fill [4] 10
+let doubled = map (let mul x y = x * y in mul 2) arr

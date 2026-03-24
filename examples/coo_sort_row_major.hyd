@@ -1,0 +1,35 @@
+let coo =
+  { nrows = 3
+  , ncols = 4
+  , nnz = 6
+  , rows = generate [6] (let f [i] =
+      if i = 0 then 2 else
+      if i = 1 then 0 else
+      if i = 2 then 1 else
+      if i = 3 then 0 else
+      if i = 4 then 2 else 1 in f)
+  , cols = generate [6] (let f [i] =
+      if i = 0 then 1 else
+      if i = 1 then 3 else
+      if i = 2 then 0 else
+      if i = 3 then 1 else
+      if i = 4 then 0 else 2 in f)
+  , vals = generate [6] (let f [i] =
+      if i = 0 then 21 else
+      if i = 1 then 3 else
+      if i = 2 then 10 else
+      if i = 3 then 1 else
+      if i = 4 then 20 else 12 in f)
+  }
+
+let packed_keys =
+  generate [coo.nnz]
+    (let f [i] = index [i] coo.rows * coo.ncols + index [i] coo.cols in f)
+
+let perm = sort_indices packed_keys
+
+let sorted_rows = gather perm coo.rows
+
+let sorted_cols = gather perm coo.cols
+
+let main = gather perm coo.vals

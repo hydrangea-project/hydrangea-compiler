@@ -1,0 +1,20 @@
+(* Guarded weighted histogram benchmark.
+   Models a masked/filtered binning pipeline: generate WH_G_N samples, route each
+   sample into one of WH_G_BINS dense bins, accumulate integer weights, and skip
+   samples that fail a simple validity test. Returns a scalar checksum so
+   benchmarking does not spend time printing the whole histogram. *)
+
+let main =
+  let n = get_env_int "GWH_N" in
+  let bins = get_env_int "GWH_BINS" in
+  let keep_period = get_env_int "GWH_KEEP_PERIOD" in
+  let src = generate [n] (let sample [i] = i in sample) in
+  let route x = (x * bins) / n in
+  let weight x = (x * 3) + 1 in
+  let keep x = ((x / keep_period) * keep_period) = x in
+  let hist =
+    scatter_guarded (+) (fill [bins] 0)
+      (map route src)
+      (map weight src)
+      (map keep src) in
+  index () (reduce (+) 0 hist)

@@ -1,0 +1,3 @@
+let main =
+  let arr = generate [6] (let f [i] = i + 1 in f) in
+  scan (let add acc x = acc + x in add) 0 arr

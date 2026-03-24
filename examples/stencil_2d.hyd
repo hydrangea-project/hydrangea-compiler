@@ -1,0 +1,20 @@
+(* 2D stencil example: discrete Laplacian (edge detection kernel). *)
+(* Each output element is the sum of the 4 axis-aligned neighbours *)
+(* minus 4 times the centre element.  Boundary pixels use clamp. *)
+(* *)
+(* Kernel: *)
+(*        0  1  0 *)
+(*        1 -4  1 *)
+(*        0  1  0 *)
+(* *)
+(* Input: 3x3 array [[1,2,3],[4,5,6],[7,8,9]] *)
+(* Output centre (1,1): *)
+(*   acc(-1,0) + acc(1,0) + acc(0,-1) + acc(0,1) - 4*(acc 0 0) *)
+(*   = 2 + 8 + 4 + 6 - 4*5 = 20 - 20 = 0 *)
+
+let input = generate [3,3] (let f [i,j] = (i * 3) + j + 1 in f)
+let laplacian =
+  stencil clamp
+    (fn acc =>
+      acc (-1) 0 + acc 1 0 + acc 0 (-1) + acc 0 1 - (4 * acc 0 0))
+    input

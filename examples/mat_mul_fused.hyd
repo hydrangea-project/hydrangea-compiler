@@ -1,0 +1,19 @@
+let matA = read_array_float [4, 4] "examples/matA_4x4.csv"
+let matB = read_array_float [4, 4] "examples/matB_4x4.csv"
+
+let add x y = x +. y
+let mul x y = x *. y
+
+let shapeA = shape_of matA
+let m = index [0] shapeA
+let k = index [1] shapeA
+let shapeB = shape_of matB  
+let n = index [1] shapeB
+
+let innerGen i j [idx] = mul (index [i, idx] matA) (index [idx, j] matB)
+
+let matElem [i, j] = reduce_generate add 0.0 [k] (innerGen i j)
+
+let result = generate [m, n] matElem
+
+result

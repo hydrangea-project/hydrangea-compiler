@@ -1,0 +1,11 @@
+let main =
+  let init = ((0.0, 0.0), 0) in
+  foldl
+    (fn acc _ =>
+      let xy = fst acc in
+      let re = fst xy in
+      let im = snd xy in
+      let n  = snd acc in
+      ((re +. 1.0, im +. 1.0), n + 1))
+    init
+    (fill [3] 0)

@@ -1,0 +1,7 @@
+let add x y = x + y
+let mul x y = x * y
+
+let a = read_array [3] "examples/dotA.csv"
+let b = read_array [3] "examples/dotB.csv"
+
+let result = reduce add 0 (zipwith mul a b)
