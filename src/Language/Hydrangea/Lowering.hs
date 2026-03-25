@@ -3,33 +3,16 @@
 -- |
 -- Module: Language.Hydrangea.Lowering
 --
--- Lowering from the high-level syntax AST to the canonical CFG IR.
+-- Translation from the high-level surface AST to the imperative CFG IR.
 --
--- This module performs a direct, mostly structural translation from the
--- surface language into the imperative @Program@ representation consumed by
--- later optimisation and code-generation passes. Key responsibilities:
---  * Inline small user-defined functions when possible (to expose array
---    structure for later passes).
---  * Introduce fresh temporaries for lowered expressions (for example,
---    @t0@, @t1@, ...)
---    and avoid accidental name collisions by renaming when inlining.
---  * Lower array operations (map/generate/zipwith/reduce/etc.) into
---    explicit loops and @RHS@ forms used by the CFG pipeline.
+-- Key responsibilities:
 --
--- Invariants:
---  * Returned @Program@ values use @CVar@ temporaries created by
---    @freshCVar@.
---  * All user functions with parameters are pre-registered and lowered
---    as separate @Proc@ entries; zero-argument value-producing
---    declarations are
---    lowered to value `Proc`s and invoked where referenced.
---
--- Call graph notes:
---  * This module calls into @Language.Hydrangea.CFG@ and CFGCore types
---    and uses helper functions such as @atomToIndexExpr@ and the
---    @inline*@ family to produce loop bodies.
---  * It is called from the front-end after parsing/typechecking and before
---    optimisation passes.
+-- * Inline small user-defined functions to expose array structure for
+--   later passes.
+-- * Introduce fresh temporaries (e.g. @t0@, @t1@, ...) and rename
+--   formals when inlining to prevent name collisions.
+-- * Lower array operations (map, generate, zipWith, reduce, scatter, …)
+--   into explicit 'SLoop' and 'RHS' forms.
 module Language.Hydrangea.Lowering
   ( lowerDecs2
   , lowerDecs2WithTypeEnv
@@ -50,26 +33,18 @@ import Language.Hydrangea.CFG hiding (CVar)
 import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Syntax
 
--- * Lowering State
-
 data LowerState = LowerState
   { lsFresh :: !Int
   , lsFnEnv :: Map Var ([Pat Range], Exp Range)
   , lsValueProcs :: Set Var
   , lsTypeEnv :: Map CVar CType
-    -- ^ Authoritative concrete type for every CFG variable produced during
-    -- lowering.
+    -- ^ Concrete type for every CFG variable, populated during lowering.
   , lsArrayFacts :: Map CVar ArrayFact
-    -- ^ Lowering-provided buffer facts for the procedure currently being
-    -- lowered. Facts accumulate monotonically within a proc and are reset
-    -- between top-level proc lowers.
+    -- ^ Buffer-level facts for the procedure being lowered; reset per proc.
   , lsVectorAccessFacts :: Map CVar VectorAccessFact
-    -- ^ Lowering-provided access/layout facts for explicit vectorization.
-    -- These facts accumulate within a procedure and are reset between
-    -- top-level proc lowers.
+    -- ^ Access and layout facts for the vectorizer; reset per proc.
   , lsTopTypeEnv :: Map Var CType
-    -- ^ Top-level declaration types from inference (Var → CType).  Used to
-    -- seed lsTypeEnv when a top-level variable is referenced for the first time.
+    -- ^ Top-level declaration types from inference (@Var → CType@).
   }
 
 type LowerM = State LowerState
@@ -101,17 +76,10 @@ initState = LowerState
 initStateWithTypeEnv :: Map Var CType -> LowerState
 initStateWithTypeEnv topEnv = initState { lsTopTypeEnv = topEnv }
 
--- * Entry Point
-
--- | Lower a list of top-level declarations into a @Program@.
+-- | Lower a list of top-level declarations into a 'Program'.
 --
--- This is the main entry point for the lowering pass. It pre-registers
--- multi-argument function declarations so they can be inlined at call
--- sites and then lowers each top-level declaration into a procedure in
--- the resulting program.
---
--- The lowering preserves program semantics and produces explicit loop
--- and memory operations that later optimisation passes consume.
+-- Multi-argument function declarations are pre-registered so they can be
+-- inlined at call sites; each remaining declaration becomes a 'Proc'.
 lowerDecs2 :: [Dec Range] -> Program
 lowerDecs2 decs = evalState go initState
   where
@@ -122,10 +90,8 @@ lowerDecs2 decs = evalState go initState
       | not (null pats) = registerFn name pats body
       | otherwise       = pure ()
 
--- | Lower declarations with a top-level type environment from inference.
--- The type map seeds @lsTypeEnv@ so that the lowering pass can record accurate
--- 'CType' information for each generated variable rather than reconstructing
--- it heuristically.
+-- | Like 'lowerDecs2' but initialised with a top-level type environment
+-- from inference, enabling accurate 'CType' annotation for generated variables.
 lowerDecs2WithTypeEnv :: Map Var CType -> [Dec Range] -> Program
 lowerDecs2WithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
   where
@@ -167,15 +133,8 @@ shapeRankExp expr = case expr of
   EVec _ es -> Just (length es)
   _ -> Nothing
 
--- * Expression Lowering
-
--- | Lower an expression to a pair of @([Stmt], Atom)@.
---
--- The returned pair represents the sequence of lowered statements needed
--- to compute the expression and an atom naming the resulting value.
--- Callers typically append the statements and use the atom in later RHS
--- forms. This helper maintains the invariant that temporaries introduced
--- by lowering are fresh (via @freshCVar@).
+-- | Lower an expression, returning the emitted statements and the atom
+-- that holds the result.
 lowerExp :: Exp Range -> LowerM ([Stmt], Atom)
 lowerExp expr = case expr of
   EInt _ n -> pure ([], AInt n)
@@ -478,8 +437,6 @@ lowerExp expr = case expr of
     base <- freshCVar "base"
     flatIn <- freshCVar "flat_in"
     elem' <- freshCVar "elem"
-    -- Update the accumulator in place when the reduction step lowers to a
-    -- primitive binary operator; otherwise fall back to the general inliner.
     (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
     let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
     pure ( si ++ sa
@@ -490,7 +447,6 @@ lowerExp expr = case expr of
              , SAssign outArr (RArrayAlloc (AVar outShp))
              , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction)
                   ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
-                      -- Initialize the accumulator for this output element.
                       , SAssign acc (RAtom ai)
                       , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
                           ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
@@ -522,7 +478,6 @@ lowerExp expr = case expr of
     _val <- freshCVar "val"
     registerCType idx CTTuple
     genStmts <- inlineArrayFn genExp idx elem'
-    -- Reuse the accumulator variable as the reduction destination.
     (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
     let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
     pure ( si ++ ss
@@ -548,8 +503,6 @@ lowerExp expr = case expr of
          , AVar outArr
          )
 
-  -- foldl step init arr: sequential left fold over a 1D array, returns scalar.
-  -- Lowers to: acc = init; for i in 0..n: acc = step(acc, arr[i])
   EFoldl _ fnExp initExp arrExp -> do
     (si, ai) <- lowerExp initExp
     (sa, aa) <- lowerExp arrExp
@@ -819,15 +772,13 @@ lowerExp expr = case expr of
              ]
       , AVar result
       )
-  -- Special-case scalar extraction from @reduce_generate@ so the reduction
-  -- stays scalar in the CFG instead of materializing a temporary 0D array.
+  -- Index into a scalar (0-D) reduce_generate: keeps the reduction scalar
+  -- in the CFG rather than materialising a temporary 0-D array.
   EIndex _ idxExp arrExp@(EReduceGenerate _ fnExp initExp shapeExp genExp) -> do
     case idxExp of
       EUnit{} -> do
-        -- Lower the reduction inputs first.
         (si, ai) <- lowerExp initExp
         (ss, as') <- lowerExp shapeExp
-        -- Prepare the loop temporaries for the scalar reduction.
         redDim <- freshCVar "red_dim"
         outN <- freshCVar "out_n"
         j <- freshCVar "j"
@@ -839,9 +790,7 @@ lowerExp expr = case expr of
         elem' <- freshCVar "elem"
         val <- freshCVar "val"
         registerCType idx CTTuple
-        -- inline generator: given an index `idx` produce element in `elem'`
         genStmts <- inlineArrayFn genExp idx elem'
-        -- inline reduction operator into accumulator updates
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
         let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
         outShp <- freshCVar "out_shp"
@@ -849,8 +798,6 @@ lowerExp expr = case expr of
              ++ [ SAssign outShp (RShapeInit as')
                 , SAssign redDim (RShapeLast as')
                 , SAssign outN (RShapeSize (AVar outShp))
-                -- We know outN == 1 for a 0D reduction, loop once to run
-                -- the reduction and produce a scalar in `acc`.
                 , SAssign acc (RAtom ai)
                 , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopReductionWrapper)
                     ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
@@ -868,7 +815,6 @@ lowerExp expr = case expr of
              , AVar val
              )
       _ -> do
-        -- fallback: general indexing
         (si, ai) <- lowerExp idxExp
         (sa, aa) <- lowerExp arrExp
         shp <- freshCVar "shp"
@@ -882,8 +828,6 @@ lowerExp expr = case expr of
              , AVar val
              )
 
-  -- General index into an array: lower index and array then perform a
-  -- flat conversion and array load.
   EIndex _ idxExp arrExp -> do
     val <- freshCVar "val"
     case idxExp of
@@ -1028,7 +972,6 @@ lowerExp expr = case expr of
     elemD <- freshCVar "elem"
     idx <- freshCVar "idx"
     permIdx <- freshCVar "pidx"
-    -- flatPerm not yet used in lowering; keep name prefixed to avoid -Wall
     _flatPerm <- freshCVar "fp"
     srcElem <- freshCVar "se"
     registerCType idx CTTuple
@@ -1061,21 +1004,20 @@ lowerExp expr = case expr of
     oldVal <- freshCVar "old"
     newVal <- freshCVar "new"
     idx <- freshCVar "idx"
-    -- Inline combine as a binary function: newVal = combine(val, oldVal)
     combStmts <- inlineBinaryFn combExp val oldVal newVal
     pure ( sd ++ si ++ sv
-         ++ [ SAssign shp (RArrayShape ai)   -- iterate over source (index array) positions
+         ++ [ SAssign shp (RArrayShape ai)
             , SAssign n (RShapeSize (AVar shp))
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
                 ( [ SAssign idx (RArrayLoad ai (AVar i))
                   , SAssign val (RArrayLoad av (AVar i))
-                  , SAssign oldVal (RArrayLoad ad (AVar idx))  -- load current accumulator
-                  ] ++ combStmts ++                            -- apply combine
-                  [ SArrayWrite ad (AVar idx) (AVar newVal)   -- write back result
+                  , SAssign oldVal (RArrayLoad ad (AVar idx))
+                  ] ++ combStmts ++
+                  [ SArrayWrite ad (AVar idx) (AVar newVal)
                   ]
                 )
             ]
-         , ad   -- return the (mutated) output array, not the shape
+         , ad
          )
 
   EScatterGuarded _ combExp defaultsExp idxArrExp valsExp guardExp -> do
@@ -1150,8 +1092,6 @@ lowerExp expr = case expr of
              , ad
              )
 
-  -- Like EScatter but generates values on the fly via valFn(nd_idx) instead of
-  -- loading from a materialised array.  Avoids allocating the values array.
   EScatterGenerate _ combExp defaultsExp idxArrExp valFnExp -> do
     case idxArrExp of
       EGenerate _ shpExp routeFn -> do
@@ -1183,10 +1123,6 @@ lowerExp expr = case expr of
                 ]
              , ad
              )
-      -- When the index array is itself a map over a shared source, lower a
-      -- single source-driven scatter loop instead of materializing the route
-      -- array. This matches the common weighted-histogram pattern:
-      --   scatter (+) d (map route src) (generate ... (\i -> value (index i src)))
       EMap _ routeFn srcArrExp -> do
         (sd, ad) <- lowerExp defaultsExp
         (ssrc, asrc) <- lowerExp srcArrExp
@@ -1245,19 +1181,15 @@ lowerExp expr = case expr of
                     ( [ SAssign ndIdx (RFlatToNd (AVar i) (AVar shp))
                       , SAssign idx (RArrayLoad ai (AVar i))
                       ] ++ kernelStmts ++
-                      [ SAssign oldVal (RArrayLoad ad (AVar idx))  -- load current accumulator
-                      ] ++ combStmts ++                            -- apply combine
-                      [ SArrayWrite ad (AVar idx) (AVar newVal)   -- write back result
+                      [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                      ] ++ combStmts ++
+                      [ SArrayWrite ad (AVar idx) (AVar newVal)
                       ]
                     )
                 ]
-             , ad   -- return the (mutated) output array, not the shape
+             , ad
              )
 
-
-  -- gather idxArrExp srcArrExp: for each i, result[i] = srcArr[hyd_nd_to_flat(idxArr[i], srcShape)]
-  -- The first argument is the index array (elements are ND index tuples),
-  -- the second is the source array to gather elements from.
   EGather _ idxArrExp srcArrExp -> do
     (sidx, aidx) <- lowerExp idxArrExp
     (ssrc, asrc) <- lowerExp srcArrExp
@@ -1281,8 +1213,8 @@ lowerExp expr = case expr of
             CTArray CTInt64 -> True
             _ -> False
     pure ( sidx ++ ssrc
-         ++ [ SAssign idxShp (RArrayShape aidx)        -- shape of index array = result shape
-            , SAssign srcShp (RArrayShape asrc)        -- shape of source array (for offset computation)
+         ++ [ SAssign idxShp (RArrayShape aidx)
+            , SAssign srcShp (RArrayShape asrc)
             , SAssign arr    (RArrayAlloc (AVar idxShp))
             , SAssign n      (RShapeSize (AVar idxShp))
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
@@ -1290,7 +1222,7 @@ lowerExp expr = case expr of
                   ++ (if scalarRoutes
                         then [SAssign flat (RAtom (AVar ndIdx))]
                         else [SAssign flat (RNdToFlat (AVar ndIdx) (AVar srcShp))])
-                  ++ [ SAssign val   (RArrayLoad asrc (AVar flat)) -- gather from source
+                  ++ [ SAssign val (RArrayLoad asrc (AVar flat))
                      , SArrayWrite (AVar arr) (AVar i) (AVar val)
                      ]
                 )
@@ -1302,14 +1234,12 @@ lowerExp expr = case expr of
     (ss, as') <- lowerExp shapeExp
     (sf, af) <- lowerExp fileExp
     t <- freshCVar "t"
-    -- runtime expects filename first, then shape: hyd_read_array_csv(const char*, hyd_tuple_t)
     pure (ss ++ sf ++ [SAssign t (RCall "hyd_read_array_csv" [af, as'])], AVar t)
 
   EReadArrayFloat _ shapeExp fileExp -> do
     (ss, as') <- lowerExp shapeExp
     (sf, af) <- lowerExp fileExp
     t <- freshCVar "t"
-    -- runtime expects filename first, then shape
     pure (ss ++ sf ++ [SAssign t (RCall "hyd_read_float_array_csv" [af, as'])], AVar t)
 
   EWriteArray _ arrExp pathExp -> do
@@ -1334,25 +1264,19 @@ lowerExp expr = case expr of
 
   EStencil _ bnd fnExp arrExp -> do
     (sa, aa) <- lowerExp arrExp
-    -- Lower default value for BConst outside the loop
     (sDef, maDef) <- case bnd of
       BConst defExp -> do (s, a) <- lowerExp defExp; pure (s, Just a)
       _             -> pure ([], Nothing)
-    -- Extract accessor variable and function body
     mLambda <- extractStencilFn fnExp
     let (accVar, bodyExp) = case mLambda of
           Just r  -> r
           Nothing -> error "EStencil: expected a single-parameter lambda function"
-    -- Detect rank from the body expression
     let rank = detectStencilRank accVar bodyExp
-    -- Substitute all accessor call sites with fresh variables
     (bodyExp', accCalls) <- substituteAccCalls accVar rank bodyExp
-    -- Fresh variables for the loop structure
     shp    <- freshCVar "shp"
     outArr <- freshCVar "arr"
     n      <- freshCVar "n"
     i      <- freshCVar "i"
-    -- For 2D, extract per-dimension indices and sizes inside the loop
     (preLoopStmts, idxVars, dimVars) <- case rank of
       2 -> do
         n0   <- freshCVar "n0"
@@ -1368,11 +1292,9 @@ lowerExp expr = case expr of
                     ]
         pure (stmts, [i0, i1], [n0, n1])
       _ -> pure ([], [i], [n])
-    -- Generate boundary-conditioned load stmts for each accessor call site
     bndStmtss <- mapM
       (genBndStmts aa (map AVar idxVars) (map AVar dimVars) bnd maDef)
       accCalls
-    -- Lower the body with accessor calls replaced by fresh variables
     (sb, ab) <- lowerExp bodyExp'
     let loopBody = preLoopStmts
                 ++ concat bndStmtss
@@ -1386,10 +1308,6 @@ lowerExp expr = case expr of
            ]
          , AVar outArr
          )
-
--- * Helper Functions
-
--- * Stencil Helpers
 
 -- | Extract the accessor variable name and body from a stencil function expression.
 -- Handles both inline lambdas and named functions registered in the environment.
@@ -1429,11 +1347,9 @@ substituteAccCalls :: Var -> Int -> Exp Range
 substituteAccCalls accVar rank = go
   where
     go expr = case expr of
-      -- 2D: (acc d0) d1
       EApp r (EApp _ (EVar _ v) d0) d1 | v == accVar && rank == 2 -> do
         rv <- freshCVar "sten"
         pure (EVar r rv, [([d0, d1], rv)])
-      -- 1D: acc d
       EApp r (EVar _ v) d | v == accVar && rank == 1 -> do
         rv <- freshCVar "sten"
         pure (EVar r rv, [([d], rv)])
@@ -1653,17 +1569,12 @@ handleApp fn arg = case fn of
             (sb, ab) <- lowerExp body
             pure (s1 ++ s2 ++ b1 ++ b2 ++ sb, ab)
           else do
-            -- Still have remaining parameters: register a partial and return its name.
-            -- The b1/b2 stmts are emitted here so the partially-bound vars are in scope
-            -- when the partial is later inlined.
             let newName = BS.append fName "__partial2"
             registerFn newName restPats body
             pure (s1 ++ s2 ++ b1 ++ b2, AVar newName)
       _ -> do
         (sf, af) <- lowerExp fn
         (sa, aa) <- lowerExp arg
-        -- If the lowered function is a registered partial, apply it directly
-        -- rather than emitting an unsupported __apply call.
         case af of
           AVar pName -> do
             mPartialFn <- lookupFn pName
@@ -1691,7 +1602,6 @@ handleApp fn arg = case fn of
   _ -> do
     (sf, af) <- lowerExp fn
     (sa, aa) <- lowerExp arg
-    -- If the lowered function is a registered partial, apply it directly.
     case af of
       AVar pName -> do
         mFn <- lookupFn pName
@@ -1974,7 +1884,6 @@ renameVarInIndexExpr old new ie = case ie of
   IFlatToNd a b -> IFlatToNd (renameVarInIndexExpr old new a) (renameVarInIndexExpr old new b)
   INdToFlat a b -> INdToFlat (renameVarInIndexExpr old new a) (renameVarInIndexExpr old new b)
   ICall f args -> ICall f (map (renameVarInIndexExpr old new) args)
-  -- Remaining cases covered above; return expr unchanged.
   _ -> ie
 
 renameVarInRHS :: CVar -> CVar -> RHS -> RHS
@@ -2094,11 +2003,6 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
     mFn <- lookupFn name
     case mFn of
       Just ([pat], body) -> do
-        -- Lower the function body first, then pick fresh local names for
-        -- the parameter(s) and rename occurrences in the lowered stmts to
-        -- avoid accidental name collisions with temporaries produced by
-        -- lowering. This prevents self-referential temporaries such as
-        -- `t28 = (t28 + elem)`.
         (stmts, atom) <- lowerExp body
         case pat of
           PVar _ x -> do
@@ -2130,7 +2034,6 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
     inlineArrayFn rest paramVar resultVar
   _ -> do
     (sf, af) <- lowerExp fnExp
-    -- If lowering produced a registered partial function name, inline it now.
     case af of
       AVar partialName -> do
         mPart <- lookupFn partialName
@@ -2231,28 +2134,16 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
 
 inlineBinaryFn :: Exp Range -> CVar -> CVar -> CVar -> LowerM [Stmt]
 inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of
-  -- Operator-as-value (e.g. `(+.)` passed as argument to reduce_generate or foldl).
-  -- Lower directly to a binary op rather than going through __apply/__prim_*.
   EOp _ op ->
     pure [ SAssign resultVar (RBinOp (lowerBinOp op) (AVar param1) (AVar param2)) ]
   EVar _ name -> do
     mFn <- lookupFn name
     case mFn of
       Just ([PVar _ x, PVar _ y], body) ->
-        -- Optimize the common case of a simple binary operator body (e.g.
-        -- `x + y` or `x * y`) by emitting a direct RBinOp using the actual
-        -- params. Only fire this shortcut when the operands are exactly the
-        -- parameter variables; more complex bodies (e.g. `0 - x * y`) must go
-        -- through the general fallback to avoid computing the wrong operation.
         case body of
           EBinOp _ (EVar _ bx) op' (EVar _ by) | bx == x, by == y ->
             pure [ SAssign resultVar (RBinOp (lowerBinOp op') (AVar param1) (AVar param2)) ]
           _ -> do
-            -- Fallback: lower body and rename formal occurrences to fresh
-            -- locals to avoid collisions.
-            -- Register the formal params with pair type info before lowering
-            -- the body, so that `fst x`/`snd x` inside the body generate
-            -- RPairFst/RPairSnd rather than RProj.
             propagatePairInfo x (AVar param1)
             (stmts, atom) <- lowerExp body
             px <- freshCVar "p"
@@ -2274,7 +2165,6 @@ inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of
     inlineBinaryFn rest param1 param2 resultVar
   _ -> do
     (sf, af) <- lowerExp fnExp
-    -- If lowering produced a registered partial function name, inline it directly.
     case af of
       AVar partialName -> do
         mPart <- lookupFn partialName
