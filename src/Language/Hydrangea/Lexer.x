@@ -59,6 +59,8 @@ tokens :-
 <0> scan     { tok Scan }
 <0> segmented_reduce { tok SegmentedReduce }
 <0> sort_indices { tok SortIndices }
+<0> iota        { tok Iota }
+<0> make_index  { tok MakeIndex }
 <0> coo_sum_duplicates { tok COOSumDuplicates }
 <0> csr_from_sorted_coo { tok CSRFromSortedCOO }
 <0> index       { tok Index }
@@ -291,6 +293,8 @@ data Token
   | Scan
   | SegmentedReduce
   | SortIndices
+  | Iota
+  | MakeIndex
   | COOSumDuplicates
   | CSRFromSortedCOO
   | Index

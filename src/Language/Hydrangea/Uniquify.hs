@@ -99,6 +99,8 @@ uniqExp expr =
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> uniqExp f <*> uniqExp z <*> uniqExp offsets <*> uniqExp vals
     ESortIndices a arr -> ESortIndices a <$> uniqExp arr
+    EIota a n -> EIota a <$> uniqExp n
+    EMakeIndex a n arr -> EMakeIndex a <$> uniqExp n <*> uniqExp arr
     ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
       ECOOSumDuplicates a <$> uniqExp nrows <*> uniqExp ncols <*> uniqExp nnz
         <*> uniqExp rows <*> uniqExp cols <*> uniqExp vals
@@ -232,6 +234,8 @@ collectVarsExp expr =
     ESegmentedReduce _ f z offsets vals ->
       collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals
     ESortIndices _ arr -> collectVarsExp arr
+    EIota _ n -> collectVarsExp n
+    EMakeIndex _ n arr -> collectVarsExp n `S.union` collectVarsExp arr
     ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
       collectVarsExp nrows `S.union` collectVarsExp ncols `S.union` collectVarsExp nnz
         `S.union` collectVarsExp rows `S.union` collectVarsExp cols `S.union` collectVarsExp vals

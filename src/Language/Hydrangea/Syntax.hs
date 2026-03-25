@@ -274,6 +274,16 @@ data Exp a
   | -- | Stable sort returning the permutation of indices that sorts the input keys in ascending order.
     -- @sort_indices : Array[n, Int] -> Array[n, Int]@
     ESortIndices a (Exp a)
+  | -- | Generate the integer sequence [0, 1, …, n-1].
+    -- Elements are guaranteed to be valid indices into any array of size n.
+    -- @iota : Int -> Array[n, Int]@
+    EIota a (Exp a)
+  | -- | Assert that every element of an integer array is a valid index into an array of size N.
+    -- This is a type-level annotation (no runtime check); the user is responsible for
+    -- correctness.  Gather-safety checking will accept the result as an index array for
+    -- any source array whose first dimension is at least N.
+    -- @make_index : Int -> Array[s, Int] -> Array[s, Int]@
+    EMakeIndex a (Exp a) (Exp a)
   | -- | Sum duplicate entries of a COO sparse matrix in sorted row-major order.
     -- @coo_sum_duplicates : nrows -> ncols -> nnz -> rows -> cols -> vals -> COO@
     ECOOSumDuplicates a (Exp a) (Exp a) (Exp a) (Exp a) (Exp a) (Exp a)
@@ -391,6 +401,8 @@ firstParam e = case e of
   EScan a _ _ _ -> a
   ESegmentedReduce a _ _ _ _ -> a
   ESortIndices a _ -> a
+  EIota a _ -> a
+  EMakeIndex a _ _ -> a
   ECOOSumDuplicates a _ _ _ _ _ _ -> a
   ECSRFromSortedCOO a _ _ _ _ _ _ -> a
   EPermute a _ _ _ _ -> a

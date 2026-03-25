@@ -70,6 +70,7 @@ instance Pretty Term where
       TMul l r -> parens (pPrint l <+> text "*" <+> pPrint r)
       TNeg t -> text "-" <> pPrint t
       TDim v i -> text "dim" <> parens (text (unpack v) <> text "," <+> int i)
+      TValBound v -> text "vbound" <> parens (text (unpack v))
 
 instance Pretty Pred where
   pPrint pred' =
@@ -114,6 +115,8 @@ instance Pretty (Exp a) where
   pPrint (ESegmentedReduce _ f z offsets vals) =
     text "segmented_reduce" <+> pPrint f <+> pPrint z <+> pPrint offsets <+> pPrint vals
   pPrint (ESortIndices _ arr) = text "sort_indices" <+> pPrint arr
+  pPrint (EIota _ n) = text "iota" <+> pPrint n
+  pPrint (EMakeIndex _ n arr) = text "make_index" <+> pPrint n <+> pPrint arr
   pPrint (ECOOSumDuplicates _ nrows ncols nnz rows cols vals) =
     text "coo_sum_duplicates" <+> pPrint nrows <+> pPrint ncols <+> pPrint nnz
       <+> pPrint rows <+> pPrint cols <+> pPrint vals

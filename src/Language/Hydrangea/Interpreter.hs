@@ -322,6 +322,14 @@ evalExp expr env = case expr of
                   Nothing -> throwError $ TypeError "segmented_reduce: offsets must contain integers"
               _ -> throwError $ InvalidArrayOperation "segmented_reduce: offsets and values must be 1-dimensional"
       _ -> throwError $ TypeError "segmented_reduce: expected offsets and values arrays"
+  EIota _ nExpr -> do
+    vn <- evalExp nExpr env
+    case valueAsInt vn of
+      Just n -> pure $ VArray [n] (map VInt [0 .. n - 1])
+      Nothing -> throwError $ TypeError "iota: argument must be an integer"
+  EMakeIndex _ _ arrExpr ->
+    -- make_index is a type-level annotation; identity at runtime
+    evalExp arrExpr env
   ESortIndices _ arrExpr -> do
     varr <- evalExp arrExpr env
     case varr of

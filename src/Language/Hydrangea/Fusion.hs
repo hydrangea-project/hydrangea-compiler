@@ -102,6 +102,8 @@ collectVarsExp expr =
     ESegmentedReduce _ f z offsets vals ->
       collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals
     ESortIndices _ arr -> collectVarsExp arr
+    EIota _ n -> collectVarsExp n
+    EMakeIndex _ n arr -> collectVarsExp n `S.union` collectVarsExp arr
     ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
       collectVarsExp nrows `S.union` collectVarsExp ncols `S.union` collectVarsExp nnz
         `S.union` collectVarsExp rows `S.union` collectVarsExp cols `S.union` collectVarsExp vals
@@ -201,6 +203,8 @@ freeVarsExp expr =
     ESegmentedReduce _ f z offsets vals ->
       freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp offsets `S.union` freeVarsExp vals
     ESortIndices _ arr -> freeVarsExp arr
+    EIota _ n -> freeVarsExp n
+    EMakeIndex _ n arr -> freeVarsExp n `S.union` freeVarsExp arr
     ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
       freeVarsExp nrows `S.union` freeVarsExp ncols `S.union` freeVarsExp nnz
         `S.union` freeVarsExp rows `S.union` freeVarsExp cols `S.union` freeVarsExp vals
@@ -282,6 +286,8 @@ boundVarsExp expr =
     ESegmentedReduce _ f z offsets vals ->
       boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp offsets `S.union` boundVarsExp vals
     ESortIndices _ arr -> boundVarsExp arr
+    EIota _ n -> boundVarsExp n
+    EMakeIndex _ n arr -> boundVarsExp n `S.union` boundVarsExp arr
     ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
       boundVarsExp nrows `S.union` boundVarsExp ncols `S.union` boundVarsExp nnz
         `S.union` boundVarsExp rows `S.union` boundVarsExp cols `S.union` boundVarsExp vals
@@ -368,6 +374,8 @@ countVarExp v expr =
     ESegmentedReduce _ f z offsets vals ->
       countVarExp v f + countVarExp v z + countVarExp v offsets + countVarExp v vals
     ESortIndices _ arr -> countVarExp v arr
+    EIota _ n -> countVarExp v n
+    EMakeIndex _ n arr -> countVarExp v n + countVarExp v arr
     ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
       countVarExp v nrows + countVarExp v ncols + countVarExp v nnz
         + countVarExp v rows + countVarExp v cols + countVarExp v vals
@@ -453,6 +461,8 @@ substExp v replacement expr =
       ESegmentedReduce a (substExp v replacement f) (substExp v replacement z)
         (substExp v replacement offsets) (substExp v replacement vals)
     ESortIndices a arr -> ESortIndices a (substExp v replacement arr)
+    EIota a n -> EIota a (substExp v replacement n)
+    EMakeIndex a n arr -> EMakeIndex a (substExp v replacement n) (substExp v replacement arr)
     ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
       ECOOSumDuplicates a
         (substExp v replacement nrows)
@@ -554,6 +564,8 @@ isArrayExp expr =
     EScan {} -> True
     ESegmentedReduce {} -> False
     ESortIndices {} -> True
+    EIota {} -> True
+    EMakeIndex {} -> True
     ECOOSumDuplicates {} -> False
     ECSRFromSortedCOO {} -> False
     EPermute {} -> True
@@ -752,6 +764,11 @@ asProducer expr =
           -- Normalize to enable fusion with other slices of same dimensions
           shape = normalizeShapesExp rawShape
       pure $ Producer shape (kComposeUnary (producerElem pArr) srcIdx)
+    -- iota n: generates [0..n-1]; element at index i is i itself (KVar 0)
+    EIota a nExp ->
+      Just (Producer (EVec a [nExp]) (KVar 0))
+    -- make_index is a type annotation; transparent for fusion
+    EMakeIndex _ _ arr -> asProducer arr
     _ -> Nothing
 
 asScatterProducer :: (Eq a) => Exp a -> Maybe (Producer a)
@@ -1037,6 +1054,8 @@ normExp expr =
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> normExp f <*> normExp z <*> normExp offsets <*> normExp vals
     ESortIndices a arr -> ESortIndices a <$> normExp arr
+    EIota a n -> EIota a <$> normExp n
+    EMakeIndex a n arr -> EMakeIndex a <$> normExp n <*> normExp arr
     ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
       ECOOSumDuplicates a <$> normExp nrows <*> normExp ncols <*> normExp nnz
         <*> normExp rows <*> normExp cols <*> normExp vals
@@ -1246,6 +1265,8 @@ fuseOnce expr =
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce offsets <*> fuseOnce vals
     ESortIndices a arr -> ESortIndices a <$> fuseOnce arr
+    EIota a n -> EIota a <$> fuseOnce n
+    EMakeIndex a n arr -> EMakeIndex a <$> fuseOnce n <*> fuseOnce arr
     ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
       ECOOSumDuplicates a <$> fuseOnce nrows <*> fuseOnce ncols <*> fuseOnce nnz
         <*> fuseOnce rows <*> fuseOnce cols <*> fuseOnce vals

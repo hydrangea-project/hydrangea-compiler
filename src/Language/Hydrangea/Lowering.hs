@@ -600,6 +600,28 @@ lowerExp expr = case expr of
              ]
       , AVar outArr
       )
+  EIota _ nExp -> do
+    -- Lower iota n as: allocate [n] int array, fill with loop index i
+    (sn, an) <- lowerExp nExp
+    shp <- freshCVar "iota_shp"
+    arr <- freshCVar "iota_arr"
+    n   <- freshCVar "iota_n"
+    i   <- freshCVar "iota_i"
+    registerCType arr (CTArray CTInt64)
+    markArrayFreshWriteOnce arr
+    markContiguousWriteArray arr
+    pure ( sn
+         ++ [ SAssign shp (RTuple [an])
+            , SAssign arr (RArrayAlloc (AVar shp))
+            , SAssign n   (RShapeSize  (AVar shp))
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+                [SArrayWrite (AVar arr) (AVar i) (AVar i)]
+            ]
+         , AVar arr
+         )
+  EMakeIndex _ _ arrExp ->
+    -- make_index is a type-level annotation; lower to the inner array unchanged
+    lowerExp arrExp
   ESortIndices _ arrExp -> do
     (sa, aa) <- lowerExp arrExp
     outArr <- freshCVar "sort_idx"

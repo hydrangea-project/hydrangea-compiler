@@ -55,6 +55,8 @@ import Language.Hydrangea.Syntax
   scan       { L.RangedToken L.Scan _ }
   segmented_reduce { L.RangedToken L.SegmentedReduce _ }
   sort_indices { L.RangedToken L.SortIndices _ }
+  iota       { L.RangedToken L.Iota _ }
+  make_index { L.RangedToken L.MakeIndex _ }
   coo_sum_duplicates { L.RangedToken L.COOSumDuplicates _ }
   csr_from_sorted_coo { L.RangedToken L.CSRFromSortedCOO _ }
   index      { L.RangedToken L.Index _ }
@@ -243,6 +245,8 @@ expspecial :: { Exp L.Range }
   | segmented_reduce atom atom atom atom
       { ESegmentedReduce (L.rtRange $1 <-> info $5) $2 $3 $4 $5 }
   | sort_indices atom          { ESortIndices (L.rtRange $1 <-> info $2) $2 }
+  | iota atom                  { EIota (L.rtRange $1 <-> info $2) $2 }
+  | make_index atom atom       { EMakeIndex (L.rtRange $1 <-> info $3) $2 $3 }
   | coo_sum_duplicates atom atom atom atom atom atom
       { ECOOSumDuplicates (L.rtRange $1 <-> info $7) $2 $3 $4 $5 $6 $7 }
   | csr_from_sorted_coo atom atom atom atom atom atom

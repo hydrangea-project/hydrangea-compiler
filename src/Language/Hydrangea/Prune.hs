@@ -55,6 +55,8 @@ collectTopLevelRefs topNames expr bound =
     ESegmentedReduce _ f z offsets vals ->
       go f bound `S.union` go z bound `S.union` go offsets bound `S.union` go vals bound
     ESortIndices _ a -> go a bound
+    EIota _ n -> go n bound
+    EMakeIndex _ n a -> go n bound `S.union` go a bound
     ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
       S.unions (map (`go` bound) [nrows, ncols, nnz, rows, cols, vals])
     ECSRFromSortedCOO _ nrows ncols nnz rows cols vals ->

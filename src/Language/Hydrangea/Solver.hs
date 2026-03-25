@@ -112,6 +112,7 @@ termToSBV env term =
     TMul l r -> termToSBV env l * termToSBV env r
     TNeg t -> negate (termToSBV env t)
     TDim arr ix -> lookupVar (dimVarName arr ix)
+    TValBound arr -> lookupVar (valBoundName arr)
   where
     lookupVar v =
       case M.lookup v env of

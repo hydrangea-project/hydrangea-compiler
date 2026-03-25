@@ -893,7 +893,28 @@ infer (ESortIndices _ arrExp) = do
     Nothing -> return arrTyOut
     Just srcVar -> do
       emitPred (PEq (TDim arrVar 0) (TDim srcVar 0))
+      emitPred (PEq (TValBound arrVar) (TDim srcVar 0))
       return arrTyOut
+infer (EIota _ nExp) = do
+  nTy <- infer nExp
+  _ <- wrange (firstParam nExp) $ nTy =:= UTyInt
+  nTy' <- applyBindings nTy
+  let sTy' = UTyCons nTy' UTyUnit
+  (arrVar, arrTy) <- freshRefined (UTyArray sTy' UTyInt)
+  shapeTerms <- termsFromIndexExp nExp
+  forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
+    emitPred (PEq (TDim arrVar i) t)
+  emitPred (PEq (TValBound arrVar) (TDim arrVar 0))
+  return arrTy
+infer (EMakeIndex _ nExp arrExp) = do
+  nTy   <- infer nExp
+  arrTy <- infer arrExp
+  _     <- wrange (firstParam nExp) $ nTy =:= UTyInt
+  (mArrVar, _, _) <- asArrayType (firstParam arrExp) arrTy
+  arrVar' <- maybe freshPredVar return mArrVar
+  nTerm <- termFromExp nExp
+  emitPred (PEq (TValBound arrVar') nTerm)
+  return arrTy
 infer (ECOOSumDuplicates _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = do
   nrowsTy <- infer nrowsExp
   ncolsTy <- infer ncolsExp
@@ -1037,21 +1058,29 @@ infer (EScatterGenerate _ comb defaults idxArr valFn) =
            (EGenerate (firstParam idxArr) (EShapeOf (firstParam idxArr) idxArr) valFn))
 infer (EGather _ idxArr arrExp) = do
   idxArrTy <- infer idxArr
-  arrTy <- infer arrExp
+  arrTy    <- infer arrExp
   (mIdxVar, sIdx, idxTy) <- asArrayType (firstParam idxArr) idxArrTy
-  (_mSrcVar, sSrc, eTy) <- asArrayType (firstParam arrExp) arrTy
+  (mSrcVar, sSrc, eTy) <- asArrayType (firstParam arrExp) arrTy
   idxTy' <- normalizeShapeToTupleOf (firstParam idxArr) UTyInt idxTy
   sSrc' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sSrc
   _ <- wrange (firstParam idxArr) $ idxTy' =:= sSrc'
   sIdx' <- applyBindings sIdx
   (arrVar, arrTyOut) <- freshRefined (UTyArray sIdx' eTy)
   case mIdxVar of
-    Nothing -> return arrTyOut
+    Nothing -> return ()
     Just idxVar -> do
       rank <- shapeArityFromType (firstParam idxArr) sIdx'
       forM_ [0 .. rank - 1] $ \i ->
         emitPred (PEq (TDim arrVar i) (TDim idxVar i))
-      return arrTyOut
+  -- Element value bounds: require that the established element upper bound of
+  -- the index array is at most the first dimension of the source array.
+  -- Both mIdxVar and mSrcVar are available because inferDecs now preserves the
+  -- UTyRefine wrapper in stored polytypes.
+  case (mIdxVar, mSrcVar) of
+    (Just idxVar, Just srcVar) ->
+      emitPred (PLe (TValBound idxVar) (TDim srcVar 0))
+    _ -> return ()
+  return arrTyOut
 infer (EIndex _ idx arrExp) = do
   idxTy <- infer idx
   arrTy <- infer arrExp
@@ -1209,7 +1238,13 @@ inferDecs (Dec r var pats mty e : rest) = do
   case skolemAnn of
     Just ann -> void $ wrange r (funTy =:= ann)
     Nothing  -> return ()
-  boundTy <- generalizeWithPreds rhsPreds funTy
+  -- Preserve the refinement binder from the inferred body type.  The =:= call
+  -- above strips refinement wrappers before structural unification, so bodyTy
+  -- (and funTy) loses the UTyRefine wrapper that carries the pred variable.
+  -- For zero-pattern declarations we use inferredBodyTy directly (which still
+  -- holds the wrapper); for function declarations funTy already tracks params.
+  let rhsTy = if null pats then inferredBodyTy else funTy
+  boundTy <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
   rest'   <- withBinding var boundTy $ inferDecs rest
   return $ (var, boundTy) : rest'
 

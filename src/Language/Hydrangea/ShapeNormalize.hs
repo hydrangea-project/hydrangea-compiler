@@ -176,6 +176,8 @@ normExp expr = case expr of
   ESegmentedReduce a f z offsets vals ->
     ESegmentedReduce a <$> normExp f <*> normExp z <*> normExp offsets <*> normExp vals
   ESortIndices a arr -> ESortIndices a <$> normExp arr
+  EIota a n -> EIota a <$> normExp n
+  EMakeIndex a n arr -> EMakeIndex a <$> normExp n <*> normExp arr
   ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
     ECOOSumDuplicates a <$> normExp nrows <*> normExp ncols <*> normExp nnz
       <*> normExp rows <*> normExp cols <*> normExp vals

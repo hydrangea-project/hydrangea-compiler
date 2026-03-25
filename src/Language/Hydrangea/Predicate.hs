@@ -38,6 +38,10 @@ data Term
   | TMul Term Term
   | TNeg Term
   | TDim Var Int
+    -- ^ @TDim arr i@ projects the @i@th dimension of the array bound to @arr@.
+  | TValBound Var
+    -- ^ @TValBound arr@ is the exclusive upper bound on every element of the
+    --   integer array bound to @arr@.  Analogous to @TDim@ but for values.
   deriving (Eq, Ord, Show, Generic)
 
 -- | Predicates over refinement terms.
@@ -54,6 +58,12 @@ dimVarName :: Var -> Int -> Var
 dimVarName arr dimIx =
   arr <> "__dim__" <> fromString (show dimIx)
 
+-- | Synthetic variable name for the element value upper bound of an integer array.
+-- Used by gather-safety checking: @valBoundName arrVar@ is a symbolic integer
+-- representing the exclusive upper bound on every element of the array bound to @arrVar@.
+valBoundName :: Var -> Var
+valBoundName arr = arr <> "__vbound__"
+
 -- | Collect solver variables referenced by a term.
 termVars :: Term -> Set Var
 termVars term =
@@ -65,6 +75,7 @@ termVars term =
     TMul l r -> termVars l <> termVars r
     TNeg t -> termVars t
     TDim arr ix -> S.singleton (dimVarName arr ix)
+    TValBound arr -> S.singleton (valBoundName arr)
 
 -- | Collect binder variables referenced by a term.
 termBindVars :: Term -> Set Var
@@ -77,6 +88,7 @@ termBindVars term =
     TMul l r -> termBindVars l <> termBindVars r
     TNeg t -> termBindVars t
     TDim arr _ -> S.singleton arr
+    TValBound arr -> S.singleton arr
 
 -- | Collect solver variables referenced by a predicate.
 predVars :: Pred -> Set Var
@@ -109,6 +121,7 @@ substTermVars f term =
     TMul l r -> TMul (substTermVars f l) (substTermVars f r)
     TNeg t -> TNeg (substTermVars f t)
     TDim arr ix -> TDim (f arr) ix
+    TValBound arr -> TValBound (f arr)
 
 -- | Substitute variables inside a predicate.
 substPredVars :: (Var -> Var) -> Pred -> Pred
@@ -131,6 +144,7 @@ evalTermConst term =
     TMul l r -> (*) <$> evalTermConst l <*> evalTermConst r
     TNeg t -> negate <$> evalTermConst t
     TDim _ _ -> Nothing
+    TValBound _ -> Nothing
 
 -- | Evaluate a predicate to a constant if both sides are constant.
 evalPredConst :: Pred -> Maybe Bool
