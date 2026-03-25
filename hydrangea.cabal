@@ -19,33 +19,33 @@ common warnings
 library
     import:          warnings
     exposed-modules: Language.Hydrangea.Lexer
-                    , Language.Hydrangea.Parser
-                    , Language.Hydrangea.Syntax
-                    , Language.Hydrangea.Prune
-                    , Language.Hydrangea.Predicate
-                    , Language.Hydrangea.Solver
-                    , Language.Hydrangea.Pretty
-                    , Language.Hydrangea.Infer
-                    , Language.Hydrangea.Uniquify
-                     , Language.Hydrangea.Fusion
-                     , Language.Hydrangea.ShapeNormalize
-                     , Language.Hydrangea.CLI
-                      , Language.Hydrangea.Frontend
-                    , Language.Hydrangea.Interpreter
-                    , Language.Hydrangea.Shape
-                    , Language.Hydrangea.CFGCore
-                    , Language.Hydrangea.Lowering
-                    , Language.Hydrangea.CFG
-                    , Language.Hydrangea.CFGAnalysis
-                    , Language.Hydrangea.CFGOpt
-                    , Language.Hydrangea.CFGTyping
-                    , Language.Hydrangea.Tile
-                    , Language.Hydrangea.Vectorize
-                    , Language.Hydrangea.Parallelize
-                    , Language.Hydrangea.CFGPipeline
-                    , Language.Hydrangea.CodegenC
-                    , Language.Hydrangea.Dependence
-                    , Language.Hydrangea.ErrorFormat
+                   , Language.Hydrangea.Parser
+                   , Language.Hydrangea.Syntax
+                   , Language.Hydrangea.Prune
+                   , Language.Hydrangea.Predicate
+                   , Language.Hydrangea.Solver
+                   , Language.Hydrangea.Pretty
+                   , Language.Hydrangea.Infer
+                   , Language.Hydrangea.Uniquify
+                   , Language.Hydrangea.Fusion
+                   , Language.Hydrangea.ShapeNormalize
+                   , Language.Hydrangea.CLI
+                   , Language.Hydrangea.Frontend
+                   , Language.Hydrangea.Interpreter
+                   , Language.Hydrangea.Shape
+                   , Language.Hydrangea.CFGCore
+                   , Language.Hydrangea.Lowering
+                   , Language.Hydrangea.CFG
+                   , Language.Hydrangea.CFGAnalysis
+                   , Language.Hydrangea.CFGOpt
+                   , Language.Hydrangea.CFGTyping
+                   , Language.Hydrangea.Tile
+                   , Language.Hydrangea.Vectorize
+                   , Language.Hydrangea.Parallelize
+                   , Language.Hydrangea.CFGPipeline
+                   , Language.Hydrangea.CodegenC
+                   , Language.Hydrangea.Dependence
+                   , Language.Hydrangea.ErrorFormat
     build-depends:   base  >= 4.17 && < 5
                     , bytestring
                     , ansi-terminal
@@ -58,7 +58,6 @@ library
                     , unification-fd
                     , deriving-compat
                     , sbv
-                    , language-c
     include-dirs:    third_party/simde
     default-language: GHC2021
     build-tool-depends: alex:alex, happy:happy
@@ -84,29 +83,29 @@ test-suite hydrangea-test
     main-is:          Spec.hs
     hs-source-dirs:   test
     other-modules:
-         Language.Hydrangea.FrontendSpec,
-         Language.Hydrangea.CLISpec,
-         Language.Hydrangea.LexerSpec,
-        Language.Hydrangea.LoweringSpec,
-        Language.Hydrangea.ReduceLoweringSpec,
-        Language.Hydrangea.ParserSpec,
-        Language.Hydrangea.InterpreterSpec,
-        Language.Hydrangea.FusionSpec,
-        Language.Hydrangea.CFGAnalysisSpec,
-         Language.Hydrangea.CFGOptSpec,
-         Language.Hydrangea.TileSpec,
-         Language.Hydrangea.CodegenCSpec,
-         Language.Hydrangea.VectorizeSpec,
-         Language.Hydrangea.EndToEndSpec,
-         Language.Hydrangea.DependenceSpec,
-         Language.Hydrangea.ParallelizeSpec
-         , Language.Hydrangea.MatmulInterpSpec
-         , Language.Hydrangea.PruneSpec
-         , Language.Hydrangea.KernelCheckSpec
-         , Language.Hydrangea.PairSpec
-         , Language.Hydrangea.RecordSpec
-         , Language.Hydrangea.StencilSpec
-         , Language.Hydrangea.GatherBoundsSpec
+         Language.Hydrangea.FrontendSpec
+       , Language.Hydrangea.CLISpec
+       , Language.Hydrangea.LexerSpec
+       , Language.Hydrangea.LoweringSpec
+       , Language.Hydrangea.ReduceLoweringSpec
+       , Language.Hydrangea.ParserSpec
+       , Language.Hydrangea.InterpreterSpec
+       , Language.Hydrangea.FusionSpec
+       , Language.Hydrangea.CFGAnalysisSpec
+       , Language.Hydrangea.CFGOptSpec
+       , Language.Hydrangea.TileSpec
+       , Language.Hydrangea.CodegenCSpec
+       , Language.Hydrangea.VectorizeSpec
+       , Language.Hydrangea.EndToEndSpec
+       , Language.Hydrangea.DependenceSpec
+       , Language.Hydrangea.ParallelizeSpec
+       , Language.Hydrangea.MatmulInterpSpec
+       , Language.Hydrangea.PruneSpec
+       , Language.Hydrangea.KernelCheckSpec
+       , Language.Hydrangea.PairSpec
+       , Language.Hydrangea.RecordSpec
+       , Language.Hydrangea.StencilSpec
+       , Language.Hydrangea.GatherBoundsSpec
     type:             exitcode-stdio-1.0
     default-language: GHC2021
     build-depends:
