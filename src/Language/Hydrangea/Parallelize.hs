@@ -3,21 +3,26 @@
 -- |
 -- Module: Language.Hydrangea.Parallelize
 --
--- Parallelization transformation for canonical CFG loops.
+-- Parallelization pass for the CFG IR.  The pass annotates eligible serial
+-- 'SLoop' nodes with a 'Parallel' execution policy and a strategy tag that
+-- downstream code generation uses to select the appropriate OpenMP pragma
+-- and atomic/privatization idiom.
 --
--- The pass uses two legality checks:
+-- Two legality paths are tried in order:
 --
--- * a conservative fallback based on CFG array accesses and
---   'Language.Hydrangea.Dependence.findDependences2', and
--- * a lowering-guided fast path for top-level 'LoopMap' kernels whose
---   procedure-level 'procArrayFacts' prove that written arrays are fresh,
---   write-once outputs and that read arrays are read-only inputs.
+-- 1. /Facts-guided fast path/ — for 'LoopMap' kernels that carry
+--    lowering-provided 'ArrayFact' annotations, the pass checks directly
+--    whether each accessed array is a fresh write-once output or a
+--    read-only input, avoiding dependence analysis entirely.
 --
--- Lowering can record semantic facts that are harder to reconstruct from the
--- final imperative loop body, so the procedure-level entry points take advantage
--- of that information when it is available. The statement-list helper,
--- 'parallelizeStmts2', remains intentionally conservative because it runs
--- without procedure-level facts.
+-- 2. /Conservative dependence fallback/ — all other loops are tested
+--    via 'findDependences2' on the set of array accesses visible in the
+--    loop body.  The loop is parallelized only when no loop-carried
+--    non-forward dependence is found and no array is both read and written.
+--
+-- The procedure-level entry points exploit the richer per-procedure
+-- 'procArrayFacts'; the statement-level helper 'parallelizeStmts2' wraps
+-- a synthetic procedure to remain conservative.
 module Language.Hydrangea.Parallelize
   ( parallelizeProc2
   , parallelizeProgram2
@@ -34,431 +39,480 @@ import Language.Hydrangea.CFGAnalysis
   , loopTripCount2
   , tripCountValue2
   )
-import Language.Hydrangea.Dependence (findDependences2, ArrayAccess2(..), AccessType2(..), depDirection2, depIsLoopCarried2, DependenceDirection2(..))
+import Language.Hydrangea.Dependence
+  ( findDependences2
+  , ArrayAccess2(..)
+  , AccessType2(..)
+  , depDirection2
+  , depIsLoopCarried2
+  , DependenceDirection2(..)
+  )
 
 type ArrayFacts = Map CVar ArrayFact
 
+------------------------------------------------------------------------
+-- Internal detection types
+------------------------------------------------------------------------
+
+-- | Result of identifying an injective scatter kernel: the single
+-- destination array whose write index maps bijectively to the loop iterator.
 data ScatterKernelInfo = ScatterKernelInfo
   { skiDestArray :: CVar
   }
 
+-- | Result of identifying an atomic-add scatter kernel: the destination
+-- array and the element type (determines which atomic intrinsic to emit).
 data ScatterAtomicAddInfo = ScatterAtomicAddInfo
   { saDestArray :: CVar
   , saValueType :: CType
   }
 
-scatterAtomicAddBody :: [Stmt] -> (Maybe Atom, [Stmt])
-scatterAtomicAddBody body =
-  case reverse body of
-    (SIf cond thn [] : revPrefix) -> (Just cond, reverse revPrefix ++ thn)
-    _ -> (Nothing, body)
+------------------------------------------------------------------------
+-- Array-access extraction
+------------------------------------------------------------------------
 
-collectArrayAllocSizes :: [Stmt] -> Map CVar Integer
-collectArrayAllocSizes = snd . go Map.empty Map.empty
-  where
-    go tupleSizes allocSizes [] = (tupleSizes, allocSizes)
-    go tupleSizes allocSizes (stmt:rest) =
-      case stmt of
-        SAssign v (RTuple atoms) ->
-          let tupleSizes' =
-                case constantTupleSize atoms of
-                  Just sz -> Map.insert v sz tupleSizes
-                  Nothing -> tupleSizes
-          in go tupleSizes' allocSizes rest
-        SAssign v (RArrayAlloc (AVar shpVar)) ->
-          let allocSizes' =
-                case Map.lookup shpVar tupleSizes of
-                  Just sz -> Map.insert v sz allocSizes
-                  Nothing -> allocSizes
-          in go tupleSizes allocSizes' rest
-        SLoop _ body ->
-          let (_, bodyAllocs) = go tupleSizes Map.empty body
-          in go tupleSizes (Map.union allocSizes bodyAllocs) rest
-        SIf _ thn els ->
-          let (_, thnAllocs) = go tupleSizes Map.empty thn
-              (_, elsAllocs) = go tupleSizes Map.empty els
-          in go tupleSizes (Map.unions [allocSizes, thnAllocs, elsAllocs]) rest
-        _ ->
-          go tupleSizes allocSizes rest
+-- | Lift an 'Atom' to an 'IndexExpr' for dependence analysis.
+-- Opaque atoms (non-variable, non-constant) are represented as an
+-- uninterpreted call so the dependence analyser treats them conservatively.
+atomToIndexExpr :: Atom -> IndexExpr
+atomToIndexExpr (AVar v) = IVar v
+atomToIndexExpr (AInt n) = IConst n
+atomToIndexExpr _        = ICall "opaque" []
 
-    constantTupleSize atoms = product <$> traverse atomInt atoms
-    atomInt (AInt n) = Just n
-    atomInt _ = Nothing
-
--- | Collect the array accesses visible in a loop body and assign them a stable
--- statement order.
---
--- The fallback dependence check uses the statement index to distinguish the
--- relative order of loads and stores within the same loop body.
+-- | Extract all array accesses from a statement list in left-to-right,
+-- depth-first order, assigning each a unique sequential index.  The index
+-- is used by 'findDependences2' to determine the relative order of a source
+-- and target access within the same loop body.
 extractAccesses2 :: [Stmt] -> [ArrayAccess2]
-extractAccesses2 stmts = fst (goBlock 0 stmts)
+extractAccesses2 stmts =
+  zipWith (\i acc -> acc { aa2StmtIndex = i }) [0..] (collect stmts)
   where
-    goBlock next [] = ([], next)
-    goBlock next (stmt:rest) =
-      let (stmtAccesses, next') = goStmt next stmt
-          (restAccesses, next'') = goBlock next' rest
-      in (stmtAccesses ++ restAccesses, next'')
+    collect :: [Stmt] -> [ArrayAccess2]
+    collect = concatMap collectStmt
 
-    goStmt next stmt = case stmt of
-      SArrayWrite (AVar arr) idxAtom _ ->
-        let idx = atomToIndexExpr idxAtom
-        in  ([ArrayAccess2 arr idx Write2 next], next + 1)
-      SAssign _ (RArrayLoad (AVar arr) idxAtom) ->
-        let idx = atomToIndexExpr idxAtom
-        in  ([ArrayAccess2 arr idx Read2 next], next + 1)
-      SLoop _ body -> goBlock next body
-      SIf _ thn els ->
-        let (thnAccesses, next') = goBlock next thn
-            (elsAccesses, next'') = goBlock next' els
-        in (thnAccesses ++ elsAccesses, next'')
-      _ -> ([], next)
+    collectStmt (SArrayWrite (AVar arr) idx _) =
+      [ArrayAccess2 arr (atomToIndexExpr idx) Write2 0]
+    collectStmt (SAssign _ (RArrayLoad (AVar arr) idx)) =
+      [ArrayAccess2 arr (atomToIndexExpr idx) Read2 0]
+    collectStmt (SLoop _ body)  = collect body
+    collectStmt (SIf _ thn els) = collect thn ++ collect els
+    collectStmt _               = []
 
-    atomToIndexExpr (AVar v) = IVar v
-    atomToIndexExpr (AInt n) = IConst n
-    atomToIndexExpr _ = ICall "opaque" []
+------------------------------------------------------------------------
+-- Array usage summary
+------------------------------------------------------------------------
 
-passesConservativeDependenceCheck :: LoopSpec -> [Stmt] -> Bool
-passesConservativeDependenceCheck spec body =
-  isParallelTripCount2 (loopTripCount2 spec)
-    && not hasBlockingDependence
-    && not hasReadWriteHazard
-  where
-    accesses = extractAccesses2 body
-    deps = findDependences2 accesses
-    usage = collectLoopArrayUsage body
-    hasBlockingDependence =
-      any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward) deps
-    hasReadWriteHazard =
-      any (\usageInfo -> lauReads usageInfo && lauWrites usageInfo) (Map.elems usage)
-
+-- | Per-array read/write summary used by legality checks.
 data LoopArrayUsage = LoopArrayUsage
-  { lauReads :: Bool
+  { lauReads  :: Bool
   , lauWrites :: Bool
   }
 
 emptyLoopArrayUsage :: LoopArrayUsage
 emptyLoopArrayUsage = LoopArrayUsage False False
 
+-- | Incorporate one access type into an existing usage summary.
 accumulateArrayUsage :: LoopArrayUsage -> AccessType2 -> LoopArrayUsage
-accumulateArrayUsage usage accessType = case accessType of
-  Read2 -> usage { lauReads = True }
-  Write2 -> usage { lauWrites = True }
-  ReadWrite2 -> usage { lauReads = True, lauWrites = True }
+accumulateArrayUsage u accessType = case accessType of
+  Read2      -> u { lauReads  = True }
+  Write2     -> u { lauWrites = True }
+  ReadWrite2 -> u { lauReads  = True, lauWrites = True }
 
+-- | Build a per-array read/write summary for all accesses in a loop body.
 collectLoopArrayUsage :: [Stmt] -> Map CVar LoopArrayUsage
-collectLoopArrayUsage =
-  foldl' go Map.empty . extractAccesses2
+collectLoopArrayUsage = foldl' record Map.empty . extractAccesses2
   where
-    go usageMap access =
-      Map.insertWith
-        combineUsage
-        (aa2ArrayVar access)
-        (accumulateArrayUsage emptyLoopArrayUsage (aa2AccessType access))
-        usageMap
+    record m acc =
+      Map.insertWith mergeUsage (aa2ArrayVar acc)
+        (accumulateArrayUsage emptyLoopArrayUsage (aa2AccessType acc)) m
 
-    combineUsage newer older = LoopArrayUsage
-      { lauReads = lauReads newer || lauReads older
-      , lauWrites = lauWrites newer || lauWrites older
+    mergeUsage a b = LoopArrayUsage
+      { lauReads  = lauReads  a || lauReads  b
+      , lauWrites = lauWrites a || lauWrites b
       }
 
--- | Check whether procedure-level array facts are sufficient to prove that a
--- top-level @LoopMap@ is embarrassingly parallel.
+------------------------------------------------------------------------
+-- Legality checks
+------------------------------------------------------------------------
+
+-- | Conservative dependence-based legality check.  Returns 'True' when:
 --
--- This path deliberately refuses any loop that both reads and writes the same
--- array variable. The current facts are about freshness/read-only/write-once,
--- not about in-place updates or aliasing.
+-- * the loop has a parallelizable trip count,
+-- * no loop-carried non-forward dependence is found among the body's
+--   array accesses, and
+-- * no array is both read and written inside the body.
+passesConservativeDependenceCheck :: LoopSpec -> [Stmt] -> Bool
+passesConservativeDependenceCheck spec body =
+  isParallelTripCount2 (loopTripCount2 spec)
+  && not hasBlockingDependence
+  && not hasReadWriteHazard
+  where
+    accesses = extractAccesses2 body
+    deps     = findDependences2 accesses
+    usage    = collectLoopArrayUsage body
+
+    hasBlockingDependence =
+      any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward) deps
+    hasReadWriteHazard =
+      any (\u -> lauReads u && lauWrites u) (Map.elems usage)
+
+-- | Returns 'True' when lowering-provided array facts are sufficient to
+-- prove that the loop body is embarrassingly parallel.  Every array
+-- accessed in the body must be either a fresh write-once output (reads
+-- are then rejected) or a read-only input.  Loops that read and write
+-- the same array are conservatively rejected.
 factsPermitParallelLoop :: ArrayFacts -> [Stmt] -> Bool
 factsPermitParallelLoop arrayFacts body =
-  not (Map.null usage) && all arrayIsSafe (Map.toList usage)
+  not (Map.null usage) && all arraySafe (Map.toList usage)
   where
     usage = collectLoopArrayUsage body
 
-    arrayIsSafe (arr, usageInfo) =
-      case Map.lookup arr arrayFacts of
-        Nothing -> False
-        Just fact
-          | lauWrites usageInfo -> afFreshAlloc fact && afWriteOnce fact && not (lauReads usageInfo)
-          | lauReads usageInfo -> afReadOnly fact
-          | otherwise -> True
+    arraySafe (arr, u) = case Map.lookup arr arrayFacts of
+      Nothing   -> False
+      Just fact
+        | lauWrites u -> afFreshAlloc fact && afWriteOnce fact && not (lauReads u)
+        | lauReads u  -> afReadOnly fact
+        | otherwise   -> True
 
+------------------------------------------------------------------------
+-- Index environment / scatter-kernel detection helpers
+------------------------------------------------------------------------
+
+-- | Resolve an 'Atom' to an 'IndexExpr' given a scalar variable
+-- environment, or return 'Nothing' for atoms that cannot be expressed.
 resolveAtomIndex :: Map CVar IndexExpr -> Atom -> Maybe IndexExpr
 resolveAtomIndex env atom = case atom of
   AVar v -> Just (Map.findWithDefault (IVar v) v env)
   AInt n -> Just (IConst n)
-  _ -> Nothing
+  _      -> Nothing
 
+-- | Resolve an 'RHS' to an 'IndexExpr' if it denotes a simple arithmetic
+-- expression.  Non-arithmetic forms (array loads, calls, etc.) return
+-- 'Nothing' so callers can fall back to conservative treatment.
 resolveRHSIndex :: Map CVar IndexExpr -> RHS -> Maybe IndexExpr
 resolveRHSIndex env rhs = case rhs of
-  RAtom atom -> resolveAtomIndex env atom
-  RProj i atom -> IProj (fromIntegral i) <$> resolveAtomIndex env atom
+  RAtom a       -> resolveAtomIndex env a
+  RProj i a     -> IProj (fromIntegral i) <$> resolveAtomIndex env a
   RFlatToNd a b -> IFlatToNd <$> resolveAtomIndex env a <*> resolveAtomIndex env b
   RNdToFlat a b -> INdToFlat <$> resolveAtomIndex env a <*> resolveAtomIndex env b
-  RBinOp op a b ->
-    case op of
-      CAdd -> IAdd <$> resolveAtomIndex env a <*> resolveAtomIndex env b
-      CSub -> ISub <$> resolveAtomIndex env a <*> resolveAtomIndex env b
-      CMul -> IMul <$> resolveAtomIndex env a <*> resolveAtomIndex env b
-      CDiv -> IDiv <$> resolveAtomIndex env a <*> resolveAtomIndex env b
-      _ -> Nothing
+  RBinOp op a b -> case op of
+    CAdd -> IAdd <$> resolveAtomIndex env a <*> resolveAtomIndex env b
+    CSub -> ISub <$> resolveAtomIndex env a <*> resolveAtomIndex env b
+    CMul -> IMul <$> resolveAtomIndex env a <*> resolveAtomIndex env b
+    CDiv -> IDiv <$> resolveAtomIndex env a <*> resolveAtomIndex env b
+    _    -> Nothing
   _ -> Nothing
 
+-- | Build an index expression environment by scanning a flat statement
+-- list for pure scalar assignments.  Used to inline index arithmetic
+-- when examining array write indices.
 buildIndexEnv :: [Stmt] -> Map CVar IndexExpr
-buildIndexEnv = foldl' go Map.empty
+buildIndexEnv = foldl' step Map.empty
   where
-    go env stmt = case stmt of
-      SAssign v rhs ->
-        case resolveRHSIndex env rhs of
-          Just expr -> Map.insert v expr env
-          Nothing -> env
-      _ -> env
+    step env (SAssign v rhs) = case resolveRHSIndex env rhs of
+      Just expr -> Map.insert v expr env
+      Nothing   -> env
+    step env _ = env
 
+-- | Returns 'True' when @idxExpr@ maps the single loop iterator to itself
+-- (possibly with a constant offset), making the write index injective over
+-- the iteration space.
 isInjectiveScatterIndex :: LoopSpec -> IndexExpr -> Bool
 isInjectiveScatterIndex spec idxExpr =
   case (lsIters spec, simplifyIndexExpr idxExpr) of
-    ([i], IVar j) -> i == j
-    ([i], IAdd (IVar j) (IConst _)) -> i == j
-    ([i], IProj 0 (IFlatToNd (IVar j) _)) -> i == j
+    ([i], IVar j)                                         -> i == j
+    ([i], IAdd (IVar j) (IConst _))                       -> i == j
+    ([i], IProj 0 (IFlatToNd (IVar j) _))                 -> i == j
     ([i], IAdd (IProj 0 (IFlatToNd (IVar j) _)) (IConst _)) -> i == j
     _ -> False
 
+-- | Identify an injective scatter kernel: a loop body containing exactly
+-- one array write whose index is injective in the loop iterator, together
+-- with a matching read at the same index.  Returns 'Nothing' when the
+-- body does not match this pattern.
 detectInjectiveScatterKernel :: LoopSpec -> [Stmt] -> Maybe ScatterKernelInfo
 detectInjectiveScatterKernel spec body = do
   let env = buildIndexEnv body
-      writes =
-        [ (arr, idxExpr)
-        | SArrayWrite (AVar arr) idxAtom _ <- body
-        , Just idxExpr <- [resolveAtomIndex env idxAtom]
-        ]
-  (destArr, writeIdx) <-
-    case writes of
-      [oneWrite] -> Just oneWrite
-      _ -> Nothing
-  let hasMatchingRead =
-        any
-          (\stmt -> case stmt of
-              SAssign _ (RArrayLoad (AVar arr) idxAtom) ->
-                arr == destArr && fmap simplifyIndexExpr (resolveAtomIndex env idxAtom) == Just (simplifyIndexExpr writeIdx)
-              _ -> False
-          )
-          body
-  if hasMatchingRead && isInjectiveScatterIndex spec writeIdx
+  (destArr, writeIdx) <- case
+    [ (arr, expr)
+    | SArrayWrite (AVar arr) idxAtom _ <- body
+    , Just expr <- [resolveAtomIndex env idxAtom]
+    ] of
+    [single] -> Just single
+    _        -> Nothing
+  let hasMatchingRead stmt = case stmt of
+        SAssign _ (RArrayLoad (AVar arr) idxAtom) ->
+          arr == destArr
+          && fmap simplifyIndexExpr (resolveAtomIndex env idxAtom)
+               == Just (simplifyIndexExpr writeIdx)
+        _ -> False
+  if any hasMatchingRead body && isInjectiveScatterIndex spec writeIdx
     then Just (ScatterKernelInfo destArr)
     else Nothing
 
+-- | Returns 'True' when facts prove that an injective scatter loop over a
+-- fresh write-once array is safe to parallelize directly (without atomics
+-- or privatization).  Requires the destination array to be fresh and
+-- write-once, and all other accessed arrays to be read-only.
 factsPermitDirectScatterLoop :: ArrayFacts -> LoopSpec -> [Stmt] -> Bool
 factsPermitDirectScatterLoop arrayFacts spec body =
-  isParallelTripCount2 (loopTripCount2 spec)
-    && case detectInjectiveScatterKernel spec body of
-         Nothing -> False
-         Just info ->
-           case Map.lookup (skiDestArray info) usage of
-             Nothing -> False
-             Just destUsage ->
-               destIsSafe destUsage
-                 && all otherArrayIsSafe (Map.toList usage)
+  isParallelTripCount2 (loopTripCount2 spec) &&
+  case detectInjectiveScatterKernel spec body of
+    Nothing   -> False
+    Just info ->
+      let dest  = skiDestArray info
+          usage = collectLoopArrayUsage body
+          destSafe = case (Map.lookup dest usage, Map.lookup dest arrayFacts) of
+            (Just u, Just fact) ->
+              lauReads u && lauWrites u && afFreshAlloc fact && afWriteOnce fact
+            _ -> False
+      in  destSafe && all (safeNonDest dest) (Map.toList usage)
   where
-    usage = collectLoopArrayUsage body
+    safeNonDest dest (arr, u)
+      | arr == dest = True   -- destination is checked by destSafe above
+      | lauWrites u = False  -- non-destination writes are unsafe
+      | otherwise   = True
 
-    destIsSafe usageInfo =
-      case Map.lookup destArr arrayFacts of
-        Nothing -> False
-        Just fact ->
-          lauReads usageInfo && lauWrites usageInfo && afFreshAlloc fact && afWriteOnce fact
+-- | Strip a conditional filter wrapper from a potential atomic-add loop
+-- body.  If the last statement is @if cond then body else {}@, returns
+-- @(Just cond, prefix ++ body)@ to let the detector inspect the inner
+-- accesses directly.  Returns @(Nothing, body)@ when no such wrapper
+-- is present.
+scatterAtomicAddBody :: [Stmt] -> (Maybe Atom, [Stmt])
+scatterAtomicAddBody body = case reverse body of
+  SIf cond thn [] : revPrefix -> (Just cond, reverse revPrefix ++ thn)
+  _                            -> (Nothing, body)
 
-    destArr =
-      case detectInjectiveScatterKernel spec body of
-        Just info -> skiDestArray info
-        Nothing -> "__no_scatter_dest"
-
-    otherArrayIsSafe (arr, usageInfo)
-      | arr == destArr = True
-      | lauWrites usageInfo = False
-      | lauReads usageInfo = True
-      | otherwise = True
-
+-- | Identify an atomic-add scatter kernel: a loop body that reads a
+-- value from an array at some index, adds a scalar contribution, and
+-- writes the result back to the same index.  Returns the destination
+-- array and the value element type on success.
 detectScatterAtomicAddKernel :: LoopSpec -> [Stmt] -> Maybe ScatterAtomicAddInfo
 detectScatterAtomicAddKernel spec body = do
   let (_, atomicBody) = scatterAtomicAddBody body
-      env = buildIndexEnv body
-  (destArr, writeIdx, newVar) <-
-    case [ (arr, idxExpr, newVar)
-         | SArrayWrite (AVar arr) idxAtom (AVar newVar) <- atomicBody
-         , Just idxExpr <- [resolveAtomIndex env idxAtom]
-         ] of
-      [oneWrite] -> Just oneWrite
-      _ -> Nothing
-  oldVar <-
-    case [ oldV
-         | SAssign oldV (RArrayLoad (AVar arr) idxAtom) <- atomicBody
-         , arr == destArr
-         , fmap simplifyIndexExpr (resolveAtomIndex env idxAtom) == Just (simplifyIndexExpr writeIdx)
-         ] of
-      [oneOld] -> Just oneOld
-      _ -> Nothing
-  valueTy <-
-    case [ ty
-         | SAssign newV (RBinOp op a b) <- atomicBody
-         , newV == newVar
-         , Just _ <- [nonOldOperand oldVar a b]
-         , Just ty <- [atomicAddValueType op]
-         ] of
-      [oneTy] -> Just oneTy
-      _ -> Nothing
+      env             = buildIndexEnv body
+  (destArr, writeIdx, newVar) <- case
+    [ (arr, expr, nv)
+    | SArrayWrite (AVar arr) idxAtom (AVar nv) <- atomicBody
+    , Just expr <- [resolveAtomIndex env idxAtom]
+    ] of
+    [single] -> Just single
+    _        -> Nothing
+  oldVar <- case
+    [ ov
+    | SAssign ov (RArrayLoad (AVar arr) idxAtom) <- atomicBody
+    , arr == destArr
+    , fmap simplifyIndexExpr (resolveAtomIndex env idxAtom)
+        == Just (simplifyIndexExpr writeIdx)
+    ] of
+    [single] -> Just single
+    _        -> Nothing
+  valueTy <- case
+    [ ty
+    | SAssign nv (RBinOp op a b) <- atomicBody
+    , nv == newVar
+    , usesOldVar oldVar a b
+    , Just ty <- [addResultType op]
+    ] of
+    [single] -> Just single
+    _        -> Nothing
   if isParallelTripCount2 (loopTripCount2 spec)
     then Just (ScatterAtomicAddInfo destArr valueTy)
     else Nothing
   where
-    nonOldOperand oldVar a b = case (a, b) of
-      (AVar oldV, other) | oldV == oldVar -> Just other
-      (other, AVar oldV) | oldV == oldVar -> Just other
-      _ -> Nothing
-    atomicAddValueType op = case op of
-      CAdd -> Just CTInt64
-      CAddF -> Just CTDouble
-      _ -> Nothing
+    -- Returns True when one of the two atoms is a reference to @ov@,
+    -- confirming that the new value is computed from the old element.
+    usesOldVar ov a b = case (a, b) of
+      (AVar v, _) | v == ov -> True
+      (_, AVar v) | v == ov -> True
+      _                     -> False
 
+    addResultType op = case op of
+      CAdd  -> Just CTInt64
+      CAddF -> Just CTDouble
+      _     -> Nothing
+
+-- | Returns 'True' when facts prove that an atomic-add scatter loop over
+-- a fresh destination array is safe to parallelize using hardware atomic
+-- operations.
 factsPermitAtomicScatterLoop :: ArrayFacts -> Map CVar CType -> LoopSpec -> [Stmt] -> Bool
 factsPermitAtomicScatterLoop arrayFacts typeEnv spec body =
   case detectScatterAtomicAddKernel spec body of
-    Nothing -> False
+    Nothing   -> False
     Just info ->
-      case Map.lookup (saDestArray info) usage of
-        Nothing -> False
-        Just destUsage ->
-          destIsSafe destUsage
-            && all otherArrayIsSafe (Map.toList usage)
+      let dest   = saDestArray info
+          elemTy = saValueType info
+          usage  = collectLoopArrayUsage body
+          destSafe = case (Map.lookup dest usage, Map.lookup dest arrayFacts, Map.lookup dest typeEnv) of
+            (Just u, Just fact, Just (CTArray ty)) | ty == elemTy ->
+              lauReads u && lauWrites u && afFreshAlloc fact && afWriteOnce fact
+            _ -> False
+      in  destSafe && all (safeNonDest dest) (Map.toList usage)
   where
-    usage = collectLoopArrayUsage body
+    safeNonDest dest (arr, u)
+      | arr == dest = True
+      | lauWrites u = False
+      | otherwise   = True
 
-    destIsSafe usageInfo =
-      case (Map.lookup destArr arrayFacts, Map.lookup destArr typeEnv) of
-        (Just fact, Just (CTArray elemTy)) | elemTy == destElemTy ->
-          lauReads usageInfo && lauWrites usageInfo && afFreshAlloc fact && afWriteOnce fact
-        _ -> False
+-- | Collect the total element counts of statically-sized array
+-- allocations.  Used by the privatization profitability heuristic to
+-- decide whether a scatter destination is small enough to privatize per
+-- thread.
+collectArrayAllocSizes :: [Stmt] -> Map CVar Integer
+collectArrayAllocSizes = snd . go Map.empty Map.empty
+  where
+    go tuples allocs [] = (tuples, allocs)
+    go tuples allocs (stmt : rest) = case stmt of
+      SAssign v (RTuple atoms) ->
+        let tuples' = case constantProduct atoms of
+              Just sz -> Map.insert v sz tuples
+              Nothing -> tuples
+        in  go tuples' allocs rest
+      SAssign v (RArrayAlloc (AVar shpVar)) ->
+        let allocs' = case Map.lookup shpVar tuples of
+              Just sz -> Map.insert v sz allocs
+              Nothing -> allocs
+        in  go tuples allocs' rest
+      SLoop _ body ->
+        let (_, bodyAllocs) = go tuples Map.empty body
+        in  go tuples (Map.union allocs bodyAllocs) rest
+      SIf _ thn els ->
+        let (_, thnAllocs) = go tuples Map.empty thn
+            (_, elsAllocs) = go tuples Map.empty els
+        in  go tuples (Map.unions [allocs, thnAllocs, elsAllocs]) rest
+      _ -> go tuples allocs rest
 
-    destArr =
-      case detectScatterAtomicAddKernel spec body of
-        Just info -> saDestArray info
-        Nothing -> "__no_atomic_scatter_dest"
+    constantProduct atoms = product <$> traverse atomInt atoms
+    atomInt (AInt n) = Just n
+    atomInt _        = Nothing
 
-    destElemTy =
-      case detectScatterAtomicAddKernel spec body of
-        Just info -> saValueType info
-        Nothing -> CTInt64
-
-    otherArrayIsSafe (arr, usageInfo)
-      | arr == destArr = True
-      | lauWrites usageInfo = False
-      | lauReads usageInfo = True
-      | otherwise = True
-
-factsPermitPrivatizedIntScatterLoop :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> LoopSpec -> [Stmt] -> Bool
+-- | Returns 'True' when privatized reduction is both legal and
+-- profitable: the destination array is a fresh integer array small
+-- enough (≤ 64 elements) to fit comfortably in per-thread private
+-- storage, and the loop trip count is large enough to amortize the
+-- initialization and reduction costs.
+factsPermitPrivatizedIntScatterLoop
+  :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> LoopSpec -> [Stmt] -> Bool
 factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
   case detectScatterAtomicAddKernel spec body of
-    Nothing -> False
+    Nothing   -> False
     Just info ->
-      case ( Map.lookup (saDestArray info) usage
-           , Map.lookup (saDestArray info) arrayFacts
-           , Map.lookup (saDestArray info) typeEnv
-           ) of
-        (Just destUsage, Just fact, Just (CTArray CTInt64)) ->
-          lauReads destUsage
-            && lauWrites destUsage
-            && afFreshAlloc fact
-            && afWriteOnce fact
-            && profitable
-            && all otherArrayIsSafe (Map.toList usage)
-        _ -> False
+      let dest  = saDestArray info
+          usage = collectLoopArrayUsage body
+      in  case (Map.lookup dest usage, Map.lookup dest arrayFacts, Map.lookup dest typeEnv) of
+            (Just u, Just fact, Just (CTArray CTInt64)) ->
+              lauReads u
+              && lauWrites u
+              && afFreshAlloc fact
+              && afWriteOnce fact
+              && profitable dest
+              && all (safeNonDest dest) (Map.toList usage)
+            _ -> False
   where
-    usage = collectLoopArrayUsage body
-    destArr =
-      case detectScatterAtomicAddKernel spec body of
-        Just info -> saDestArray info
-        Nothing -> "__no_privatized_scatter_dest"
+    profitable dest =
+      case (Map.lookup dest allocSizes, tripCountValue2 (loopTripCount2 spec)) of
+        (Just sz, Just tc) -> sz > 0 && sz <= 64 && tc >= max 32 (sz * 4)
+        _                  -> not (hasExternalReads dest body)
 
-    shouldPrivatize allocSize tripCount =
-      allocSize > 0
-        && allocSize <= 64
-        && tripCount >= max 32 (allocSize * 4)
+    safeNonDest dest (arr, u)
+      | arr == dest = True
+      | lauWrites u = False
+      | otherwise   = True
 
-    profitable =
-      case (Map.lookup destArr allocSizes, tripCountValue2 (loopTripCount2 spec)) of
-        (Just allocSize, Just tripCount) -> shouldPrivatize allocSize tripCount
-        _ -> not (hasExternalArrayReads destArr body)
+    hasExternalReads dest = any (stmtHasExternalRead dest)
 
-    otherArrayIsSafe (arr, usageInfo)
-      | arr == destArr = True
-      | lauWrites usageInfo = False
-      | lauReads usageInfo = True
-      | otherwise = True
+    stmtHasExternalRead dest stmt = case stmt of
+      SAssign _ (RArrayLoad (AVar arr) _) -> arr /= dest
+      SLoop _ inner                       -> hasExternalReads dest inner
+      SIf _ thn els                       ->
+        hasExternalReads dest thn || hasExternalReads dest els
+      _                                   -> False
 
-    hasExternalArrayReads dest bodyStmts = any stmtHasExternalRead bodyStmts
-      where
-        stmtHasExternalRead stmt = case stmt of
-          SAssign _ (RArrayLoad (AVar arr) _) -> arr /= dest
-          SLoop _ inner -> hasExternalArrayReads dest inner
-          SIf _ thn els -> hasExternalArrayReads dest thn || hasExternalArrayReads dest els
-          _ -> False
+------------------------------------------------------------------------
+-- Loop parallelizability
+------------------------------------------------------------------------
 
+-- | Returns 'True' when a loop at the given nesting depth should be
+-- considered for parallelization.  Reduction-wrapper loops are never
+-- parallelized; all other loop roles are eligible only at the outermost
+-- level (@insideLoop = False@).
 shouldParallelizeLoop :: Bool -> LoopSpec -> Bool
 shouldParallelizeLoop insideLoop spec = case lsRole spec of
   LoopReductionWrapper -> False
-  LoopReduction -> not insideLoop
-  LoopPlain -> not insideLoop
-  LoopMap -> not insideLoop
-  LoopMapReduction -> not insideLoop
+  _                    -> not insideLoop
 
-parallelizeLoop :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> Bool -> LoopSpec -> [Stmt] -> Maybe (LoopSpec, [Stmt])
+-- | Attempt to annotate a single loop with a parallel execution policy.
+-- Returns 'Nothing' if the loop is already non-serial, is nested inside
+-- another parallel candidate, or no legality check succeeds.
+-- On success, returns the updated 'LoopSpec' (with the 'Parallel' policy
+-- and chosen strategy) together with the (unchanged) body.
+parallelizeLoop
+  :: ArrayFacts
+  -> Map CVar CType
+  -> Map CVar Integer
+  -> Bool
+  -> LoopSpec
+  -> [Stmt]
+  -> Maybe (LoopSpec, [Stmt])
 parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
-  | lsExec spec /= Serial = Nothing
+  | lsExec spec /= Serial                    = Nothing
   | not (shouldParallelizeLoop insideLoop spec) = Nothing
-  | not (canParallelizeWithFacts || canParallelizeDirectScatter || canParallelizePrivatizedScatter || canParallelizeAtomicScatter || passesConservativeDependenceCheck spec body) = Nothing
-  | otherwise =
-      let strategy
-            | canParallelizeDirectScatter = ParallelScatterDirect
-            | canParallelizePrivatizedScatter = ParallelScatterPrivatizedIntAdd
-            | canParallelizeAtomicScatter =
-                case detectScatterAtomicAddKernel spec body of
-                  Just info | saValueType info == CTDouble -> ParallelScatterAtomicAddFloat
-                  _ -> ParallelScatterAtomicAddInt
-            | otherwise = ParallelGeneric
-          newSpec = spec { lsExec = Parallel (ParallelSpec strategy Nothing) }
-      in  Just (newSpec, body)
+  | not eligible                             = Nothing
+  | otherwise = Just (spec { lsExec = Parallel (ParallelSpec strategy Nothing) }, body)
   where
+    eligible =
+         canParallelizeWithFacts
+      || canParallelizeDirectScatter
+      || canParallelizePrivatizedScatter
+      || canParallelizeAtomicScatter
+      || passesConservativeDependenceCheck spec body
+
+    strategy
+      | canParallelizeDirectScatter     = ParallelScatterDirect
+      | canParallelizePrivatizedScatter = ParallelScatterPrivatizedIntAdd
+      | canParallelizeAtomicScatter     = case detectScatterAtomicAddKernel spec body of
+          Just info | saValueType info == CTDouble -> ParallelScatterAtomicAddFloat
+          _                                        -> ParallelScatterAtomicAddInt
+      | otherwise                       = ParallelGeneric
+
     canParallelizeWithFacts =
       lsRole spec == LoopMap
-        && isParallelTripCount2 (loopTripCount2 spec)
-        && factsPermitParallelLoop arrayFacts body
-    canParallelizeDirectScatter =
-      factsPermitDirectScatterLoop arrayFacts spec body
-    canParallelizePrivatizedScatter =
-      factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body
-    canParallelizeAtomicScatter =
-      factsPermitAtomicScatterLoop arrayFacts typeEnv spec body
+      && isParallelTripCount2 (loopTripCount2 spec)
+      && factsPermitParallelLoop arrayFacts body
+    canParallelizeDirectScatter     = factsPermitDirectScatterLoop     arrayFacts           spec body
+    canParallelizePrivatizedScatter = factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body
+    canParallelizeAtomicScatter     = factsPermitAtomicScatterLoop     arrayFacts typeEnv   spec body
 
-parallelizeProcWithFacts :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> [Stmt] -> [Stmt]
+------------------------------------------------------------------------
+-- Statement and procedure traversal
+------------------------------------------------------------------------
+
+parallelizeProcWithFacts
+  :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> [Stmt] -> [Stmt]
 parallelizeProcWithFacts arrayFacts typeEnv allocSizes =
   rewriteStmts2With False (const True) rewriteStmt
   where
     rewriteStmt insideLoop stmt = case stmt of
       SLoop spec body ->
-         case parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body of
-               Just (newSpec, newBody) -> [SLoop newSpec newBody]
-               Nothing -> [SLoop spec body]
-      stmt' -> [stmt']
+        case parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body of
+          Just (spec', body') -> [SLoop spec' body']
+          Nothing             -> [SLoop spec  body]
+      _ -> [stmt]
 
--- | Rewrite eligible serial loops in one procedure using any lowering-provided
--- array facts attached to that procedure.
+-- | Rewrite eligible serial loops in one procedure using the array facts
+-- and type environment attached to that procedure by the lowering pass.
 parallelizeProc2 :: Proc -> Proc
 parallelizeProc2 proc =
-  let recoveredTypeEnv = recoverProcTypeEnv2 Map.empty proc
+  let typeEnv    = recoverProcTypeEnv2 Map.empty proc
       allocSizes = collectArrayAllocSizes (procBody proc)
-  in proc { procBody = parallelizeProcWithFacts (procArrayFacts proc) recoveredTypeEnv allocSizes (procBody proc) }
+  in  proc { procBody = parallelizeProcWithFacts
+                          (procArrayFacts proc) typeEnv allocSizes (procBody proc) }
 
--- | Parallelize an entire CFG program procedure-by-procedure.
+-- | Parallelize every procedure in a program.
 parallelizeProgram2 :: Program -> Program
 parallelizeProgram2 (Program procs) = Program (map parallelizeProc2 procs)
 
--- | Rewrite eligible serial loops to use CFG parallel execution hints.
+-- | Rewrite eligible serial loops in a statement list using the
+-- conservative dependence-based legality check (no array facts available).
 parallelizeStmts2 :: [Stmt] -> [Stmt]
 parallelizeStmts2 = procBody . parallelizeProc2 . mkProc "parallelize_stmts2" []
