@@ -5,54 +5,28 @@
 -- |
 -- Module: Language.Hydrangea.Infer
 --
--- This module implements Hindley-Milner style type inference for the small
--- language, extended with refinement-style obligations for array bounds.
--- Key concepts and components:
+-- Hindley-Milner type inference for Hydrangea, extended with refinement
+-- predicates for array bounds checking.
 --
--- - @TypeF@ / @Type@ (from Syntax): the structural shape of source-level
---   types.
--- - @UType@ (@UTerm TypeF IntVar@): unification terms used during inference
---   with @IntVar@ unification variables.
--- - @Infer@ monad: a reader for the typing context, a state for refinement
---   variable generation, a writer for accumulated predicate obligations, an
---   ExceptT for type errors, and an @IntBindingT@ for unification state.
+-- __Types and terms.__
+-- Source types are @TypeF@-fixed-points ('Type') from "Language.Hydrangea.Syntax".
+-- During inference, type variables are replaced by unification metavariables
+-- (@UType = UTerm TypeF IntVar@).  Refinement wrappers (@TyRefineF v t@) bind a
+-- symbolic variable @v@ to a value of type @t@; they are stripped before
+-- structural unification and collected as 'Pred' obligations instead.
 --
--- Algorithm overview:
+-- __Entry points.__
+-- 'runInfer' and 'runInferWithCtx' run an 'Infer' action and return a fully
+-- generalized 'Polytype' (or a 'TypeError').  'runInferDecs' infers a sequence
+-- of top-level declarations, returning the generalized scheme for each.  All
+-- three entry points invoke the SMT solver to discharge refinement obligations
+-- before returning; unsatisfiable obligations surface as 'UnsatConstraints'.
 --
--- The main entrypoint is @infer :: Exp Range -> Infer UType@, which
--- recursively walks the AST and constructs unification constraints. High-level
--- steps performed by the algorithm:
---
--- 1. For variables, look up a polymorphic type in the typing context and
---   instantiate it to a @UType@ with fresh unification variables (@instantiate@).
--- 2. For applications, create a fresh result variable and unify the function
---   type with @arg -> res@.
--- 3. For let-bindings and declarations, infer the right-hand side, generalize
---   it with @generalize@ (quantifying unbound unification variables) and attach
---   any predicate obligations, then extend the context for subsequent inference.
--- 4. For annotated bindings, skolemize the annotation to check against the
---   computed type, preventing problematic generalization.
---
--- Refinements:
---
--- Refinements are represented with a type wrapper @TyRefineF v t@ that binds a
--- symbolic variable @v@ to the value of type @t@. Constraint generation emits
--- predicates (@Pred@) relating these symbols (e.g. @dim(a,0) = n@, @0 <= i@).
--- Refinement predicates are collected during inference and attached to the
--- resulting @Poly@ type scheme. The solver discharges them at the end of
--- @runInfer@/@runInferDecs@.
---
--- The unification is performed via the @Control.Unification@ library. Since
--- refinements are obligations rather than structural type information,
--- unification strips refinement wrappers before comparing types.
--- Any predicate obligations produced during inference are solved at the end
--- of @runInfer@/@runInferDecs@; unsatisfiable obligations yield
--- @UnsatConstraints@.
---
--- The module also provides helpers @runInfer@ and @runInferWithCtx@ to run
--- inference with an initially empty or custom context (useful for injecting
--- builtins during testing or temporary phases). These return @IO@ because the
--- constraint solver is invoked at the end of inference.
+-- __Inference monad.__
+-- The 'Infer' monad provides: a 'Reader' for the typing context ('Ctx'), a
+-- 'State' for fresh predicate-variable generation, a 'Writer' for accumulated
+-- 'Pred' obligations, 'ExceptT' for 'TypeError', and 'IntBindingT' for
+-- unification state.
 module Language.Hydrangea.Infer where
 
 import Control.Monad
@@ -71,7 +45,6 @@ import Data.Functor.Fixedpoint
 import Data.Map (Map)
 import Data.Map qualified as M
 import Data.Maybe
--- Debug traces removed for production-ready code
 import Data.Set (Set, (\\))
 import Data.Set qualified as S
 import Language.Hydrangea.Lexer (Range)
@@ -127,25 +100,23 @@ pattern UTyVar v = UTerm (TyVarF v)
 pattern UTyRefine :: Var -> UType -> UType
 pattern UTyRefine v t = UTerm (TyRefineF v t)
 
--- | Inference monad stack.
--- Reader: typing context
--- State:  fresh refinement variable generation
--- Writer: accumulated predicate obligations
--- Except: type errors
--- Binding: unification state
+-- | The inference monad: reader for the typing context, state for the
+-- predicate-variable supply, writer for accumulated 'Pred' obligations,
+-- 'ExceptT' for 'TypeError', and 'IntBindingT' for unification state.
 type Infer = ReaderT Ctx (StateT InferState (WriterT [Pred] (ExceptT TypeError (IntBindingT TypeF Identity))))
 
--- | Typing context mapping term variables to polymorphic unification types.
+-- | Typing context mapping term variables to their polymorphic types.
 type Ctx = Map Var UPolytype
 
--- | Mutable state used during inference, currently just the fresh predicate-name supply.
+-- | Mutable state threaded through inference: a counter for generating
+-- fresh predicate variable names.
 newtype InferState = InferState
   { predVarCounter :: Int
   }
 
--- | Initial inference state with the predicate-name counter reset.
+-- | Initial inference state.
 initInferState :: InferState
-initInferState = InferState {predVarCounter = 0}
+initInferState = InferState { predVarCounter = 0 }
 
 -- | Lift a unification-library action into the full inference monad.
 liftBinding :: IntBindingT TypeF Identity a -> Infer a
@@ -354,10 +325,8 @@ generalizeWithPreds preds uty = do
   Forall xs _ ty <- generalize uty
   return $ Forall xs preds ty
 
--- | Generalize a @UType@ by quantifying any unification variables that are
--- not free in the current typing context. This implements the usual HM
--- generalization step for let-bindings. Predicate obligations are handled
--- separately by @generalizeWithPreds@.
+-- | Lift a surface 'Polytype' to the unification-level representation by
+-- replacing fixed-point type terms with 'UTerm' nodes.
 toUPolytype :: Polytype -> UPolytype
 toUPolytype = fmap unfreeze
 
@@ -416,38 +385,23 @@ findDuplicateField fields = go S.empty fields
       | field `S.member` seen = Just field
       | otherwise = go (S.insert field seen) rest
 
--- | Generalized shape normalization.
---
--- Many parts of the compiler represent tuple/shape types as a cons-list
--- (@TyCons elt rest ... TyUnit@). When a shape is written as a scalar (for
--- example a single-dimension shape @3@) we normalize it to the singleton
--- cons-list form. This helper checks that any cons elements unify with the
--- supplied @expectedElt@ and performs the scalar-to-singleton promotion.
---
--- @normalizeShapeToTupleOfInts@ is the integer-specialized wrapper around
--- this general helper.
+-- | Normalize a shape type to a cons-list (@TyCons elt rest … TyUnit@)
+-- whose elements all unify with @expectedElt@.  A bare scalar is promoted
+-- to a singleton cons-list.  Returns the normalized type.
 normalizeShapeToTupleOf :: Range -> UType -> UType -> Infer UType
 normalizeShapeToTupleOf r expectedElt ty = do
   ty' <- applyBindings ty
   case stripRefineTop ty' of
-    -- Cons-list: ensure each element unifies with the expected element
-    -- type and recurse over the rest.
     UTyCons t rest -> do
       _ <- wrange r $ t =:= expectedElt
       _ <- normalizeShapeToTupleOf r expectedElt rest
       return ty'
-
-    -- Unit is the empty tuple: nothing to check.
     UTyUnit -> return UTyUnit
-    -- Scalar or other: try to unify the scalar with the expected element
-    -- type and promote it to a singleton cons-list. If unification fails
-    -- an appropriate type error will be raised.
     _ -> do
       _ <- wrange r $ ty' =:= expectedElt
       return $ UTyCons expectedElt UTyUnit
 
--- Backwards-compatible integer-only variant
--- | Normalize a shape expression to the integer tuple encoding used internally.
+-- | Normalize a shape expression to the cons-list-of-'Int' encoding.
 normalizeShapeToTupleOfInts :: Range -> UType -> Infer UType
 normalizeShapeToTupleOfInts r = normalizeShapeToTupleOf r UTyInt
 
@@ -552,7 +506,22 @@ emitRefineLink r expected actual = do
     _ -> return ()
 
 
--- | Infer the unification type of an expression and emit any refinement obligations it generates.
+-- | Decompose a type into its two pair (or cons-tuple) components.
+-- Handles 'UTyPair', cons-list shapes (@TyCons t1 (TyCons t2 TyUnit)@), and
+-- unknown types (unified against 'UTyPair' via fresh metavariables).
+extractPair :: Range -> UType -> Infer (UType, UType)
+extractPair r pty = case stripRefineTop pty of
+  UTyPair t1 t2 -> return (t1, t2)
+  UTyCons _ _ -> do
+    ty1 <- fresh; ty2 <- fresh
+    _ <- wrange r $ UTyCons ty1 (UTyCons ty2 UTyUnit) =:= pty
+    return (ty1, ty2)
+  _ -> do
+    ty1 <- fresh; ty2 <- fresh
+    _ <- wrange r $ UTyPair ty1 ty2 =:= pty
+    return (ty1, ty2)
+
+-- | Infer the type of an expression, emitting any refinement obligations.
 infer :: Exp Range -> Infer UType
 infer (EInt _ n) = do
   v <- freshPredVar
@@ -573,9 +542,6 @@ infer (EProj r i e) = do
   t1 <- infer e
   t1b <- applyBindings t1
   (ts, t2) <- makeNFresh i
-  -- Use the applied form of the inferred expression type when unifying
-  -- with the tuple skeleton to ensure we compare against the current
-  -- bindings (avoids unifying raw UVar that may later be rebound).
   _ <- wrange r $ t1b =:= t2
   _ <- applyBindings t2
   let elt = ts !! fromIntegral i
@@ -593,143 +559,36 @@ infer (ERecordProj r e field) = do
       _ <- wrange r $ recTy =:= uTyRecord [(field, fieldTy)]
       applyBindings fieldTy
 infer (EBinOp _ e1 op e2) = case op of
-  Plus _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyInt
-  Minus _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyInt
-  Times _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyInt
-  Divide _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyInt
-  Eq _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyBool
-  Lt _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyBool
-  Gt _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyBool
-  Le _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyBool
-  Ge _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyBool
-  Neq _ -> do
-    check e1 UTyInt
-    check e2 UTyInt
-    return UTyBool
-  And _ -> do
-    check e1 UTyBool
-    check e2 UTyBool
-    return UTyBool
-  Or _ -> do
-    check e1 UTyBool
-    check e2 UTyBool
-    return UTyBool
-  PlusF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyFloat
-  MinusF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyFloat
-  TimesF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyFloat
-  DivideF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyFloat
-  EqF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyBool
-  NeqF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyBool
-  LtF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyBool
-  LeF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyBool
-  GtF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyBool
-  GeF _ -> do
-    check e1 UTyFloat
-    check e2 UTyFloat
-    return UTyBool
+  Plus _    -> ii UTyInt;   Minus _   -> ii UTyInt
+  Times _   -> ii UTyInt;   Divide _  -> ii UTyInt
+  Eq _      -> ii UTyBool;  Neq _     -> ii UTyBool
+  Lt _      -> ii UTyBool;  Le _      -> ii UTyBool
+  Gt _      -> ii UTyBool;  Ge _      -> ii UTyBool
+  And _     -> bb;          Or _      -> bb
+  PlusF _   -> ff UTyFloat; MinusF _  -> ff UTyFloat
+  TimesF _  -> ff UTyFloat; DivideF _ -> ff UTyFloat
+  EqF _     -> ff UTyBool;  NeqF _    -> ff UTyBool
+  LtF _     -> ff UTyBool;  LeF _     -> ff UTyBool
+  GtF _     -> ff UTyBool;  GeF _     -> ff UTyBool
+  where
+    ii res = check e1 UTyInt   >> check e2 UTyInt   >> return res
+    ff res = check e1 UTyFloat >> check e2 UTyFloat >> return res
+    bb     = check e1 UTyBool  >> check e2 UTyBool  >> return UTyBool
 infer (EUnOp r uop e) =
   case uop of
-    Not _ -> do
-      check e UTyBool
-      return UTyBool
-    Fst _ -> do
-      pty <- infer e
-      pty' <- applyBindings pty
-      case stripRefineTop pty' of
-        UTyPair t1 _ -> return t1
-        UTyCons _ _ -> do
-          -- Shape (cons-list) projection
-          ty1 <- fresh
-          ty2 <- fresh
-          _ <- wrange r $ UTyCons ty1 (UTyCons ty2 UTyUnit) =:= pty
-          return ty1
-        _ -> do
-          -- Unknown/fresh type: assume pair (fst/snd keywords are pair operators)
-          ty1 <- fresh
-          ty2 <- fresh
-          _ <- wrange r $ UTyPair ty1 ty2 =:= pty
-          return ty1
-    Snd _ -> do
-      pty <- infer e
-      pty' <- applyBindings pty
-      case stripRefineTop pty' of
-        UTyPair _ t2 -> return t2
-        UTyCons _ _ -> do
-          -- Shape (cons-list) projection
-          ty1 <- fresh
-          ty2 <- fresh
-          _ <- wrange r $ UTyCons ty1 (UTyCons ty2 UTyUnit) =:= pty
-          return ty2
-        _ -> do
-          -- Unknown/fresh type: assume pair
-          ty1 <- fresh
-          ty2 <- fresh
-          _ <- wrange r $ UTyPair ty1 ty2 =:= pty
-          return ty2
-    Sqrt _ -> check e UTyFloat >> return UTyFloat
-    ExpF _ -> check e UTyFloat >> return UTyFloat
-    Log  _ -> check e UTyFloat >> return UTyFloat
-    Sin  _ -> check e UTyFloat >> return UTyFloat
-    Cos  _ -> check e UTyFloat >> return UTyFloat
-    AbsF _ -> check e UTyFloat >> return UTyFloat
-    FloorF _ -> check e UTyFloat >> return UTyFloat
-    CeilF  _ -> check e UTyFloat >> return UTyFloat
-    Erf  _ -> check e UTyFloat >> return UTyFloat
-    FloatOf _ -> check e UTyInt >> return UTyFloat
+    Not _     -> check e UTyBool >> return UTyBool
+    Fst _     -> infer e >>= applyBindings >>= fmap fst . extractPair r
+    Snd _     -> infer e >>= applyBindings >>= fmap snd . extractPair r
+    Sqrt _    -> check e UTyFloat >> return UTyFloat
+    ExpF _    -> check e UTyFloat >> return UTyFloat
+    Log  _    -> check e UTyFloat >> return UTyFloat
+    Sin  _    -> check e UTyFloat >> return UTyFloat
+    Cos  _    -> check e UTyFloat >> return UTyFloat
+    AbsF _    -> check e UTyFloat >> return UTyFloat
+    FloorF _  -> check e UTyFloat >> return UTyFloat
+    CeilF  _  -> check e UTyFloat >> return UTyFloat
+    Erf  _    -> check e UTyFloat >> return UTyFloat
+    FloatOf _ -> check e UTyInt   >> return UTyFloat
 infer (EApp r e1 e2) = do
   ty1 <- infer e1
   ty2 <- infer e2
@@ -777,20 +636,13 @@ infer (EShapeOf _ arrExp) = do
   (_mArrVar, sTy, _eTy) <- asArrayType (firstParam arrExp) arrTy
   normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
 infer (EGenerate _ shapeExp fn) = do
-  -- Infer the shape expression and build an expected concrete tuple-of-Int
-  -- shape based on the syntactic vector. Unify the expected shape with the
-  -- inferred shape so partially-known unification variables are preserved
-  -- and filled where possible.
-  sTy <- infer shapeExp
+  sTy      <- infer shapeExp
   expected <- expectedShapeFromExp shapeExp
   _ <- wrange (firstParam shapeExp) $ expected =:= sTy
-  -- Use the (possibly partially-instantiated) expected shape as the array
-  -- shape we return.
-  sTy' <- applyBindings expected
-  fty <- infer fn
+  sTy'   <- applyBindings expected
+  fty    <- infer fn
   elemTy <- fresh
-  -- Ensure the function's parameter type unifies with the normalized shape
-  fty' <- applyBindings fty
+  fty'   <- applyBindings fty
   case fty' of
     UTyFun argTy _ -> do
       _ <- wrange (firstParam shapeExp) $ argTy =:= sTy'
@@ -987,8 +839,6 @@ infer (EReduce _ fn initExp arrExp) = do
       return arrTyOut
 infer (EReduceGenerate r fn initExp shapeExp genFn) =
   infer (EReduce r fn initExp (EGenerate r shapeExp genFn))
--- foldl : (s -> a -> s) -> s -> Array[n, a] -> s
--- The result type is s (the state type), which may differ from a.
 infer (EFoldl _ fn initExp arrExp) = do
   arrTy  <- infer arrExp
   initTy <- infer initExp
@@ -999,8 +849,6 @@ infer (EFoldl _ fn initExp arrExp) = do
   when (rank /= 1) $ throwError $ MiscError (Just (firstParam arrExp))
   _ <- wrange (firstParam fn) $ fty =:= UTyFun initTy (UTyFun eTy initTy)
   return initTy
--- scan : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]
--- First wave is limited to 1D arrays and returns the exclusive prefix states.
 infer (EScan _ fn initExp arrExp) = do
   arrTy <- infer arrExp
   initTy <- infer initExp
@@ -1185,7 +1033,6 @@ infer (EScatterGuarded _ comb defaults idxArr vals guardArr) = do
         emitPred (PEq (TDim arrVar i) (TDim dstVar i))
       return arrTyOut
 infer (EScatterGenerate _ comb defaults idxArr valFn) =
-  -- Semantically equivalent to scatter c d idx (generate (shape_of idx) valFn).
   infer (EScatter (firstParam defaults) comb defaults idxArr
            (EGenerate (firstParam idxArr) (EShapeOf (firstParam idxArr) idxArr) valFn))
 infer (EGather _ idxArr arrExp) = do
@@ -1213,11 +1060,7 @@ infer (EIndex _ idx arrExp) = do
   idxTy' <- applyBindings idxTy
   _ <- wrange (firstParam idx) $ idxTy' =:= sTy'
   idxTerms <- termsFromIndexExp idx
-  -- Bounds are expressed over the refined array binder; no expression
-  -- inspection is needed because shape constraints are emitted when arrays
-  -- are constructed (generate/fill/reshape/replicate/slice/etc.).
-  arrVar <- maybe freshPredVar return mArrVar
-  -- Emit 0 <= index < dim for each dimension.
+  arrVar   <- maybe freshPredVar return mArrVar
   forM_ (zip [0 ..] idxTerms) $ \(i, t) -> do
     emitPred (PLe (TConst 0) t)
     emitPred (PLt t (TDim arrVar i))
@@ -1231,30 +1074,22 @@ infer (ECheckIndex _ idx defVal arrExp) = do
   idxTy' <- applyBindings idxTy
   eTy' <- applyBindings eTy
   defValTy' <- applyBindings defValTy
-  -- Unify index type with shape type
-  _ <- wrange (firstParam idx) $ idxTy' =:= sTy'
-  -- Unify default value type with element type
+  _ <- wrange (firstParam idx)    $ idxTy'    =:= sTy'
   _ <- wrange (firstParam defVal) $ defValTy' =:= eTy'
-  -- Return the element type (no bounds checking needed)
   return eTy'
 infer (EStencil _ bnd fnExp arrExp) = do
-  -- Infer boundary condition and array types
   inferBnd bnd
   arrTy <- infer arrExp
   (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
-  -- Determine the array's rank to build the accessor function type.
-  -- For rank 1: accessor : Int -> a
-  -- For rank 2: accessor : Int -> Int -> a
-  rank <- shapeArityFromType (firstParam arrExp) sTy'
+  sTy'  <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  -- Stencil is currently limited to 1-D and 2-D arrays.
+  rank  <- shapeArityFromType (firstParam arrExp) sTy'
   when (rank < 1 || rank > 2) $
     throwError $ MiscError (Just (firstParam arrExp))
   let accessorTy = foldr UTyFun eTy (replicate rank UTyInt)
-  -- The stencil function receives the accessor and returns the output element.
   outTy <- fresh
   fty   <- infer fnExp
   _ <- wrange (firstParam fnExp) $ fty =:= UTyFun accessorTy outTy
-  -- Output array has the same shape as the source array.
   (arrVar, arrTyOut) <- freshRefined (UTyArray sTy' outTy)
   case mArrVar of
     Nothing -> return arrTyOut
@@ -1263,120 +1098,36 @@ infer (EStencil _ bnd fnExp arrExp) = do
         emitPred (PEq (TDim arrVar i) (TDim srcVar i))
       return arrTyOut
 infer (ELetIn r dec e) = do
-  let -- Build pattern bindings and a tentative function type for a declaration
-      -- without inferring the body. Returns (patBinds, funTy, bodyTy, skolemAnn)
-      buildDecSkeleton :: Dec Range -> Infer ([(Var, UType)], UType, UType, Maybe UType)
-      buildDecSkeleton (Dec rr _ pats mty _body) = do
-        bodyTy <- fresh
-        skolemAnn <- mapM (skolemize . toUPolytype) mty
-
-        let buildFunType :: [Pat Range] -> Maybe UType -> Infer ([(Var, UType)], UType)
-            buildFunType [] Nothing = return ([], bodyTy)
-            buildFunType [] (Just ty) = return ([], ty)
-            buildFunType [PVar _ arg] mAnn = do
-              argTy <- freshValue
-              funTy <- case mAnn of
-                Nothing -> return $ UTyFun argTy bodyTy
-                Just ann -> wrange rr (ann =:= UTyFun argTy bodyTy)
-              return ([(arg, argTy)], funTy)
-            buildFunType [PVec _ vs] mAnn = do
-              tyArgs <- mapM (const freshValue) vs
-              let argTy = foldr UTyCons UTyUnit tyArgs
-                  binds = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
-              funTy <- case mAnn of
-                Nothing -> return $ UTyFun argTy bodyTy
-                Just ann -> wrange rr (ann =:= UTyFun argTy bodyTy)
-              return (binds, funTy)
-            buildFunType (PVar _ arg : ps) mAnn = do
-              argTy <- freshValue
-              case mAnn of
-                Nothing -> do
-                  (binds, restTy) <- buildFunType ps Nothing
-                  return ((arg, argTy) : binds, UTyFun argTy restTy)
-                Just ann -> do
-                  innerTy <- fresh
-                  funTy <- wrange rr $ (ann =:= UTyFun argTy innerTy)
-                  (binds, _) <- buildFunType ps (Just innerTy)
-                  return ((arg, argTy) : binds, funTy)
-            buildFunType (PVec _ vs : ps) mAnn = do
-              tyArgs <- mapM (const freshValue) vs
-              let argTy = foldr UTyCons UTyUnit tyArgs
-                  bindsLocal = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
-              case mAnn of
-                Nothing -> do
-                  (bindsRest, restTy) <- buildFunType ps Nothing
-                  return (bindsLocal ++ bindsRest, UTyFun argTy restTy)
-                Just ann -> do
-                  innerTy <- fresh
-                  funTy <- wrange rr (ann =:= UTyFun argTy innerTy)
-                  (bindsRest, _) <- buildFunType ps (Just innerTy)
-                  return (bindsLocal ++ bindsRest, funTy)
-        -- all handled cases covered above; no unreachable catch-all needed
-
-        (patBinds, funTy) <- buildFunType pats skolemAnn
-        return (patBinds, funTy, bodyTy, skolemAnn)
-
-      bindPats :: [(Var, UType)] -> Infer a -> Infer a
-      bindPats [] m = m
-      bindPats ((v, t) : vs) m = withBinding v (Forall [] [] t) $ bindPats vs m
-
-  let Dec rr v pats _ body = dec
-   in do
-        -- Deferred generalization for single, non-recursive, unannotated let.
-        -- Build a skeleton (pat bindings and function type) so we can bind
-        -- the monomorphic `v` to the function type itself, ensuring the same
-        -- unification variables are visible inside the declaration body and
-        -- at the use site.
-        (patBinds, funTy, bodyTy, skolemAnn) <- buildDecSkeleton dec
-        -- Bind pattern variables first, then bind `v` monomorphically and
-        -- infer the RHS. Binding patterns before `v` ensures the pattern
-        -- variables have their own fresh unification variables in scope
-        -- so checks inside the body don't accidentally collapse the whole
-        -- parameter's UVar before tuple/shape constraints are applied.
-        (rhsTy, rhsPreds) <- censor (const []) $
-          listen $
-            bindPats patBinds $
-              withBinding v (Forall [] [] funTy) $ do
-                inferredBodyTy <- infer body
-                _ <- inferredBodyTy =:= bodyTy
-                case skolemAnn of
-                  Just ann -> do
-                    _ <- wrange rr $ funTy =:= ann
-                    return ann
-                  Nothing ->
-                    if null pats
-                      then return inferredBodyTy
-                      else return funTy
-
-        -- Generalize RHS after body inference and re-infer body under the
-        -- generalized scheme for `v`.
-        rhsTy' <- applyBindings rhsTy
-        sch <- generalizeWithPreds rhsPreds rhsTy'
-        withBinding v sch $ wrange r $ infer e
-infer (EOp _ op) =
-  case op of
-    Plus _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyInt)
-    Minus _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyInt)
-    Times _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyInt)
-    Divide _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyInt)
-    Eq _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyBool)
-    Neq _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyBool)
-    Lt _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyBool)
-    Le _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyBool)
-    Gt _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyBool)
-    Ge _ -> return $ UTyFun UTyInt (UTyFun UTyInt UTyBool)
-    And _ -> return $ UTyFun UTyBool (UTyFun UTyBool UTyBool)
-    Or _ -> return $ UTyFun UTyBool (UTyFun UTyBool UTyBool)
-    PlusF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyFloat)
-    MinusF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyFloat)
-    TimesF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyFloat)
-    DivideF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyFloat)
-    EqF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
-    NeqF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
-    LtF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
-    LeF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
-    GtF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
-    GeF _ -> return $ UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
+  let Dec rr v pats mty body = dec
+  bodyTy    <- fresh
+  skolemAnn <- mapM (skolemize . toUPolytype) mty
+  (patBinds, funTy) <- buildPatFunType rr bodyTy pats skolemAnn
+  -- Infer the RHS under the pattern bindings and a monomorphic self-reference,
+  -- collecting refinement predicates emitted inside.  After generalization
+  -- the binding is re-introduced with a polymorphic scheme for the body @e@.
+  (rhsTy, rhsPreds) <- censor (const []) $ listen $
+    bindPats patBinds $ withBinding v (Forall [] [] funTy) $ do
+      inferredBodyTy <- infer body
+      _ <- inferredBodyTy =:= bodyTy
+      case skolemAnn of
+        Just ann -> wrange rr (funTy =:= ann) >> return ann
+        Nothing  -> return (if null pats then inferredBodyTy else funTy)
+  sch <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
+  withBinding v sch $ wrange r $ infer e
+infer (EOp _ op) = pure $ case op of
+  Plus _    -> ii2i; Minus _   -> ii2i; Times _   -> ii2i; Divide _  -> ii2i
+  Eq _      -> ii2b; Neq _     -> ii2b; Lt _       -> ii2b; Le _     -> ii2b
+  Gt _      -> ii2b; Ge _      -> ii2b
+  And _     -> bb2b; Or _      -> bb2b
+  PlusF _   -> ff2f; MinusF _  -> ff2f; TimesF _  -> ff2f; DivideF _ -> ff2f
+  EqF _     -> ff2b; NeqF _    -> ff2b; LtF _      -> ff2b; LeF _    -> ff2b
+  GtF _     -> ff2b; GeF _     -> ff2b
+  where
+    ii2i = UTyFun UTyInt   (UTyFun UTyInt   UTyInt)
+    ii2b = UTyFun UTyInt   (UTyFun UTyInt   UTyBool)
+    bb2b = UTyFun UTyBool  (UTyFun UTyBool  UTyBool)
+    ff2f = UTyFun UTyFloat (UTyFun UTyFloat UTyFloat)
+    ff2b = UTyFun UTyFloat (UTyFun UTyFloat UTyBool)
 
 -- | Type-check a boundary condition.
 -- BConst requires the constant expression to have the same type as the source
@@ -1388,79 +1139,78 @@ inferBnd BWrap       = return ()
 inferBnd BMirror     = return ()
 inferBnd (BConst e)  = void (infer e)
 
+-- | Build the function type for a multi-argument declaration from its pattern
+-- list, threading an optional skolemized annotation through each argument.
+-- Returns the accumulated (variable, type) bindings and the complete function
+-- type.
+buildPatFunType
+  :: Range          -- ^ source range for error reporting
+  -> UType          -- ^ fresh result type variable
+  -> [Pat Range]    -- ^ argument patterns
+  -> Maybe UType    -- ^ skolemized annotation (if present)
+  -> Infer ([(Var, UType)], UType)
+buildPatFunType r bodyTy = go
+  where
+    go [] Nothing       = return ([], bodyTy)
+    go [] (Just ty)     = return ([], ty)
+    go [PVar _ arg] mAnn = do
+      argTy <- freshValue
+      funTy <- case mAnn of
+        Nothing  -> return $ UTyFun argTy bodyTy
+        Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
+      return ([(arg, argTy)], funTy)
+    go [PVec _ vs] mAnn = do
+      tyArgs <- mapM (const freshValue) vs
+      let argTy = foldr UTyCons UTyUnit tyArgs
+          binds = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
+      funTy <- case mAnn of
+        Nothing  -> return $ UTyFun argTy bodyTy
+        Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
+      return (binds, funTy)
+    go (PVar _ arg : ps) mAnn = do
+      argTy <- freshValue
+      case mAnn of
+        Nothing -> do
+          (binds, restTy) <- go ps Nothing
+          return ((arg, argTy) : binds, UTyFun argTy restTy)
+        Just ann -> do
+          innerTy <- fresh
+          funTy <- wrange r (ann =:= UTyFun argTy innerTy)
+          (binds, _) <- go ps (Just innerTy)
+          return ((arg, argTy) : binds, funTy)
+    go (PVec _ vs : ps) mAnn = do
+      tyArgs <- mapM (const freshValue) vs
+      let argTy      = foldr UTyCons UTyUnit tyArgs
+          bindsLocal = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
+      case mAnn of
+        Nothing -> do
+          (bindsRest, restTy) <- go ps Nothing
+          return (bindsLocal ++ bindsRest, UTyFun argTy restTy)
+        Just ann -> do
+          innerTy <- fresh
+          funTy <- wrange r (ann =:= UTyFun argTy innerTy)
+          (bindsRest, _) <- go ps (Just innerTy)
+          return (bindsLocal ++ bindsRest, funTy)
+
+-- | Extend the context with a list of monomorphic variable bindings.
+bindPats :: [(Var, UType)] -> Infer a -> Infer a
+bindPats []            m = m
+bindPats ((v, t) : vs) m = withBinding v (Forall [] [] t) $ bindPats vs m
+
 -- | Infer and generalize a sequence of declarations from left to right.
 inferDecs :: [Dec Range] -> Infer [(Var, UPolytype)]
 inferDecs [] = return []
 inferDecs (Dec r var pats mty e : rest) = do
-  -- Fresh type variable representing the body/result of this declaration
-  bodyTy <- fresh
-
-  -- Skolemize any provided annotation so we can check against it
+  bodyTy    <- fresh
   skolemAnn <- mapM (skolemize . toUPolytype) mty
-
-  -- Build the function type and collect pattern variable bindings
-  let buildFunType :: [Pat Range] -> Maybe UType -> Infer ([(Var, UType)], UType)
-      buildFunType [] Nothing = return ([], bodyTy)
-      buildFunType [] (Just ty) = return ([], ty)
-      buildFunType [PVar _ arg] mAnn = do
-        argTy <- freshValue
-        funTy <- case mAnn of
-          Nothing -> return $ UTyFun argTy bodyTy
-          Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
-        return ([(arg, argTy)], funTy)
-      buildFunType [PVec _ vs] mAnn = do
-        tyArgs <- mapM (const freshValue) vs
-        let argTy = foldr UTyCons UTyUnit tyArgs
-            binds = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
-        funTy <- case mAnn of
-          Nothing -> return $ UTyFun argTy bodyTy
-          Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
-        return (binds, funTy)
-      buildFunType (PVar _ arg : ps) mAnn = do
-        argTy <- freshValue
-        case mAnn of
-          Nothing -> do
-            (binds, restTy) <- buildFunType ps Nothing
-            return ((arg, argTy) : binds, UTyFun argTy restTy)
-          Just ann -> do
-            innerTy <- fresh
-            funTy <- wrange r (ann =:= UTyFun argTy innerTy)
-            (binds, _) <- buildFunType ps (Just innerTy)
-            return ((arg, argTy) : binds, funTy)
-      buildFunType (PVec _ vs : ps) mAnn = do
-        tyArgs <- mapM (const freshValue) vs
-        let argTy = foldr UTyCons UTyUnit tyArgs
-            bindsLocal = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
-        case mAnn of
-          Nothing -> do
-            (bindsRest, restTy) <- buildFunType ps Nothing
-            return (bindsLocal ++ bindsRest, UTyFun argTy restTy)
-          Just ann -> do
-            innerTy <- fresh
-            funTy <- wrange r (ann =:= UTyFun argTy innerTy)
-            (bindsRest, _) <- buildFunType ps (Just innerTy)
-            return (bindsLocal ++ bindsRest, funTy)
-
-      -- Add pattern bindings to a computation
-      bindPats :: [(Var, UType)] -> Infer a -> Infer a
-      bindPats [] m = m
-      bindPats ((v, t) : vs) m = withBinding v (Forall [] [] t) $ bindPats vs m
-
-  (patBinds, funTy) <- buildFunType pats skolemAnn
-
-  -- Infer the body with pattern variables bound and capture predicates
+  (patBinds, funTy) <- buildPatFunType r bodyTy pats skolemAnn
   (inferredBodyTy, rhsPreds) <- censor (const []) $ listen $ bindPats patBinds $ infer e
   _ <- inferredBodyTy =:= bodyTy
-
-  -- If there was an annotation, ensure the computed function type matches it
   case skolemAnn of
-    Just ann -> do
-      _ <- wrange r (funTy =:= ann)
-      return ()
-    Nothing -> return ()
-
+    Just ann -> void $ wrange r (funTy =:= ann)
+    Nothing  -> return ()
   boundTy <- generalizeWithPreds rhsPreds funTy
-  rest' <- withBinding var boundTy $ inferDecs rest
+  rest'   <- withBinding var boundTy $ inferDecs rest
   return $ (var, boundTy) : rest'
 
 -- | Extend the typing context with many bindings for the duration of an action.
@@ -1526,44 +1276,25 @@ runInferWithCtxOptions opts ctx e = do
       (ty, preds) <- censor (const []) $ listen (e >>= applyBindings)
       generalizeWithPreds preds ty
 
--- | `runInfer` runs an `Infer` computation and returns a fully-generalized
--- @Polytype@ (or a @TypeError@). @runInferWithCtx@ is identical but takes an
--- initial typing context @Ctx@ which is useful when temporarily injecting
--- builtin polymorphic values.
+-- | Infer and generalize the type of a single expression.
 inferPolytype :: Exp Range -> IO (Either TypeError Polytype)
 inferPolytype = runInfer . infer
 
--- | Example (illustrative):
---
--- > -- construct a literal expression (range omitted for brevity)
--- > let expr = EInt someRange 42
--- > result <- runInfer (infer expr)
--- > case result of
--- >   Left err -> print err
--- >   Right poly -> print poly
-
+-- | Rename the universally-quantified type variables of a 'Polytype' to
+-- canonical @a0, a1, …@ names.
 renamePolytype :: Polytype -> Polytype
-renamePolytype pty = evalState (processPolytype pty) (0 :: Int, M.empty)
+renamePolytype pty = evalState (go pty) (0 :: Int, M.empty)
   where
-    processPolytype pty' =
-      case pty' of
-        Forall vars preds t -> do
-          vars' <- forM vars $ \v -> do
-            (n, m) <- get
-            let v' = BS.pack $ "a" ++ show n
-                m' = M.insert v v' m
-            put (n + 1, m')
-            return v'
-          t' <- ycataM rename t
-          return $ Forall vars' preds t'
-    rename t =
-      case t of
-        TyVar v -> do
-          (_, m) <- get
-          case M.lookup v m of
-            Nothing -> return $ TyVar v
-            Just v' -> return $ TyVar v'
-        t' -> return t'
+    go (Forall vars preds t) = do
+      vars' <- forM vars $ \v -> do
+        (n, m) <- get
+        let v' = BS.pack ("a" ++ show n)
+        put (n + 1, M.insert v v' m)
+        return v'
+      t' <- ycataM rename t
+      return (Forall vars' preds t')
+    rename (TyVar v) = gets (maybe (TyVar v) TyVar . M.lookup v . snd)
+    rename t         = return t
 
 -- | Infer top-level declarations and return their generalized Polytypes.
 runInferDecs :: [Dec Range] -> IO (Either TypeError [(Var, Polytype)])
@@ -1572,26 +1303,15 @@ runInferDecs = runInferDecsWithOptions defaultInferOptions
 runInferDecsWithOptions :: InferOptions -> [Dec Range] -> IO (Either TypeError [(Var, Polytype)])
 runInferDecsWithOptions opts decs = do
   let result =
-        runIdentity $ evalIntBindingT $ runExceptT $ runWriterT $ runStateT (flip runReaderT M.empty $ inferDecs decs) initInferState
+        runIdentity $ evalIntBindingT $ runExceptT $ runWriterT $
+          runStateT (flip runReaderT M.empty $ inferDecs decs) initInferState
   case result of
     Left err -> return $ Left err
     Right ((ups, _preds), _st) -> do
-      pairs <-
-        mapM
-          ( \(v, up) -> do
-              let poly = fromUPolytype up
-              res <- finalizePolyWithOptions opts poly
-              return (v, res)
-          )
-          ups
-      case traverse
-        ( \(v, res) -> case res of
-            Left err -> Left err
-            Right poly -> Right (v, poly)
-        )
-        pairs of
-        Left err -> return $ Left err
-        Right oks -> return $ Right oks
+      pairs <- forM ups $ \(v, up) -> do
+        res <- finalizePolyWithOptions opts (fromUPolytype up)
+        return (v, res)
+      return $ traverse (\(v, res) -> fmap (v,) res) pairs
 
 -- | Discharge the predicates attached to a generalized type scheme.
 finalizePoly :: Polytype -> IO (Either TypeError Polytype)
