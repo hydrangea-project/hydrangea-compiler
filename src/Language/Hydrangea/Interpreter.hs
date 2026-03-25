@@ -18,8 +18,6 @@
 -- of integers (Int * Int * ... * ()) and indices are similarly structured.
 module Language.Hydrangea.Interpreter where
 
--- Note: runnable examples are intentionally restricted to core modules.
-
 import Control.Monad (foldM, forM, when, zipWithM)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
@@ -48,27 +46,24 @@ data Value
     VString ByteString
   | -- | Unit value
     VUnit
-  | -- | Tuple/vector as inductive cons: VTuple [v1, v2, ..., vn] represents (v1, v2, ..., vn)
-    -- An empty tuple VTuple [] represents ()
+  | -- | Tuple / shape vector: @VTuple [v1, v2, ..., vn]@ represents @(v1, v2, ..., vn)@;
+    -- @VTuple []@ is the unit shape @()@.
     VTuple [Value]
-  | -- | Pair value: a product of exactly two values of arbitrary types.
-    -- Distinct from VTuple (which is used for shapes) and compiles to a C struct.
+  | -- | Product of exactly two values of arbitrary types.
+    -- Distinct from 'VTuple' (used for shapes) and lowers to a C struct.
     VPair Value Value
-  | -- | Structural record value with named fields stored in canonical field-name order.
+  | -- | Record value with named fields in canonical (sorted) field-name order.
     VRecord [(Var, Value)]
-  | -- | Closure: captured environment, patterns to match against one argument,
-    -- and the body expression to evaluate.
+  | -- | Closure capturing its environment; matched against arguments one pattern at a time.
     VClosure Env [Pat ()] (Exp ())
-  | -- | First-class operator value (curried for binary operators)
-    -- Nothing means waiting for 2 args, Just v means waiting for 1 more arg with v already applied
+  | -- | First-class operator value. @'Nothing'@ holds an unapplied binary operator;
+    -- @'Just' v@ holds one with the first argument already supplied.
     VPrimOp (Maybe Value) (Operator ())
-  | -- | Stencil accessor value: applied one integer offset at a time.
-    -- Carries the boundary condition, source array shape and elements,
-    -- the current ND index being processed, and the offsets collected so far.
+  | -- | Stencil accessor applied one integer offset per dimension at a time.
+    -- Once all offsets for the array rank are collected the boundary-conditioned
+    -- element is returned.
     VStencilAcc (BoundaryCondition ()) [Integer] [Value] [Integer] [Integer]
-    -- bnd shape elems ndIdx offsets_so_far
-  | -- | Immutable array with shape (as a list of integers in row-major order)
-    -- and flattened element values stored in row-major order
+  | -- | Immutable array with a row-major shape and flattened element storage.
     VArray [Integer] [Value]
   deriving (Eq, Show)
 
@@ -102,12 +97,11 @@ evalExp expr env = case expr of
   EBool _ b -> pure $ VBool b
   EString _ s -> pure $ VString s
   EUnit _ -> pure VUnit
-  EVec _ es -> VTuple <$> mapM (\e -> evalExp e env) es
+  EVec _ es -> VTuple <$> mapM (`evalExp` env) es
   EVar _ v -> case Map.lookup v env of
-    Just val -> case val of
-      VClosure cEnv [] body -> evalExp body cEnv  -- Zero-argument closure is evaluated immediately
-      _ -> pure val
-    Nothing -> throwError $ UnboundVariable v
+    Just (VClosure cEnv [] body) -> evalExp body cEnv
+    Just val                     -> pure val
+    Nothing                      -> throwError $ UnboundVariable v
   ENeg _ e -> do
     v <- evalExp e env
     case v of
@@ -117,11 +111,8 @@ evalExp expr env = case expr of
   EBinOp _ e1 op e2 -> do
     v1 <- evalExp e1 env
     v2 <- evalExp e2 env
-    res <- liftEither $ evalBinOp v1 op v2
-    pure res
-  EUnOp _ op e -> do
-    v <- evalExp e env
-    liftEither $ evalUnOp op v
+    liftEither $ evalBinOp v1 op v2
+  EUnOp _ op e -> evalExp e env >>= liftEither . evalUnOp op
   EOp _ op -> pure $ VPrimOp Nothing op
   EApp _ ef ea -> do
     vf <- evalExp ef env
@@ -148,10 +139,8 @@ evalExp expr env = case expr of
       _ -> throwError $ TypeError "Projection only works on tuples"
   EPair _ e1 e2 -> VPair <$> evalExp e1 env <*> evalExp e2 env
   ERecord _ fields -> do
-    values <- mapM (\(field, expr') -> do
-      value <- evalExp expr' env
-      pure (field, value)) fields
-    pure $ VRecord (sortOn fst values)
+    vals <- mapM (\(f, e') -> (f,) <$> evalExp e' env) fields
+    pure $ VRecord (sortOn fst vals)
   ERecordProj _ e field -> do
     v <- evalExp e env
     case v of
@@ -160,21 +149,14 @@ evalExp expr env = case expr of
           Just fieldVal -> pure fieldVal
           Nothing -> throwError $ TypeError ("Record field not found: " ++ unpack field)
       _ -> throwError $ TypeError "Record projection only works on records"
-  ELetIn _ (Dec _ var pats _ body) e -> do
-    -- Create a closure for the declaration and bind it in the environment
-    let closure = VClosure env pats body
-    let newEnv = Map.insert var closure env
-    evalExp e newEnv
-  -- Array operations
+  ELetIn _ (Dec _ var pats _ body) e ->
+    evalExp e (Map.insert var (VClosure env pats body) env)
   EGenerate _ szExpr fnExpr -> do
     vSz <- evalExp szExpr env
     shape <- liftEither $ shapeFromValue vSz
     vFn <- evalExp fnExpr env
     let indices = generateIndicesRowMajor shape
-    vals <- mapM (\idx -> do
-      let arg = valueFromShape idx
-      evalApp vFn arg env
-      ) indices
+    vals <- mapM (\idx -> evalApp vFn (valueFromShape idx) env) indices
     pure $ VArray shape vals
   EIndex _ idxExpr arrExpr -> do
     vidx <- evalExp idxExpr env
@@ -182,10 +164,7 @@ evalExp expr env = case expr of
     varr <- evalExp arrExpr env
     case varr of
       VArray shape vals -> do
-        offRes <- pure $ computeOffsetRowMajor shape vidx_shape
-        offset <- case offRes of
-          Right o -> pure o
-          Left msg -> if "out of bounds" `isInfixOf` msg then throwError $ IndexOutOfBounds msg else throwError $ InvalidArrayOperation msg
+        offset <- resolveOffset shape vidx_shape
         if offset < 0 || offset >= length vals
           then throwError $ IndexOutOfBounds "Array index out of bounds"
           else pure $ vals !! offset
@@ -197,10 +176,11 @@ evalExp expr env = case expr of
     varr <- evalExp arrExpr env
     case varr of
       VArray shape vals -> do
-        offRes <- pure $ computeOffsetRowMajor shape vidx_shape
-        offset <- case offRes of
-          Right o -> pure o
-          Left msg -> if "out of bounds" `isInfixOf` msg then pure (-1) else throwError $ InvalidArrayOperation msg
+        offset <- case computeOffsetRowMajor shape vidx_shape of
+          Right o  -> pure o
+          Left msg -> if "out of bounds" `isInfixOf` msg
+                      then pure (-1)
+                      else throwError $ InvalidArrayOperation msg
         if offset < 0 || offset >= length vals
           then pure vdef
           else pure $ vals !! offset
@@ -233,7 +213,7 @@ evalExp expr env = case expr of
         if shape1 /= shape2
           then throwError $ InvalidArrayOperation "ZipWith: arrays must have the same shape"
           else do
-            newVals <- sequence $ zipWith3 (\a b _ -> evalApp vFn a env >>= \fnA -> evalApp fnA b env) vals1 vals2 (repeat ())
+            newVals <- zipWithM (\a b -> evalApp vFn a env >>= \fnA -> evalApp fnA b env) vals1 vals2
             pure $ VArray shape1 newVals
       _ -> throwError $ TypeError "ZipWith requires two arrays"
   EReduce _ fnExpr zeroExpr arrExpr -> do
@@ -250,15 +230,9 @@ evalExp expr env = case expr of
                 reduceValuesAtPrefix prefix =
                   foldM
                     (\acc k -> do
-                        let idx = prefix ++ [k]
-                        offRes <- pure $ computeOffsetRowMajor shape idx
-                        offset <- case offRes of
-                          Right o -> pure o
-                          Left msg -> if "out of bounds" `isInfixOf` msg then throwError $ IndexOutOfBounds msg else throwError $ InvalidArrayOperation msg
-                        let v = vals !! offset
-                        fnAcc <- evalApp vFn acc env
-                        res <- evalApp fnAcc v env
-                        pure res
+                        offset <- resolveOffset shape (prefix ++ [k])
+                        fnAcc  <- evalApp vFn acc env
+                        evalApp fnAcc (vals !! offset) env
                     )
                     vZero
                     [0 .. redDim - 1]
@@ -288,7 +262,6 @@ evalExp expr env = case expr of
                 vals
         outVals <- mapM reduceGeneratedAtPrefix prefixIndices
         pure $ VArray outShape outVals
-  -- foldl step init arr: strict left fold returning the final accumulator (scalar)
   EFoldl _ fnExpr initExpr arrExpr -> do
     vFn   <- evalExp fnExpr env
     vInit <- evalExp initExpr env
@@ -297,12 +270,9 @@ evalExp expr env = case expr of
       VArray shape vals ->
         case shape of
           [n] -> foldM
-                   (\acc k -> do
-                       fnAcc <- evalApp vFn acc env
-                       res   <- evalApp fnAcc (vals !! k) env
-                       pure res)
+                   (\acc k -> evalApp vFn acc env >>= \fnAcc -> evalApp fnAcc (vals !! k) env)
                    vInit
-                    [0 .. fromIntegral n - 1]
+                   [0 .. fromIntegral n - 1]
           _ -> throwError $ InvalidArrayOperation "foldl: array must be 1-dimensional"
       _ -> throwError $ TypeError "foldl: third argument must be an array"
   EScan _ fnExpr initExpr arrExpr -> do
@@ -454,27 +424,21 @@ evalExp expr env = case expr of
           then throwError $ InvalidArrayOperation "Permute: source and destination must have same rank"
           else do
             let dstIndices = generateIndicesRowMajor dstShape
-            -- For each destination index, find if any source element maps to it
-            newVals <- forM (zip dstIndices [0..]) $ \(dstIdx, dstOffset) -> do
+                srcIndices = generateIndicesRowMajor srcShape
+            newVals <- forM (zip dstIndices [0..]) $ \(_dstIdx, dstOffset) -> do
               let dstVal = dstVals !! dstOffset
-              -- Search through source indices to find one that maps to this destination
-              let srcIndices = generateIndicesRowMajor srcShape
               mbResult <- foldM (\acc (srcIdx, srcOffset) -> case acc of
-                Just _ -> pure acc  -- Already found a mapping
+                Just _  -> pure acc
                 Nothing -> do
-                  permIdx <- evalApp vPermFn (valueFromShape srcIdx) env
+                  permIdx      <- evalApp vPermFn (valueFromShape srcIdx) env
                   permIdxShape <- liftEither $ shapeFromValue permIdx
                   case computeOffsetRowMajor dstShape permIdxShape of
                     Right permOffset | permOffset == dstOffset -> do
-                      -- This source element maps to this destination
-                      let srcVal = srcVals !! srcOffset
-                      result <- evalApp vComb srcVal env >>= \fnSrc -> evalApp fnSrc dstVal env
+                      result <- evalApp vComb (srcVals !! srcOffset) env >>= \fnSrc -> evalApp fnSrc dstVal env
                       pure (Just result)
-                    _ -> pure Nothing  -- Out of bounds or doesn't match
+                    _ -> pure Nothing
                 ) Nothing (zip srcIndices [0..])
-              case mbResult of
-                Just result -> pure result
-                Nothing -> pure dstVal  -- No source element maps here, use default
+              pure $ maybe dstVal id mbResult
             pure $ VArray dstShape newVals
       _ -> throwError $ TypeError "Permute requires two arrays"
   EScatter _ combExpr defaultsExpr idxArrExpr valsExpr -> do
@@ -489,10 +453,7 @@ evalExp expr env = case expr of
           else do
             let applyScatter dstVals' (idxVal, val) = do
                   idxShape' <- liftEither $ shapeFromValue idxVal
-                  offRes <- pure $ computeOffsetRowMajor dstShape idxShape'
-                  dstOffset <- case offRes of
-                    Right o -> pure o
-                    Left msg -> if "out of bounds" `isInfixOf` msg then throwError $ IndexOutOfBounds msg else throwError $ InvalidArrayOperation msg
+                  dstOffset <- resolveOffset dstShape idxShape'
                   if dstOffset < 0 || dstOffset >= length dstVals'
                     then throwError $ IndexOutOfBounds "Scatter: index out of bounds"
                     else do
@@ -518,10 +479,7 @@ evalExp expr env = case expr of
                     VBool False -> pure dstVals'
                     VBool True -> do
                       idxShape' <- liftEither $ shapeFromValue idxVal
-                      offRes <- pure $ computeOffsetRowMajor dstShape idxShape'
-                      dstOffset <- case offRes of
-                        Right o -> pure o
-                        Left msg -> if "out of bounds" `isInfixOf` msg then throwError $ IndexOutOfBounds msg else throwError $ InvalidArrayOperation msg
+                      dstOffset <- resolveOffset dstShape idxShape'
                       if dstOffset < 0 || dstOffset >= length dstVals'
                         then throwError $ IndexOutOfBounds "ScatterGuarded: index out of bounds"
                         else do
@@ -533,23 +491,18 @@ evalExp expr env = case expr of
             pure $ VArray dstShape result
       _ -> throwError $ TypeError "ScatterGuarded requires index, values, and guard arrays"
   EScatterGenerate _ combExpr defaultsExpr idxArrExpr valFnExpr ->
-    -- Evaluate as scatter c d idx (generate (shape_of idx) valFn).
-    let a = firstParam defaultsExpr
+    let a  = firstParam defaultsExpr
         ai = firstParam idxArrExpr
-     in evalExp (EScatter a combExpr defaultsExpr idxArrExpr
-                   (EGenerate ai (EShapeOf ai idxArrExpr) valFnExpr)) env
+    in evalExp (EScatter a combExpr defaultsExpr idxArrExpr
+                  (EGenerate ai (EShapeOf ai idxArrExpr) valFnExpr)) env
   EGather _ idxArrExpr arrExpr -> do
     vIdxArr <- evalExp idxArrExpr env
     varr <- evalExp arrExpr env
     case (vIdxArr, varr) of
-      (VArray idxShape idxVals, VArray srcShape srcVals) ->
-        do
+      (VArray idxShape idxVals, VArray srcShape srcVals) -> do
           gatheredVals <- forM idxVals $ \idxVal -> do
             idxShape' <- liftEither $ shapeFromValue idxVal
-            offRes <- pure $ computeOffsetRowMajor srcShape idxShape'
-            srcOffset <- case offRes of
-              Right o -> pure o
-              Left msg -> if "out of bounds" `isInfixOf` msg then throwError $ IndexOutOfBounds msg else throwError $ InvalidArrayOperation msg
+            srcOffset <- resolveOffset srcShape idxShape'
             if srcOffset < 0 || srcOffset >= length srcVals
               then throwError $ IndexOutOfBounds "Gather: index out of bounds"
               else pure $ srcVals !! srcOffset
@@ -607,10 +560,7 @@ evalExp expr env = case expr of
                 _ -> throwError $ TypeError "Slice indices must be integers"
         (outShape, sliceIndices) <- liftEither $ buildSliceShape srcShape sliceSpecs
         slicedVals <- forM sliceIndices $ \idx -> do
-          let offRes = computeOffsetRowMajor srcShape idx
-          offset <- case offRes of
-            Right o -> pure o
-            Left msg -> if "out of bounds" `isInfixOf` msg then throwError $ IndexOutOfBounds msg else throwError $ InvalidArrayOperation msg
+          offset <- resolveOffset srcShape idx
           if offset < 0 || offset >= length srcVals
             then throwError $ IndexOutOfBounds "Slice: index out of bounds"
             else pure $ srcVals !! offset
@@ -710,11 +660,8 @@ evalExp expr env = case expr of
     case vArr of
       VArray shape vals -> do
         let indices = generateIndicesRowMajor shape
-        outVals <- forM indices $ \ndIdx -> do
-          -- Build an accessor closure that takes integer offsets and returns
-          -- the element at ndIdx + offsets after applying the boundary condition.
-          let accessorVal = buildStencilAccessor bnd shape vals ndIdx
-          evalApp vFn accessorVal env
+        outVals <- forM indices $ \ndIdx ->
+          evalApp vFn (buildStencilAccessor bnd shape vals ndIdx) env
         pure $ VArray shape outVals
       _ -> throwError $ TypeError "stencil: source must be an array"
 
@@ -724,34 +671,32 @@ stripQuotes s
   | BS.length s >= 2 && BS.head s == '"' && BS.last s == '"' = BS.tail (BS.init s)
   | otherwise = s
 
+-- | Project an integer out of a 'VInt', returning 'Nothing' for any other value.
 valueAsInt :: Value -> Maybe Integer
 valueAsInt (VInt n) = Just n
-valueAsInt _ = Nothing
+valueAsInt _        = Nothing
 
--- | Parse comma/newline-separated integers from a string
+-- | Split a string on any character in the delimiter set.
+splitOn :: String -> String -> [String]
+splitOn _ [] = [""]
+splitOn delims (x:xs)
+  | x `elem` delims = "" : splitOn delims xs
+  | otherwise       = let (w:ws) = splitOn delims xs in (x:w) : ws
+
+-- | Strip whitespace characters from a string.
+trimWS :: String -> String
+trimWS = filter (\c -> c /= ' ' && c /= '\n' && c /= '\r' && c /= '\t')
+
+-- | Parse comma/newline-separated integers from a string.
 parseCSVInts :: String -> [Integer]
-parseCSVInts = map read . filter (not . null) . map strip . splitDelims ",\n\r"
-  where
-    strip = filter (\c -> c /= ' ' && c /= '\n' && c /= '\r' && c /= '\t')
-    splitDelims :: String -> String -> [String]
-    splitDelims _ [] = [""]
-    splitDelims delims (x:xs)
-      | x `elem` delims = "" : splitDelims delims xs
-      | otherwise = let (w:ws) = splitDelims delims xs in (x:w) : ws
+parseCSVInts = map read . filter (not . null) . map trimWS . splitOn ",\n\r"
 
--- | Parse comma/newline-separated doubles from a string
+-- | Parse comma/newline-separated doubles from a string.
 parseCSVFloats :: String -> [Double]
-parseCSVFloats = map read . filter (not . null) . map strip . splitDelims ",\n\r"
-  where
-    strip = filter (\c -> c /= ' ' && c /= '\n' && c /= '\r' && c /= '\t')
-    splitDelims :: String -> String -> [String]
-    splitDelims _ [] = [""]
-    splitDelims delims (x:xs)
-      | x `elem` delims = "" : splitDelims delims xs
-      | otherwise = let (w:ws) = splitDelims delims xs in (x:w) : ws
+parseCSVFloats = map read . filter (not . null) . map trimWS . splitOn ",\n\r"
 
--- | Pure evaluation helper for contexts that don't support IO (e.g. replicate shape dims).
--- This fails if the expression requires IO (e.g. read_array).
+-- | Evaluate a constant sub-expression (integer literal or variable) without IO.
+-- Used for shape dimension expressions in @replicate@ where IO is unavailable.
 evalExpPure :: Exp () -> Env -> Either EvalError Value
 evalExpPure expr env = case expr of
   EInt _ n -> pure $ VInt n
@@ -760,19 +705,17 @@ evalExpPure expr env = case expr of
     Nothing -> Left $ UnboundVariable v
   _ -> Left $ TypeError "Complex expression in shape dimension"
 
--- | Replicate a source array into a larger shape by projecting each output index back to the consumed source axes.
+-- | Replicate a source array into a larger shape by projecting each output index
+-- back onto the consumed source axes.
 replicateValues :: [Bool] -> [Integer] -> [Value] -> [Integer] -> Either EvalError [Value]
 replicateValues consumeMap srcShape srcVals outShape =
   forM (generateIndicesRowMajor outShape) $ \outIdx -> do
     let srcIdx = [i | (i, keep) <- zip outIdx consumeMap, keep]
-    let offRes = computeOffsetRowMajor srcShape srcIdx
-    offset <- case offRes of
-      Right o -> pure o
-      Left msg -> if "out of bounds" `isInfixOf` msg then Left $ IndexOutOfBounds msg else Left $ InvalidArrayOperation msg
+    offset <- resolveOffset srcShape srcIdx
     pure $ srcVals !! offset
-  
 
--- | Helper function to build slice shape and compute indices
+
+-- | Compute the output shape and enumerated multi-indices for a slice operation.
 buildSliceShape :: [Integer] -> [Maybe (Integer, Integer)] -> Either EvalError ([Integer], [[Integer]])
 buildSliceShape srcShape sliceSpecs = do
   when (length srcShape /= length sliceSpecs) $
@@ -790,27 +733,18 @@ buildSliceShape srcShape sliceSpecs = do
     cartesian [] = [[]]
     cartesian (xs : xss) = [x : rest | x <- xs, rest <- cartesian xss]
 
--- | Apply a function value to an argument
+-- | Apply a function value to an argument.
 evalApp :: Value -> Value -> Env -> EvalM Value
-evalApp (VClosure env pats body) arg _env = do
-  -- Match the argument against the first pattern
-  case pats of
-    [] -> throwError $ ArityMismatch "Closure has no patterns to match"
-    (pat : restPats) -> do
-      newEnv <- liftEither $ matchPattern pat arg env
-      if null restPats
-        then do
-          res <- evalExp body newEnv
-          pure res
-        else pure $ VClosure newEnv restPats body
-evalApp (VPrimOp Nothing op) arg _env = do
-  -- Binary operator waiting for first argument
-  pure $ VPrimOp (Just arg) op
-evalApp (VPrimOp (Just arg1) op) arg2 _env = do
-  -- Binary operator with both arguments provided
-  liftEither $ evalBinOp arg1 op arg2
+evalApp (VClosure env pats body) arg _env = case pats of
+  [] -> throwError $ ArityMismatch "Closure has no patterns to match"
+  pat : restPats -> do
+    newEnv <- liftEither $ matchPattern pat arg env
+    if null restPats
+      then evalExp body newEnv
+      else pure $ VClosure newEnv restPats body
+evalApp (VPrimOp Nothing   op) arg  _env = pure $ VPrimOp (Just arg) op
+evalApp (VPrimOp (Just a)  op) b    _env = liftEither $ evalBinOp a op b
 evalApp (VStencilAcc bnd shape vals ndIdx offsets) arg _env = do
-  -- Stencil accessor: collect one integer offset.
   offset <- case arg of
     VInt n -> pure n
     _      -> throwError $ TypeError "stencil accessor: offset must be an integer"
@@ -907,7 +841,15 @@ valueFromShape :: [Integer] -> Value
 valueFromShape [] = VUnit
 valueFromShape ns = VTuple (map VInt ns)
 
--- Note: index/offset helpers are provided by `Language.Hydrangea.Shape`.
+-- | Compute the flat row-major offset for @idx@ into an array of @shape@,
+-- translating the 'String'-tagged error from 'computeOffsetRowMajor' into the
+-- appropriate 'EvalError' constructor.
+resolveOffset :: MonadError EvalError m => [Integer] -> [Integer] -> m Int
+resolveOffset shape idx = case computeOffsetRowMajor shape idx of
+  Right o  -> pure o
+  Left msg -> throwError $ if "out of bounds" `isInfixOf` msg
+                            then IndexOutOfBounds msg
+                            else InvalidArrayOperation msg
 
 -- | Build a stencil accessor value for a given source array and current ND index.
 --
@@ -956,18 +898,13 @@ loadStencilElem bnd shape vals ndIdx offsets = do
            then throwError $ InvalidArrayOperation "stencil: index out of bounds"
            else pure $ vals !! fromIntegral flat
 
--- | Evaluate a list of declarations, returning bindings
+-- | Evaluate a list of top-level declarations, returning the accumulated bindings.
 evalDecs :: [Dec ()] -> EvalM Env
-evalDecs decs = go decs Map.empty
+evalDecs = foldM step Map.empty
   where
-    go [] env = pure env
-    go (Dec _ var pats _ body : rest) env = do
-      val <-
-        if null pats
-          then evalExp body env
-          else pure (VClosure env pats body)
-      let newEnv = Map.insert var val env
-      go rest newEnv
+    step env (Dec _ var pats _ body) = do
+      val <- if null pats then evalExp body env else pure (VClosure env pats body)
+      pure $ Map.insert var val env
 
 -- | Pretty printing for runtime values
 instance Pretty Value where
