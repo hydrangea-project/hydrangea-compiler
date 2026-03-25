@@ -3,26 +3,16 @@
 -- |
 -- Module: Language.Hydrangea.CFG
 --
--- Canonical CFG representation (Phase 2). This module defines the
--- core IR types used by later optimisation and code-generation passes.
--- It focuses on a small, well-documented set of primitives:
---  * @IndexExpr@ — a structural index language used for loop bounds and
---    dependence analysis,
---  * @LoopSpec@ / @ExecPolicy@ — representations of ND loops and
---    execution hints (serial/parallel/vector), and
---  * @Stmt@ / @Proc@ / @Program@ — a minimal statement set for lowered
---    programs.
+-- Core IR types for the imperative CFG representation used by optimisation
+-- and code-generation passes.
 --
--- Design notes / invariants:
---  * @CVar@ is the canonical name type for temporaries and parameters.
---  * @IndexExpr@ is deliberately small and structural to make analysis
---    deterministic and amenable to canonicalisation (@simplifyIndexExpr@).
---  * @LoopSpec.lsBounds@ and @IndexExpr@ are used by analysis/optimisation
---    to compute iteration space sizes; they should be kept in simplified
---    form when possible.
+-- The key abstractions are:
 --
--- This module provides only types and small helpers; higher-level
--- operations (bridges/adapters) belong in the CFG bridge and pipeline modules.
+-- * 'IndexExpr' — a structural index expression language for loop bounds
+--   and dependence analysis; use 'simplifyIndexExpr' to obtain a canonical form.
+-- * 'LoopSpec' \/ 'ExecPolicy' — n-dimensional loop descriptors with
+--   serial, parallel, and vector execution hints.
+-- * 'Stmt' \/ 'Proc' \/ 'Program' — the minimal statement IR for lowered programs.
 module Language.Hydrangea.CFG
   ( CVar
   , IndexExpr(..)
@@ -56,21 +46,8 @@ import Language.Hydrangea.CFGCore (Atom, RHS, Redop, CType)
 -- | Canonical name for variables in the CFG.
 type CVar = ByteString
 
--- | Small structural index expression language for dependence analysis.
---
--- Constructor notes:
--- * @IVar name@ — a symbolic variable (typically a loop iterator or named
---   bound).
--- * @IConst n@ — integer constant.
--- * @IAdd a b@, @ISub a b@, @IMul a b@, @IDiv a b@ — binary arithmetic
---   ops. @simplifyIndexExpr@ performs folding and canonical ordering.
--- * @ITuple@ / @IProj@ — lightweight tuple projection to represent
---   multi-dimensional indices.
--- * @IFlatToNd flat sh@ / @INdToFlat nd sh@ — explicit conversions
---   between flat (linear) and n-dimensional indices; the shape is itself
---   an @IndexExpr@ describing the shape/strides.
--- * @ICall f args@ — opaque call returning an index value; treated as
---   an uninterpreted symbol by most analyses.
+-- | Structural index expression language for loop bounds and dependence analysis.
+-- Use 'simplifyIndexExpr' to obtain a canonical form suitable for comparison.
 data IndexExpr
   = IVar CVar
   -- ^ symbolic variable (loop iterator or named bound)
@@ -96,23 +73,19 @@ data IndexExpr
   -- ^ opaque call to an index-producing function; preserved verbatim
   deriving (Eq, Show)
 
--- | Simplify/normalize an 'IndexExpr' into a small canonical form.
--- The goal is deterministic, locally-sound algebraic normalization that
--- makes expressions easier to compare and reason about in analyses.
+-- | Normalise an 'IndexExpr' into a canonical form suitable for comparison.
 --
--- Implemented rules (non-exhaustive):
--- * constant folding for @IAdd@ and @IMul@ (collect constant terms)
--- * flatten nested @IAdd@ / @IMul@ into n-ary forms encoded as binary
---   trees with a deterministic left/right ordering
--- * convert @ISub a b@ into @IAdd a (IMul (IConst (-1)) b)@
--- * reorder additive/multiplicative terms: non-constant (variables,
---   projections, multiplications) come before the final constant term
--- * recursively simplify sub-expressions; @IDiv@ is preserved as a
---   syntactic node (no cancellation rules)
+-- Normalisation rules applied recursively:
 --
--- Example:
--- > simplifyIndexExpr (IAdd (IConst 1) (IAdd (IVar "i") (IConst 2)))
--- yields a canonical form equivalent to @IAdd (IVar "i") (IConst 3)@
+-- * Constant folding: sums and products of constants are evaluated.
+-- * Flattening: nested @IAdd@ \/ @IMul@ trees are collected into n-ary
+--   sums \/ products, then re-encoded as binary trees in a deterministic order.
+-- * @ISub a b@ is rewritten to @IAdd a (IMul (IConst (-1)) b)@.
+-- * Terms are sorted so that non-constant terms precede the constant term.
+-- * @IDiv@ is kept syntactic (no algebraic cancellation is performed).
+--
+-- Example: @'simplifyIndexExpr' (IAdd (IConst 1) (IAdd (IVar "i") (IConst 2)))@
+-- produces a form equivalent to @IAdd (IVar "i") (IConst 3)@.
 simplifyIndexExpr :: IndexExpr -> IndexExpr
 simplifyIndexExpr ie = case ie of
   IVar{} -> ie
@@ -127,11 +100,8 @@ simplifyIndexExpr ie = case ie of
   IMul a b -> simplifyMul (simplifyIndexExpr a) (simplifyIndexExpr b)
   IDiv a b -> IDiv (simplifyIndexExpr a) (simplifyIndexExpr b)
 
--- Helpers
--- | Rank expressions for deterministic canonical ordering used by the
--- simplifiers. Lower return value means higher priority when sorting
--- terms (so multiplicative factors come before variables, which come
--- before opaque calls).
+-- | Priority rank for canonical term ordering: lower rank sorts earlier.
+-- Multiplicative factors rank before variables; opaque calls rank last.
 exprRank :: IndexExpr -> Int
 exprRank ex = case ex of
   IMul{} -> 0
@@ -145,8 +115,8 @@ exprRank ex = case ex of
   ISub{} -> 1
   ICall{} -> 3
   _ -> 2
--- | Collect/add terms and produce a canonical @IAdd@ tree where constant
--- terms are collected and placed last.
+-- | Flatten and normalise an addition into a canonical 'IAdd' tree with the
+-- constant term last.
 simplifyAdd :: IndexExpr -> IndexExpr -> IndexExpr
 simplifyAdd a b =
   let collectAdd :: IndexExpr -> ([IndexExpr], Integer)
@@ -157,11 +127,8 @@ simplifyAdd a b =
 
       (termsA, constA) = collectAdd a
       (termsB, constB) = collectAdd b
-      terms = termsA ++ termsB
       constSum = constA + constB
-      -- canonical ordering: prefer multiplicative/variable terms before
-      -- opaque calls, then fall back to string ordering for determinism.
-      sortedTerms = sortBy (comparing (\t -> (exprRank t, show t))) terms
+      sortedTerms = sortBy (comparing (\t -> (exprRank t, show t))) (termsA ++ termsB)
 
       build ts n = case (ts, n) of
         ([], 0) -> IConst 0
@@ -172,8 +139,8 @@ simplifyAdd a b =
         (ts', n') -> IAdd (foldr1 IAdd ts') (IConst n')
   in build sortedTerms constSum
 
--- | Collect/multiply terms and produce a canonical @IMul@ tree where
--- constant factors are multiplied together and placed last.
+-- | Flatten and normalise a multiplication into a canonical 'IMul' tree with
+-- the constant factor last.
 simplifyMul :: IndexExpr -> IndexExpr -> IndexExpr
 simplifyMul a b =
   let collectMul :: IndexExpr -> ([IndexExpr], Integer)
@@ -184,10 +151,8 @@ simplifyMul a b =
 
       (termsA, constA) = collectMul a
       (termsB, constB) = collectMul b
-      terms = termsA ++ termsB
       constProd = constA * constB
-      -- prefer variables/multiplicative factors before opaque calls
-      sortedTerms = sortBy (comparing (\t -> (exprRank t, show t))) terms
+      sortedTerms = sortBy (comparing (\t -> (exprRank t, show t))) (termsA ++ termsB)
 
       build ts n = case (ts, n) of
         ([], 1) -> IConst 1
@@ -198,60 +163,53 @@ simplifyMul a b =
         (ts', n') -> IMul (foldr1 IMul ts') (IConst n')
   in build sortedTerms constProd
 
--- | Tail handling policy for vector loops
+-- | How the tail (sub-vector-width remainder) of a vectorised loop is handled.
 data TailPolicy = TailRemainder | TailMask | TailNone
   deriving (Eq, Show)
 
--- | Vectorisation parameters for a loop
+-- | SIMD vectorisation parameters for a loop.
 data VectorSpec = VectorSpec { vsWidth :: Int, vsTail :: TailPolicy }
   deriving (Eq, Show)
 
+-- | The parallelisation strategy selected for a loop.
 data ParallelStrategy
-  = ParallelGeneric
-  | ParallelScatterDirect
-  | ParallelScatterAtomicAddInt
-  | ParallelScatterAtomicAddFloat
-  | ParallelScatterPrivatizedIntAdd
+  = ParallelGeneric                  -- ^ Generic parallel map (no scatter).
+  | ParallelScatterDirect            -- ^ Direct (injective) scatter.
+  | ParallelScatterAtomicAddInt      -- ^ Scatter with atomic integer addition.
+  | ParallelScatterAtomicAddFloat    -- ^ Scatter with atomic float addition.
+  | ParallelScatterPrivatizedIntAdd  -- ^ Scatter via thread-private accumulators.
   deriving (Eq, Show)
 
--- | Parallel execution hint.
+-- | Parallel execution parameters for a loop.
 --
--- @psStrategy@ records why the loop was parallelized at a high level, so
--- later passes and debugging output can distinguish generic map-like
--- parallelism from specific scatter strategies.
---
--- @psPolicy@ optionally carries backend-specific clauses such as
--- @schedule(static)@.
+-- 'psStrategy' records which parallelism strategy was selected so that
+-- downstream passes can distinguish generic map-like parallelism from scatter
+-- strategies.  'psPolicy' carries optional backend scheduling directives
+-- (e.g. @schedule(static)@).
 data ParallelSpec = ParallelSpec
   { psStrategy :: ParallelStrategy
-  , psPolicy :: Maybe ByteString
+  , psPolicy   :: Maybe ByteString
   }
   deriving (Eq, Show)
 
--- | Specification for reductions performed across the loop nest.
---
--- * @rsAccVar@ is the accumulator variable used inside the loop body.
--- * @rsInit@ is the initial value of the accumulator expressed as an
---   @IndexExpr@ (allows constant or computed initialisers).
--- * @rsRedop@ is the reduction operator (see @Redop@ in CFGCore).
+-- | Reduction performed across a loop nest.
 data ReductionSpec = ReductionSpec
-  { rsAccVar :: CVar
-  , rsInit :: IndexExpr
-  , rsRedop :: Redop
+  { rsAccVar :: CVar       -- ^ accumulator variable bound inside the loop body
+  , rsInit   :: IndexExpr  -- ^ initial accumulator value (constant or expression)
+  , rsRedop  :: Redop      -- ^ reduction operator (see 'Redop' in "Language.Hydrangea.CFGCore")
   }
   deriving (Eq, Show)
 
--- | High-level loop role carried from lowering.
+-- | Semantic role of a loop, carried from the lowering pass.
 --
--- This distinguishes structurally similar loops that should be treated
--- differently by later passes:
--- * @LoopPlain@ — generic loop with no special source-level intent.
--- * @LoopMap@ — per-output-element map/generate style loop.
--- * @LoopReductionWrapper@ — scalar wrapper around a true reduction, usually
---   introduced by lowering 0D reductions.
--- * @LoopReduction@ — the loop that semantically performs a reduction.
--- * @LoopMapReduction@ — an outer map loop whose body contains a serial
---   per-element reduction.
+-- Distinguishes structurally similar loops so that later passes can apply
+-- appropriate transformations:
+--
+-- * 'LoopPlain' — generic loop with no special source-level intent.
+-- * 'LoopMap' — per-output-element map\/generate kernel.
+-- * 'LoopReductionWrapper' — scalar wrapper around a reduction, usually from a 0-D source reduction.
+-- * 'LoopReduction' — the loop that performs the reduction.
+-- * 'LoopMapReduction' — outer map whose body contains a per-element reduction.
 data LoopRole
   = LoopPlain
   | LoopMap
@@ -260,61 +218,37 @@ data LoopRole
   | LoopMapReduction
   deriving (Eq, Show)
 
--- | Execution policy hints for loops.
---
--- * @Serial@ — no parallelism/vectorisation is requested.
--- * @Parallel@ — a parallel policy is suggested (backend may ignore).
--- * @Vector@ — vectorisation with the given @VectorSpec@ is desired.
+-- | Execution policy for a loop.
 data ExecPolicy
-  = Serial
-  | Parallel ParallelSpec
-  | Vector VectorSpec
+  = Serial              -- ^ Execute iterations sequentially.
+  | Parallel ParallelSpec  -- ^ Execute iterations in parallel.
+  | Vector VectorSpec      -- ^ Vectorise iterations with the given SIMD width.
   deriving (Eq, Show)
 
--- | LoopSpec supports ND loops via a list of iterators and bounds.
+-- | Descriptor for an n-dimensional loop nest.
 --
--- Invariants:
--- * @lsIters@ and @lsBounds@ must have the same length; each bound is an
---   @IndexExpr@ describing the trip count or shape for the corresponding
---   iterator.
--- * @lsExec@ carries execution hints (serial/parallel/vector).
--- * @lsRed@ optionally carries a reduction performed across the loop.
--- * @lsRole@ carries high-level intent from lowering.
+-- 'lsIters' and 'lsBounds' have the same length; each bound is the trip count
+-- for the corresponding iterator.
 data LoopSpec = LoopSpec
-  { lsIters :: [CVar]
-  -- ^ iterator variable names for each loop dimension
-  , lsBounds :: [IndexExpr]
-  -- ^ per-dimension bounds/limits (trip counts or shapes)
-  , lsExec :: ExecPolicy
-  -- ^ execution policy (vector/parallel/serial)
-  , lsRed :: Maybe ReductionSpec
-  -- ^ optional reduction performed across the loop nest
-  , lsRole :: LoopRole
-  -- ^ high-level role for the loop nest
+  { lsIters  :: [CVar]            -- ^ iterator variable names
+  , lsBounds :: [IndexExpr]       -- ^ per-dimension trip counts
+  , lsExec   :: ExecPolicy        -- ^ execution policy (serial\/parallel\/vector)
+  , lsRed    :: Maybe ReductionSpec  -- ^ optional loop-carried reduction
+  , lsRole   :: LoopRole          -- ^ semantic role from lowering
   }
   deriving (Eq, Show)
 
--- | Minimal statement set for the CFG. For now reuse Atom/RHS from CFGCore.
---
--- Constructor semantics (brief):
--- * @SAssign dst rhs@ — bind the destination to the computed RHS value.
--- * @SArrayWrite arr ix val@ — write the value into the array at the index (atoms
---   used here are expected to evaluate to a memory reference/index).
--- * @SLoop loopSpec loopBody@ — execute the body over the ND iteration space
---   described by the loop spec (iterators are bound lexically inside
---   the body).
--- * @SIf cond thenStmts elseStmts@ — conditional control-flow.
--- * @SReturn atom@ — return an atom from a procedure.
+-- | Minimal statement set for the CFG, using 'Atom' and 'RHS' from "Language.Hydrangea.CFGCore".
 data Stmt
-  = SAssign CVar RHS
-  | SArrayWrite Atom Atom Atom
-  | SLoop LoopSpec [Stmt]
-  | SIf Atom [Stmt] [Stmt]
-  | SReturn Atom
+  = SAssign CVar RHS           -- ^ Bind a variable to a right-hand-side expression.
+  | SArrayWrite Atom Atom Atom -- ^ Write a value into an array at an index.
+  | SLoop LoopSpec [Stmt]      -- ^ Execute a body over an n-dimensional iteration space.
+  | SIf Atom [Stmt] [Stmt]     -- ^ Conditional control flow.
+  | SReturn Atom               -- ^ Return a value from a procedure.
   deriving (Eq, Show)
 
--- | Rewrite a statement tree while centralizing the standard recursive walk
--- over loops and conditionals.
+-- | Walk a statement list, applying @rewrite@ to each statement after recursing
+-- into loops and conditionals.  @descend@ updates the context when entering a loop.
 rewriteStmts2With
   :: ctx
   -> (ctx -> ctx)
@@ -332,7 +266,7 @@ rewriteStmts2With initialCtx descend rewrite = go initialCtx
             _ -> stmt
       in rewrite ctx stmt'
 
--- | Monadic variant of 'rewriteStmts2With'.
+-- | Monadic variant of 'rewriteStmts2With'; effects from @rewrite@ are sequenced left-to-right.
 rewriteStmts2WithM
   :: Monad m
   => ctx
@@ -356,83 +290,47 @@ rewriteStmts2WithM initialCtx descend rewrite = go initialCtx
         _ ->
           rewrite ctx stmt
 
--- | Buffer-level array facts preserved from lowering.
---
--- These are intentionally conservative facts about concrete CFG array
--- variables, not full aliasing proofs and not arbitrary source-level array
--- properties:
---
--- * @afFreshAlloc@ means lowering allocated the buffer in this procedure.
--- * @afWriteOnce@ means lowering knows the buffer is populated by a map-like
---   kernel that writes each logical output element once.
--- * @afReadOnly@ means the buffer is only read, not written, by the relevant
---   lowered kernel context that introduced the fact.
+-- | Array-level facts recorded by the lowering pass for a concrete buffer variable.
 data ArrayFact = ArrayFact
-  { afFreshAlloc :: Bool
-  , afWriteOnce  :: Bool
-  , afReadOnly   :: Bool
+  { afFreshAlloc :: Bool  -- ^ Buffer was freshly allocated in this procedure.
+  , afWriteOnce  :: Bool  -- ^ Each element is written exactly once by a map-like kernel.
+  , afReadOnly   :: Bool  -- ^ Buffer is only read within the relevant kernel context.
   }
   deriving (Eq, Show)
 
--- | Lowering-preserved access/layout facts that help the explicit vectorizer.
---
--- These facts are intentionally small and backend-oriented:
---
--- * @vxfDenseLinearIndexOf@ records that a variable denotes the same dense
---   linear traversal position as a loop iterator introduced by lowering, even
---   if that position flowed through shape/index conversion helpers.
--- * @vxfDenseRead@ records that an array is read via a dense linear traversal
---   in a map-like kernel.
--- * @vxfIndirectRead@ records that an array is read indirectly (for example via
---   gather-style indexing) and should therefore stay off the explicit
---   contiguous-load path.
--- * @vxfContiguousWrite@ records that lowering writes the array contiguously in
---   iteration order.
+-- | Access and layout facts for a buffer variable, used by the vectorizer.
 data VectorAccessFact = VectorAccessFact
   { vxfDenseLinearIndexOf :: Maybe CVar
+    -- ^ The variable aliases the dense linear position of this loop iterator.
   , vxfDenseRead          :: Bool
+    -- ^ Array is read via a dense linear traversal in a map-like kernel.
   , vxfIndirectRead       :: Bool
+    -- ^ Array is accessed indirectly (e.g. gather); excludes it from contiguous-load vectorisation.
   , vxfContiguousWrite    :: Bool
+    -- ^ Lowering writes the array contiguously in iteration order.
   }
   deriving (Eq, Show)
 
--- | Procedure / function in the CFG program.
---
--- @procName@ is the unique identifier for the procedure, @procParams@
--- lists parameter names (each a @CVar@) and @procBody@ is the sequence of
--- @Stmt@ forming the function body. @procTypeEnv@ records the concrete
--- 'CType' of every variable produced during lowering, allowing downstream
--- passes to look up types directly instead of re-inferring them from
--- the statement structure. @procArrayFacts@ is a lowering-provided side table
--- for concrete array buffers in this procedure. @procVectorAccessFacts@
--- preserves a small amount of lowering-time access/layout information for
--- vectorization.
+-- | A procedure in the CFG program.
 data Proc = Proc
   { procName    :: CVar
   , procParams  :: [CVar]
   , procBody    :: [Stmt]
   , procTypeEnv :: Map CVar CType
-    -- ^ Concrete C type for every variable in this procedure.  Populated
-    -- by the lowering pass; preserved (not modified) by optimisation passes.
+    -- ^ Concrete C type for every variable, populated by the lowering pass.
   , procArrayFacts :: Map CVar ArrayFact
-    -- ^ Lowering-provided facts for concrete array variables/buffers in this
-    -- procedure. Optimisation passes may consult these conservatively.
+    -- ^ Buffer-level facts for array variables in this procedure.
   , procVectorAccessFacts :: Map CVar VectorAccessFact
-    -- ^ Lowering-provided access/layout facts used primarily by the explicit
-    -- vectorizer to distinguish dense linear traversals from indirect ones.
+    -- ^ Access\/layout facts for the vectorizer.
   } deriving (Eq, Show)
 
--- | A program is simply a collection of top-level procedures.
---
--- The ordering may be significant for code emission; passes that modify
--- or transform programs should preserve referential integrity of
--- procedure names.
+-- | An ordered collection of top-level procedures.
+-- Procedure order is significant for code emission.
 data Program = Program [Proc]
   deriving (Eq, Show)
 
--- | Smart constructor for 'Proc' with an empty type environment.
--- Useful in tests and any context that doesn't participate in the
--- type-threading pipeline.
+-- | Construct a 'Proc' with empty type and fact tables.
+-- Useful in tests and contexts that do not participate in the lowering pipeline.
 mkProc :: CVar -> [CVar] -> [Stmt] -> Proc
 mkProc name params body = Proc
   { procName    = name

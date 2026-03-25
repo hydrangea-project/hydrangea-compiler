@@ -8,30 +8,18 @@
 {-|
 Module: Language.Hydrangea.Syntax
 
-High-level abstract syntax for the MiniML-like language used in the
-project. This module defines:
+Abstract syntax for the Hydrangea source language: types, expressions,
+declarations, and patterns.
 
-- The syntactic representation of types (@TypeF@, @Type@, @Polytype@),
-  including refinement wrappers (@TyRefineF@) used to attach symbolic
-  names to values.
-  (@EGenerate@, @EMap@, @EZipWith@, @EReduce@, @EScan@, @ESortIndices@, @EPermute@, @EScatter@,
-  @EScatterGuarded@,
-  @EGather@, and @EIndex@).
-- Pattern syntax used in value-level bindings.
+Types use a functor @'TypeF'@ with an outer @'Fix'@ (aliased as @'Type'@).
+The same functor is reused for unification-backed types (@'UType'@), which
+are @UTerm TypeF IntVar@.  Refinement wrappers (@'TyRefineF'@) bind a
+symbolic name to a value for use in refinement predicates stored on
+@'Polytype'@ schemes.
 
-Types are represented using a functor @TypeF@ with an outer @Fix@ (alias
-@Type@). This makes it easy to reuse the same shape for unification-backed
-types (@UType@), which are @UTerm TypeF IntVar@. Refinements are modeled
-as a wrapper @TyRefineF v t@ that binds a symbolic variable name @v@ to the
-value of @t@. Refinement predicates are stored on @Poly@ type schemes.
-
-The AST nodes carry a generic annotation @a@ (usually a source @Range@) so
-that the rest of the compiler can attach position information.
-
-The primary convenience functions and constructors are defined in this
-module (for example, @tyFun@, @tyArray@, @tyCons@, and pattern synonyms
-such as @TyFun@), and these are what the rest of the codebase
-imports and manipulates.
+Expression nodes carry a generic annotation @a@ (typically a source
+@'Range'@) so that parsers, error reporters, and later passes can attach
+position information.
 -}
 module Language.Hydrangea.Syntax where
 
@@ -48,8 +36,6 @@ import Text.Show.Deriving
 
 -- | Variables in our syntax are just bytestrings
 type Var = ByteString
-
--- * Types
 
 deriving instance Unifiable []
 deriving instance Unifiable ((,) Var)
@@ -102,41 +88,21 @@ pattern TyArray shape elt = Fix (TyArrayF shape elt)
 pattern TyRefine :: Var -> Type -> Type
 pattern TyRefine v t = Fix (TyRefineF v t)
 
--- | Constructors for the syntax of types, with the recursion factored out: use 'Fix TypeF'
---   as the data type for types in the language.
---   The @TypeF@ functor defines the shape of types. A concrete @Type@ is
---   the fixed point @Fix TypeF@. This separation is useful because the
---   unification library represents unification terms as
---   @UTerm TypeF IntVar@.
+-- | Shape functor for Hydrangea types.  A concrete 'Type' is @Fix TypeF@;
+-- a unification type is @UTerm TypeF IntVar@.
 data TypeF f
-  = -- | Type variable
-    TyVarF Var
-  | -- | Refinement wrapper with a binder variable
-    TyRefineF Var f
-  | -- | Unit type
-    TyUnitF
-  | -- | Int type
-    TyIntF
-  | -- | Float type (Double precision)
-    TyFloatF
-  | -- | Bool type
-    TyBoolF
-  | -- | String type
-    TyStringF
-  | -- | Inductive tuple cons type (used for shapes: Int * Int * ())
-    TyConsF f f
-  | -- | Pair type: a product of exactly two values of (potentially) different types.
-    -- Pairs are distinct from shapes (TyConsF) and compile to C structs.
-    TyPairF f f
-  | -- | Structural record type with named fields in canonical field-name order.
-    TyRecordF [(Var, f)]
-  | -- | Array type with an explicit shape and element type.
-    -- The first parameter encodes the shape as an inductive tuple
-    -- (e.g. @Int * Int * ()@ for a 2D shape), and the second is the
-    -- element type stored in the array.
-    TyArrayF f f
-  | -- | Function type
-    TyFunF f f
+  = TyVarF Var           -- ^ Type variable.
+  | TyRefineF Var f      -- ^ Refinement wrapper binding a symbolic name to a type.
+  | TyUnitF              -- ^ Unit type @()@.
+  | TyIntF               -- ^ Integer type.
+  | TyFloatF             -- ^ Double-precision floating-point type.
+  | TyBoolF              -- ^ Boolean type.
+  | TyStringF            -- ^ String type.
+  | TyConsF f f          -- ^ Inductive tuple cons used for shapes: @Int * Int * ()@.
+  | TyPairF f f          -- ^ Heterogeneous product of two types; lowers to a C struct.
+  | TyRecordF [(Var, f)] -- ^ Structural record with named fields in canonical order.
+  | TyArrayF f f         -- ^ Array with a shape (inductive tuple) and an element type.
+  | TyFunF f f           -- ^ Function type.
   deriving (Functor, Foldable, Traversable, Generic1, Unifiable)
 
 -- | Create a type variable node
@@ -197,16 +163,14 @@ deriving instance (Eq f) => Eq (TypeF f)
 
 deriving instance (Ord f) => Ord (TypeF f)
 
--- | Alias for 'Fix TypeF'
+-- | Concrete Hydrangea type: the fixed point of 'TypeF'.
 type Type = Fix TypeF
 
--- | Syntax of types with unification variables
+-- | Hydrangea type with unification variables: @UTerm TypeF IntVar@.
 type UType = UTerm TypeF IntVar
 
--- | Forall quantifier binding
-data Poly t
-  = -- | Bind variables inside some type
-    Forall [Var] [Pred] t
+-- | Universally quantified type scheme with refinement predicates.
+data Poly t = Forall [Var] [Pred] t
   deriving (Functor, Eq, Show, Ord)
 
 -- | Fully elaborated polymorphic types over concrete syntax types.
@@ -219,12 +183,8 @@ $(deriveOrd1 ''TypeF)
 -- | Polymorphic types whose bodies may still contain unification variables.
 type UPolytype = Poly UType
 
--- * AST
-
--- | Syntax for names in the language.
---   Note that this is different than 'Var' because it has an annotation.
-data Name a
-  = Name a ByteString
+-- | An annotated name (distinct from 'Var', which carries no annotation).
+data Name a = Name a ByteString
   deriving (Functor, Foldable, Eq, Show)
 
 -- | Convert a @Name@ to a @Var@ by stripping the annotation.
@@ -250,11 +210,7 @@ decName (Dec _ name _ _ _) = name
 decPolyTy :: Dec a -> Maybe Polytype
 decPolyTy (Dec _ _ _ polyty _) = polyty
 
--- | Expression AST.
---
--- The @Exp@ type is annotated with a generic parameter @a@ (typically a
--- @Range@) so that parsers and later phases can attach source locations or
--- other metadata. Each constructor below has a brief description:
+-- | Expression AST parameterised by an annotation @a@ (typically a source 'Range').
 data Exp a
   = -- | Integer literal with its annotation and numeric value
     EInt a Integer
@@ -305,28 +261,24 @@ data Exp a
     EReduce a (Exp a) (Exp a) (Exp a)
   | -- | Reduce a generated array along the trailing axis without materializing it: function, init, shape, generator
     EReduceGenerate a (Exp a) (Exp a) (Exp a) (Exp a)
-  | -- | Sequential left fold over a 1D array: step function, initial state, array
-    -- foldl : (s -> a -> s) -> s -> Array[n, a] -> s
-    -- Unlike reduce, foldl is strictly sequential and the state type may differ from
-    -- the element type. The result is the final accumulator (a scalar).
+  | -- | Strict left fold over a 1-D array; the accumulator type may differ from the element type.
+    -- @foldl : (s -> a -> s) -> s -> Array[n, a] -> s@
     EFoldl a (Exp a) (Exp a) (Exp a)
-  | -- | Exclusive left scan over a 1D array: step function, initial state, array.
-    -- scan : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]
-    -- The output at position i is the state before consuming element i.
+  | -- | Exclusive prefix scan over a 1-D array.
+    -- @scan : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]@
+    -- The output at position @i@ is the state /before/ consuming element @i@.
     EScan a (Exp a) (Exp a) (Exp a)
-  | -- | Reduce contiguous value segments described by offsets.
-    -- segmented_reduce : (s -> a -> s) -> s -> offsets -> vals -> Array[nsegs, s]
-    -- The ith result reduces vals[offsets[i] : offsets[i+1]] from left to right.
+  | -- | Segmented reduction: reduces each @vals[offsets[i] : offsets[i+1]]@ from left to right.
+    -- @segmented_reduce : (s -> a -> s) -> s -> offsets -> vals -> Array[nsegs, s]@
     ESegmentedReduce a (Exp a) (Exp a) (Exp a) (Exp a)
-  | -- | Stable permutation sort for 1D integer keys.
-    -- sort_indices : Array[n, Int] -> Array[n, Int]
-    -- Returns the permutation p such that gather p keys is the stable ascending sort.
+  | -- | Stable sort returning the permutation of indices that sorts the input keys in ascending order.
+    -- @sort_indices : Array[n, Int] -> Array[n, Int]@
     ESortIndices a (Exp a)
-  | -- | Combine adjacent duplicate COO entries in sorted row-major order.
-    -- coo_sum_duplicates : nrows -> ncols -> nnz -> rows -> cols -> vals -> COO
+  | -- | Sum duplicate entries of a COO sparse matrix in sorted row-major order.
+    -- @coo_sum_duplicates : nrows -> ncols -> nnz -> rows -> cols -> vals -> COO@
     ECOOSumDuplicates a (Exp a) (Exp a) (Exp a) (Exp a) (Exp a) (Exp a)
-  | -- | Convert sorted COO arrays to CSR arrays.
-    -- csr_from_sorted_coo : nrows -> ncols -> nnz -> rows -> cols -> vals -> CSR
+  | -- | Convert a sorted COO sparse matrix to CSR format.
+    -- @csr_from_sorted_coo : nrows -> ncols -> nnz -> rows -> cols -> vals -> CSR@
     ECSRFromSortedCOO a (Exp a) (Exp a) (Exp a) (Exp a) (Exp a) (Exp a)
   | -- | Permute elements into a default array using an index mapping
     EPermute a (Exp a) (Exp a) (Exp a) (Exp a)
@@ -336,9 +288,8 @@ data Exp a
     --   but only contribute source positions whose guard array entry is true.
     --   Fields: combine, defaults, index array, values array, guard array.
     EScatterGuarded a (Exp a) (Exp a) (Exp a) (Exp a) (Exp a)
-  | -- | Scatter generated values into a default array using an index array.
-    --   Semantically equivalent to @EScatter c d idx (EGenerate (EShapeOf idx) valFn)@
-    --   but avoids materialising the intermediate values array.
+  | -- | Scatter generated values without materialising an intermediate values array.
+    --   Equivalent to @EScatter c d idx (EGenerate (EShapeOf idx) valFn)@.
     --   Fields: combine, defaults, index array, value generator function.
     EScatterGenerate a (Exp a) (Exp a) (Exp a) (Exp a)
   | -- | Gather values from an array using an index array
@@ -470,48 +421,45 @@ deriving instance (Ord a) => Ord (Exp a)
 
 -- | Unary operators in surface syntax.
 data UnOperator a
-  = Not a
-  | Fst a
-  | Snd a
-  -- Float math functions (unary, Float -> Float)
-  | Sqrt a
-  | ExpF a
-  | Log a
-  | Sin a
-  | Cos a
-  | AbsF a
-  | FloorF a
-  | CeilF a
-  | Erf a
-  -- Type conversion
-  | FloatOf a  -- Int -> Float cast
+  = Not a     -- ^ Logical negation.
+  | Fst a     -- ^ First projection.
+  | Snd a     -- ^ Second projection.
+  | Sqrt a    -- ^ Square root (@Float -> Float@).
+  | ExpF a    -- ^ Natural exponential (@Float -> Float@).
+  | Log a     -- ^ Natural logarithm (@Float -> Float@).
+  | Sin a     -- ^ Sine (@Float -> Float@).
+  | Cos a     -- ^ Cosine (@Float -> Float@).
+  | AbsF a    -- ^ Absolute value (@Float -> Float@).
+  | FloorF a  -- ^ Floor (@Float -> Float@).
+  | CeilF a   -- ^ Ceiling (@Float -> Float@).
+  | Erf a     -- ^ Error function (@Float -> Float@).
+  | FloatOf a -- ^ Integer-to-float cast (@Int -> Float@).
   deriving (Functor, Foldable, Show, Eq, Ord)
 
 -- | Binary operators in surface syntax.
 data Operator a
-  = Plus a
-  | Minus a
-  | Times a
-  | Divide a
-  | Eq a
-  | Neq a
-  | Lt a
-  | Le a
-  | Gt a
-  | Ge a
-  | And a
-  | Or a
-  -- Float operators
-  | PlusF a
-  | MinusF a
-  | TimesF a
-  | DivideF a
-  | EqF a
-  | NeqF a
-  | LtF a
-  | LeF a
-  | GtF a
-  | GeF a
+  = Plus a    -- ^ Integer addition.
+  | Minus a   -- ^ Integer subtraction.
+  | Times a   -- ^ Integer multiplication.
+  | Divide a  -- ^ Integer division.
+  | Eq a      -- ^ Integer equality.
+  | Neq a     -- ^ Integer inequality.
+  | Lt a      -- ^ Integer less-than.
+  | Le a      -- ^ Integer less-than-or-equal.
+  | Gt a      -- ^ Integer greater-than.
+  | Ge a      -- ^ Integer greater-than-or-equal.
+  | And a     -- ^ Boolean conjunction.
+  | Or a      -- ^ Boolean disjunction.
+  | PlusF a   -- ^ Float addition.
+  | MinusF a  -- ^ Float subtraction.
+  | TimesF a  -- ^ Float multiplication.
+  | DivideF a -- ^ Float division.
+  | EqF a     -- ^ Float equality.
+  | NeqF a    -- ^ Float inequality.
+  | LtF a     -- ^ Float less-than.
+  | LeF a     -- ^ Float less-than-or-equal.
+  | GtF a     -- ^ Float greater-than.
+  | GeF a     -- ^ Float greater-than-or-equal.
   deriving (Functor, Foldable, Show, Eq, Ord)
 
 -- | Patterns used for function parameters and destructuring binds.
