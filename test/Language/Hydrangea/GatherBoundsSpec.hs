@@ -325,10 +325,11 @@ spec = describe "gather bounds checking" $ do
 
   describe "ungrounded obligation warnings" $ do
     it "emits a warning for an ungrounded index obligation" $ do
-      -- x has no bound annotation so the obligation x < dim(arr,0) is ungrounded
+      -- i has no bound annotation and no concrete value, so its pred var is
+      -- unconstrained; the obligation i < dim(arr,0) remains ungrounded
       let src = BS.unlines
             [ "let arr  = generate [5] (let f [i] = i in f)"
-            , "let main = let x = 2 in index [x] arr"
+            , "let f [i] = index [i] arr"  -- standalone function, i is free
             ]
       case readDecs src of
         Left err -> expectationFailure ("Parse error: " ++ err)
@@ -338,3 +339,144 @@ spec = describe "gather bounds checking" $ do
             Left msg -> expectationFailure ("Expected success: " ++ msg)
             Right (_, warnings) ->
               warnings `shouldSatisfy` any (isInfixOf "could not verify")
+
+  describe "parametric index safety" $ do
+    it "verifies index safety when generate size matches indexed array size" $ do
+      -- f [i] indexes into 5-element arr; main = generate [5] f is safe
+      expectDecsOk $ BS.unlines
+        [ "let arr  = generate [5] (let g [i] = i in g)"
+        , "let f [i] = index [i] arr"
+        , "let main = generate [5] f"
+        ]
+
+    it "rejects index safety when generate size exceeds indexed array size" $ do
+      -- f [i] indexes into 3-element arr; main = generate [5] f is unsafe
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [3] (let g [i] = i in g)"
+            , "let f [i] = index [i] arr"
+            , "let main = generate [5] f"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "verifies concrete index variable when value is known" $ do
+      -- let x = 2 in index [x] arr where arr has 5 elements
+      -- x's pred var is linked to 2 → obligation 2 < 5 is verified
+      let src = BS.unlines
+            [ "let arr  = generate [5] (let g [i] = i in g)"
+            , "let main = let x = 2 in index [x] arr"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` all (not . isInfixOf "could not verify")
+
+    it "rejects concrete out-of-bounds index variable" $ do
+      -- let x = 6 in index [x] arr where arr has 5 elements → 6 < 5 is false
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [5] (let g [i] = i in g)"
+            , "let main = let x = 6 in index [x] arr"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Arithmetic over concrete values: termFromExp on EBinOp now uses pred vars
+    -- for each EVar operand, so the computed value is trackable through the chain.
+
+    it "verifies arithmetic index when result is in bounds" $ do
+      -- let x = 3 in index [x + 1] arr (5 elements) → 4 < 5 ✓
+      let src = BS.unlines
+            [ "let arr  = generate [5] (let g [i] = i in g)"
+            , "let main = let x = 3 in index [x + 1] arr"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` all (not . isInfixOf "could not verify")
+
+    it "rejects arithmetic index at exact boundary" $ do
+      -- let x = 4 in index [x + 1] arr (5 elements) → 5 < 5 is false
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [5] (let g [i] = i in g)"
+            , "let main = let x = 4 in index [x + 1] arr"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "verifies last valid concrete index" $ do
+      -- let x = 4 in index [x] arr (5 elements) → 4 < 5 ✓
+      let src = BS.unlines
+            [ "let arr  = generate [5] (let g [i] = i in g)"
+            , "let main = let x = 4 in index [x] arr"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` all (not . isInfixOf "could not verify")
+
+    it "rejects index at exactly arr size" $ do
+      -- let x = 5 in index [x] arr (5 elements) → 5 < 5 is false
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [5] (let g [i] = i in g)"
+            , "let main = let x = 5 in index [x] arr"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Inline generator lambdas (not named declarations) benefit from the same
+    -- EGenerate hypothesis emission as named functions.
+
+    it "verifies index inside inline generator lambda" $ do
+      -- generate [5] (let f [i] = index [i] arr in f) where arr has 5 elements
+      expectDecsOk $ BS.unlines
+        [ "let arr  = generate [5] (let g [i] = i in g)"
+        , "let main = generate [5] (let f [i] = index [i] arr in f)"
+        ]
+
+    it "rejects index inside inline generator lambda when size mismatches" $ do
+      -- generate [5] (let f [i] = index [i] arr in f) where arr has 3 elements
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [3] (let g [i] = i in g)"
+            , "let main = generate [5] (let f [i] = index [i] arr in f)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Chained index: f accesses two arrays; both must be safe.
+
+    it "verifies when both arrays match the generate size" $ do
+      expectDecsOk $ BS.unlines
+        [ "let a = generate [4] (let g [i] = i in g)"
+        , "let b = generate [4] (let g [i] = i * 2 in g)"
+        , "let f [i] = index [i] a + index [i] b"
+        , "let main = generate [4] f"
+        ]
+
+    it "rejects when second array is too small" $ do
+      -- a has 4 elements, b has 3 — f indexing b with i up to 3 is unsafe
+      expectDecsError
+        ( BS.unlines
+            [ "let a = generate [4] (let g [i] = i in g)"
+            , "let b = generate [3] (let g [i] = i * 2 in g)"
+            , "let f [i] = index [i] a + index [i] b"
+            , "let main = generate [4] f"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")

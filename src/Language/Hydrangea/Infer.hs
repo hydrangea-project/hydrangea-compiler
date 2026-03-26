@@ -493,7 +493,6 @@ termFromExp :: Exp Range -> Infer Term
 termFromExp expr =
   case expr of
     EInt _ n -> return $ TConst n
-    EVar _ v -> return $ TVar v
     ENeg _ e -> TNeg <$> termFromExp e
     EBinOp _ e1 op e2 -> do
       t1 <- termFromExp e1
@@ -504,14 +503,19 @@ termFromExp expr =
         Times _ -> return $ TMul t1 t2
         _ -> TVar <$> freshPredVar
     _ -> do
-      -- For expressions not directly translatable (e.g. record field projections),
-      -- infer the type and use the refinement variable if present.  This preserves
-      -- the concrete value chain (e.g. coo.nnz = 6 → pred-var p with hyp p = 6).
+      -- Infer the type of the expression and use its refinement pred var as the
+      -- SMT term.  This handles variables (EVar), record field projections, and
+      -- any other expression whose integer value is tracked through a pred var.
+      -- For EVar specifically, this returns the pred var from the variable's type
+      -- (e.g. UTyRefine pi Int → TVar pi) rather than the raw source name, so
+      -- obligations and hypotheses share the same SMT variable.
       ty <- infer expr
       ty' <- applyBindings ty
       case fst (unwrapRefine ty') of
         Just v  -> return (TVar v)
-        Nothing -> TVar <$> freshPredVar
+        Nothing -> case expr of
+          EVar _ v -> return (TVar v)  -- source-name fallback if no refinement wrapper
+          _        -> TVar <$> freshPredVar
 
 -- | Interpret index expressions as a list of refinement terms.
 -- Vector indices map to per-dimension terms; scalars become singleton lists.
@@ -526,6 +530,16 @@ termsFromIndexExp (EShapeOf _ arrExp) = do
   arrVar <- maybe freshPredVar return mArrVar
   return [TDim arrVar i | i <- [0 .. rank - 1]]
 termsFromIndexExp e = (: []) <$> termFromExp e
+
+-- | Extract the refinement pred var from each Int component of a shape cons-list type.
+-- Shape types have the form: UTyCons (UTyRefine v0 UTyInt) (UTyCons ...) UTyUnit.
+-- Returns pred vars in dimension order; components without a refinement wrapper are skipped.
+extractShapeDimVars :: UType -> [Var]
+extractShapeDimVars ty =
+  case stripRefineTop ty of
+    UTyUnit -> []
+    UTyCons h rest -> maybeToList (fst (unwrapRefine h)) ++ extractShapeDimVars rest
+    _ -> []
 
 -- | Like 'termsFromIndexExp' but pairs each term with the source expression
 -- it was derived from (for use by 'inferBVal' in bounds checking).
@@ -829,6 +843,18 @@ infer (EGenerate _ shapeExp fn) = do
     -- so the validity checker can use it (e.g., index [0] on a symbolic-size
     -- array is safe when dim ≥ 1).
     emitHyp (PLe (TConst 1) (TDim arrVar i))
+  -- Emit bounds hypotheses for the generator function's index argument pred vars.
+  -- For each dimension i, assert that the index component is in [0, TDim arrVar i).
+  -- We extract pred vars from the *function's* argument type (fty'), not from sTy',
+  -- because =:= strips refinements before structural unification so sTy' has its own
+  -- fresh pred vars rather than those of the function's declared arg type.
+  fty'' <- applyBindings fty
+  let argDimVars = case stripRefineTop fty'' of
+        UTyFun argTy _ -> extractShapeDimVars argTy
+        _              -> []
+  forM_ (zip [0 ..] argDimVars) $ \(i, dv) -> do
+    emitHyp (PLe (TConst 0) (TVar dv))
+    emitHyp (PLt (TVar dv) (TDim arrVar i))
   -- Attempt to infer value bound from generator body if PBound annotation present.
   case extractPBoundInfo fn of
     Nothing -> return ()
