@@ -634,6 +634,21 @@ extractPBoundInfo (ELetIn _ (Dec _ _ [PVec _ [PBound _ v e]] _ _) _) = Just (v, 
 extractPBoundInfo (ELetIn _ (Dec _ _ [PBound _ v e]            _ _) _) = Just (v, e)
 extractPBoundInfo _ = Nothing
 
+-- | Extract the variable from a single parameter pattern.
+-- Handles bare @x@ (PVar), vec-style @[x]@ (PVec [PVar]), and PBound.
+patVar :: Pat Range -> Maybe Var
+patVar (PVar _ v)          = Just v
+patVar (PVec _ [PVar _ v]) = Just v
+patVar (PBound _ v _)      = Just v
+patVar _                   = Nothing
+
+-- | Extract ordered parameter variable names from an inline function
+-- expression of the form @let f p1 p2 ... = body in f@.
+-- Returns @[]@ if the expression is not in this recognizable form.
+extractFnParamVars :: Exp Range -> [Var]
+extractFnParamVars (ELetIn _ (Dec _ _ pats _ _) _) = mapMaybe patVar pats
+extractFnParamVars _                                = []
+
 -- | Compute the value bound of an inline generator body, with the index
 -- variable already registered in the caller's 'valBoundCtx'.
 inferBodyBound :: Exp Range -> Infer (Maybe Term)
@@ -918,6 +933,9 @@ infer (EFill _ shapeExp valExp) = do
   shapeTerms <- termsFromIndexExp shapeExp
   forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
     emitPred (PEq (TDim arrVar i) t)
+  -- Propagate value bound from the fill value expression.
+  mBound <- inferValBound valExp
+  forM_ mBound $ \b -> emitPred (PEq (TValBound arrVar) b)
   return arrTy
 infer (EReplicate _ shapeDims arrExp) = do
   arrTy <- infer arrExp
@@ -949,6 +967,10 @@ infer (EReplicate _ shapeDims arrExp) = do
   (arrVar, arrTyOut) <- freshRefined (UTyArray outShape eTy)
   forM_ (zip [0 ..] outTerms) $ \(i, t) ->
     emitPred (PEq (TDim arrVar i) t)
+  -- Propagate value bound: replicate preserves elements unchanged.
+  case mArrVar of
+    Just sv -> emitPred (PEq (TValBound arrVar) (TValBound sv))
+    Nothing -> return ()
   return arrTyOut
 infer (ESlice _ sliceDims arrExp) = do
   arrTy <- infer arrExp
@@ -978,6 +1000,10 @@ infer (ESlice _ sliceDims arrExp) = do
       SliceRange _ _ len -> do
         tLen <- termFromExp len
         emitPred (PEq (TDim arrVar i) tLen)
+  -- Propagate value bound: slice returns a subset of source elements.
+  case mArrVar of
+    Just sv -> emitPred (PEq (TValBound arrVar) (TValBound sv))
+    Nothing -> return ()
   return arrTyOut
 infer (EReshape _ shapeExp arrExp) = do
   arrTy <- infer arrExp
@@ -998,6 +1024,10 @@ infer (EReshape _ shapeExp arrExp) = do
   (arrVar, arrTyOut) <- freshRefined (UTyArray sOutTy' eTy)
   forM_ (zip [0 ..] outTerms) $ \(i, t) ->
     emitPred (PEq (TDim arrVar i) t)
+  -- Propagate value bound: reshape rearranges elements without changing values.
+  case mArrVar of
+    Just sv -> emitPred (PEq (TValBound arrVar) (TValBound sv))
+    Nothing -> return ()
   return arrTyOut
 infer (EMap _ fn arrExp) = do
   arrTy <- infer arrExp
@@ -1012,6 +1042,14 @@ infer (EMap _ fn arrExp) = do
       rank <- shapeArityFromType (firstParam arrExp) sTy
       forM_ [0 .. rank - 1] $ \i ->
         emitPred (PEq (TDim arrVar i) (TDim srcVar i))
+      -- Propagate value bounds through the map function body.
+      case extractFnParamVars fn of
+        (paramVar : _) -> do
+          mOutBound <- withValBound paramVar (TValBound srcVar) $
+                         inferBodyBound fn
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBound arrVar) outBound)
+        [] -> return ()
       return arrTyOut
 infer (EZipWith _ fn arrExp1 arrExp2) = do
   arrTy1 <- infer arrExp1
@@ -1031,6 +1069,17 @@ infer (EZipWith _ fn arrExp1 arrExp2) = do
         emitPred (PEq (TDim v1 i) (TDim v2 i))
       forM_ [0 .. rank - 1] $ \i ->
         emitPred (PEq (TDim arrVar i) (TDim v1 i))
+      -- Propagate value bounds through the binary function body.
+      case extractFnParamVars fn of
+        (p1 : p2 : _) -> do
+          let b1 = TValBound v1
+              b2 = TValBound v2
+          mOutBound <- withValBound p1 b1 $
+                         withValBound p2 b2 $
+                           inferBodyBound fn
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBound arrVar) outBound)
+        _ -> return ()
       return arrTyOut
     _ -> return arrTyOut
 infer (EReduce _ fn initExp arrExp) = do
@@ -1050,6 +1099,17 @@ infer (EReduce _ fn initExp arrExp) = do
     Just srcVar -> do
       forM_ [0 .. rank - 2] $ \i ->
         emitPred (PEq (TDim arrVar i) (TDim srcVar i))
+      -- Conservative value bound: propagate element bound through the binary
+      -- reduce function body.  Sound for monotone functions (max, min).
+      case extractFnParamVars fn of
+        (p1 : p2 : _) -> do
+          let elemBound = TValBound srcVar
+          mOutBound <- withValBound p1 elemBound $
+                         withValBound p2 elemBound $
+                           inferBodyBound fn
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBound arrVar) outBound)
+        _ -> return ()
       return arrTyOut
 infer (EReduceGenerate r fn initExp shapeExp genFn) =
   infer (EReduce r fn initExp (EGenerate r shapeExp genFn))
@@ -1077,6 +1137,17 @@ infer (EScan _ fn initExp arrExp) = do
     Nothing -> return arrTyOut
     Just srcVar -> do
       emitPred (PEq (TDim arrVar 0) (TDim srcVar 0))
+      -- Conservative value bound: propagate element bound through the scan
+      -- function body (same approach as EReduce; sound for monotone functions).
+      case extractFnParamVars fn of
+        (p1 : p2 : _) -> do
+          let elemBound = TValBound srcVar
+          mOutBound <- withValBound p1 elemBound $
+                         withValBound p2 elemBound $
+                           inferBodyBound fn
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBound arrVar) outBound)
+        _ -> return ()
       return arrTyOut
 infer (ESegmentedReduce _ fn initExp offsetsExp valsExp) = do
   offsetsTy <- infer offsetsExp
@@ -1295,6 +1366,11 @@ infer (EGather _ idxArr arrExp) = do
     (Just idxVar, Just srcVar) ->
       emitObl (PLe (TValBound idxVar) (TDim srcVar 0))
     _ -> return ()
+  -- Propagate the source array's element value bound to the output: gathered
+  -- elements are a subset of the source elements, so they share the same bound.
+  case mSrcVar of
+    Just srcVar -> emitPred (PEq (TValBound arrVar) (TValBound srcVar))
+    Nothing -> return ()
   return arrTyOut
 infer (EIndex _ idx arrExp) = do
   idxTy <- infer idx

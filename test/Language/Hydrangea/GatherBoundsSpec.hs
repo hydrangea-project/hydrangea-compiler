@@ -480,3 +480,218 @@ spec = describe "gather bounds checking" $ do
             ]
         )
         (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- map bounds propagation
+  -- ------------------------------------------------------------------ --
+  describe "map bounds propagation" $ do
+
+    it "identity map over iota preserves bound for gather" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [5] (let f [i] = i in f)"
+        , "let idx    = map (let f x = x in f) (iota 5)"
+        , "let main   = gather idx src"
+        ]
+
+    it "map x+1 over iota 5 is safe when source has 6 elements" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [6] (let f [i] = i in f)"
+        , "let idx    = map (let f x = x + 1 in f) (iota 5)"
+        , "let main   = gather idx src"
+        ]
+
+    it "map x+1 over iota 5 is rejected when source has only 5 elements" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src    = generate [5] (let f [i] = i in f)"
+            , "let idx    = map (let f x = x + 1 in f) (iota 5)"
+            , "let main   = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "map x*2 over iota 5 is safe when source has 10 elements" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [10] (let f [i] = i in f)"
+        , "let idx    = map (let f x = x * 2 in f) (iota 5)"
+        , "let main   = gather idx src"
+        ]
+
+    it "map x*2 over iota 5 is rejected when source has only 9 elements" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src    = generate [9] (let f [i] = i in f)"
+            , "let idx    = map (let f x = x * 2 in f) (iota 5)"
+            , "let main   = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "map over generate with PBound propagates bound" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [5]  (let g [i] = i in g)"
+        , "let base   = generate [5]  (let f [i bound 5] = i in f)"
+        , "let idx    = map (let f x = x in f) base"
+        , "let main   = gather idx src"
+        ]
+
+    it "chained maps compose bounds correctly" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [12] (let f [i] = i in f)"
+        , "let step1  = map (let f x = x + 1 in f) (iota 5)"
+        , "let idx    = map (let f x = x * 2 in f) step1"
+        , "let main   = gather idx src"
+        ]
+
+    it "chained maps rejected when source too small for composed bound" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src    = generate [11] (let f [i] = i in f)"
+            , "let step1  = map (let f x = x + 1 in f) (iota 5)"
+            , "let idx    = map (let f x = x * 2 in f) step1"
+            , "let main   = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "map with non-inline fn is permissive (no false positive)" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [3] (let g [i] = i in g)"
+        , "let f x    = x + 1"
+        , "let idx    = map f (iota 5)"
+        , "let main   = gather idx src"
+        ]
+
+  -- ------------------------------------------------------------------ --
+  -- fill bounds
+  -- ------------------------------------------------------------------ --
+  describe "fill bounds propagation" $ do
+
+    it "fill with a literal constant gives a bounded array" $ do
+      -- fill [5] 3: all elements = 3, bounded by 4; source has 4 elements
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [4] (let f [i] = i in f)"
+        , "let idx = fill [5] 3"
+        , "let main = gather idx src"
+        ]
+
+    it "fill with too-large constant is rejected" $ do
+      -- fill [5] 4: elements = 4, bound = 5; source has 4 elements (< 5)
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [4] (let f [i] = i in f)"
+            , "let idx = fill [5] 4"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "fill with EBoundLetIn value propagates bound" $ do
+      -- let v bound 5 = 3: v < 5; source has 5 elements
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [5] (let f [i] = i in f)"
+        , "let main = let v bound 5 = 3 in gather (fill [3] v) src"
+        ]
+
+  -- ------------------------------------------------------------------ --
+  -- replicate bounds
+  -- ------------------------------------------------------------------ --
+  describe "replicate bounds propagation" $ do
+
+    it "replicate preserves value bound for gather" $ do
+      -- iota 5 has bound 5; replicate to [2][5] keeps bound; src has 5 elements
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [5] (let f [i] = i in f)"
+        , "let idx1 = iota 5"
+        , "let idx2 = replicate [2, All] idx1"
+        , "let main = gather idx2 src"
+        ]
+
+    it "replicate with too-large source is rejected" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src  = generate [4] (let f [i] = i in f)"
+            , "let idx1 = iota 5"
+            , "let idx2 = replicate [2, All] idx1"
+            , "let main = gather idx2 src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- slice bounds
+  -- ------------------------------------------------------------------ --
+  describe "slice bounds propagation" $ do
+
+    it "slice preserves value bound for gather" $ do
+      -- iota 10 has bound 10; slice [0:5] gives 5 elements still bounded by 10
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [10] (let f [i] = i in f)"
+        , "let full = iota 10"
+        , "let idx  = slice [[0, 5]] full"
+        , "let main = gather idx src"
+        ]
+
+    it "slice with too-small source is rejected" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src  = generate [9] (let f [i] = i in f)"
+            , "let full = iota 10"
+            , "let idx  = slice [[0, 5]] full"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- reshape bounds
+  -- ------------------------------------------------------------------ --
+  describe "reshape bounds propagation" $ do
+
+    it "reshape preserves value bound for gather" $ do
+      -- iota 6 has bound 6; reshape to [2][3] keeps bound; src has 6 elements
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [6] (let f [i] = i in f)"
+        , "let flat = iota 6"
+        , "let idx  = reshape [2, 3] flat"
+        , "let main = gather idx src"
+        ]
+
+    it "reshape with too-small source is rejected" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src  = generate [5] (let f [i] = i in f)"
+            , "let flat = iota 6"
+            , "let idx  = reshape [2, 3] flat"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- gather output bounds (chained gather)
+  -- ------------------------------------------------------------------ --
+  describe "gather output bounds propagation" $ do
+
+    it "gather result carries source element bound for chained gather" $ do
+      -- src2 has elements = indices into src1; gather1 gathers those indices;
+      -- gather2 uses gather1 output as new indices into src1
+      expectDecsOk $ BS.unlines
+        [ "let src1  = generate [5] (let f [i] = i in f)"
+        , "let idx1  = iota 5"
+        , "let src2  = iota 5"
+        , "let tmp   = gather idx1 src2"
+        , "let main  = gather tmp src1"
+        ]
+
+    it "chained gather is rejected when final source is too small" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let src1  = generate [4] (let f [i] = i in f)"
+            , "let idx1  = iota 5"
+            , "let src2  = iota 5"
+            , "let tmp   = gather idx1 src2"
+            , "let main  = gather tmp src1"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
