@@ -11,6 +11,7 @@ module Language.Hydrangea.Solver where
 
 import Control.Monad (forM)
 import Data.ByteString.Lazy.Char8 qualified as BS
+import Data.List (intercalate)
 import Data.Map (Map)
 import Data.Map qualified as M
 import Data.Set (Set)
@@ -18,6 +19,8 @@ import Data.Set qualified as S
 import Data.SBV
 import Data.SBV.Control
 import Language.Hydrangea.Predicate
+import Language.Hydrangea.Pretty ()
+import Text.PrettyPrint.HughesPJClass (render, pPrint)
 
 -- | Check predicates for consistency.
 --
@@ -204,12 +207,15 @@ hypVars tagged = S.unions [predVars p | Hyp p <- tagged]
 -- For each @Obl p@, if every SMT variable the obligation mentions is constrained
 -- by at least one hypothesis (i.e., the obligation variable set is a subset of
 -- the hypothesis variable set), run @checkObligation@.  Ungrounded obligations
--- are treated as @ObligationUnknown@
--- (warn, not error) to preserve backward compatibility with un-annotated programs.
+-- are treated as @ObligationUnknown@ (warn, not error) to preserve backward
+-- compatibility with un-annotated programs.
 --
--- Returns @Left failing_preds@ on failure, @Right residual@ (non-constant tagged
--- preds) on success.
-checkTaggedPredicates :: [TaggedPred] -> IO (Either [Pred] [TaggedPred])
+-- Returns @Left (failing_preds, mWitness)@ on failure, where @mWitness@ is a
+-- Z3 counterexample if available.  Returns @Right (residual, warnings)@ on
+-- success, where @warnings@ contains diagnostic notes for obligations that
+-- could not be statically verified.
+checkTaggedPredicates :: [TaggedPred]
+  -> IO (Either ([Pred], Maybe [(Var, Integer)]) ([TaggedPred], [String]))
 checkTaggedPredicates tagged = do
   let hyps = [p | Hyp p <- tagged]
       obls = [p | Obl p <- tagged]
@@ -217,7 +223,7 @@ checkTaggedPredicates tagged = do
   -- 1. Eagerly evaluate constant hypotheses.
   let (constHyps, symHyps) = partitionConsts hyps
   case findFalseConst constHyps of
-    Just p -> return (Left [p])
+    Just p -> return (Left ([p], Nothing))
     Nothing -> do
       -- 1b. One-pass constant propagation: substitute dim/var constants from
       -- hypotheses into other hypotheses, then re-run findFalseConst.  This
@@ -228,7 +234,7 @@ checkTaggedPredicates tagged = do
           foldedHyps = map (applyConstMapToPred cmap) hyps
           (foldedConsts, _) = partitionConsts foldedHyps
       case findFalseConst foldedConsts of
-        Just p -> return (Left [p])
+        Just p -> return (Left ([p], Nothing))
         Nothing -> do
           -- 2. Check each obligation.
           -- An obligation is "grounded" only when every SMT variable it mentions is
@@ -240,11 +246,24 @@ checkTaggedPredicates tagged = do
             let oblVars = predVars obl
             if oblVars `S.isSubsetOf` hVars
               then do r <- checkObligation (symHyps ++ constHyps) obl
-                      return (obl, r)
-              else -- Some obligation variable has no hypothesis — treat as unknown.
-                   return (obl, ObligationUnknown)
-          -- 3. Collect failures.
-          let failures = [obl | (obl, Counterexample _) <- results]
+                      return (obl, r, True)
+              else return (obl, ObligationUnknown, False)
+          -- 3. Collect failures (obligations with a concrete counterexample).
+          let failures = [(obl, w) | (obl, Counterexample w, _) <- results]
           if not (null failures)
-            then return (Left failures)
-            else return (Right tagged)
+            then do
+              let failPreds        = map fst failures
+                  mWitness         = Just (snd (head failures))
+              return (Left (failPreds, mWitness))
+            else do
+              -- 4. Generate warnings for obligations that could not be verified.
+              let warnings = concatMap mkWarning results
+              return (Right (tagged, warnings))
+  where
+    mkWarning (obl, ObligationUnknown, False) =
+      [ "note: could not verify '" ++ render (pPrint obl) ++ "'"
+        ++ " — some index variables lack bound annotations" ]
+    mkWarning (obl, ObligationUnknown, True) =
+      [ "note: could not verify '" ++ render (pPrint obl) ++ "'"
+        ++ " — solver returned Unknown" ]
+    mkWarning _ = []

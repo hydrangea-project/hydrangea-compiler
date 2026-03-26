@@ -253,7 +253,7 @@ data TypeError where
   InvalidPoly :: Maybe Range -> Polytype -> TypeError
   DuplicateRecordField :: Maybe Range -> ByteString -> TypeError
   MissingRecordField :: Maybe Range -> ByteString -> TypeError
-  UnsatConstraints :: [Pred] -> TypeError
+  UnsatConstraints :: [Pred] -> Maybe [(Var, Integer)] -> TypeError
   MiscError :: Maybe Range -> TypeError
   deriving (Show)
 
@@ -1514,7 +1514,7 @@ runInferWithOptions opts e = do
     Left err -> return $ Left err
     Right ((sch, _preds), _st) -> do
       let poly = fromUPolytype sch
-      finalizePolyWithOptions opts poly
+      fst <$> finalizePolyWithOptions opts poly
   where
     action = do
       (ty, preds) <- censor (const []) $ listen (e >>= applyBindings)
@@ -1532,7 +1532,7 @@ runInferWithCtxOptions opts ctx e = do
     Left err -> return $ Left err
     Right ((sch, _preds), _st) -> do
       let poly = fromUPolytype sch
-      finalizePolyWithOptions opts poly
+      fst <$> finalizePolyWithOptions opts poly
   where
     action = do
       (ty, preds) <- censor (const []) $ listen (e >>= applyBindings)
@@ -1571,21 +1571,21 @@ runInferDecsWithOptions opts decs = do
     Left err -> return $ Left err
     Right ((ups, st), _preds) -> do
       pairs <- forM ups $ \(v, up) -> do
-        res <- finalizePolyWithOptions opts (fromUPolytype up)
-        return (v, res)
-      let warnings = inferWarnings st
-      return $ fmap (, warnings) $ traverse (\(v, res) -> fmap (v,) res) pairs
+        (res, solverWs) <- finalizePolyWithOptions opts (fromUPolytype up)
+        return (v, res, solverWs)
+      let warnings = inferWarnings st ++ concatMap (\(_, _, ws) -> ws) pairs
+      return $ fmap (, warnings) $ traverse (\(v, res, _) -> fmap (v,) res) pairs
 
 -- | Discharge the predicates attached to a generalized type scheme.
 finalizePoly :: Polytype -> IO (Either TypeError Polytype)
-finalizePoly = finalizePolyWithOptions defaultInferOptions
+finalizePoly poly = fst <$> finalizePolyWithOptions defaultInferOptions poly
 
-finalizePolyWithOptions :: InferOptions -> Polytype -> IO (Either TypeError Polytype)
+finalizePolyWithOptions :: InferOptions -> Polytype -> IO (Either TypeError Polytype, [String])
 finalizePolyWithOptions opts poly
-  | not (inferSolveRefinements opts) = return (Right poly)
+  | not (inferSolveRefinements opts) = return (Right poly, [])
   | otherwise = do
   let Forall xs tagged ty = poly
   checked <- checkTaggedPredicates tagged
   case checked of
-    Left failing -> return $ Left (UnsatConstraints failing)
-    Right residual -> return $ Right (Forall xs residual ty)
+    Left (failing, mWitness) -> return (Left (UnsatConstraints failing mWitness), [])
+    Right (residual, warnings) -> return (Right (Forall xs residual ty), warnings)

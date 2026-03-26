@@ -322,3 +322,19 @@ spec = describe "gather bounds checking" $ do
             ]
         )
         (isInfixOf "UnsatConstraints")
+
+  describe "ungrounded obligation warnings" $ do
+    it "emits a warning for an ungrounded index obligation" $ do
+      -- x has no bound annotation so the obligation x < dim(arr,0) is ungrounded
+      let src = BS.unlines
+            [ "let arr  = generate [5] (let f [i] = i in f)"
+            , "let main = let x = 2 in index [x] arr"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` any (isInfixOf "could not verify")

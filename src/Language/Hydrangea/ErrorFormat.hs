@@ -10,9 +10,13 @@ module Language.Hydrangea.ErrorFormat
 
 import Data.ByteString.Lazy.Char8 (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as BS
+import Data.List (intercalate, isPrefixOf, isSuffixOf)
 import Language.Hydrangea.Infer (TypeError(..))
 import Language.Hydrangea.Interpreter (EvalError(..))
 import Language.Hydrangea.Lexer (AlexPosn(..), Range(..))
+import Language.Hydrangea.Predicate (Var)
+import Language.Hydrangea.Pretty ()
+import Text.PrettyPrint.HughesPJClass (render, pPrint)
 import System.Console.ANSI
 
 typeErrorSummary :: TypeError -> (Maybe Range, String)
@@ -24,8 +28,36 @@ typeErrorSummary err =
     InvalidPoly mr _ -> (mr, "Invalid polymorphic type")
     DuplicateRecordField mr field -> (mr, "Duplicate record field: " ++ BS.unpack field)
     MissingRecordField mr field -> (mr, "Missing record field: " ++ BS.unpack field)
-    UnsatConstraints _ -> (Nothing, "Unsatisfiable constraints (UnsatConstraints)")
+    UnsatConstraints preds mWitness ->
+      ( Nothing
+      , "UnsatConstraints: unsatisfiable array-safety constraints\n"
+        ++ unlines ["  - " ++ render (pPrint p) | p <- preds]
+        ++ case mWitness of
+             Nothing -> ""
+             Just ws -> "  counterexample: "
+                        ++ intercalate ", " [prettyVar v ++ " = " ++ show n | (v, n) <- ws]
+      )
     MiscError mr -> (mr, "Type error")
+
+-- | Demangle a synthetic SMT variable name for human-readable counterexample output.
+prettyVar :: Var -> String
+prettyVar v =
+  let s = BS.unpack v
+  in if "__vbound__" `isSuffixOf` s
+       then "vbound(" ++ take (length s - 10) s ++ ")"
+       else case splitOnFirst "__dim__" s of
+              Just (arr, dimIx) -> "dim(" ++ arr ++ ", " ++ dimIx ++ ")"
+              Nothing           -> s
+
+-- | Split a string at the first occurrence of a separator.
+splitOnFirst :: String -> String -> Maybe (String, String)
+splitOnFirst _   [] = Nothing
+splitOnFirst sep s@(c:cs)
+  | sep `isPrefixOf` s = Just ("", drop (length sep) s)
+  | otherwise =
+      case splitOnFirst sep cs of
+        Nothing        -> Nothing
+        Just (l, r)    -> Just (c : l, r)
 
 formatHeader :: Maybe FilePath -> Maybe Range -> String -> String
 formatHeader mfile mr short =
