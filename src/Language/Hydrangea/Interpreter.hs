@@ -151,6 +151,9 @@ evalExp expr env = case expr of
       _ -> throwError $ TypeError "Record projection only works on records"
   ELetIn _ (Dec _ var pats _ body) e ->
     evalExp e (Map.insert var (VClosure env pats body) env)
+  EBoundLetIn _ x _ rhs body -> do
+    val <- evalExp rhs env
+    evalExp body (Map.insert x val env)
   EGenerate _ szExpr fnExpr -> do
     vSz <- evalExp szExpr env
     shape <- liftEither $ shapeFromValue vSz
@@ -766,6 +769,7 @@ evalApp other _arg _env =
 -- | Match a pattern against a value, extending the environment
 matchPattern :: Pat () -> Value -> Env -> Either EvalError Env
 matchPattern (PVar _ v) val env = pure $ Map.insert v val env
+matchPattern (PBound _ v _) val env = pure $ Map.insert v val env
 matchPattern (PVec _ pats) (VTuple vals) env =
   if length pats /= length vals
     then Left $ MismatchedPatterns "Pattern length mismatch in tuple"

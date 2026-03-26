@@ -15,7 +15,7 @@ module Language.Hydrangea.GatherBoundsSpec (spec) where
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (isInfixOf)
-import Language.Hydrangea.Frontend (inferDecsTop, readDecs, typeCheckExp, readExp)
+import Language.Hydrangea.Frontend (inferDecsTop, inferDecsTopWithWarnings, readDecs, typeCheckExp, readExp)
 import Test.Hspec
 
 -- | Parse and type-check a sequence of top-level declarations.
@@ -194,3 +194,76 @@ spec = describe "gather bounds checking" $ do
         , "let idx = generate [3]  (let f [i] = i * 3 in f)"
         , "let main = gather idx src"
         ]
+
+  -- ------------------------------------------------------------------ --
+  -- PBound value bound propagation through generator bodies
+  -- ------------------------------------------------------------------ --
+  describe "PBound value bound propagation" $ do
+
+    it "identity body [i bound N] propagates bound N to gather" $ do
+      -- generate [N] (let f [i bound N] = i in f) has TValBound = N
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [5] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i bound 5] = i in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "i+1 body with [i bound N] propagates bound N+1" $ do
+      -- elements < N+1; src size = N+1 — safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [6] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i bound 5] = i + 1 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "i+1 body with wrong source size is rejected" $ do
+      -- elements bounded by N+1=6 but src has only 5 — unsafe
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i bound 5] = i + 1 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "generate without PBound is permissive (no TValBound)" $ do
+      -- No annotation — no TValBound established, gather is unchecked.
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [3] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i] = i + 1 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "PBound soundness check: shape must not exceed declared bound" $ do
+      -- generate [10] with [i bound 5] — shape 10 > bound 5: unsound
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i bound 5] = i in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- make_index warning
+  -- ------------------------------------------------------------------ --
+  describe "make_index warnings" $ do
+
+    it "make_index emits a warning about unverified bound" $ do
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` any (isInfixOf "make_index")
+      where
+        src = BS.unlines
+          [ "let src     = generate [10] (let f [i] = i in f)"
+          , "let raw_idx = generate [5]  (let f [i] = 0 in f)"
+          , "let idx     = make_index 10 raw_idx"
+          , "let main    = gather idx src"
+          ]

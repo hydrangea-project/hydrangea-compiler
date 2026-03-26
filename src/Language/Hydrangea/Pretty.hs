@@ -147,6 +147,9 @@ instance Pretty (Exp a) where
   pPrint (EGetEnvString _ var) = text "get_env_string" <+> pPrint var
   pPrint (EStencil _ bnd f arr) =
     text "stencil" <+> pPrint bnd <+> pPrint f <+> pPrint arr
+  pPrint (EBoundLetIn _ x boundE rhs body) =
+    parens (text "let" <+> text (unpack x) <+> text "bound" <+> pPrint boundE
+            <+> text "=" <+> pPrint rhs <+> text "in" <+> pPrint body)
 
 instance Pretty (BoundaryCondition a) where
   pPrint BClamp        = text "clamp"
@@ -203,6 +206,7 @@ instance Pretty (Pat a) where
   pPrint (PVar _ nam) = parens (text $ unpack nam)
   pPrint (PVec _ pats) =
     brackets (sep (punctuate (text ",") (map pPrint pats)))
+  pPrint (PBound _ nam e) = text (unpack nam) <+> text "bound" <+> pPrint e
 
 instance Pretty (ShapeDim a) where
   pPrint dim =

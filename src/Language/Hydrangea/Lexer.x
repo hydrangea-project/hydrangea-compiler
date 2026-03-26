@@ -61,6 +61,7 @@ tokens :-
 <0> sort_indices { tok SortIndices }
 <0> iota        { tok Iota }
 <0> make_index  { tok MakeIndex }
+<0> bound       { tok Bound }
 <0> coo_sum_duplicates { tok COOSumDuplicates }
 <0> csr_from_sorted_coo { tok CSRFromSortedCOO }
 <0> index       { tok Index }
@@ -295,6 +296,7 @@ data Token
   | SortIndices
   | Iota
   | MakeIndex
+  | Bound
   | COOSumDuplicates
   | CSRFromSortedCOO
   | Index

@@ -336,6 +336,11 @@ data Exp a
     -- @current_index + offset@ subject to the boundary condition.
     -- stencil : Boundary -> ((Int -> a) -> b) -> Array[sh, a] -> Array[sh, b]
     EStencil a (BoundaryCondition a) (Exp a) (Exp a)
+  | -- | Bound-annotated let-in: @let x bound E = rhs in body@.
+    -- Asserts (and if possible verifies statically) that @rhs@ evaluates to a
+    -- value in @[0, E)@, then binds @x@ with that value-bound annotation for
+    -- propagation through @body@.  Identity at runtime.
+    EBoundLetIn a Var (Exp a) (Exp a) (Exp a)
   deriving (Functor, Foldable)
 
 -- | Boundary condition for stencil operations.
@@ -478,4 +483,28 @@ data Operator a
 data Pat a
   = PVar a Var
   | PVec a [Pat a]
-  deriving (Functor, Foldable, Show, Eq, Ord)
+  | -- | Bound-annotated index pattern: @[i bound E]@.
+    -- Declares that the index variable @i@ is in @[0, E)@.  Used inside
+    -- @generate@ to enable value-bound propagation to the output array.
+    PBound a Var (Exp a)
+  deriving (Functor, Foldable)
+
+instance (Show a) => Show (Pat a) where
+  show (PVar a v) = "PVar (" ++ show a ++ ") " ++ show v
+  show (PVec a ps) = "PVec (" ++ show a ++ ") " ++ show ps
+  show (PBound a v _) = "PBound (" ++ show a ++ ") " ++ show v ++ " <expr>"
+
+instance (Eq a) => Eq (Pat a) where
+  PVar a1 v1       == PVar a2 v2       = a1 == a2 && v1 == v2
+  PVec a1 ps1      == PVec a2 ps2      = a1 == a2 && ps1 == ps2
+  PBound a1 v1 _   == PBound a2 v2 _   = a1 == a2 && v1 == v2
+  _                == _                = False
+
+instance (Ord a) => Ord (Pat a) where
+  compare (PVar a1 v1)     (PVar a2 v2)     = compare a1 a2 <> compare v1 v2
+  compare (PVec a1 ps1)    (PVec a2 ps2)    = compare a1 a2 <> compare ps1 ps2
+  compare (PBound a1 v1 _) (PBound a2 v2 _) = compare a1 a2 <> compare v1 v2
+  compare (PVar _ _)       _                = LT
+  compare _                (PVar _ _)       = GT
+  compare (PVec _ _)       _                = LT
+  compare _                (PVec _ _)       = GT

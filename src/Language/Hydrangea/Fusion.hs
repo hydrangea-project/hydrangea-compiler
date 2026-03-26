@@ -130,6 +130,8 @@ collectVarsExp expr =
     EGetEnvString _ e -> collectVarsExp e
     EStencil _ bnd f arr ->
       collectVarsBndFusion bnd `S.union` collectVarsExp f `S.union` collectVarsExp arr
+    EBoundLetIn _ x boundExp rhs body ->
+      S.insert x (collectVarsExp boundExp `S.union` collectVarsExp rhs `S.union` collectVarsExp body)
 
 collectVarsBndFusion :: BoundaryCondition a -> Set Var
 collectVarsBndFusion BClamp     = S.empty
@@ -145,6 +147,7 @@ collectVarsPat :: Pat a -> Set Var
 collectVarsPat pat =
   case pat of
     PVar _ v -> S.singleton v
+    PBound _ v _ -> S.singleton v
     PVec _ ps -> S.unions (map collectVarsPat ps)
 
 collectVarsShapeDim :: ShapeDim a -> Set Var
@@ -164,6 +167,7 @@ patVars :: Pat a -> Set Var
 patVars pat =
   case pat of
     PVar _ v -> S.singleton v
+    PBound _ v _ -> S.singleton v
     PVec _ ps -> S.unions (map patVars ps)
 
 decBoundVars :: Dec a -> Set Var
@@ -231,6 +235,9 @@ freeVarsExp expr =
     EGetEnvString _ e -> freeVarsExp e
     EStencil _ bnd f arr ->
       freeVarsBnd bnd `S.union` freeVarsExp f `S.union` freeVarsExp arr
+    EBoundLetIn _ x boundExp rhs body ->
+      collectVarsExp boundExp `S.union` freeVarsExp rhs
+        `S.union` S.delete x (freeVarsExp body)
 
 freeVarsBnd :: BoundaryCondition a -> Set Var
 freeVarsBnd BClamp     = S.empty
@@ -314,6 +321,8 @@ boundVarsExp expr =
     EGetEnvString _ _ -> S.empty
     EStencil _ bnd f arr ->
       boundVarsBnd bnd `S.union` boundVarsExp f `S.union` boundVarsExp arr
+    EBoundLetIn _ x _ rhs body ->
+      S.insert x (boundVarsExp rhs `S.union` boundVarsExp body)
 
 boundVarsBnd :: BoundaryCondition a -> Set Var
 boundVarsBnd BClamp     = S.empty
@@ -402,6 +411,8 @@ countVarExp v expr =
     EGetEnvString _ e -> countVarExp v e
     EStencil _ bnd f arr ->
       countVarBnd v bnd + countVarExp v f + countVarExp v arr
+    EBoundLetIn _ _ boundExp rhs body ->
+      countVarExp v boundExp + countVarExp v rhs + countVarExp v body
 
 countVarBnd :: Var -> BoundaryCondition a -> Int
 countVarBnd _ BClamp     = 0
@@ -502,6 +513,12 @@ substExp v replacement expr =
       EStencil a (substBnd v replacement bnd)
                  (substExp v replacement f)
                  (substExp v replacement arr)
+    EBoundLetIn a x boundExp rhs body ->
+      -- Don't substitute into body if x shadows v
+      let rhs' = substExp v replacement rhs
+          boundExp' = substExp v replacement boundExp
+          body' = if x == v then body else substExp v replacement body
+      in EBoundLetIn a x boundExp' rhs' body'
 
 substBnd :: Var -> Exp a -> BoundaryCondition a -> BoundaryCondition a
 substBnd _ _ BClamp     = BClamp
@@ -991,6 +1008,7 @@ normPat :: Pat a -> State NormFusionState (Pat a)
 normPat pat =
   case pat of
     PVar a v -> PVar a <$> normBindVar v
+    PBound a v e -> PBound a <$> normBindVar v <*> normExp e
     PVec a ps -> PVec a <$> mapM normPat ps
 
 normShapeDim :: ShapeDim a -> State NormFusionState (ShapeDim a)
@@ -1082,6 +1100,13 @@ normExp expr =
     EGetEnvInt a e -> EGetEnvInt a <$> normExp e
     EGetEnvString a e -> EGetEnvString a <$> normExp e
     EStencil a bnd f arr -> EStencil a <$> normBndFusion bnd <*> normExp f <*> normExp arr
+    EBoundLetIn a x boundExp rhs body -> do
+      env <- gets normFusionEnv
+      x' <- normBindVar x
+      boundExp' <- normExp boundExp
+      rhs' <- normExp rhs
+      body' <- withNormEnv (M.insert x x' env) (normExp body)
+      pure (EBoundLetIn a x' boundExp' rhs' body')
 
 normBndFusion :: BoundaryCondition a -> State NormFusionState (BoundaryCondition a)
 normBndFusion BClamp     = pure BClamp
@@ -1345,6 +1370,8 @@ fuseOnce expr =
       s' <- fuseOnce s
       arr' <- fuseOnce arr
       fuseReshape a s' arr'
+    EBoundLetIn a x boundExp rhs body ->
+      EBoundLetIn a x <$> fuseOnce boundExp <*> fuseOnce rhs <*> fuseOnce body
 
 fuseDecM :: (Eq a) => Dec a -> FusionM (Dec a)
 fuseDecM (Dec a name pats poly body) = do

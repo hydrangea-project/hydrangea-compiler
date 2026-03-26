@@ -58,6 +58,15 @@ inferDecsTop = inferDecsTopWithOptions defaultInferOptions
 inferDecsTopWithOptions :: InferOptions -> [Dec Range] -> IO (Either String [(Var, Polytype)])
 inferDecsTopWithOptions opts ds = do
   res <- runInferDecsWithOptions opts ds
+  pure $ fmap fst $ formatInferResult res (formatTypeError Nothing Nothing)
+
+-- | Like 'inferDecsTop' but also returns any accumulated warnings.
+inferDecsTopWithWarnings :: [Dec Range] -> IO (Either String ([(Var, Polytype)], [String]))
+inferDecsTopWithWarnings = inferDecsTopWithWarningsOptions defaultInferOptions
+
+inferDecsTopWithWarningsOptions :: InferOptions -> [Dec Range] -> IO (Either String ([(Var, Polytype)], [String]))
+inferDecsTopWithWarningsOptions opts ds = do
+  res <- runInferDecsWithOptions opts ds
   pure $ formatInferResult res (formatTypeError Nothing Nothing)
 
 -- | Convert a monomorphic 'Type' to the corresponding CFG 'CType'.
@@ -97,8 +106,8 @@ inferTopLevelTypesWithOptions :: InferOptions -> [Dec Range] -> IO (Map.Map Var 
 inferTopLevelTypesWithOptions opts decs = do
   res <- runInferDecsWithOptions opts decs
   case res of
-    Left _     -> pure Map.empty
-    Right pairs -> pure $
+    Left _            -> pure Map.empty
+    Right (pairs, _) -> pure $
       M.fromList [(v, ct) | (v, poly) <- pairs, Just ct <- [typeOfPolytype poly]]
 
 -- | Type-check a single expression and return its inferred polytype.
@@ -268,7 +277,7 @@ typeCheckAndEvalDecs = typeCheckAndEvalDecsWithOptions defaultInferOptions
 typeCheckAndEvalDecsWithOptions :: InferOptions -> [Dec Range] -> IO (Either String [(Var, Polytype, Maybe Value)])
 typeCheckAndEvalDecsWithOptions opts decs = do
   res <- runInferDecsWithOptions opts decs
-  case formatInferResult res (formatTypeError Nothing Nothing) of
+  case fmap fst $ formatInferResult res (formatTypeError Nothing Nothing) of
     Left err -> pure (Left err)
     Right typedDecs -> do
       evaled <- evalDecsFrontend decs

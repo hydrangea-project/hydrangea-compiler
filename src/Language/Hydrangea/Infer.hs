@@ -109,14 +109,25 @@ type Infer = ReaderT Ctx (StateT InferState (WriterT [Pred] (ExceptT TypeError (
 type Ctx = Map Var UPolytype
 
 -- | Mutable state threaded through inference: a counter for generating
--- fresh predicate variable names.
-newtype InferState = InferState
+-- fresh predicate variable names, a local value-bound context for index
+-- variables annotated with @[i bound E]@, and accumulated warnings.
+data InferState = InferState
   { predVarCounter :: Int
+  , valBoundCtx    :: Map Var Term
+    -- ^ Maps variables with @[i bound E]@ annotations to their exclusive
+    --   upper bound term.  Used by 'inferValBound' to compute output bounds
+    --   from generator body expressions.
+  , inferWarnings  :: [String]
+    -- ^ Non-fatal diagnostic messages (e.g. unverifiable bound annotations).
   }
 
 -- | Initial inference state.
 initInferState :: InferState
-initInferState = InferState { predVarCounter = 0 }
+initInferState = InferState
+  { predVarCounter = 0
+  , valBoundCtx    = M.empty
+  , inferWarnings  = []
+  }
 
 -- | Lift a unification-library action into the full inference monad.
 liftBinding :: IntBindingT TypeF Identity a -> Infer a
@@ -422,6 +433,24 @@ expectedShapeFromExp e = normalizeShapeToTupleOfInts (firstParam e) =<< infer e
 emitPred :: Pred -> Infer ()
 emitPred pred' = tell [pred']
 
+-- | Emit a non-fatal diagnostic warning.
+emitWarning :: String -> Infer ()
+emitWarning w = modify (\s -> s { inferWarnings = inferWarnings s ++ [w] })
+
+-- | Run an action with an extra value-bound annotation in scope for one variable.
+-- The annotation is removed (restored to prior state) when the action completes.
+withValBound :: Var -> Term -> Infer a -> Infer a
+withValBound v t m = do
+  st <- get
+  modify (\s -> s { valBoundCtx = M.insert v t (valBoundCtx s) })
+  x <- m
+  modify (\s -> s { valBoundCtx = valBoundCtx st })
+  return x
+
+-- | Look up the value-bound annotation for a variable, if any.
+lookupValBound :: Var -> Infer (Maybe Term)
+lookupValBound v = gets (M.lookup v . valBoundCtx)
+
 -- | Extract a refinement term from a restricted set of integer expressions.
 -- Unsupported forms are conservatively replaced by fresh predicate variables.
 termFromExp :: Exp Range -> Infer Term
@@ -453,6 +482,89 @@ termsFromIndexExp (EShapeOf _ arrExp) = do
   arrVar <- maybe freshPredVar return mArrVar
   return [TDim arrVar i | i <- [0 .. rank - 1]]
 termsFromIndexExp e = (: []) <$> termFromExp e
+
+-- ---------------------------------------------------------------------------
+-- Value-bound propagation for generator body expressions
+-- ---------------------------------------------------------------------------
+
+-- | Internal representation of a value bound during propagation.
+-- 'BoundOf t' means the value is strictly less than @t@ (exclusive upper bound).
+-- 'ExactVal t' means the value is exactly @t@ (a constant or shape variable).
+data BVal = BoundOf Term | ExactVal Term
+
+-- | Convert a 'BVal' to an exclusive upper bound 'Term'.
+-- For an exact value @c@, the exclusive bound is @c + 1@.
+toBound :: BVal -> Term
+toBound (BoundOf t)  = t
+toBound (ExactVal t) = TAdd t (TConst 1)
+
+-- | Combine two 'BVal's under addition.
+bvalAdd :: BVal -> BVal -> BVal
+bvalAdd (BoundOf b)   (ExactVal c)  = BoundOf  (TAdd b c)
+bvalAdd (ExactVal c)  (BoundOf b)   = BoundOf  (TAdd b c)
+bvalAdd (BoundOf b1)  (BoundOf b2)  = BoundOf  (TAdd b1 b2)
+bvalAdd (ExactVal c1) (ExactVal c2) = ExactVal (TAdd c1 c2)
+
+-- | Combine two 'BVal's under subtraction.
+-- When the right operand could be non-negative (the common case for index vars),
+-- subtracting it from an exact value gives the same exact value as a conservative
+-- upper bound; subtracting from a 'BoundOf' term decreases the bound.
+bvalSub :: BVal -> BVal -> BVal
+bvalSub (BoundOf b)   (ExactVal c)  = BoundOf  (TSub b c)
+bvalSub (ExactVal c)  (BoundOf _)   = ExactVal c  -- y >= 0 so c - y <= c
+bvalSub (ExactVal c1) (ExactVal c2) = ExactVal (TSub c1 c2)
+bvalSub (BoundOf b1)  (BoundOf _)   = BoundOf  b1 -- conservative
+
+-- | Multiply a 'BVal' by a positive integer constant.
+bvalMulConst :: Integer -> BVal -> BVal
+bvalMulConst k (BoundOf b)   = BoundOf  (TMul (TConst k) b)
+bvalMulConst k (ExactVal c)  = ExactVal (TMul (TConst k) c)
+
+-- | Conservatively compute a 'BVal' for an integer expression, given the
+-- current 'valBoundCtx'.  Returns 'Nothing' if the bound cannot be determined.
+inferBVal :: Exp Range -> Infer (Maybe BVal)
+inferBVal expr = case expr of
+  EVar _ v -> do
+    mb <- lookupValBound v
+    return $ Just $ maybe (ExactVal (TVar v)) BoundOf mb
+  EInt _ n -> return $ Just $ ExactVal (TConst n)
+  EBinOp _ e1 op e2 -> case op of
+    Plus  _ -> combine bvalAdd e1 e2
+    Minus _ -> combine bvalSub e1 e2
+    Times _ -> do
+      mb1 <- inferBVal e1
+      mb2 <- inferBVal e2
+      return $ case (mb1, mb2, e1, e2) of
+        (Just (ExactVal (TConst k)), Just b2, _, _) | k > 0 -> Just (bvalMulConst k b2)
+        (Just b1, Just (ExactVal (TConst k)), _, _) | k > 0 -> Just (bvalMulConst k b1)
+        _ -> Nothing
+    _ -> return Nothing
+  _ -> return Nothing
+  where
+    combine f e1 e2 = do
+      mb1 <- inferBVal e1
+      mb2 <- inferBVal e2
+      return $ f <$> mb1 <*> mb2
+
+-- | Compute an exclusive upper bound 'Term' for an integer expression.
+-- Returns 'Nothing' if the bound cannot be statically determined.
+inferValBound :: Exp Range -> Infer (Maybe Term)
+inferValBound e = fmap toBound <$> inferBVal e
+
+-- | Extract the 'PBound' pattern info from an inline generator lambda.
+-- Handles @let f [i bound E] = body in f@ (PVec containing a single PBound)
+-- and @let f (i bound E) = body in f@ (bare PBound at the top level).
+-- Returns @(indexVar, boundExp)@ if found, 'Nothing' otherwise.
+extractPBoundInfo :: Exp Range -> Maybe (Var, Exp Range)
+extractPBoundInfo (ELetIn _ (Dec _ _ [PVec _ [PBound _ v e]] _ _) _) = Just (v, e)
+extractPBoundInfo (ELetIn _ (Dec _ _ [PBound _ v e]            _ _) _) = Just (v, e)
+extractPBoundInfo _ = Nothing
+
+-- | Compute the value bound of an inline generator body, with the index
+-- variable already registered in the caller's 'valBoundCtx'.
+inferBodyBound :: Exp Range -> Infer (Maybe Term)
+inferBodyBound (ELetIn _ (Dec _ _ _ _ body) _) = inferValBound body
+inferBodyBound _ = return Nothing
 
 -- | Count the number of dimensions in a shape type after normalization.
 shapeArityFromType :: Range -> UType -> Infer Int
@@ -653,6 +765,18 @@ infer (EGenerate _ shapeExp fn) = do
   shapeTerms <- termsFromIndexExp shapeExp
   forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
     emitPred (PEq (TDim arrVar i) t)
+  -- Attempt to infer value bound from generator body if PBound annotation present.
+  case extractPBoundInfo fn of
+    Nothing -> return ()
+    Just (idxVar, idxBoundExp) -> do
+      idxBoundTerm <- termFromExp idxBoundExp
+      -- Soundness: shape must not exceed the declared input bound.
+      emitPred (PLe (TDim arrVar 0) idxBoundTerm)
+      -- Infer output bound from body expression.
+      mOutBound <- withValBound idxVar idxBoundTerm $ inferBodyBound fn
+      case mOutBound of
+        Just outBound -> emitPred (PEq (TValBound arrVar) outBound)
+        Nothing -> emitWarning "note: generator body value bound not statically inferred"
   return arrTy
 infer (EReadArray _ shapeExp fileExp) = do
   fTy <- infer fileExp
@@ -914,6 +1038,7 @@ infer (EMakeIndex _ nExp arrExp) = do
   arrVar' <- maybe freshPredVar return mArrVar
   nTerm <- termFromExp nExp
   emitPred (PEq (TValBound arrVar') nTerm)
+  emitWarning "note: make_index bound not statically verified"
   return arrTy
 infer (ECOOSumDuplicates _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = do
   nrowsTy <- infer nrowsExp
@@ -1143,6 +1268,20 @@ infer (ELetIn r dec e) = do
         Nothing  -> return (if null pats then inferredBodyTy else funTy)
   sch <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
   withBinding v sch $ wrange r $ infer e
+infer (EBoundLetIn _ x boundExp rhs body) = do
+  rhsTy <- infer rhs
+  _ <- wrange (firstParam rhs) $ rhsTy =:= UTyInt
+  boundTerm <- termFromExp boundExp
+  -- Try to verify the bound statically; warn if we cannot.
+  mRhsBound <- inferValBound rhs
+  case mRhsBound of
+    Just rhsBound -> emitPred (PLe rhsBound boundTerm)
+    Nothing -> emitWarning $
+      "note: bound annotation on '" ++ BS.unpack x ++ "' not statically verified"
+  -- Bind x as Int with bound in context for the body.
+  withBinding x (Forall [] [] UTyInt) $
+    withValBound x boundTerm $
+      infer body
 infer (EOp _ op) = pure $ case op of
   Plus _    -> ii2i; Minus _   -> ii2i; Times _   -> ii2i; Divide _  -> ii2i
   Eq _      -> ii2b; Neq _     -> ii2b; Lt _       -> ii2b; Le _     -> ii2b
@@ -1188,10 +1327,17 @@ buildPatFunType r bodyTy = go
         Nothing  -> return $ UTyFun argTy bodyTy
         Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
       return ([(arg, argTy)], funTy)
+    go [PBound _ arg _] mAnn = do
+      argTy <- freshValue
+      funTy <- case mAnn of
+        Nothing  -> return $ UTyFun argTy bodyTy
+        Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
+      return ([(arg, argTy)], funTy)
     go [PVec _ vs] mAnn = do
       tyArgs <- mapM (const freshValue) vs
       let argTy = foldr UTyCons UTyUnit tyArgs
           binds = [(v, t) | (PVar _ v, t) <- zip vs tyArgs]
+                ++ [(v, t) | (PBound _ v _, t) <- zip vs tyArgs]
       funTy <- case mAnn of
         Nothing  -> return $ UTyFun argTy bodyTy
         Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
@@ -1259,11 +1405,15 @@ withPats [] e = e
 withPats ((PVar _ v) : ps) e = do
   tyArg <- freshValue
   withBinding v (Forall [] [] tyArg) $ withPats ps e
+withPats ((PBound _ v _) : ps) e = do
+  tyArg <- freshValue
+  withBinding v (Forall [] [] tyArg) $ withPats ps e
 withPats ((PVec r vs) : ps) e = do
   tyArgs <- mapM (const freshValue) vs
   vars <- forM vs $ \p ->
     case p of
-      PVar _ v -> return v
+      PVar _ v   -> return v
+      PBound _ v _ -> return v
       _ -> throwError $ MiscError (Just r)
   withAllBinding (zip vars $ map (Forall [] []) tyArgs) $ withPats ps e
 
@@ -1332,21 +1482,22 @@ renamePolytype pty = evalState (go pty) (0 :: Int, M.empty)
     rename t         = return t
 
 -- | Infer top-level declarations and return their generalized Polytypes.
-runInferDecs :: [Dec Range] -> IO (Either TypeError [(Var, Polytype)])
+runInferDecs :: [Dec Range] -> IO (Either TypeError ([(Var, Polytype)], [String]))
 runInferDecs = runInferDecsWithOptions defaultInferOptions
 
-runInferDecsWithOptions :: InferOptions -> [Dec Range] -> IO (Either TypeError [(Var, Polytype)])
+runInferDecsWithOptions :: InferOptions -> [Dec Range] -> IO (Either TypeError ([(Var, Polytype)], [String]))
 runInferDecsWithOptions opts decs = do
   let result =
         runIdentity $ evalIntBindingT $ runExceptT $ runWriterT $
           runStateT (flip runReaderT M.empty $ inferDecs decs) initInferState
   case result of
     Left err -> return $ Left err
-    Right ((ups, _preds), _st) -> do
+    Right ((ups, st), _preds) -> do
       pairs <- forM ups $ \(v, up) -> do
         res <- finalizePolyWithOptions opts (fromUPolytype up)
         return (v, res)
-      return $ traverse (\(v, res) -> fmap (v,) res) pairs
+      let warnings = inferWarnings st
+      return $ fmap (, warnings) $ traverse (\(v, res) -> fmap (v,) res) pairs
 
 -- | Discharge the predicates attached to a generalized type scheme.
 finalizePoly :: Polytype -> IO (Either TypeError Polytype)

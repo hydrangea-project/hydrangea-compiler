@@ -126,6 +126,7 @@ lowerDec (Dec _ name pats _ body) = do
 
 patVarNames :: Pat a -> [CVar]
 patVarNames (PVar _ v) = [v]
+patVarNames (PBound _ v _) = [v]
 patVarNames (PVec _ ps) = concatMap patVarNames ps
 
 shapeRankExp :: Exp a -> Maybe Int
@@ -306,6 +307,13 @@ lowerExp expr = case expr of
         propagatePairInfo name ab
         (sr, ar) <- lowerExp rest
         pure (sb ++ [bindStmt] ++ sr, ar)
+
+  EBoundLetIn _ x _ rhs body -> do
+    (sr, ar) <- lowerExp rhs
+    let bindStmt = SAssign x (RAtom ar)
+    propagatePairInfo x ar
+    (sb, ab) <- lowerExp body
+    pure (sr ++ [bindStmt] ++ sb, ab)
 
   EApp _ fn arg -> handleApp fn arg
 
@@ -1843,6 +1851,7 @@ bindCopyVar dst src = do
 
 bindPatAtom :: Pat Range -> Atom -> LowerM [Stmt]
 bindPatAtom (PVar _ v) src = bindCopyVar v src
+bindPatAtom (PBound _ v _) src = bindCopyVar v src
 bindPatAtom (PVec _ ps) src = bindPVecPats ps src
 
 bindAppliedPat :: Pat Range -> Exp Range -> Atom -> LowerM [Stmt]
@@ -2036,6 +2045,15 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
             propagatePairInfo resultVar atom'
             bindParam <- bindCopyVar px (AVar paramVar)
             pure $ bindParam ++ stmts' ++ [SAssign resultVar (RAtom atom')]
+          PBound _ x _ -> do
+            px <- freshCVar "p"
+            let stmts' = renameVarInStmts x px stmts
+                atom' = renameVarInAtom x px atom
+            atomTy <- ctypeOfAtom atom'
+            registerCType resultVar atomTy
+            propagatePairInfo resultVar atom'
+            bindParam <- bindCopyVar px (AVar paramVar)
+            pure $ bindParam ++ stmts' ++ [SAssign resultVar (RAtom atom')]
           PVec _ ps -> do
             paramTy <- ctypeOfAtom (AVar paramVar)
             binds <-
@@ -2076,7 +2094,13 @@ inlineArrayFn1D fnExp paramVar resultVar = case fnExp of
           PVar _ x -> do
             propagateDenseLinearIndex x (AVar paramVar)
             bindCopyVar x (AVar paramVar)
+          PBound _ x _ -> do
+            propagateDenseLinearIndex x (AVar paramVar)
+            bindCopyVar x (AVar paramVar)
           PVec _ [PVar _ x] -> do
+            propagateDenseLinearIndex x (AVar paramVar)
+            bindCopyVar x (AVar paramVar)
+          PVec _ [PBound _ x _] -> do
             propagateDenseLinearIndex x (AVar paramVar)
             bindCopyVar x (AVar paramVar)
           PVec _ [p] -> do
@@ -2120,6 +2144,16 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
     mFn <- lookupFn name
     case mFn of
       Just ([PVar _ x], body) -> do
+        (stmts, atom) <- lowerExp body
+        px <- freshCVar "p"
+        let stmts' = renameVarInStmts x px stmts
+            atom' = renameVarInAtom x px atom
+        atomTy <- ctypeOfAtom atom'
+        registerCType resultVar atomTy
+        propagatePairInfo resultVar atom'
+        bindParam <- bindCopyVar px (AVar paramVar)
+        pure $ bindParam ++ stmts' ++ [SAssign resultVar (RAtom atom')]
+      Just ([PBound _ x _], body) -> do
         (stmts, atom) <- lowerExp body
         px <- freshCVar "p"
         let stmts' = renameVarInStmts x px stmts

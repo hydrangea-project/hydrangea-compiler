@@ -126,6 +126,13 @@ uniqExp expr =
     EGetEnvInt a e -> EGetEnvInt a <$> uniqExp e
     EGetEnvString a e -> EGetEnvString a <$> uniqExp e
     EStencil a bnd f arr -> EStencil a <$> uniqBnd bnd <*> uniqExp f <*> uniqExp arr
+    EBoundLetIn a x boundExp rhs body -> do
+      env <- gets uniqEnv
+      x' <- freshenBinder x
+      boundExp' <- uniqExp boundExp
+      rhs' <- uniqExp rhs
+      body' <- withEnv (M.insert x x' env) (uniqExp body)
+      pure (EBoundLetIn a x' boundExp' rhs' body')
 
 uniqBnd :: BoundaryCondition a -> UniqM (BoundaryCondition a)
 uniqBnd BClamp        = pure BClamp
@@ -153,6 +160,11 @@ uniqPat pat =
     PVar a v -> do
       v' <- freshenBinder v
       pure (PVar a v', M.singleton v v')
+    PBound a v boundExp -> do
+      v' <- freshenBinder v
+      -- boundExp is not a binder site; rename free uses inside it too
+      boundExp' <- uniqExp boundExp
+      pure (PBound a v' boundExp', M.singleton v v')
     PVec a ps -> do
       (ps', envs) <- unzip <$> mapM uniqPat ps
       pure (PVec a ps', M.unions envs)
@@ -261,6 +273,8 @@ collectVarsExp expr =
     EGetEnvInt _ e -> collectVarsExp e
     EGetEnvString _ e -> collectVarsExp e
     EStencil _ bnd f arr -> collectVarsBnd bnd `S.union` collectVarsExp f `S.union` collectVarsExp arr
+    EBoundLetIn _ x boundExp rhs body ->
+      S.insert x (collectVarsExp boundExp `S.union` collectVarsExp rhs `S.union` collectVarsExp body)
 
 collectVarsBnd :: BoundaryCondition a -> Set Var
 collectVarsBnd BClamp     = S.empty
@@ -276,6 +290,7 @@ collectVarsPat :: Pat a -> Set Var
 collectVarsPat pat =
   case pat of
     PVar _ v -> S.singleton v
+    PBound _ v _ -> S.singleton v
     PVec _ ps -> S.unions (map collectVarsPat ps)
 
 collectVarsShapeDim :: ShapeDim a -> Set Var

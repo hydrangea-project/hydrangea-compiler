@@ -57,6 +57,7 @@ import Language.Hydrangea.Syntax
   sort_indices { L.RangedToken L.SortIndices _ }
   iota       { L.RangedToken L.Iota _ }
   make_index { L.RangedToken L.MakeIndex _ }
+  bound      { L.RangedToken L.Bound _ }
   coo_sum_duplicates { L.RangedToken L.COOSumDuplicates _ }
   csr_from_sorted_coo { L.RangedToken L.CSRFromSortedCOO _ }
   index      { L.RangedToken L.Index _ }
@@ -220,6 +221,9 @@ exp :: { Exp L.Range }
       { ELetIn (L.rtRange $1 <-> info $5) (Dec (L.rtRange $1 <-> info $5) (mkLambdaName $1) ($2 : $3) Nothing $5) (EVar (L.rtRange $1 <-> info $5) (mkLambdaName $1)) }
   -- Binding
   | dec in exp               { ELetIn (info $1 <-> info $3) $1 $3 }
+  -- Bound-annotated binding: let x bound E = rhs in body
+  | let name bound atom '=' exp in exp
+      { EBoundLetIn (L.rtRange $1 <-> info $8) (unName $2) $4 $6 $8 }
 
 expapp :: { Exp L.Range }
   : expapp atom              { EApp (info $1 <-> info $2) $1 $2 }
@@ -383,6 +387,7 @@ patVec :: {[Pat L.Range]}
 pat :: { Pat L.Range }
   : name                       { PVar (info $1) (unName $1) }
   | '[' patVec ']'             { PVec (L.rtRange $1 <-> L.rtRange $3) $2 }
+  | name bound atom            { PBound (info $1 <-> info $3) (unName $1) $3 }
 
 
 optional(p)
