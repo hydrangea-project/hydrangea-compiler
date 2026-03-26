@@ -9,9 +9,11 @@
 -- cannot decide a query.
 module Language.Hydrangea.Solver where
 
+import Control.Monad (forM)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.Map (Map)
 import Data.Map qualified as M
+import Data.Set (Set)
 import Data.Set qualified as S
 import Data.SBV
 import Data.SBV.Control
@@ -60,6 +62,46 @@ findFalseConst = foldr go Nothing
         Just False -> Just pred'
         _ -> acc
 
+-- | Build a constant substitution map from hypotheses of the form
+-- @TVar v = TConst n@, @TDim arr i = TConst n@, or @TValBound arr = TConst n@.
+-- Used for one-pass constant propagation to detect concrete-false hypotheses
+-- that reference synthetic dim/bound variables (which evalPredConst cannot see).
+buildConstMap :: [Pred] -> Map Var Integer
+buildConstMap preds = M.fromList (concatMap extract preds)
+  where
+    extract (PEq l r) = extractPair l r ++ extractPair r l
+    extract _         = []
+    extractPair (TVar v)      (TConst n) = [(v, n)]
+    extractPair (TDim arr i)  (TConst n) = [(dimVarName arr i, n)]
+    extractPair (TValBound a) (TConst n) = [(valBoundName a, n)]
+    extractPair _ _                      = []
+
+-- | Substitute known constant values into a term.
+applyConstMapToTerm :: Map Var Integer -> Term -> Term
+applyConstMapToTerm m t =
+  case t of
+    TVar v       -> maybe t TConst (M.lookup v m)
+    TDim arr i   -> maybe t TConst (M.lookup (dimVarName arr i) m)
+    TValBound a  -> maybe t TConst (M.lookup (valBoundName a) m)
+    TConst _     -> t
+    TAdd l r     -> TAdd (f l) (f r)
+    TSub l r     -> TSub (f l) (f r)
+    TMul l r     -> TMul (f l) (f r)
+    TNeg x       -> TNeg (f x)
+  where f = applyConstMapToTerm m
+
+-- | Substitute known constant values into a predicate.
+applyConstMapToPred :: Map Var Integer -> Pred -> Pred
+applyConstMapToPred m p =
+  case p of
+    PLt  l r -> PLt  (f l) (f r)
+    PLe  l r -> PLe  (f l) (f r)
+    PEq  l r -> PEq  (f l) (f r)
+    PNeq l r -> PNeq (f l) (f r)
+    PGe  l r -> PGe  (f l) (f r)
+    PGt  l r -> PGt  (f l) (f r)
+  where f = applyConstMapToTerm m
+
 -- | Check satisfiability of symbolic predicates using SBV.
 --
 -- Returns @True@ for @Sat@ or @Unk@ (unknown) and @False@ for @Unsat@ so
@@ -95,11 +137,12 @@ buildVars vars = do
 predToSBV :: Map Var SInteger -> Pred -> SBool
 predToSBV env pred' =
   case pred' of
-    PLt l r -> termToSBV env l .< termToSBV env r
-    PLe l r -> termToSBV env l .<= termToSBV env r
-    PEq l r -> termToSBV env l .== termToSBV env r
-    PGe l r -> termToSBV env l .>= termToSBV env r
-    PGt l r -> termToSBV env l .> termToSBV env r
+    PLt  l r -> termToSBV env l .<  termToSBV env r
+    PLe  l r -> termToSBV env l .<= termToSBV env r
+    PEq  l r -> termToSBV env l .== termToSBV env r
+    PNeq l r -> termToSBV env l ./= termToSBV env r
+    PGe  l r -> termToSBV env l .>= termToSBV env r
+    PGt  l r -> termToSBV env l .>  termToSBV env r
 
 -- | Translate a term to an SBV integer expression.
 termToSBV :: Map Var SInteger -> Term -> SInteger
@@ -118,3 +161,90 @@ termToSBV env term =
       case M.lookup v env of
         Just symVar -> symVar
         Nothing -> literal 0
+
+-- ---------------------------------------------------------------------------
+-- Validity checking (hypothesis / obligation architecture)
+-- ---------------------------------------------------------------------------
+
+-- | Result of checking a single obligation against its hypotheses.
+data ObligationResult
+  = Verified                       -- ^ H ∧ ¬S is UNSAT: obligation is entailed.
+  | Counterexample [(Var, Integer)] -- ^ H ∧ ¬S is SAT: concrete witness values.
+  | ObligationUnknown              -- ^ Solver returned Unknown.
+  deriving (Show)
+
+-- | Check whether obligation @obl@ is entailed by @hyps@.
+--
+-- Runs Z3 on @hyps ∧ ¬obl@.  Returns @Verified@ if UNSAT (obligation holds),
+-- @Counterexample@ if SAT (obligation may be violated), or @ObligationUnknown@.
+checkObligation :: [Pred] -> Pred -> IO ObligationResult
+checkObligation hyps obl = do
+  let negObl   = negatePred obl
+      allPreds  = negObl : hyps
+      vars      = S.toList $ S.unions (map predVars allPreds)
+  runSMT $ do
+    symVars <- buildVars vars
+    mapM_ (constrain . predToSBV symVars) hyps
+    constrain (predToSBV symVars negObl)
+    query $ do
+      cs <- checkSat
+      case cs of
+        Unsat -> return Verified
+        Unk   -> return ObligationUnknown
+        Sat   -> do
+          vals <- mapM (\v -> (v,) <$> getValue (symVars M.! v)) vars
+          return (Counterexample vals)
+
+-- | Collect the set of SMT variables that appear in a predicate's hypotheses.
+hypVars :: [TaggedPred] -> Set Var
+hypVars tagged = S.unions [predVars p | Hyp p <- tagged]
+
+-- | Check all tagged predicates.
+--
+-- For each @Obl p@, if every SMT variable the obligation mentions is constrained
+-- by at least one hypothesis (i.e., the obligation variable set is a subset of
+-- the hypothesis variable set), run @checkObligation@.  Ungrounded obligations
+-- are treated as @ObligationUnknown@
+-- (warn, not error) to preserve backward compatibility with un-annotated programs.
+--
+-- Returns @Left failing_preds@ on failure, @Right residual@ (non-constant tagged
+-- preds) on success.
+checkTaggedPredicates :: [TaggedPred] -> IO (Either [Pred] [TaggedPred])
+checkTaggedPredicates tagged = do
+  let hyps = [p | Hyp p <- tagged]
+      obls = [p | Obl p <- tagged]
+      hVars = S.unions (map predVars hyps)
+  -- 1. Eagerly evaluate constant hypotheses.
+  let (constHyps, symHyps) = partitionConsts hyps
+  case findFalseConst constHyps of
+    Just p -> return (Left [p])
+    Nothing -> do
+      -- 1b. One-pass constant propagation: substitute dim/var constants from
+      -- hypotheses into other hypotheses, then re-run findFalseConst.  This
+      -- catches concrete-false symbolic hypotheses like
+      --   PEq (TMul (TDim src 0) (TDim src 1)) (TConst 5)
+      -- when there are also hyps TDim src 0 = 2 and TDim src 1 = 3.
+      let cmap = buildConstMap (constHyps ++ symHyps)
+          foldedHyps = map (applyConstMapToPred cmap) hyps
+          (foldedConsts, _) = partitionConsts foldedHyps
+      case findFalseConst foldedConsts of
+        Just p -> return (Left [p])
+        Nothing -> do
+          -- 2. Check each obligation.
+          -- An obligation is "grounded" only when every SMT variable it mentions is
+          -- constrained by at least one hypothesis.  Ungrounded obligations have free
+          -- variables that Z3 can assign arbitrarily, producing spurious counterexamples
+          -- for programs that are safe in practice.  We treat them as ObligationUnknown
+          -- (permissive) to preserve backward compatibility with un-annotated programs.
+          results <- forM obls $ \obl -> do
+            let oblVars = predVars obl
+            if oblVars `S.isSubsetOf` hVars
+              then do r <- checkObligation (symHyps ++ constHyps) obl
+                      return (obl, r)
+              else -- Some obligation variable has no hypothesis — treat as unknown.
+                   return (obl, ObligationUnknown)
+          -- 3. Collect failures.
+          let failures = [obl | (obl, Counterexample _) <- results]
+          if not (null failures)
+            then return (Left failures)
+            else return (Right tagged)

@@ -48,7 +48,10 @@ import Data.Maybe
 import Data.Set (Set, (\\))
 import Data.Set qualified as S
 import Language.Hydrangea.Lexer (Range)
-import Language.Hydrangea.Predicate (Pred (..), Term (..), predBindVars, substPredVars)
+import Language.Hydrangea.Predicate
+  ( Pred (..), TaggedPred (..), Term (..)
+  , predBindVars, substTaggedPredVars, untagPred
+  )
 import Language.Hydrangea.Solver
 import Language.Hydrangea.Syntax
 
@@ -103,7 +106,7 @@ pattern UTyRefine v t = UTerm (TyRefineF v t)
 -- | The inference monad: reader for the typing context, state for the
 -- predicate-variable supply, writer for accumulated 'Pred' obligations,
 -- 'ExceptT' for 'TypeError', and 'IntBindingT' for unification state.
-type Infer = ReaderT Ctx (StateT InferState (WriterT [Pred] (ExceptT TypeError (IntBindingT TypeF Identity))))
+type Infer = ReaderT Ctx (StateT InferState (WriterT [TaggedPred] (ExceptT TypeError (IntBindingT TypeF Identity))))
 
 -- | Typing context mapping term variables to their polymorphic types.
 type Ctx = Map Var UPolytype
@@ -282,13 +285,13 @@ instantiate (Forall xs preds uty) = do
     if null xs
       then return (preds, uty)
       else do
-        let vars = S.toList $ S.unions (map predBindVars preds) `S.union` refineBindVars uty
+        let vars = S.toList $ S.unions (map (predBindVars . untagPred) preds) `S.union` refineBindVars uty
         subs <- forM vars $ \v -> do
           v' <- freshPredVar
           return (v, v')
         let env = M.fromList subs
             rename v = fromMaybe v (M.lookup v env)
-        return (map (substPredVars rename) preds, substRefineVars rename uty)
+        return (map (substTaggedPredVars rename) preds, substRefineVars rename uty)
   tell preds'
   return $ substU (M.fromList (zip (map Left xs) xs')) uty'
 
@@ -330,8 +333,8 @@ generalize uty = do
       xs = map (either id (mkVarName "a")) fvs
   return $ Forall xs [] (substU (M.fromList (zip fvs (map UTyVar xs))) uty')
 
--- | Generalize a type and attach the collected refinement predicates to the resulting scheme.
-generalizeWithPreds :: [Pred] -> UType -> Infer UPolytype
+-- | Generalize a type and attach the collected tagged refinement predicates to the resulting scheme.
+generalizeWithPreds :: [TaggedPred] -> UType -> Infer UPolytype
 generalizeWithPreds preds uty = do
   Forall xs _ ty <- generalize uty
   return $ Forall xs preds ty
@@ -429,18 +432,30 @@ expectedShapeFromExp (EVec _ elems) = do
   return $ mkTyConsFromVec tys
 expectedShapeFromExp e = normalizeShapeToTupleOfInts (firstParam e) =<< infer e
 
--- | Emit a refinement predicate obligation into the writer.
+-- | Emit a known fact (hypothesis) into the writer.
+emitHyp :: Pred -> Infer ()
+emitHyp p = tell [Hyp p]
+
+-- | Emit a safety obligation into the writer.
+emitObl :: Pred -> Infer ()
+emitObl p = tell [Obl p]
+
+-- | Backward-compatible alias: emit as a hypothesis (facts established during inference).
 emitPred :: Pred -> Infer ()
-emitPred pred' = tell [pred']
+emitPred = emitHyp
 
 -- | Emit a non-fatal diagnostic warning.
 emitWarning :: String -> Infer ()
 emitWarning w = modify (\s -> s { inferWarnings = inferWarnings s ++ [w] })
 
 -- | Run an action with an extra value-bound annotation in scope for one variable.
+-- Emits @0 ≤ v@ and @v < t@ as SMT hypotheses so the validity checker can use
+-- them when discharging index-safety obligations.
 -- The annotation is removed (restored to prior state) when the action completes.
 withValBound :: Var -> Term -> Infer a -> Infer a
 withValBound v t m = do
+  emitHyp (PLe (TConst 0) (TVar v))
+  emitHyp (PLt (TVar v) t)
   st <- get
   modify (\s -> s { valBoundCtx = M.insert v t (valBoundCtx s) })
   x <- m
@@ -450,6 +465,27 @@ withValBound v t m = do
 -- | Look up the value-bound annotation for a variable, if any.
 lookupValBound :: Var -> Infer (Maybe Term)
 lookupValBound v = gets (M.lookup v . valBoundCtx)
+
+-- | Propagate PBound annotations from a list of patterns into valBoundCtx for
+-- the duration of an action.  Called around function body inference so that
+-- @[i bound N]@ patterns are visible to 'EIndex' and other bound-sensitive
+-- constructs inside the body.
+withBoundsFromPats :: [Pat Range] -> Infer a -> Infer a
+withBoundsFromPats [] m = m
+withBoundsFromPats (PBound _ v bExp : ps) m = do
+  bt <- termFromExp bExp
+  withValBound v bt $ withBoundsFromPats ps m
+withBoundsFromPats (PVec _ vs : ps) m =
+  withBoundsFromPatsFlat vs $ withBoundsFromPats ps m
+withBoundsFromPats (_ : ps) m = withBoundsFromPats ps m
+
+-- | Like 'withBoundsFromPats' but for the flat sub-pattern list inside a PVec.
+withBoundsFromPatsFlat :: [Pat Range] -> Infer a -> Infer a
+withBoundsFromPatsFlat [] m = m
+withBoundsFromPatsFlat (PBound _ v bExp : ps) m = do
+  bt <- termFromExp bExp
+  withValBound v bt $ withBoundsFromPatsFlat ps m
+withBoundsFromPatsFlat (_ : ps) m = withBoundsFromPatsFlat ps m
 
 -- | Extract a refinement term from a restricted set of integer expressions.
 -- Unsupported forms are conservatively replaced by fresh predicate variables.
@@ -467,7 +503,15 @@ termFromExp expr =
         Minus _ -> return $ TSub t1 t2
         Times _ -> return $ TMul t1 t2
         _ -> TVar <$> freshPredVar
-    _ -> TVar <$> freshPredVar
+    _ -> do
+      -- For expressions not directly translatable (e.g. record field projections),
+      -- infer the type and use the refinement variable if present.  This preserves
+      -- the concrete value chain (e.g. coo.nnz = 6 → pred-var p with hyp p = 6).
+      ty <- infer expr
+      ty' <- applyBindings ty
+      case fst (unwrapRefine ty') of
+        Just v  -> return (TVar v)
+        Nothing -> TVar <$> freshPredVar
 
 -- | Interpret index expressions as a list of refinement terms.
 -- Vector indices map to per-dimension terms; scalars become singleton lists.
@@ -482,6 +526,22 @@ termsFromIndexExp (EShapeOf _ arrExp) = do
   arrVar <- maybe freshPredVar return mArrVar
   return [TDim arrVar i | i <- [0 .. rank - 1]]
 termsFromIndexExp e = (: []) <$> termFromExp e
+
+-- | Like 'termsFromIndexExp' but pairs each term with the source expression
+-- it was derived from (for use by 'inferBVal' in bounds checking).
+-- Returns 'Nothing' for dimensions coming from 'EShapeOf', which are runtime
+-- values with no statically analysable expression.
+termsAndExpsFromIndex :: Exp Range -> Infer [(Term, Maybe (Exp Range))]
+termsAndExpsFromIndex (EVec _ elems) = do
+  ts <- mapM termFromExp elems
+  return $ zip ts (map Just elems)
+termsAndExpsFromIndex (EUnit _) = return []
+termsAndExpsFromIndex e@(EShapeOf _ _) = do
+  ts <- termsFromIndexExp e
+  return [(t, Nothing) | t <- ts]
+termsAndExpsFromIndex e = do
+  t <- termFromExp e
+  return [(t, Just e)]
 
 -- ---------------------------------------------------------------------------
 -- Value-bound propagation for generator body expressions
@@ -763,15 +823,19 @@ infer (EGenerate _ shapeExp fn) = do
   _ <- wrange (firstParam shapeExp) $ fty =:= UTyFun sTy' elemTy
   (arrVar, arrTy) <- freshRefined (UTyArray sTy' elemTy)
   shapeTerms <- termsFromIndexExp shapeExp
-  forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
+  forM_ (zip [0 ..] shapeTerms) $ \(i, t) -> do
     emitPred (PEq (TDim arrVar i) t)
+    -- Implicit invariant: all generate dimensions are ≥ 1.  Emit as hypothesis
+    -- so the validity checker can use it (e.g., index [0] on a symbolic-size
+    -- array is safe when dim ≥ 1).
+    emitHyp (PLe (TConst 1) (TDim arrVar i))
   -- Attempt to infer value bound from generator body if PBound annotation present.
   case extractPBoundInfo fn of
     Nothing -> return ()
     Just (idxVar, idxBoundExp) -> do
       idxBoundTerm <- termFromExp idxBoundExp
       -- Soundness: shape must not exceed the declared input bound.
-      emitPred (PLe (TDim arrVar 0) idxBoundTerm)
+      emitObl (PLe (TDim arrVar 0) idxBoundTerm)
       -- Infer output bound from body expression.
       mOutBound <- withValBound idxVar idxBoundTerm $ inferBodyBound fn
       case mOutBound of
@@ -877,9 +941,9 @@ infer (ESlice _ sliceDims arrExp) = do
         _ <- wrange (firstParam len) $ lenTy =:= UTyInt
         tStart <- termFromExp start
         tLen <- termFromExp len
-        emitPred (PLe (TConst 0) tStart)
-        emitPred (PLe (TConst 0) tLen)
-        emitPred (PLe (TAdd tStart tLen) (TDim srcVar i))
+        emitObl (PLe (TConst 0) tStart)
+        emitObl (PLe (TConst 0) tLen)
+        emitObl (PLe (TAdd tStart tLen) (TDim srcVar i))
   let outShape = mkTyConsFromVec (replicate srcRank UTyInt)
   (arrVar, arrTyOut) <- freshRefined (UTyArray outShape eTy)
   forM_ (zip [0 ..] sliceDims) $ \(i, dim) ->
@@ -1203,7 +1267,7 @@ infer (EGather _ idxArr arrExp) = do
   -- UTyRefine wrapper in stored polytypes.
   case (mIdxVar, mSrcVar) of
     (Just idxVar, Just srcVar) ->
-      emitPred (PLe (TValBound idxVar) (TDim srcVar 0))
+      emitObl (PLe (TValBound idxVar) (TDim srcVar 0))
     _ -> return ()
   return arrTyOut
 infer (EIndex _ idx arrExp) = do
@@ -1213,11 +1277,22 @@ infer (EIndex _ idx arrExp) = do
   sTy' <- applyBindings sTy
   idxTy' <- applyBindings idxTy
   _ <- wrange (firstParam idx) $ idxTy' =:= sTy'
-  idxTerms <- termsFromIndexExp idx
-  arrVar   <- maybe freshPredVar return mArrVar
-  forM_ (zip [0 ..] idxTerms) $ \(i, t) -> do
-    emitPred (PLe (TConst 0) t)
-    emitPred (PLt t (TDim arrVar i))
+  pairs  <- termsAndExpsFromIndex idx
+  arrVar <- maybe freshPredVar return mArrVar
+  forM_ (zip [0 ..] pairs) $ \(i, (t, mExp)) -> do
+    emitObl (PLe (TConst 0) t)
+    emitObl (PLt t (TDim arrVar i))
+    -- If the index sub-expression has a statically known exclusive upper bound
+    -- (via valBoundCtx or arithmetic over bounded variables), emit a verifiable
+    -- constraint: bound ≤ dim(arr, i).  This makes index safety checkable for
+    -- variables introduced with [x bound N] or let x bound N = ... in ...
+    case mExp of
+      Nothing -> return ()   -- EShapeOf: no static expression to analyse
+      Just e  -> do
+        mb <- inferBVal e
+        case mb of
+          Just (BoundOf b) -> emitObl (PLe b (TDim arrVar i))
+          _                -> return ()  -- no useful bound; check remains permissive
   return eTy
 infer (ECheckIndex _ idx defVal arrExp) = do
   idxTy <- infer idx
@@ -1260,6 +1335,7 @@ infer (ELetIn r dec e) = do
   -- collecting refinement predicates emitted inside.  After generalization
   -- the binding is re-introduced with a polymorphic scheme for the body @e@.
   (rhsTy, rhsPreds) <- censor (const []) $ listen $
+    withBoundsFromPats pats $
     bindPats patBinds $ withBinding v (Forall [] [] funTy) $ do
       inferredBodyTy <- infer body
       _ <- inferredBodyTy =:= bodyTy
@@ -1275,7 +1351,7 @@ infer (EBoundLetIn _ x boundExp rhs body) = do
   -- Try to verify the bound statically; warn if we cannot.
   mRhsBound <- inferValBound rhs
   case mRhsBound of
-    Just rhsBound -> emitPred (PLe rhsBound boundTerm)
+    Just rhsBound -> emitObl (PLe rhsBound boundTerm)
     Nothing -> emitWarning $
       "note: bound annotation on '" ++ BS.unpack x ++ "' not statically verified"
   -- Bind x as Int with bound in context for the body.
@@ -1379,7 +1455,8 @@ inferDecs (Dec r var pats mty e : rest) = do
   bodyTy    <- fresh
   skolemAnn <- mapM (skolemize . toUPolytype) mty
   (patBinds, funTy) <- buildPatFunType r bodyTy pats skolemAnn
-  (inferredBodyTy, rhsPreds) <- censor (const []) $ listen $ bindPats patBinds $ infer e
+  (inferredBodyTy, rhsPreds) <- censor (const []) $ listen $
+    withBoundsFromPats pats $ bindPats patBinds $ infer e
   _ <- inferredBodyTy =:= bodyTy
   case skolemAnn of
     Just ann -> void $ wrange r (funTy =:= ann)
@@ -1507,8 +1584,8 @@ finalizePolyWithOptions :: InferOptions -> Polytype -> IO (Either TypeError Poly
 finalizePolyWithOptions opts poly
   | not (inferSolveRefinements opts) = return (Right poly)
   | otherwise = do
-  let Forall xs preds ty = poly
-  checked <- checkPredicates preds
+  let Forall xs tagged ty = poly
+  checked <- checkTaggedPredicates tagged
   case checked of
-    Left _ -> return $ Left (UnsatConstraints preds)
+    Left failing -> return $ Left (UnsatConstraints failing)
     Right residual -> return $ Right (Forall xs residual ty)

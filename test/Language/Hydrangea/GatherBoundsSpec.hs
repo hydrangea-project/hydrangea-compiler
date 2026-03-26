@@ -252,6 +252,12 @@ spec = describe "gather bounds checking" $ do
   describe "make_index warnings" $ do
 
     it "make_index emits a warning about unverified bound" $ do
+      let src = BS.unlines
+            [ "let src     = generate [10] (let f [i] = i in f)"
+            , "let raw_idx = generate [5]  (let f [i] = 0 in f)"
+            , "let idx     = make_index 10 raw_idx"
+            , "let main    = gather idx src"
+            ]
       case readDecs src of
         Left err -> expectationFailure ("Parse error: " ++ err)
         Right decs -> do
@@ -260,10 +266,59 @@ spec = describe "gather bounds checking" $ do
             Left msg -> expectationFailure ("Expected success: " ++ msg)
             Right (_, warnings) ->
               warnings `shouldSatisfy` any (isInfixOf "make_index")
-      where
-        src = BS.unlines
-          [ "let src     = generate [10] (let f [i] = i in f)"
-          , "let raw_idx = generate [5]  (let f [i] = 0 in f)"
-          , "let idx     = make_index 10 raw_idx"
-          , "let main    = gather idx src"
-          ]
+
+  -- ------------------------------------------------------------------ --
+  -- index bounds checking
+  -- ------------------------------------------------------------------ --
+  describe "index bounds checking" $ do
+
+    it "index with EBoundLetIn bound is safe when arr is large enough" $ do
+      -- let y bound 5 = 3 in index [y] arr; arr has 5 elements → PLe 5 5 → SAT
+      expectDecsOk $ BS.unlines
+        [ "let arr  = generate [5] (let f [i] = i in f)"
+        , "let main = let y bound 5 = 3 in index [y] arr"
+        ]
+
+    it "index with bound larger than arr is rejected" $ do
+      -- let y bound 5 = 3 in index [y] arr; arr has 4 elements → PLe 5 4 → UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [4] (let f [i] = i in f)"
+            , "let main = let y bound 5 = 3 in index [y] arr"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "index x+1 with bound is safe when arr is large enough" $ do
+      -- x bound 5 → bound of x+1 = 6 → arr has 6 elements → PLe 6 6 → SAT
+      expectDecsOk $ BS.unlines
+        [ "let arr  = generate [6] (let f [i] = i in f)"
+        , "let main = let x bound 5 = 3 in index [x + 1] arr"
+        ]
+
+    it "index x+1 with bound too large is rejected" $ do
+      -- x bound 5 → bound of x+1 = 6 → arr has 5 elements → PLe 6 5 → UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [5] (let f [i] = i in f)"
+            , "let main = let x bound 5 = 3 in index [x + 1] arr"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "index inside generator with PBound is safe" $ do
+      -- i bound 5 via PBound, arr has 5 elements → PLe 5 5 → SAT
+      expectDecsOk $ BS.unlines
+        [ "let arr  = generate [5] (let f [i] = i in f)"
+        , "let main = generate [5] (let f [i bound 5] = index [i] arr in f)"
+        ]
+
+    it "index inside generator with PBound, arr too small, is rejected" $ do
+      -- i bound 5 via PBound, arr has 4 elements → PLe 5 4 → UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let arr  = generate [4] (let f [i] = i in f)"
+            , "let main = generate [5] (let f [i bound 5] = index [i] arr in f)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")

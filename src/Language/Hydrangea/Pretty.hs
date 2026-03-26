@@ -58,7 +58,7 @@ instance (Pretty t) => Pretty (Poly t) where
     let headDoc = text "forall" <+> hsep (map (text . unpack) vars) <+> text "." <+> pPrint t
      in if null preds
           then headDoc
-          else headDoc <+> text "where" <+> braces (sep (punctuate comma (map pPrint preds)))
+          else headDoc <+> text "where" <+> braces (sep (punctuate comma (map (pPrint . untagPred) preds)))
 
 instance Pretty Term where
   pPrint term =

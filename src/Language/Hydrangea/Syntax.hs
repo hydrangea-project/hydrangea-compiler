@@ -31,7 +31,7 @@ import Data.Functor.Fixedpoint
 import Data.List (sortOn)
 import Data.Ord.Deriving
 import GHC.Generics (Generic1)
-import Language.Hydrangea.Predicate (Pred)
+import Language.Hydrangea.Predicate (TaggedPred)
 import Text.Show.Deriving
 
 -- | Variables in our syntax are just bytestrings
@@ -169,8 +169,12 @@ type Type = Fix TypeF
 -- | Hydrangea type with unification variables: @UTerm TypeF IntVar@.
 type UType = UTerm TypeF IntVar
 
--- | Universally quantified type scheme with refinement predicates.
-data Poly t = Forall [Var] [Pred] t
+-- | Universally quantified type scheme with tagged refinement predicates.
+--
+-- Predicates are split into hypotheses (@Hyp@, known facts) and obligations
+-- (@Obl@, safety conditions that must be entailed).  The @Pred@ alias is kept
+-- for backward compatibility in patterns that peel @untagPred@.
+data Poly t = Forall [Var] [TaggedPred] t
   deriving (Functor, Eq, Show, Ord)
 
 -- | Fully elaborated polymorphic types over concrete syntax types.

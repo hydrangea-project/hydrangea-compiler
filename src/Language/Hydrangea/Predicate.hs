@@ -46,12 +46,43 @@ data Term
 
 -- | Predicates over refinement terms.
 data Pred
-  = PLt Term Term
-  | PLe Term Term
-  | PEq Term Term
-  | PGe Term Term
-  | PGt Term Term
+  = PLt  Term Term
+  | PLe  Term Term
+  | PEq  Term Term
+  | PNeq Term Term   -- ^ Disequality: used as the negation of PEq in validity checks.
+  | PGe  Term Term
+  | PGt  Term Term
   deriving (Eq, Ord, Show, Generic)
+
+-- | A predicate tagged as a hypothesis (known fact) or a safety obligation.
+--
+-- Hypotheses are assumed true (shape equalities, declared bounds).  Obligations
+-- are conditions that must be *entailed* by the hypotheses: for each obligation
+-- @S@ with hypotheses @H@, the solver checks that @H ∧ ¬S@ is UNSAT (i.e., @S@
+-- is valid given @H@).  This is validity checking, not satisfiability checking.
+data TaggedPred
+  = Hyp Pred   -- ^ A known fact (shape equality, declared bound).
+  | Obl Pred   -- ^ A safety obligation (must be entailed by hypotheses).
+  deriving (Eq, Ord, Show, Generic)
+
+-- | Extract the underlying predicate from a tagged predicate.
+untagPred :: TaggedPred -> Pred
+untagPred (Hyp p) = p
+untagPred (Obl p) = p
+
+-- | Negate a predicate (used to form the check @H ∧ ¬S@ for validity).
+negatePred :: Pred -> Pred
+negatePred (PLt  l r) = PGe l r
+negatePred (PLe  l r) = PGt l r
+negatePred (PEq  l r) = PNeq l r
+negatePred (PNeq l r) = PEq  l r
+negatePred (PGe  l r) = PLt  l r
+negatePred (PGt  l r) = PLe  l r
+
+-- | Substitute variables inside a tagged predicate.
+substTaggedPredVars :: (Var -> Var) -> TaggedPred -> TaggedPred
+substTaggedPredVars f (Hyp p) = Hyp (substPredVars f p)
+substTaggedPredVars f (Obl p) = Obl (substPredVars f p)
 
 -- | Convert a dimension projection into a synthetic variable name used in the solver.
 dimVarName :: Var -> Int -> Var
@@ -94,21 +125,23 @@ termBindVars term =
 predVars :: Pred -> Set Var
 predVars pred' =
   case pred' of
-    PLt l r -> termVars l <> termVars r
-    PLe l r -> termVars l <> termVars r
-    PEq l r -> termVars l <> termVars r
-    PGe l r -> termVars l <> termVars r
-    PGt l r -> termVars l <> termVars r
+    PLt  l r -> termVars l <> termVars r
+    PLe  l r -> termVars l <> termVars r
+    PEq  l r -> termVars l <> termVars r
+    PNeq l r -> termVars l <> termVars r
+    PGe  l r -> termVars l <> termVars r
+    PGt  l r -> termVars l <> termVars r
 
 -- | Collect binder variables referenced by a predicate.
 predBindVars :: Pred -> Set Var
 predBindVars pred' =
   case pred' of
-    PLt l r -> termBindVars l <> termBindVars r
-    PLe l r -> termBindVars l <> termBindVars r
-    PEq l r -> termBindVars l <> termBindVars r
-    PGe l r -> termBindVars l <> termBindVars r
-    PGt l r -> termBindVars l <> termBindVars r
+    PLt  l r -> termBindVars l <> termBindVars r
+    PLe  l r -> termBindVars l <> termBindVars r
+    PEq  l r -> termBindVars l <> termBindVars r
+    PNeq l r -> termBindVars l <> termBindVars r
+    PGe  l r -> termBindVars l <> termBindVars r
+    PGt  l r -> termBindVars l <> termBindVars r
 
 -- | Substitute variables inside a term.
 substTermVars :: (Var -> Var) -> Term -> Term
@@ -127,11 +160,12 @@ substTermVars f term =
 substPredVars :: (Var -> Var) -> Pred -> Pred
 substPredVars f pred' =
   case pred' of
-    PLt l r -> PLt (substTermVars f l) (substTermVars f r)
-    PLe l r -> PLe (substTermVars f l) (substTermVars f r)
-    PEq l r -> PEq (substTermVars f l) (substTermVars f r)
-    PGe l r -> PGe (substTermVars f l) (substTermVars f r)
-    PGt l r -> PGt (substTermVars f l) (substTermVars f r)
+    PLt  l r -> PLt  (substTermVars f l) (substTermVars f r)
+    PLe  l r -> PLe  (substTermVars f l) (substTermVars f r)
+    PEq  l r -> PEq  (substTermVars f l) (substTermVars f r)
+    PNeq l r -> PNeq (substTermVars f l) (substTermVars f r)
+    PGe  l r -> PGe  (substTermVars f l) (substTermVars f r)
+    PGt  l r -> PGt  (substTermVars f l) (substTermVars f r)
 
 -- | Evaluate a term to a constant if it contains no symbolic variables.
 evalTermConst :: Term -> Maybe Integer
@@ -150,11 +184,12 @@ evalTermConst term =
 evalPredConst :: Pred -> Maybe Bool
 evalPredConst pred' =
   case pred' of
-    PLt l r -> (<) <$> evalTermConst l <*> evalTermConst r
-    PLe l r -> (<=) <$> evalTermConst l <*> evalTermConst r
-    PEq l r -> (==) <$> evalTermConst l <*> evalTermConst r
-    PGe l r -> (>=) <$> evalTermConst l <*> evalTermConst r
-    PGt l r -> (>) <$> evalTermConst l <*> evalTermConst r
+    PLt  l r -> (<)  <$> evalTermConst l <*> evalTermConst r
+    PLe  l r -> (<=) <$> evalTermConst l <*> evalTermConst r
+    PEq  l r -> (==) <$> evalTermConst l <*> evalTermConst r
+    PNeq l r -> (/=) <$> evalTermConst l <*> evalTermConst r
+    PGe  l r -> (>=) <$> evalTermConst l <*> evalTermConst r
+    PGt  l r -> (>)  <$> evalTermConst l <*> evalTermConst r
 
 -- | Pack a regular string into the bytestring representation used for variables.
 fromString :: String -> ByteString
