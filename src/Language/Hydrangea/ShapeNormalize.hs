@@ -201,6 +201,8 @@ normExp expr = case expr of
   EWriteArrayFloat a arr f -> EWriteArrayFloat a <$> normExp arr <*> normExp f
   EGetEnvInt a e -> EGetEnvInt a <$> normExp e
   EGetEnvString a e -> EGetEnvString a <$> normExp e
+  EBoundLetIn a v boundExp rhs body ->
+    EBoundLetIn a v <$> normExp boundExp <*> normExp rhs <*> normExp body
   EStencil a bnd f arr -> EStencil a <$> normBnd bnd <*> normExp f <*> normExp arr
 
 normBnd :: BoundaryCondition a -> ShapeM a (BoundaryCondition a)

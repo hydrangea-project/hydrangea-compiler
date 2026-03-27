@@ -783,6 +783,8 @@ evalBinOp (VInt a) (Minus _) (VInt b) = pure $ VInt (a - b)
 evalBinOp (VInt a) (Times _) (VInt b) = pure $ VInt (a * b)
 evalBinOp (VInt a) (Divide _) (VInt b) =
   if b == 0 then Left DivisionByZero else pure $ VInt (a `div` b)
+evalBinOp (VInt a) (Mod _) (VInt b) =
+  if b == 0 then Left DivisionByZero else pure $ VInt (a `mod` b)
 evalBinOp (VInt a) (Eq _) (VInt b) = pure $ VBool (a == b)
 evalBinOp (VInt a) (Neq _) (VInt b) = pure $ VBool (a /= b)
 evalBinOp (VInt a) (Lt _) (VInt b) = pure $ VBool (a < b)
@@ -943,6 +945,7 @@ operatorToString (Plus _) = "+"
 operatorToString (Minus _) = "-"
 operatorToString (Times _) = "*"
 operatorToString (Divide _) = "/"
+operatorToString (Mod _) = "%"
 operatorToString (Eq _) = "=="
 operatorToString (Neq _) = "<>"
 operatorToString (Lt _) = "<"

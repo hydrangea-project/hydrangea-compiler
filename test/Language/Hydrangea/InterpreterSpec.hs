@@ -96,6 +96,13 @@ spec = do
       expectEval "10 / 2" (VInt 5)
       expectEval "7 / 2" (VInt 3)
 
+    it "evaluates modulo" $ do
+      expectEval "10 % 3" (VInt 1)
+      expectEval "9 % 3" (VInt 0)
+      expectEval "0 % 5" (VInt 0)
+      expectEval "7 % 7" (VInt 0)
+      expectEval "1 % 8" (VInt 1)
+
     it "evaluates negation" $ do
       expectEval "-42" (VInt (-42))
       expectEval "-(5 + 3)" (VInt (-8))

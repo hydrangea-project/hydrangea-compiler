@@ -219,6 +219,7 @@ lowerExp expr = case expr of
           Minus _ -> "__prim_sub"
           Times _ -> "__prim_mul"
           Divide _ -> "__prim_div"
+          Mod _    -> "__prim_mod"
           Eq _ -> "__prim_eq"
           Neq _ -> "__prim_neq"
           Lt _ -> "__prim_lt"
@@ -1585,6 +1586,17 @@ handleApp fn arg = case fn of
         (sa, aa) <- lowerExp arg
         t <- freshCVar "t"
         pure (sa ++ [SAssign t (RCall fName [aa])], AVar t)
+  -- Saturated binary operator: ((op) lhs) rhs  →  lhs op rhs
+  -- This pattern appears when fusion builds EApp (EApp (EOp op) lhs) rhs
+  -- instead of EBinOp, e.g. the fused scatter combinator.
+  EApp _ (EOp _ op) innerArg -> do
+    (s1, a1) <- lowerExp innerArg
+    (s2, a2) <- lowerExp arg
+    t <- freshCVar "t"
+    let bop = lowerBinOp op
+    when (isFloatBinOp bop) $ registerCType t CTDouble
+    pure (s1 ++ s2 ++ [SAssign t (RBinOp bop a1 a2)], AVar t)
+
   EApp _ (EVar _ fName) firstArg -> do
     mFn <- lookupFn fName
     case mFn of
@@ -1797,6 +1809,7 @@ lowerBinOp (Plus _) = CAdd
 lowerBinOp (Minus _) = CSub
 lowerBinOp (Times _) = CMul
 lowerBinOp (Divide _) = CDiv
+lowerBinOp (Mod _) = CMod
 lowerBinOp (Eq _) = CEq
 lowerBinOp (Neq _) = CNeq
 lowerBinOp (Lt _) = CLt

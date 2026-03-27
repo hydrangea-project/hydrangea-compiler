@@ -433,6 +433,7 @@ firstParam e = case e of
   EGetEnvInt a _ -> a
   EGetEnvString a _ -> a
   EStencil a _ _ _ -> a
+  EBoundLetIn a _ _ _ _ -> a
 
 deriving instance (Show a) => Show (Exp a)
 
@@ -463,6 +464,7 @@ data Operator a
   | Minus a   -- ^ Integer subtraction.
   | Times a   -- ^ Integer multiplication.
   | Divide a  -- ^ Integer division.
+  | Mod a     -- ^ Integer modulo (non-negative result; `x % m` is in [0, m) for m > 0).
   | Eq a      -- ^ Integer equality.
   | Neq a     -- ^ Integer inequality.
   | Lt a      -- ^ Integer less-than.

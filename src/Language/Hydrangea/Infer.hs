@@ -612,6 +612,12 @@ inferBVal expr = case expr of
         (Just (ExactVal (TConst k)), Just b2, _, _) | k > 0 -> Just (bvalMulConst k b2)
         (Just b1, Just (ExactVal (TConst k)), _, _) | k > 0 -> Just (bvalMulConst k b1)
         _ -> Nothing
+    Mod _ -> do
+      mb2 <- inferBVal e2
+      return $ case mb2 of
+        Just (ExactVal m) -> Just (BoundOf m)  -- x % m  <  m  (exact modulus)
+        Just (BoundOf m)  -> Just (BoundOf m)  -- x % m  <  m  (upper bound on modulus)
+        _                 -> Nothing
     _ -> return Nothing
   _ -> return Nothing
   where
@@ -651,9 +657,50 @@ extractFnParamVars _                                = []
 
 -- | Compute the value bound of an inline generator body, with the index
 -- variable already registered in the caller's 'valBoundCtx'.
+-- Used by Case 1 (PBound) and by EMap/EZipWith bound propagation.
 inferBodyBound :: Exp Range -> Infer (Maybe Term)
 inferBodyBound (ELetIn _ (Dec _ _ _ _ body) _) = inferValBound body
 inferBodyBound _ = return Nothing
+
+-- | Infer the terminal bound from a function whose body is a chain of
+-- @EBoundLetIn@ nodes (Case 3 in EGenerate).  Traverses regular @ELetIn@
+-- wrappers and @EBoundLetIn@ nodes (adding their declared bounds to
+-- 'valBoundCtx' without emitting hypotheses), then returns the bound of the
+-- final expression only when it is a variable declared in the chain above.
+-- Returns 'Nothing' for arithmetic expressions or un-annotated variables,
+-- so it never emits spurious bounds for bodies that were not explicitly
+-- annotated.
+inferBodyBoundChain :: Exp Range -> Infer (Maybe Term)
+inferBodyBoundChain (ELetIn _ (Dec _ _ _ _ chainBody) _) = chainExprBound chainBody
+inferBodyBoundChain _ = return Nothing
+
+chainExprBound :: Exp Range -> Infer (Maybe Term)
+chainExprBound (EBoundLetIn _ v boundExp _ body) = do
+  bt <- termFromExp boundExp
+  st <- get
+  modify (\s -> s { valBoundCtx = M.insert v bt (valBoundCtx s) })
+  result <- chainExprBound body
+  modify (\s -> s { valBoundCtx = valBoundCtx st })
+  return result
+chainExprBound (ELetIn _ _ body) = chainExprBound body
+chainExprBound (EVar _ v) = do
+  mb <- lookupValBound v
+  return $ fmap toBound (BoundOf <$> mb)
+chainExprBound _ = return Nothing
+
+-- | Extract the body expression from an inline function @let f p = body in f@.
+extractFnBody :: Exp Range -> Maybe (Exp Range)
+extractFnBody (ELetIn _ (Dec _ _ _ _ body) _) = Just body
+extractFnBody _                                = Nothing
+
+-- | Infer per-component value bounds from a vector-literal body @[e0, e1, ...]@.
+-- Returns @Just [b0, b1, ...]@ when every component has an inferrable bound,
+-- @Nothing@ otherwise (caller silently skips multi-dim bound emission).
+inferVecElemBounds :: Exp Range -> Infer (Maybe [Term])
+inferVecElemBounds (EVec _ es) = do
+  mBounds <- mapM inferValBound es
+  return $ sequence mBounds
+inferVecElemBounds _ = return Nothing
 
 -- | Count the number of dimensions in a shape type after normalization.
 shapeArityFromType :: Range -> UType -> Infer Int
@@ -761,7 +808,7 @@ infer (ERecordProj r e field) = do
       applyBindings fieldTy
 infer (EBinOp _ e1 op e2) = case op of
   Plus _    -> ii UTyInt;   Minus _   -> ii UTyInt
-  Times _   -> ii UTyInt;   Divide _  -> ii UTyInt
+  Times _   -> ii UTyInt;   Divide _  -> ii UTyInt;  Mod _     -> ii UTyInt
   Eq _      -> ii UTyBool;  Neq _     -> ii UTyBool
   Lt _      -> ii UTyBool;  Le _      -> ii UTyBool
   Gt _      -> ii UTyBool;  Ge _      -> ii UTyBool
@@ -870,9 +917,10 @@ infer (EGenerate _ shapeExp fn) = do
   forM_ (zip [0 ..] argDimVars) $ \(i, dv) -> do
     emitHyp (PLe (TConst 0) (TVar dv))
     emitHyp (PLt (TVar dv) (TDim arrVar i))
-  -- Attempt to infer value bound from generator body if PBound annotation present.
+  -- Attempt to infer value bound from generator body.
+  -- Case 1: PBound annotation present — scalar bound with a declared index range.
+  -- Case 2: EVec body — per-component bounds for tuple-producing generators.
   case extractPBoundInfo fn of
-    Nothing -> return ()
     Just (idxVar, idxBoundExp) -> do
       idxBoundTerm <- termFromExp idxBoundExp
       -- Soundness: shape must not exceed the declared input bound.
@@ -880,8 +928,28 @@ infer (EGenerate _ shapeExp fn) = do
       -- Infer output bound from body expression.
       mOutBound <- withValBound idxVar idxBoundTerm $ inferBodyBound fn
       case mOutBound of
-        Just outBound -> emitPred (PEq (TValBound arrVar) outBound)
+        Just outBound -> emitPred (PEq (TValBoundDim arrVar 0) outBound)
         Nothing -> emitWarning "note: generator body value bound not statically inferred"
+    Nothing ->
+      -- Try per-component bounds when the body is an EVec literal.
+      -- Bind the first index variable from the parameter pattern so that
+      -- components like @k@ can be resolved relative to the array dimension.
+      case extractFnParamVars fn of
+        (idxVar : _) -> do
+          let idxBound = TDim arrVar 0
+          mCompBounds <- withValBound idxVar idxBound $ do
+            case extractFnBody fn of
+              Just body -> inferVecElemBounds body
+              Nothing   -> return Nothing
+          forM_ (maybe [] (zip [0..]) mCompBounds) $ \(i, b) ->
+            emitPred (PEq (TValBoundDim arrVar i) b)
+          -- Case 3: EBoundLetIn chain in the body — try scalar bound propagation.
+          -- Runs only when Case 2 (EVec) found no per-component bounds.
+          when (isNothing mCompBounds) $ do
+            mOutBound <- withValBound idxVar idxBound $ inferBodyBoundChain fn
+            forM_ mOutBound $ \outBound ->
+              emitPred (PEq (TValBoundDim arrVar 0) outBound)
+        [] -> return ()
   return arrTy
 infer (EReadArray _ shapeExp fileExp) = do
   fTy <- infer fileExp
@@ -935,7 +1003,7 @@ infer (EFill _ shapeExp valExp) = do
     emitPred (PEq (TDim arrVar i) t)
   -- Propagate value bound from the fill value expression.
   mBound <- inferValBound valExp
-  forM_ mBound $ \b -> emitPred (PEq (TValBound arrVar) b)
+  forM_ mBound $ \b -> emitPred (PEq (TValBoundDim arrVar 0) b)
   return arrTy
 infer (EReplicate _ shapeDims arrExp) = do
   arrTy <- infer arrExp
@@ -969,7 +1037,7 @@ infer (EReplicate _ shapeDims arrExp) = do
     emitPred (PEq (TDim arrVar i) t)
   -- Propagate value bound: replicate preserves elements unchanged.
   case mArrVar of
-    Just sv -> emitPred (PEq (TValBound arrVar) (TValBound sv))
+    Just sv -> emitPred (PEq (TValBoundDim arrVar 0) (TValBoundDim sv 0))
     Nothing -> return ()
   return arrTyOut
 infer (ESlice _ sliceDims arrExp) = do
@@ -1002,7 +1070,7 @@ infer (ESlice _ sliceDims arrExp) = do
         emitPred (PEq (TDim arrVar i) tLen)
   -- Propagate value bound: slice returns a subset of source elements.
   case mArrVar of
-    Just sv -> emitPred (PEq (TValBound arrVar) (TValBound sv))
+    Just sv -> emitPred (PEq (TValBoundDim arrVar 0) (TValBoundDim sv 0))
     Nothing -> return ()
   return arrTyOut
 infer (EReshape _ shapeExp arrExp) = do
@@ -1026,7 +1094,7 @@ infer (EReshape _ shapeExp arrExp) = do
     emitPred (PEq (TDim arrVar i) t)
   -- Propagate value bound: reshape rearranges elements without changing values.
   case mArrVar of
-    Just sv -> emitPred (PEq (TValBound arrVar) (TValBound sv))
+    Just sv -> emitPred (PEq (TValBoundDim arrVar 0) (TValBoundDim sv 0))
     Nothing -> return ()
   return arrTyOut
 infer (EMap _ fn arrExp) = do
@@ -1043,12 +1111,22 @@ infer (EMap _ fn arrExp) = do
       forM_ [0 .. rank - 1] $ \i ->
         emitPred (PEq (TDim arrVar i) (TDim srcVar i))
       -- Propagate value bounds through the map function body.
+      -- Case 1: scalar body — infer a single component-0 output bound.
+      -- Case 2: EVec body — infer per-component bounds for tuple-producing maps.
       case extractFnParamVars fn of
         (paramVar : _) -> do
-          mOutBound <- withValBound paramVar (TValBound srcVar) $
-                         inferBodyBound fn
-          forM_ mOutBound $ \outBound ->
-            emitPred (PEq (TValBound arrVar) outBound)
+          let srcElemBound = TValBoundDim srcVar 0
+          mOutBound <- withValBound paramVar srcElemBound $ inferBodyBound fn
+          case mOutBound of
+            Just outBound -> emitPred (PEq (TValBoundDim arrVar 0) outBound)
+            Nothing -> do
+              -- Try per-component bounds when the body is an EVec literal.
+              mCompBounds <- withValBound paramVar srcElemBound $ do
+                case extractFnBody fn of
+                  Just body -> inferVecElemBounds body
+                  Nothing   -> return Nothing
+              forM_ (maybe [] (zip [0..]) mCompBounds) $ \(i, b) ->
+                emitPred (PEq (TValBoundDim arrVar i) b)
         [] -> return ()
       return arrTyOut
 infer (EZipWith _ fn arrExp1 arrExp2) = do
@@ -1072,13 +1150,13 @@ infer (EZipWith _ fn arrExp1 arrExp2) = do
       -- Propagate value bounds through the binary function body.
       case extractFnParamVars fn of
         (p1 : p2 : _) -> do
-          let b1 = TValBound v1
-              b2 = TValBound v2
+          let b1 = TValBoundDim v1 0
+              b2 = TValBoundDim v2 0
           mOutBound <- withValBound p1 b1 $
                          withValBound p2 b2 $
                            inferBodyBound fn
           forM_ mOutBound $ \outBound ->
-            emitPred (PEq (TValBound arrVar) outBound)
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
         _ -> return ()
       return arrTyOut
     _ -> return arrTyOut
@@ -1103,12 +1181,12 @@ infer (EReduce _ fn initExp arrExp) = do
       -- reduce function body.  Sound for monotone functions (max, min).
       case extractFnParamVars fn of
         (p1 : p2 : _) -> do
-          let elemBound = TValBound srcVar
+          let elemBound = TValBoundDim srcVar 0
           mOutBound <- withValBound p1 elemBound $
                          withValBound p2 elemBound $
                            inferBodyBound fn
           forM_ mOutBound $ \outBound ->
-            emitPred (PEq (TValBound arrVar) outBound)
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
         _ -> return ()
       return arrTyOut
 infer (EReduceGenerate r fn initExp shapeExp genFn) =
@@ -1141,12 +1219,12 @@ infer (EScan _ fn initExp arrExp) = do
       -- function body (same approach as EReduce; sound for monotone functions).
       case extractFnParamVars fn of
         (p1 : p2 : _) -> do
-          let elemBound = TValBound srcVar
+          let elemBound = TValBoundDim srcVar 0
           mOutBound <- withValBound p1 elemBound $
                          withValBound p2 elemBound $
                            inferBodyBound fn
           forM_ mOutBound $ \outBound ->
-            emitPred (PEq (TValBound arrVar) outBound)
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
         _ -> return ()
       return arrTyOut
 infer (ESegmentedReduce _ fn initExp offsetsExp valsExp) = do
@@ -1178,7 +1256,7 @@ infer (ESortIndices _ arrExp) = do
     Nothing -> return arrTyOut
     Just srcVar -> do
       emitPred (PEq (TDim arrVar 0) (TDim srcVar 0))
-      emitPred (PEq (TValBound arrVar) (TDim srcVar 0))
+      emitPred (PEq (TValBoundDim arrVar 0) (TDim srcVar 0))
       return arrTyOut
 infer (EIota _ nExp) = do
   nTy <- infer nExp
@@ -1189,7 +1267,7 @@ infer (EIota _ nExp) = do
   shapeTerms <- termsFromIndexExp nExp
   forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
     emitPred (PEq (TDim arrVar i) t)
-  emitPred (PEq (TValBound arrVar) (TDim arrVar 0))
+  emitPred (PEq (TValBoundDim arrVar 0) (TDim arrVar 0))
   return arrTy
 infer (EMakeIndex _ nExp arrExp) = do
   nTy   <- infer nExp
@@ -1198,7 +1276,7 @@ infer (EMakeIndex _ nExp arrExp) = do
   (mArrVar, _, _) <- asArrayType (firstParam arrExp) arrTy
   arrVar' <- maybe freshPredVar return mArrVar
   nTerm <- termFromExp nExp
-  emitPred (PEq (TValBound arrVar') nTerm)
+  emitPred (PEq (TValBoundDim arrVar' 0) nTerm)
   emitWarning "note: make_index bound not statically verified"
   return arrTy
 infer (ECOOSumDuplicates _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = do
@@ -1294,7 +1372,7 @@ infer (EScatter _ comb defaults idxArr vals) = do
   idxArrTy <- infer idxArr
   valsTy <- infer vals
   (mDstVar, sDst, eDst) <- asArrayType (firstParam defaults) defaultsTy
-  (_mSrcVar, sSrc, idxTy) <- asArrayType (firstParam idxArr) idxArrTy
+  (mIdxVar, sSrc, idxTy) <- asArrayType (firstParam idxArr) idxArrTy
   (_mSrcVar', sSrc', eSrc) <- asArrayType (firstParam vals) valsTy
   _ <- wrange (firstParam idxArr) $ sSrc =:= sSrc'
   idxTy' <- normalizeShapeToTupleOf (firstParam idxArr) UTyInt idxTy
@@ -1305,6 +1383,15 @@ infer (EScatter _ comb defaults idxArr vals) = do
   _ <- wrange (firstParam comb) $ combTy =:= UTyFun eDst (UTyFun eDst eDst)
   sDst' <- applyBindings sDst
   (arrVar, arrTyOut) <- freshRefined (UTyArray sDst' eDst)
+  -- Bounds check: index values must fit inside the destination array.
+  -- Mirrors EGather but checks against dstVar instead of srcVar.
+  -- Ungrounded obligations (TValBoundDim not established) emit a warning, not an error.
+  idxElemRank <- shapeArityFromType (firstParam idxArr) idxTy'
+  case (mIdxVar, mDstVar) of
+    (Just idxVar, Just dstVar) ->
+      forM_ [0 .. idxElemRank - 1] $ \i ->
+        emitObl (PLe (TValBoundDim idxVar i) (TDim dstVar i))
+    _ -> return ()
   case mDstVar of
     Nothing -> return arrTyOut
     Just dstVar -> do
@@ -1318,7 +1405,7 @@ infer (EScatterGuarded _ comb defaults idxArr vals guardArr) = do
   valsTy <- infer vals
   guardTy <- infer guardArr
   (mDstVar, sDst, eDst) <- asArrayType (firstParam defaults) defaultsTy
-  (_mSrcVar, sSrc, idxTy) <- asArrayType (firstParam idxArr) idxArrTy
+  (mIdxVar, sSrc, idxTy) <- asArrayType (firstParam idxArr) idxArrTy
   (_mSrcVar', sSrc', eSrc) <- asArrayType (firstParam vals) valsTy
   (_mSrcVar'', sSrc'', guardElemTy) <- asArrayType (firstParam guardArr) guardTy
   _ <- wrange (firstParam idxArr) $ sSrc =:= sSrc'
@@ -1332,6 +1419,15 @@ infer (EScatterGuarded _ comb defaults idxArr vals guardArr) = do
   _ <- wrange (firstParam comb) $ combTy =:= UTyFun eDst (UTyFun eDst eDst)
   sDst' <- applyBindings sDst
   (arrVar, arrTyOut) <- freshRefined (UTyArray sDst' eDst)
+  -- Bounds check: index values must fit inside the destination array.
+  -- Mirrors EGather but checks against dstVar instead of srcVar.
+  -- Ungrounded obligations (TValBoundDim not established) emit a warning, not an error.
+  idxElemRank <- shapeArityFromType (firstParam idxArr) idxTy'
+  case (mIdxVar, mDstVar) of
+    (Just idxVar, Just dstVar) ->
+      forM_ [0 .. idxElemRank - 1] $ \i ->
+        emitObl (PLe (TValBoundDim idxVar i) (TDim dstVar i))
+    _ -> return ()
   case mDstVar of
     Nothing -> return arrTyOut
     Just dstVar -> do
@@ -1358,18 +1454,25 @@ infer (EGather _ idxArr arrExp) = do
       rank <- shapeArityFromType (firstParam idxArr) sIdx'
       forM_ [0 .. rank - 1] $ \i ->
         emitPred (PEq (TDim arrVar i) (TDim idxVar i))
-  -- Element value bounds: require that the established element upper bound of
-  -- the index array is at most the first dimension of the source array.
-  -- Both mIdxVar and mSrcVar are available because inferDecs now preserves the
-  -- UTyRefine wrapper in stored polytypes.
+  -- Element value bounds: for each component i of the index element type,
+  -- require that TValBoundDim idxVar i ≤ TDim srcVar i.  For a 1D gather the
+  -- index element is a scalar Int (rank 1) and we recover the original check.
+  -- For a multi-dimensional gather each component is checked independently.
+  idxElemRank <- shapeArityFromType (firstParam idxArr) idxTy'
   case (mIdxVar, mSrcVar) of
     (Just idxVar, Just srcVar) ->
-      emitObl (PLe (TValBound idxVar) (TDim srcVar 0))
+      forM_ [0 .. idxElemRank - 1] $ \i ->
+        emitObl (PLe (TValBoundDim idxVar i) (TDim srcVar i))
     _ -> return ()
   -- Propagate the source array's element value bound to the output: gathered
   -- elements are a subset of the source elements, so they share the same bound.
+  -- Loop over the element arity of the source's element type (usually 1 for Int).
+  srcElemRank <- (shapeArityFromType (firstParam arrExp) =<< normalizeShapeToTupleOf (firstParam arrExp) UTyInt eTy)
+                   `catchError` \_ -> return 1
   case mSrcVar of
-    Just srcVar -> emitPred (PEq (TValBound arrVar) (TValBound srcVar))
+    Just srcVar ->
+      forM_ [0 .. srcElemRank - 1] $ \i ->
+        emitPred (PEq (TValBoundDim arrVar i) (TValBoundDim srcVar i))
     Nothing -> return ()
   return arrTyOut
 infer (EIndex _ idx arrExp) = do
@@ -1454,14 +1557,19 @@ infer (EBoundLetIn _ x boundExp rhs body) = do
   mRhsBound <- inferValBound rhs
   case mRhsBound of
     Just rhsBound -> emitObl (PLe rhsBound boundTerm)
-    Nothing -> emitWarning $
-      "note: bound annotation on '" ++ BS.unpack x ++ "' not statically verified"
+    Nothing -> do
+      -- Static inference failed; emit a nonlinear arithmetic (NIA) obligation
+      -- for the SMT solver.  Z3 can often verify products of symbolic variables
+      -- (e.g. z*ny*nx + y*nx + x < nx*ny*nz) given the active bound hypotheses.
+      -- If Z3 returns Unknown the obligation produces a "could not verify" warning.
+      rhsTerm <- termFromExp rhs
+      emitObl (PLt rhsTerm boundTerm)
   -- Bind x as Int with bound in context for the body.
   withBinding x (Forall [] [] UTyInt) $
     withValBound x boundTerm $
       infer body
 infer (EOp _ op) = pure $ case op of
-  Plus _    -> ii2i; Minus _   -> ii2i; Times _   -> ii2i; Divide _  -> ii2i
+  Plus _    -> ii2i; Minus _   -> ii2i; Times _   -> ii2i; Divide _  -> ii2i; Mod _ -> ii2i
   Eq _      -> ii2b; Neq _     -> ii2b; Lt _       -> ii2b; Le _     -> ii2b
   Gt _      -> ii2b; Ge _      -> ii2b
   And _     -> bb2b; Or _      -> bb2b

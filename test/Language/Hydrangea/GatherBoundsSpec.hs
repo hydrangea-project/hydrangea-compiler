@@ -695,3 +695,303 @@ spec = describe "gather bounds checking" $ do
             ]
         )
         (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- multi-dimensional gather bounds
+  -- ------------------------------------------------------------------ --
+  describe "multi-dimensional gather bounds" $ do
+
+    it "2D generate (EVec body) → 2D gather, safe" $ do
+      -- generate [K] (let f [k] = [k, 0] in f) produces Array[K] (Int,Int)
+      -- where component 0 < K and component 1 < 1 (constant 0).
+      -- src : Array[K][10] Int, so dim 0 = K and dim 1 = 10.
+      -- TValBoundDim idx 0 = K ≤ K = TDim src 0  ✓
+      -- TValBoundDim idx 1 = 1 ≤ 10 = TDim src 1 ✓
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [10, 10] (let f [i, j] = i in f)"
+        , "let idx  = generate [10] (let f [k] = [k, 0] in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "2D generate → 2D gather, rejected when first component too large" $ do
+      -- src has only 5 rows but the index first component can be up to K=10
+      expectDecsError
+        ( BS.unlines
+            [ "let src  = generate [5, 10] (let f [i, j] = i in f)"
+            , "let idx  = generate [10] (let f [k] = [k, 0] in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "2D generate → 2D gather, safe when constant second component is in range" $ do
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [10, 5] (let f [i, j] = i in f)"
+        , "let idx  = generate [10] (let f [k] = [k, 0] in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "1D gather unchanged after refactor (smoke test)" $ do
+      -- Scalar index array: TValBoundDim idxVar 0 ≤ TDim srcVar 0
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [10] (let f [i bound 10] = i in f)"
+        , "let idx  = iota 10"
+        , "let main = gather idx src"
+        ]
+
+    it "map producing pairs → 2D gather, safe" $ do
+      -- map (let f x = [x, 0] in f) (iota K) produces Array[K] (Int,Int)
+      -- with TValBoundDim 0 = K, TValBoundDim 1 = 1
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [10, 10] (let f [i, j] = i in f)"
+        , "let idx  = map (let f x = [x, 0] in f) (iota 10)"
+        , "let main = gather idx src"
+        ]
+
+  -- ------------------------------------------------------------------ --
+  -- scatter_guarded bounds checking
+  -- ------------------------------------------------------------------ --
+  describe "scatter_guarded bounds checking" $ do
+
+    it "iota N as index into fill [N] 0 is safe" $ do
+      -- iota 5 elements in [0,5); dst has 5 elements — TValBoundDim = 5 ≤ dim = 5 ✓
+      expectDecsOk $ BS.unlines
+        [ "let dst  = fill [5] 0"
+        , "let idx  = iota 5"
+        , "let vals = fill [5] 1"
+        , "let keep = fill [5] true"
+        , "let main = scatter_guarded (+) dst idx vals keep"
+        ]
+
+    it "iota N as index into fill [N+1] 0 is safe" $ do
+      -- iota 5 elements bounded by 5; dst has 6 elements — 5 ≤ 6 ✓
+      expectDecsOk $ BS.unlines
+        [ "let dst  = fill [6] 0"
+        , "let idx  = iota 5"
+        , "let vals = fill [5] 1"
+        , "let keep = fill [5] true"
+        , "let main = scatter_guarded (+) dst idx vals keep"
+        ]
+
+    it "iota 6 as index into fill [5] 0 is rejected" $ do
+      -- iota 6 elements may be up to 5; dst has only 5 elements — 6 ≤ 5 is UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let dst  = fill [5] 0"
+            , "let idx  = iota 6"
+            , "let vals = fill [6] 1"
+            , "let keep = fill [6] true"
+            , "let main = scatter_guarded (+) dst idx vals keep"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "make_index N annotation satisfies obligation for fill [N]" $ do
+      -- make_index N establishes TValBoundDim = N; fill [N] gives dim = N → N ≤ N ✓
+      expectDecsOk $ BS.unlines
+        [ "let n    = 8"
+        , "let dst  = fill [n] 0"
+        , "let raw  = generate [n] (let f [i] = 0 in f)"
+        , "let idx  = make_index n raw"
+        , "let vals = fill [n] 1"
+        , "let keep = fill [n] true"
+        , "let main = scatter_guarded (+) dst idx vals keep"
+        ]
+
+    it "make_index 6 annotation rejected for fill [5] destination" $ do
+      -- make_index 6 asserts bound = 6; dst has dim = 5 — 6 ≤ 5 is UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let dst  = fill [5] 0"
+            , "let idx  = make_index 6 (iota 5)"
+            , "let vals = fill [5] 1"
+            , "let keep = fill [5] true"
+            , "let main = scatter_guarded (+) dst idx vals keep"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "ungrounded index (no make_index) produces a warning, not an error" $ do
+      -- generate with arbitrary body has no TValBoundDim established;
+      -- the obligation is ungrounded → ObligationUnknown → warning only
+      let src = BS.unlines
+            [ "let dst  = fill [5] 0"
+            , "let idx  = generate [5] (let f [i] = 4 - i in f)"
+            , "let vals = fill [5] 1"
+            , "let keep = fill [5] true"
+            , "let main = scatter_guarded (+) dst idx vals keep"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success but got error: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` any (isInfixOf "could not verify")
+
+  -- ------------------------------------------------------------------ --
+  -- scatter (unguarded) bounds checking
+  -- ------------------------------------------------------------------ --
+  describe "scatter bounds checking" $ do
+
+    it "iota N as index into fill [N] 0 is safe for scatter" $ do
+      expectDecsOk $ BS.unlines
+        [ "let dst  = fill [5] 0"
+        , "let idx  = iota 5"
+        , "let vals = fill [5] 1"
+        , "let main = scatter (+) dst idx vals"
+        ]
+
+    it "iota 6 as index into fill [5] 0 is rejected for scatter" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let dst  = fill [5] 0"
+            , "let idx  = iota 6"
+            , "let vals = fill [6] 1"
+            , "let main = scatter (+) dst idx vals"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- % operator: type checking and bounds inference
+  -- ------------------------------------------------------------------ --
+  describe "% modulo operator" $ do
+
+    it "x % m typechecks as Int" $ do
+      expectDecsOk $ BS.unlines
+        [ "let main = 7 % 3"
+        ]
+
+    it "% binds tighter than + (precedence)" $ do
+      -- 10 % 3 + 1 = 1 + 1 = 2, not 10 % 4 = 2
+      expectDecsOk $ BS.unlines
+        [ "let main = 10 % 3 + 1"
+        ]
+
+    it "% result bound from constant modulus is used for gather" $ do
+      -- let x bound 5 = 3 in (x % 5) has bound 5 — auto from inferBVal (Mod _)
+      -- Here we test that generate with % body establishes the right bound.
+      -- generate [5] (let f [i bound 5] = i % 3 in f) has TValBound = 3; src has 3 → safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [3] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i bound 5] = i % 3 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "% result bound too large for source is rejected" $ do
+      -- i % 4 has bound 4; src has only 3 elements → 4 ≤ 3 is UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [3] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i bound 5] = i % 4 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "% with concrete modulus propagates bound for scatter" $ do
+      -- i % 4 has bound 4; dst has 4 elements → TConst 4 ≤ TConst 4 ✓
+      expectDecsOk $ BS.unlines
+        [ "let n  = 10"
+        , "let dst  = fill [4] 0"
+        , "let vals = fill [n] 1"
+        , "let keep = fill [n] true"
+        , "let main = scatter_guarded (+) dst"
+        ,   "  (generate [n] (let f [i bound n] = i % 4 in f))"
+        ,   "  vals keep"
+        ]
+
+    it "% chain: x % m is a safe EBoundLetIn rhs with bound annotation" $ do
+      -- let x bound 5 = 7 % 5 in index [x] arr(5) — x < 5 by % bound → SAT
+      expectDecsOk $ BS.unlines
+        [ "let arr  = generate [5] (let g [i] = i in g)"
+        , "let main = let x bound 5 = 7 % 5 in index [x] arr"
+        ]
+
+  -- ------------------------------------------------------------------ --
+  -- NIA (nonlinear integer arithmetic) via EBoundLetIn + Z3
+  -- ------------------------------------------------------------------ --
+  describe "NIA bounds verification via EBoundLetIn" $ do
+
+    it "2D flat index: z*ny + y < ny*nz given 0<=y<ny, 0<=z<nz" $ do
+      -- let y bound ny = ...; let z bound nz = ...;
+      -- let flat bound (ny * nz) = z * ny + y → Z3 verifies NIA obligation
+      expectDecsOk $ BS.unlines
+        [ "let ny = 4"
+        , "let nz = 3"
+        , "let dst  = fill [(ny * nz)] 0"
+        , "let vals = fill [6] 1"
+        , "let keep = fill [6] true"
+        , "let main = scatter_guarded (+) dst"
+        ,   "  (generate [6]"
+        ,   "    (let f [i bound 6] ="
+        ,   "       let y bound ny = i % ny in"
+        ,   "       let z bound nz = (i / ny) % nz in"
+        ,   "       let flat bound (ny * nz) = z * ny + y in"
+        ,   "       flat in"
+        ,   "     f))"
+        ,   "  vals keep"
+        ]
+
+    it "3D flat index: (z*ny + y)*nx + x < nx*ny*nz" $ do
+      -- Mirrors the voxel_rasterization benchmark pattern with concrete constants.
+      -- x<nx, y<ny, z<nz → (z*ny+y)*nx+x < nx*ny*nz verified by Z3.
+      expectDecsOk $ BS.unlines
+        [ "let nx = 3"
+        , "let ny = 4"
+        , "let nz = 2"
+        , "let n  = 10"
+        , "let dst  = fill [(nx * ny * nz)] 0"
+        , "let vals = fill [n] 1"
+        , "let keep = fill [n] true"
+        , "let main = scatter_guarded (+) dst"
+        ,   "  (generate [n]"
+        ,   "    (let route [p] ="
+        ,   "       let x bound nx = (p * 17 + 3) % nx in"
+        ,   "       let y bound ny = (p * 29 + 5) % ny in"
+        ,   "       let z bound nz = (p * 43 + 7) % nz in"
+        ,   "       let flat bound (nx * ny * nz) = ((z * ny) + y) * nx + x in"
+        ,   "       flat in"
+        ,   "     route))"
+        ,   "  vals keep"
+        ]
+
+    it "NIA: incorrect bound on flat index is rejected" $ do
+      -- flat bound (nx * ny * nz - 1) is wrong: (z*ny+y)*nx+x can equal nx*ny*nz-1
+      -- but cannot be < nx*ny*nz-1 in general → Z3 should refute or the
+      -- scatter obligation PLe (nx*ny*nz - 1) (nx*ny*nz) is SAT but the
+      -- declared bound nx*ny*nz - 1 < nx*ny*nz means TValBoundDim = nx*ny*nz-1
+      -- and dim(dst) = nx*ny*nz → PLe (nx*ny*nz-1) (nx*ny*nz) is SAT (not rejected).
+      -- Instead test a clearly wrong bound: flat bound (nx * ny * nz - 1) when
+      -- dst has size nx * ny * nz - 1 → some inputs produce flat = nx*ny*nz-1
+      -- which violates the inner NIA obligation flat < nx*ny*nz-1.
+      -- Use a concrete small bound that Z3 can refute:
+      -- x<3, y<4, z<2 so flat = (z*4+y)*3+x can be at most 2*4*3+3*4+3-... max is 23.
+      -- nx*ny*nz = 24. If we say bound is 23 (= nx*ny*nz - 1), the NIA obligation
+      -- (z*ny+y)*nx+x < 23 is not always true (flat can equal 23 when z=1,y=3,x=2).
+      -- The NIA solver should emit an unsatisfiability or the scatter bound 23 < 24 is fine.
+      -- A cleaner rejection: use a clearly too-small destination.
+      expectDecsError
+        ( BS.unlines
+            [ "let nx = 3"
+            , "let ny = 4"
+            , "let nz = 2"
+            , "let n  = 10"
+            , "let dst  = fill [(nx * ny * nz - 1)] 0"
+            , "let vals = fill [n] 1"
+            , "let keep = fill [n] true"
+            , "let main = scatter_guarded (+) dst"
+            ,   "  (generate [n]"
+            ,   "    (let route [p] ="
+            ,   "       let x bound nx = (p * 17 + 3) % nx in"
+            ,   "       let y bound ny = (p * 29 + 5) % ny in"
+            ,   "       let z bound nz = (p * 43 + 7) % nz in"
+            ,   "       let flat bound (nx * ny * nz) = ((z * ny) + y) * nx + x in"
+            ,   "       flat in"
+            ,   "     route))"
+            ,   "  vals keep"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")

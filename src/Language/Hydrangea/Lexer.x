@@ -111,6 +111,7 @@ tokens :-
 <0> "-"     { tok Minus }
 <0> "*"     { tok Times }
 <0> "/"     { tok Divide }
+<0> "%"     { tok Percent }
 
 -- Float arithmetic operators
 <0> "+."    { tok TPlusF }
@@ -253,6 +254,7 @@ data Token
   | Minus
   | Times
   | Divide
+  | Percent
   -- Float arithmetic operators
   | TPlusF
   | TMinusF

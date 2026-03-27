@@ -42,6 +42,7 @@ import Language.Hydrangea.Pretty
 import Language.Hydrangea.Prune (checkKernelFused)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitWith, ExitCode(..))
+import System.IO (hPutStrLn, stderr)
 import Text.PrettyPrint.HughesPJClass
 
 flagValue :: String -> [String] -> Maybe String
@@ -144,7 +145,9 @@ main = do
             inferred <- runInferDecsWithOptions inferOptions decs
             case inferred of
               Left terr -> reportTypeError terr
-              Right typedDecs -> pure typedDecs
+              Right (typedDecs, warnings) -> do
+                mapM_ (hPutStrLn stderr) warnings
+                pure typedDecs
           ensureSelectedKernelIsFused =
             forM_ kernelFlag $ \name ->
               case checkKernelFused decs (BS.pack name) of

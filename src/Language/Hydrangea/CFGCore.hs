@@ -23,7 +23,7 @@ import Data.ByteString.Lazy.Char8 (ByteString)
 type CVar = ByteString
 
 -- | Binary operators used in @RBinOp@ and vector/bin-op RHS forms.
-data BinOp = CAdd | CSub | CMul | CDiv | CEq | CNeq | CLt | CLe | CGt | CGe | CAnd | COr
+data BinOp = CAdd | CSub | CMul | CDiv | CMod | CEq | CNeq | CLt | CLe | CGt | CGe | CAnd | COr
            | CAddF | CSubF | CMulF | CDivF | CEqF | CNeqF | CLtF | CLeF | CGtF | CGeF
   deriving (Eq, Show)
 

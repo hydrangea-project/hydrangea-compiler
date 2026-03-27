@@ -106,6 +106,7 @@ import Language.Hydrangea.Syntax
   '-'        { L.RangedToken L.Minus _ }
   '*'        { L.RangedToken L.Times _ }
   '/'        { L.RangedToken L.Divide _ }
+  '%'        { L.RangedToken L.Percent _ }
   -- Float arithmetic operators
   '+.'       { L.RangedToken L.TPlusF _ }
   '-.'       { L.RangedToken L.TMinusF _ }
@@ -150,7 +151,7 @@ import Language.Hydrangea.Syntax
 %left '&'
 %nonassoc '=' '<>' '<' '>' '<=' '>='
 %left '+' '-'
-%left '*' '/'
+%left '*' '/' '%'
 %nonassoc '=.' '<>.' '<.' '>.' '<=.' '>=.'
 %left '+.' '-.'
 %left '*.' '/.'
@@ -194,6 +195,7 @@ exp :: { Exp L.Range }
   | exp '-'  exp             { EBinOp (info $1 <-> info $3) $1 (Minus (L.rtRange $2)) $3 }
   | exp '*'  exp             { EBinOp (info $1 <-> info $3) $1 (Times (L.rtRange $2)) $3 }
   | exp '/'  exp             { EBinOp (info $1 <-> info $3) $1 (Divide (L.rtRange $2)) $3 }
+  | exp '%'  exp             { EBinOp (info $1 <-> info $3) $1 (Mod (L.rtRange $2)) $3 }
   -- Comparison operators
   | exp '='  exp             { EBinOp (info $1 <-> info $3) $1 (Eq (L.rtRange $2)) $3 }
   | exp '<>' exp             { EBinOp (info $1 <-> info $3) $1 (Neq (L.rtRange $2)) $3 }

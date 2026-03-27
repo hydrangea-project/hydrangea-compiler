@@ -66,7 +66,7 @@ findFalseConst = foldr go Nothing
         _ -> acc
 
 -- | Build a constant substitution map from hypotheses of the form
--- @TVar v = TConst n@, @TDim arr i = TConst n@, or @TValBound arr = TConst n@.
+-- @TVar v = TConst n@, @TDim arr i = TConst n@, or @TValBoundDim arr i = TConst n@.
 -- Used for one-pass constant propagation to detect concrete-false hypotheses
 -- that reference synthetic dim/bound variables (which evalPredConst cannot see).
 buildConstMap :: [Pred] -> Map Var Integer
@@ -76,7 +76,7 @@ buildConstMap preds = M.fromList (concatMap extract preds)
     extract _         = []
     extractPair (TVar v)      (TConst n) = [(v, n)]
     extractPair (TDim arr i)  (TConst n) = [(dimVarName arr i, n)]
-    extractPair (TValBound a) (TConst n) = [(valBoundName a, n)]
+    extractPair (TValBoundDim a i) (TConst n) = [(valBoundDimName a i, n)]
     extractPair _ _                      = []
 
 -- | Substitute known constant values into a term.
@@ -85,7 +85,7 @@ applyConstMapToTerm m t =
   case t of
     TVar v       -> maybe t TConst (M.lookup v m)
     TDim arr i   -> maybe t TConst (M.lookup (dimVarName arr i) m)
-    TValBound a  -> maybe t TConst (M.lookup (valBoundName a) m)
+    TValBoundDim a i -> maybe t TConst (M.lookup (valBoundDimName a i) m)
     TConst _     -> t
     TAdd l r     -> TAdd (f l) (f r)
     TSub l r     -> TSub (f l) (f r)
@@ -158,7 +158,7 @@ termToSBV env term =
     TMul l r -> termToSBV env l * termToSBV env r
     TNeg t -> negate (termToSBV env t)
     TDim arr ix -> lookupVar (dimVarName arr ix)
-    TValBound arr -> lookupVar (valBoundName arr)
+    TValBoundDim arr i -> lookupVar (valBoundDimName arr i)
   where
     lookupVar v =
       case M.lookup v env of

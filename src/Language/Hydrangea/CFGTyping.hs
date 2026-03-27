@@ -71,6 +71,7 @@ inferBinOpResultType op = case op of
   CSub -> Just CTInt64
   CMul -> Just CTInt64
   CDiv -> Just CTInt64
+  CMod -> Just CTInt64
   CEq -> Just CTBool
   CNeq -> Just CTBool
   CLt -> Just CTBool
@@ -96,6 +97,7 @@ inferBinOpOperandType op = case op of
   CSub -> Just CTInt64
   CMul -> Just CTInt64
   CDiv -> Just CTInt64
+  CMod -> Just CTInt64
   CEq -> Just CTInt64
   CNeq -> Just CTInt64
   CLt -> Just CTInt64

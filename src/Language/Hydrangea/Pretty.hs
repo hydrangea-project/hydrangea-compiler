@@ -70,7 +70,7 @@ instance Pretty Term where
       TMul l r -> parens (pPrint l <+> text "*" <+> pPrint r)
       TNeg t -> text "-" <> pPrint t
       TDim v i -> text "dim" <> parens (text (unpack v) <> text "," <+> int i)
-      TValBound v -> text "vbound" <> parens (text (unpack v))
+      TValBoundDim v i -> text "vbound" <> parens (text (unpack v) <> text "," <+> int i)
 
 instance Pretty Pred where
   pPrint pred' =
@@ -183,6 +183,7 @@ instance Pretty (Operator a) where
   pPrint (Minus _) = text "-"
   pPrint (Times _) = text "*"
   pPrint (Divide _) = text "/"
+  pPrint (Mod _) = text "%"
   pPrint (Eq _) = text "=="
   pPrint (Neq _) = text "<>"
   pPrint (Lt _) = text "<"

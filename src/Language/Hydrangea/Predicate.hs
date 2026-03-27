@@ -39,9 +39,10 @@ data Term
   | TNeg Term
   | TDim Var Int
     -- ^ @TDim arr i@ projects the @i@th dimension of the array bound to @arr@.
-  | TValBound Var
-    -- ^ @TValBound arr@ is the exclusive upper bound on every element of the
-    --   integer array bound to @arr@.  Analogous to @TDim@ but for values.
+  | TValBoundDim Var Int
+    -- ^ @TValBoundDim arr i@ is the exclusive upper bound on the i-th integer
+    --   component of every element of the integer[-tuple] array bound to @arr@.
+    --   For scalar-element arrays only component 0 is used.
   deriving (Eq, Ord, Show, Generic)
 
 -- | Predicates over refinement terms.
@@ -89,11 +90,12 @@ dimVarName :: Var -> Int -> Var
 dimVarName arr dimIx =
   arr <> "__dim__" <> fromString (show dimIx)
 
--- | Synthetic variable name for the element value upper bound of an integer array.
--- Used by gather-safety checking: @valBoundName arrVar@ is a symbolic integer
--- representing the exclusive upper bound on every element of the array bound to @arrVar@.
-valBoundName :: Var -> Var
-valBoundName arr = arr <> "__vbound__"
+-- | Synthetic variable name for the i-th element component value upper bound of an array.
+-- Used by gather-safety checking: @valBoundDimName arrVar i@ is a symbolic integer
+-- representing the exclusive upper bound on the i-th integer component of every element
+-- of the array bound to @arrVar@.  For scalar-element arrays only component 0 is used.
+valBoundDimName :: Var -> Int -> Var
+valBoundDimName arr i = arr <> "__vbound__" <> BS.pack (show i)
 
 -- | Collect solver variables referenced by a term.
 termVars :: Term -> Set Var
@@ -106,7 +108,7 @@ termVars term =
     TMul l r -> termVars l <> termVars r
     TNeg t -> termVars t
     TDim arr ix -> S.singleton (dimVarName arr ix)
-    TValBound arr -> S.singleton (valBoundName arr)
+    TValBoundDim arr i -> S.singleton (valBoundDimName arr i)
 
 -- | Collect binder variables referenced by a term.
 termBindVars :: Term -> Set Var
@@ -119,7 +121,7 @@ termBindVars term =
     TMul l r -> termBindVars l <> termBindVars r
     TNeg t -> termBindVars t
     TDim arr _ -> S.singleton arr
-    TValBound arr -> S.singleton arr
+    TValBoundDim arr _ -> S.singleton arr
 
 -- | Collect solver variables referenced by a predicate.
 predVars :: Pred -> Set Var
@@ -154,7 +156,7 @@ substTermVars f term =
     TMul l r -> TMul (substTermVars f l) (substTermVars f r)
     TNeg t -> TNeg (substTermVars f t)
     TDim arr ix -> TDim (f arr) ix
-    TValBound arr -> TValBound (f arr)
+    TValBoundDim arr i -> TValBoundDim (f arr) i
 
 -- | Substitute variables inside a predicate.
 substPredVars :: (Var -> Var) -> Pred -> Pred
@@ -178,7 +180,7 @@ evalTermConst term =
     TMul l r -> (*) <$> evalTermConst l <*> evalTermConst r
     TNeg t -> negate <$> evalTermConst t
     TDim _ _ -> Nothing
-    TValBound _ -> Nothing
+    TValBoundDim _ _ -> Nothing
 
 -- | Evaluate a predicate to a constant if both sides are constant.
 evalPredConst :: Pred -> Maybe Bool
