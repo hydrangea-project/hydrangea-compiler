@@ -11,6 +11,7 @@ module Language.Hydrangea.CodegenC
   , codegenProgram2WithOptionsPrune
   , CodegenArtifacts(..)
   , CodegenOptions(..)
+  , BenchmarkConfig(..)
   , defaultCodegenOptions
   , VarKind(..)
   , ctypeToVarKind
@@ -38,6 +39,15 @@ data CodegenArtifacts = CodegenArtifacts
 data CodegenOptions = CodegenOptions
   { codegenEmitMain :: Bool
   , codegenExportKernel :: Maybe CVar
+  , codegenBenchmark :: Maybe BenchmarkConfig
+  }
+  deriving (Eq, Show)
+
+-- | Configuration for benchmark scaffolding mode.
+data BenchmarkConfig = BenchmarkConfig
+  { bcKernelName   :: CVar  -- ^ Name of the zero-argument proc to benchmark.
+  , bcWarmupIters  :: Int   -- ^ Number of warmup iterations (not timed).
+  , bcMeasureIters :: Int   -- ^ Number of timed measurement iterations.
   }
   deriving (Eq, Show)
 
@@ -45,6 +55,7 @@ defaultCodegenOptions :: CodegenOptions
 defaultCodegenOptions = CodegenOptions
   { codegenEmitMain = True
   , codegenExportKernel = Nothing
+  , codegenBenchmark = Nothing
   }
 
 data ExportSpec = ExportSpec
@@ -176,6 +187,10 @@ genProgram2 opts prog@(C2.Program procs) = do
       needsMath = any (\(C2.Proc { C2.procBody = body }) -> hasMathOp body) procs
       ompInclude  = if needsOmp  then text "#include <omp.h>"   else empty
       mathInclude = if needsMath then text "#include <math.h>"  else empty
+      mBench = codegenBenchmark opts
+      timeInclude = case mBench of
+        Nothing -> empty
+        Just _  -> text "#include <time.h>"
       pairStructs = genPairStructDefs prog
       recordStructs = genRecordStructDefs prog
       structuredArrayPrints = genStructuredArrayPrintDefs retTypes
@@ -186,22 +201,50 @@ genProgram2 opts prog@(C2.Program procs) = do
                <+> hsep (punctuate comma (map text missingArrayElemVars))
                <> text "\""
              $$ text ""
+      -- File-scope cache variable for the benchmark kernel (array-returning only).
+      benchCacheGlobal = case mBench of
+        Nothing -> empty
+        Just bc ->
+          let kName = bcKernelName bc
+              kCName = sanitize kName
+              isArrayRet = case Map.lookup kName retTypes of
+                Just (CTArray _) -> True
+                _ -> case Map.findWithDefault KScalar kName retKinds of
+                       KArray     -> True
+                       KFloatArray -> True
+                       _ -> False
+          in if isArrayRet
+             then text ("static hyd_array_t* __bench_cache_" ++ kCName ++ " = NULL;") $$ text ""
+             else empty
   exportSpec <- traverse (resolveExportSpec retKinds retTypes procs) (codegenExportKernel opts)
+  -- Validate benchmark kernel existence when requested.
+  () <- case mBench of
+    Just bc ->
+      let benchName = bcKernelName bc
+          zeroArgProcNames = [C2.procName p | p <- procs, null (C2.procParams p)]
+      in if benchName `notElem` zeroArgProcNames
+         then Left ("Unknown benchmark kernel: '" ++ BS.unpack benchName ++ "'. "
+                    ++ "Available zero-argument procs: "
+                    ++ show (map BS.unpack zeroArgProcNames))
+         else Right ()
+    Nothing -> Right ()
   let sourceDoc =
         missingArrayElemDoc
           $$ text "#include \"hydrangea_runtime.h\""
           $$ ompInclude
           $$ mathInclude
+          $$ timeInclude
           $$ pairStructs
           $$ recordStructs
           $$ structuredArrayPrints
           $$ text ""
-          $$ vcat (punctuate (text "") (map (genProc2 retKinds retTypes) procs))
+          $$ benchCacheGlobal
+          $$ vcat (punctuate (text "") (map (genProc2 mBench retKinds retTypes) procs))
           $$ case exportSpec of
                Nothing -> empty
                Just spec -> text "" $$ genExportWrapper spec
           $$ case codegenEmitMain opts of
-               True -> text "" $$ genMain2 retKinds retTypes procs
+               True -> text "" $$ genMain2 mBench retKinds retTypes procs
                False -> empty
       headerDoc = fmap (genHeader pairStructs recordStructs) exportSpec
   pure CodegenArtifacts
@@ -274,14 +317,98 @@ exportHeaderGuard :: ExportSpec -> String
 exportHeaderGuard spec =
   "HYDRANGEA_EXPORT_" ++ map toUpper (sanitizeExportName (exportKernelName spec)) ++ "_H"
 
-genMain2 :: Map CVar VarKind -> Map CVar CType -> [C2.Proc] -> Doc
-genMain2 retKinds retTypes procs =
+genMain2 :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> [C2.Proc] -> Doc
+genMain2 mBench retKinds retTypes procs =
   text "int main(void) {"
-    $$ nest 4 (vcat (map callAndPrint zeroArgProcs))
+    $$ nest 4 body
     $$ nest 4 (text "return 0;")
     $$ text "}"
   where
     zeroArgProcs = filter (\(C2.Proc { C2.procParams = params }) -> null params) procs
+
+    body = case mBench of
+      Nothing -> vcat (map callAndPrint zeroArgProcs)
+      Just bc ->
+        let benchName = bcKernelName bc
+            (before, benchAndAfter) = break (\p -> C2.procName p == benchName) zeroArgProcs
+        in case benchAndAfter of
+             -- Fallback if kernel not found among zero-arg procs (should have been caught earlier).
+             [] -> vcat (map callAndPrint zeroArgProcs)
+             (benchProc : after) ->
+               vcat (map callAndPrint before)
+                 $$ benchScaffold bc benchProc
+                 $$ vcat (map callAndPrint after)
+
+    -- Generate warmup + measure loops + stats report + final call-and-print.
+    benchScaffold bc proc =
+      let name      = C2.procName proc
+          cName     = sanitize name
+          bsName    = BS.unpack name
+          warmupStr = show (bcWarmupIters bc)
+          itersStr  = show (bcMeasureIters bc)
+          isArrayRet = case Map.lookup name retTypes of
+            Just (CTArray _) -> True
+            _ -> case Map.findWithDefault KScalar name retKinds of
+                   KArray      -> True
+                   KFloatArray -> True
+                   _           -> False
+          benchCacheVar = "__bench_cache_" ++ cName
+      in
+        -- Warmup loop
+        text ("for (int __bench_w = 0; __bench_w < " ++ warmupStr ++ "; __bench_w++) {")
+          $$ nest 4 (text ("(void) " ++ cName ++ "();"))
+          $$ text "}"
+        -- Measurement loop
+        $$ text ("double __bench_times[" ++ itersStr ++ "];")
+        $$ text ("for (int __bench_i = 0; __bench_i < " ++ itersStr ++ "; __bench_i++) {")
+        $$ nest 4 (
+             text "struct timespec __ts0, __ts1;"
+             $$ text "clock_gettime(CLOCK_MONOTONIC, &__ts0);"
+             $$ text ("(void) " ++ cName ++ "();")
+             $$ text "clock_gettime(CLOCK_MONOTONIC, &__ts1);"
+             $$ text ("__bench_times[__bench_i] = (double)(__ts1.tv_sec - __ts0.tv_sec) * 1.0e9")
+             $$ text "    + (double)(__ts1.tv_nsec - __ts0.tv_nsec);"
+           )
+        $$ text "}"
+        -- Stats report
+        $$ text "{"
+        $$ nest 4 (
+             text "double __bench_min = __bench_times[0], __bench_sum = 0.0;"
+             $$ text ("for (int __bench_j = 0; __bench_j < " ++ itersStr ++ "; __bench_j++) {")
+             $$ nest 4 (
+                  text "if (__bench_times[__bench_j] < __bench_min)"
+                  $$ nest 4 (text "__bench_min = __bench_times[__bench_j];")
+                  $$ text "__bench_sum += __bench_times[__bench_j];"
+                )
+             $$ text "}"
+             $$ text ("fprintf(stderr, \"benchmark[" ++ bsName ++ "]: min=%.3f ms  mean=%.3f ms\\n\",")
+             $$ text ("    __bench_min / 1.0e6, __bench_sum / " ++ itersStr ++ ".0 / 1.0e6);")
+           )
+        $$ text "}"
+        -- Final call: populate cache (for arrays) or call-and-print normally.
+        $$ if isArrayRet
+           then benchFinalArrayCall cName benchCacheVar (Map.lookup name retTypes) (Map.findWithDefault KScalar name retKinds)
+           else callAndPrint proc
+
+    -- Assign to the pre-declared global cache then print.
+    benchFinalArrayCall cName benchCacheVar mtype kind =
+      text benchCacheVar <+> text "=" <+> text cName <> text "();"
+        $$ arrayPrintCall benchCacheVar mtype kind
+
+    -- Print an array variable given its type/kind (no declaration).
+    arrayPrintCall varName mtype kind =
+      case mtype of
+        Just (CTArray CTDouble) -> text "hyd_print_float_array(" <> text varName <> text ");"
+        Just (CTArray CTInt64)  -> text "hyd_print_array(" <> text varName <> text ");"
+        Just (CTArray CTBool)   -> text "hyd_print_array(" <> text varName <> text ");"
+        Just (CTArray CTUnit)   -> text "hyd_print_array(" <> text varName <> text ");"
+        Just (CTArray eltTy) | isStructuredPrintableArrayElem eltTy ->
+          text (structuredArrayPrintName eltTy) <> text "(" <> text varName <> text ");"
+        Just (CTArray _) -> text "(void)" <> parens (text varName) <> text ";"
+        _ -> case kind of
+          KFloatArray -> text "hyd_print_float_array(" <> text varName <> text ");"
+          KArray      -> text "hyd_print_array(" <> text varName <> text ");"
+          _           -> text "(void)" <> parens (text varName) <> text ";"
 
     callAndPrint (C2.Proc { C2.procName = name }) =
       let cName = sanitize name
@@ -329,8 +456,8 @@ genMain2 retKinds retTypes procs =
             text "int64_t" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
               $$ text "hyd_print_int(" <> text (cName ++ "_result") <> text ");"
 
-genProc2 :: Map CVar VarKind -> Map CVar CType -> C2.Proc -> Doc
-genProc2 retKinds retTypes proc@(C2.Proc { C2.procName = name, C2.procParams = params, C2.procBody = body }) =
+genProc2 :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> C2.Proc -> Doc
+genProc2 mBench retKinds retTypes proc@(C2.Proc { C2.procName = name, C2.procParams = params, C2.procBody = body }) =
   let typeEnv = recoverProcTypeEnv2 retTypes proc
       -- Authoritative classification from the recovered type environment.
       (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) = typeEnvToVarSets typeEnv
@@ -373,8 +500,14 @@ genProc2 retKinds retTypes proc@(C2.Proc { C2.procName = name, C2.procParams = p
         _ -> hsep (punctuate comma (map genParam params))
       -- Zero-argument array-returning procs are memoized with a static cache
       -- to prevent O(n) re-reads when called from inside generate loops.
-      useMemo = null params && retType == "hyd_array_t*"
+      -- Exception: the benchmark kernel uses a file-scope cache instead so
+      -- it can be called repeatedly without short-circuiting during the loop.
+      isBenchKernel = case mBench of
+        Just bc -> bcKernelName bc == name
+        Nothing -> False
+      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel
       cacheVar = text "__cache_" <> text cName
+      benchCacheVar = text "__bench_cache_" <> text cName
       (bodyWithoutReturn, finalReturn) = splitFinalReturn body
       localArrayVars = localArrayVarsProc2 typeEnv proc
       vecVars = classifyVecVars body
@@ -410,7 +543,19 @@ genProc2 retKinds retTypes proc@(C2.Proc { C2.procName = name, C2.procParams = p
               $$ returnDoc retAtom
           Nothing ->
             genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty S.empty body
-  in if useMemo
+  in if isBenchKernel && retType == "hyd_array_t*"
+     then
+       -- Benchmark kernel: check the file-scope cache (set after the timing loop
+       -- by main); if NULL, compute fresh without writing to any cache so that
+       -- the timing loop can call us repeatedly.
+       text retType <+> text cName <> text "(void) {"
+        $$ nest 4 (
+             text "if (" <> benchCacheVar <> text ") return hyd_array_reshape_view("
+               <> benchCacheVar <> text ", " <> benchCacheVar <> text "->shape);"
+             $$ procBodyNormal
+           )
+       $$ text "}"
+     else if useMemo
      then
         text "static hyd_array_t*" <+> cacheVar <+> text "= NULL;"
        $$ text retType <+> text cName <> text "(void) {"

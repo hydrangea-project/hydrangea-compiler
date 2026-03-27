@@ -18,7 +18,8 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Language.Hydrangea.CLI (allTopLevelProcsFlag, mainFlag, selectProgramDecs)
 import Language.Hydrangea.CodegenC
-  ( CodegenArtifacts(..)
+  ( BenchmarkConfig(..)
+  , CodegenArtifacts(..)
   , CodegenOptions(..)
   , codegenProgram2WithOptionsPrune
   , defaultCodegenOptions
@@ -70,6 +71,9 @@ usage = unwords
   , "[--keep-c]"
   , "[--compile-only]"
   , "[--cc=<compiler>]"
+  , "[--benchmark=<name>]"
+  , "[--bench-warmup=<n>]"
+  , "[--bench-iters=<n>]"
   , "[file]"
   ]
 
@@ -102,17 +106,28 @@ main = do
       outputHFile = flagValue "--output-h=" flags
       kernelFlag = flagValue "--kernel=" flags
       exportKernelFlag = flagValue "--export-kernel=" flags
+      benchmarkFlag = flagValue "--benchmark=" flags
+      benchWarmupFlag = flagValue "--bench-warmup=" flags
+      benchItersFlag = flagValue "--bench-iters=" flags
       inferOptions = defaultInferOptions {inferSolveRefinements = solveRefinements}
   (input, mpath) <- readInput paths
 
   let ccFlag = flagValue "--cc=" flags
+      benchmarkConfig = case benchmarkFlag of
+        Nothing -> Nothing
+        Just name -> Just BenchmarkConfig
+          { bcKernelName  = BS.pack name
+          , bcWarmupIters  = maybe 3 read benchWarmupFlag
+          , bcMeasureIters = maybe 10 read benchItersFlag
+          }
       exportCodegenOptions =
         case exportKernelFlag of
-          Nothing -> defaultCodegenOptions
+          Nothing -> defaultCodegenOptions { codegenBenchmark = benchmarkConfig }
           Just name ->
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenExportKernel = Just (BS.pack name)
+              , codegenBenchmark = benchmarkConfig
               }
 
   when (isJust outputHFile && not (isJust exportKernelFlag)) $
@@ -187,9 +202,15 @@ main = do
               Right artifacts -> do
                 putStrLn (codegenSource artifacts)
                 writeExportHeaderIfRequested artifacts
-          Nothing -> do
-            csrc <- compileSelectedC
-            putStrLn csrc
+          Nothing -> case benchmarkConfig of
+            Just _ -> do
+              artifactsRes <- generateExportArtifacts decs
+              case artifactsRes of
+                Left err -> dieWithMessage err
+                Right artifacts -> putStrLn (codegenSource artifacts)
+            Nothing -> do
+              csrc <- compileSelectedC
+              putStrLn csrc
       forM_ outputCFile $ \outPath -> do
         _ <- runCheckedInference
         ensureSelectedKernelIsFused
@@ -202,10 +223,18 @@ main = do
                 writeFile outPath (codegenSource artifacts)
                 putStrLn $ "Wrote C to " ++ outPath
                 writeExportHeaderIfRequested artifacts
-          Nothing -> do
-            csrc <- compileSelectedC
-            writeFile outPath csrc
-            putStrLn $ "Wrote C to " ++ outPath
+          Nothing -> case benchmarkConfig of
+            Just _ -> do
+              artifactsRes <- generateExportArtifacts decs
+              case artifactsRes of
+                Left err -> dieWithMessage err
+                Right artifacts -> do
+                  writeFile outPath (codegenSource artifacts)
+                  putStrLn $ "Wrote C to " ++ outPath
+            Nothing -> do
+              csrc <- compileSelectedC
+              writeFile outPath csrc
+              putStrLn $ "Wrote C to " ++ outPath
       let defaultMode =
             not printFused
               && not printCFG
@@ -228,7 +257,13 @@ main = do
           else do
             _ <- runCheckedInference
             ensureSelectedKernelIsFused
-            csrc <- compileSelectedC
+            csrc <- case benchmarkConfig of
+              Nothing -> compileSelectedC
+              Just _ -> do
+                artifactsRes <- generateExportArtifacts decs
+                case artifactsRes of
+                  Left err -> dieWithMessage err
+                  Right artifacts -> pure (codegenSource artifacts)
             ec <- compileAndRunC ccFlag csrc keepC compileOnly parallel
             case ec of
               ExitSuccess -> pure ()
