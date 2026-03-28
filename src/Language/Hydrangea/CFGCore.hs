@@ -30,7 +30,7 @@ data BinOp = CAdd | CSub | CMul | CDiv | CMod | CEq | CNeq | CLt | CLe | CGt | C
 -- | Unary operators.
 data UnOp = CNot | CNeg
   -- Math functions (Float -> Float); lowered to <math.h> calls.
-  | CSqrt | CExpF | CLog | CSin | CCos | CAbsF | CFloorF | CCeilF | CErf | CFloatOf
+  | CSqrt | CExpF | CLog | CSin | CCos | CAbsF | CFloorF | CCeilF | CErf | CFloatOf | CIntOf
   deriving (Eq, Show)
 
 -- | Evaluatable, side-effect-free atoms. @AVecVar@ names a vector/array

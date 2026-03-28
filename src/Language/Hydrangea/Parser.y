@@ -87,7 +87,8 @@ import Language.Hydrangea.Syntax
   floor_f    { L.RangedToken L.FloorF _ }
   ceil_f     { L.RangedToken L.CeilF _ }
   erf        { L.RangedToken L.Erf _ }
-  float_of   { L.RangedToken L.FloatOf _ }
+  float_of     { L.RangedToken L.FloatOf _ }
+  int_of_float { L.RangedToken L.IntOf _ }
   read_array       { L.RangedToken L.ReadArray _ }
   read_array_float { L.RangedToken L.ReadArrayFloat _ }
   write_array       { L.RangedToken L.WriteArray _ }
@@ -273,6 +274,7 @@ expspecial :: { Exp L.Range }
   | ceil_f atom    { EUnOp (L.rtRange $1 <-> info $2) (CeilF (L.rtRange $1)) $2 }
   | erf atom       { EUnOp (L.rtRange $1 <-> info $2) (Erf (L.rtRange $1)) $2 }
   | float_of atom  { EUnOp (L.rtRange $1 <-> info $2) (FloatOf (L.rtRange $1)) $2 }
+  | int_of_float atom { EUnOp (L.rtRange $1 <-> info $2) (IntOf (L.rtRange $1)) $2 }
   | index atom atom            { EIndex (L.rtRange $1 <-> info $3) $2 $3 }
   | shape_of atom              { EShapeOf (L.rtRange $1 <-> info $2) $2 }
   | check_index atom atom atom { ECheckIndex (L.rtRange $1 <-> info $4) $2 $3 $4 }

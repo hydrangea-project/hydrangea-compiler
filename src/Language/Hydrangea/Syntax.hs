@@ -456,6 +456,7 @@ data UnOperator a
   | CeilF a   -- ^ Ceiling (@Float -> Float@).
   | Erf a     -- ^ Error function (@Float -> Float@).
   | FloatOf a -- ^ Integer-to-float cast (@Int -> Float@).
+  | IntOf a   -- ^ Float-to-integer truncation toward zero (@Float -> Int@).
   deriving (Functor, Foldable, Show, Eq, Ord)
 
 -- | Binary operators in surface syntax.

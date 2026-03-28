@@ -26,6 +26,8 @@ module Language.Hydrangea.CFGTyping
   , lookupArrayElemType2
   , recoverProcTypeEnv2
   , inferProgramReturnTypes2
+  , buildCallParamTypes
+  , CallParamTypes
   ) where
 
 import Control.Applicative ((<|>))
@@ -36,6 +38,10 @@ import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), UnOp(..))
 import Language.Hydrangea.CFGCore qualified as C
 
 type TypeEnv = Map CVar CType
+
+-- | Maps each procedure name to the ordered types of its formal parameters.
+-- 'Nothing' entries indicate parameters whose types could not be determined.
+type CallParamTypes = Map CVar [Maybe CType]
 
 bindVarType :: CVar -> CType -> TypeEnv -> TypeEnv
 bindVarType v ct typeEnv = case M.lookup v typeEnv of
@@ -131,6 +137,7 @@ inferUnOpResultType op = case op of
   CCeilF -> Just CTDouble
   CErf -> Just CTDouble
   CFloatOf -> Just CTDouble
+  CIntOf -> Just CTInt64
 
 inferUnOpOperandType :: UnOp -> Maybe CType
 inferUnOpOperandType op = case op of
@@ -146,40 +153,58 @@ inferUnOpOperandType op = case op of
   CCeilF -> Just CTDouble
   CErf -> Just CTDouble
   CFloatOf -> Just CTInt64
+  CIntOf -> Just CTDouble
 
 inferCallType :: Map CVar CType -> CVar -> Maybe CType
 inferCallType callTypes fn =
   M.lookup fn callTypes <|> case fn of
     "hyd_read_array_csv" -> Just (CTArray CTInt64)
     "hyd_read_float_array_csv" -> Just (CTArray CTDouble)
+    "hyd_flat_to_nd" -> Just CTTuple
     "getenv_int" -> Just CTInt64
     "getenv_string" -> Just CTInt64
     _ -> Nothing
 
-inferStmtTypes :: Map CVar CType -> TypeEnv -> Stmt -> TypeEnv
-inferStmtTypes callTypes typeEnv stmt = case stmt of
-  SAssign v rhs -> inferAssignTypes callTypes typeEnv v rhs
+inferStmtTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> Stmt -> TypeEnv
+inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
+  SAssign v rhs -> inferAssignTypes callTypes callParamTypes typeEnv v rhs
   SArrayWrite arr _ val ->
-    case inferAtomType2 typeEnv val of
-      Just eltTy -> bindAtomType arr (CTArray eltTy) typeEnv
-      Nothing -> typeEnv
+    -- Use M.insert (not conservative bindVarType) so the fixpoint can correct
+    -- stale lowering-time array element types (e.g. CTArray CTInt64 recorded
+    -- at lowering time when the element type was not yet known, later corrected
+    -- to CTArray CTDouble when the written value's type propagates through the
+    -- fixpoint).
+    case (arr, inferAtomType2 typeEnv val) of
+      (AVar arrV, Just eltTy) -> M.insert arrV (CTArray eltTy) typeEnv
+      _ -> typeEnv
   SLoop _ body ->
-    inferStmtListTypes callTypes typeEnv body
+    inferStmtListTypes callTypes callParamTypes typeEnv body
   SIf _ thn els ->
-    let thnEnv = inferStmtListTypes callTypes typeEnv thn
-        elsEnv = inferStmtListTypes callTypes thnEnv els
+    let thnEnv = inferStmtListTypes callTypes callParamTypes typeEnv thn
+        elsEnv = inferStmtListTypes callTypes callParamTypes thnEnv els
     in elsEnv
   SReturn _ ->
     typeEnv
 
-inferAssignTypes :: Map CVar CType -> TypeEnv -> CVar -> C.RHS -> TypeEnv
-inferAssignTypes callTypes typeEnv v rhs = case rhs of
+inferAssignTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> CVar -> C.RHS -> TypeEnv
+inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RAtom atom ->
-    case inferAtomType2 typeEnv atom <|> M.lookup v typeEnv of
+    -- For pair-typed atoms, trust the source type over a potentially stale
+    -- procTypeEnv entry for the destination (e.g. foldl accumulator vars that
+    -- were recorded with a default pair type at lowering time).  We use M.insert
+    -- instead of the conservative bindVarType so that the correct pair type
+    -- propagates forward into the loop body.
+    -- For non-pair types (scalars, CTTuple, CTArray) the conservative bindVarType
+    -- is sufficient and avoids accidentally overriding correctly-inferred types.
+    case inferAtomType2 typeEnv atom of
+      Just ct@(CTPair _ _) ->
+        bindAtomType atom ct (M.insert v ct typeEnv)
       Just ct ->
         bindAtomType atom ct (bindVarType v ct typeEnv)
       Nothing ->
-        typeEnv
+        case M.lookup v typeEnv of
+          Just ct -> bindAtomType atom ct typeEnv
+          Nothing -> typeEnv
   C.RBinOp op a1 a2 ->
     let typeEnv1 = maybe typeEnv (\ct -> bindVarType v ct typeEnv) (inferBinOpResultType op)
     in case inferBinOpOperandType op of
@@ -209,25 +234,101 @@ inferAssignTypes callTypes typeEnv v rhs = case rhs of
           Nothing -> typeEnv
   C.RArrayShape _ ->
     bindVarType v CTTuple typeEnv
-  C.RProj _ _ ->
-    bindVarType v CTInt64 typeEnv
+  C.RProj i src ->
+    -- Tuples are shape/index containers (int elements). Pairs may contain
+    -- non-integer elements.  Only commit to CTInt64 when we can confirm the
+    -- source is CTTuple; for unknown sources, defer so the usage context can
+    -- propagate the correct element type in later fixpoint iterations.
+    -- Use M.insert for CTPair results so the fixpoint can correct stale
+    -- lowering-time types (e.g. a foldl accumulator whose snd was recorded as
+    -- CTInt64 before the pair element type was known).
+    case inferAtomType2 typeEnv src of
+      Just CTTuple             -> bindVarType v CTInt64 typeEnv
+      Just (CTPair ct1 ct2)    -> M.insert v (if i == 0 then ct1 else ct2) typeEnv
+      _ -> typeEnv
+  C.RPairMake _ _ a1 a2 ->
+    -- Re-derive the pair type from the current (possibly improved) element
+    -- types.  Use M.insert instead of bindVarType to allow correcting an entry
+    -- that was recorded with the CTInt64 default at lowering time.
+    case (inferAtomType2 typeEnv a1, inferAtomType2 typeEnv a2) of
+      (Just ct1, Just ct2) -> M.insert v (CTPair ct1 ct2) typeEnv
+      _ -> typeEnv
+  C.RPairFst _ct a ->
+    -- Use M.insert so that when the source pair type is corrected by the fixpoint
+    -- (e.g. foldl_acc starts as CTPair CTDouble CTInt64 then becomes
+    -- CTPair CTDouble CTDouble), the result type is updated accordingly.
+    case inferAtomType2 typeEnv a of
+      Just (CTPair ct1 _) -> M.insert v ct1 typeEnv
+      _ -> typeEnv
+  C.RPairSnd _ct a ->
+    case inferAtomType2 typeEnv a of
+      Just (CTPair _ ct2) -> M.insert v ct2 typeEnv
+      _ -> typeEnv
   C.RShapeSize _ ->
     bindVarType v CTInt64 typeEnv
   C.RShapeInit _ ->
     bindVarType v CTTuple typeEnv
   C.RShapeLast _ ->
     bindVarType v CTInt64 typeEnv
-  C.RCall fn _ ->
-    maybe typeEnv (\ct -> bindVarType v ct typeEnv) (inferCallType callTypes fn)
+  C.RCall fn args ->
+    let typeEnv1 = maybe typeEnv (\ct -> bindVarType v ct typeEnv) (inferCallType callTypes fn)
+        mParamTypes = M.findWithDefault [] fn callParamTypes
+    in foldl (\env (arg, mpt) -> case mpt of
+                 Just pt -> bindAtomType arg pt env
+                 Nothing -> env
+              ) typeEnv1 (zip args mParamTypes)
   _ ->
     typeEnv
 
-inferStmtListTypes :: Map CVar CType -> TypeEnv -> [Stmt] -> TypeEnv
-inferStmtListTypes callTypes initialEnv stmts = go initialEnv
+-- | Collect all (srcVar, projIdx, resultVar) triples from RProj assignments
+-- in a statement list (recursively into loops/conditionals).
+collectProjAssigns :: [Stmt] -> [(CVar, Integer, CVar)]
+collectProjAssigns = concatMap go
   where
-    go typeEnv =
-      let typeEnv' = foldl (inferStmtTypes callTypes) typeEnv stmts
-      in if typeEnv' == typeEnv then typeEnv else go typeEnv'
+    go stmt = case stmt of
+      SAssign v (C.RProj i (AVar src)) -> [(src, i, v)]
+      SLoop _ body -> collectProjAssigns body
+      SIf _ thn els -> collectProjAssigns thn ++ collectProjAssigns els
+      _ -> []
+
+-- | After a fixpoint pass, infer source pair types from known RProj result types.
+-- For each source variable that appears as both `RProj 0 src` and `RProj 1 src`
+-- and whose result variables have known types, bind src -> CTPair ct0 ct1.
+-- Uses M.insert (not conservative bindVarType) to allow correcting stale entries.
+inferProjSourceTypes :: TypeEnv -> [(CVar, Integer, CVar)] -> TypeEnv
+inferProjSourceTypes typeEnv projAssigns =
+  foldl bindIfKnown typeEnv (M.toList projBySource)
+  where
+    projBySource :: Map CVar (Map Integer CVar)
+    projBySource = foldl (\m (src, i, v) ->
+                            M.insertWith M.union src (M.singleton i v) m)
+                         M.empty projAssigns
+    bindIfKnown env (src, iToV) =
+      -- Only infer a pair type when the source variable has no type yet.
+      -- If it is already typed (e.g. CTTuple from hyd_flat_to_nd, CTArray, etc.)
+      -- we must not override it — that would break tuple element access in codegen.
+      case M.lookup src env of
+        Just _ -> env   -- already typed; leave it alone
+        Nothing ->
+          case (M.lookup 0 iToV >>= (`M.lookup` env),
+                M.lookup 1 iToV >>= (`M.lookup` env)) of
+            (Just ct0, Just ct1) -> M.insert src (CTPair ct0 ct1) env
+            _ -> env
+
+inferStmtListTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> [Stmt] -> TypeEnv
+inferStmtListTypes callTypes callParamTypes initialEnv stmts = outerGo initialEnv
+  where
+    projAssigns = collectProjAssigns stmts
+    -- Inner fixpoint: propagate types through assignments until stable.
+    innerGo typeEnv =
+      let typeEnv' = foldl (inferStmtTypes callTypes callParamTypes) typeEnv stmts
+      in if typeEnv' == typeEnv then typeEnv else innerGo typeEnv'
+    -- Outer loop: after inner fixpoint, infer source pair types from RProj uses.
+    -- If any new pair types were discovered, run inner fixpoint again.
+    outerGo typeEnv =
+      let after = innerGo typeEnv
+          withPairs = inferProjSourceTypes after projAssigns
+      in if withPairs == after then after else outerGo withPairs
 
 collectReturnAtoms :: [Stmt] -> [Atom]
 collectReturnAtoms = concatMap go
@@ -245,7 +346,7 @@ inferProcReturnType callTypes proc = do
     _ -> Nothing
   inferAtomType2 typeEnv atom
   where
-    typeEnv = inferStmtListTypes callTypes (procTypeEnv proc) (procBody proc)
+    typeEnv = inferStmtListTypes callTypes M.empty (procTypeEnv proc) (procBody proc)
 
 inferProgramReturnTypes2 :: Program -> Map CVar CType
 inferProgramReturnTypes2 (Program procs) = foldl addProc M.empty procs
@@ -255,8 +356,20 @@ inferProgramReturnTypes2 (Program procs) = foldl addProc M.empty procs
         Just retTy -> M.insert (procName proc) retTy callTypes
         Nothing -> callTypes
 
--- | Recover a richer per-procedure type environment from CFG structure and a
--- map of direct-call return types.
-recoverProcTypeEnv2 :: Map CVar CType -> Proc -> TypeEnv
-recoverProcTypeEnv2 callTypes proc =
-  inferStmtListTypes callTypes (procTypeEnv proc) (procBody proc)
+-- | Build a map from procedure name to its ordered parameter types.
+-- Runs a single-pass type recovery (without inter-proc argument propagation)
+-- to discover parameter types that are not recorded in 'procTypeEnv' at
+-- lowering time (e.g. array parameters typed only via backward propagation
+-- through 'RArrayLoad').
+buildCallParamTypes :: Map CVar CType -> [Proc] -> CallParamTypes
+buildCallParamTypes retTypes procs = M.fromList
+  [ (procName proc, map (\p -> M.lookup p recoveredEnv) (procParams proc))
+  | proc <- procs
+  , let recoveredEnv = inferStmtListTypes retTypes M.empty (procTypeEnv proc) (procBody proc)
+  ]
+
+-- | Recover a richer per-procedure type environment from CFG structure,
+-- a map of direct-call return types, and a map of callee parameter types.
+recoverProcTypeEnv2 :: Map CVar CType -> CallParamTypes -> Proc -> TypeEnv
+recoverProcTypeEnv2 callTypes callParamTypes proc =
+  inferStmtListTypes callTypes callParamTypes (procTypeEnv proc) (procBody proc)

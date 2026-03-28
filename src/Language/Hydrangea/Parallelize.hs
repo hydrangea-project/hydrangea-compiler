@@ -168,10 +168,17 @@ factsPermitParallelLoop arrayFacts body =
     usage = collectLoopArrayUsage body
 
     arraySafe (arr, u) = case M.lookup arr arrayFacts of
-      Nothing   -> False
+      -- Arrays with known facts follow the strict policy.
       Just fact
         | lauWrites u -> afFreshAlloc fact && afWriteOnce fact && not (lauReads u)
         | lauReads u  -> afReadOnly fact
+        | otherwise   -> True
+      -- Unknown arrays that are only *read* inside the loop body are always
+      -- safe to access in parallel — reads never conflict with each other.
+      -- Unknown arrays that are *written* (with or without reads) are unsafe
+      -- without explicit facts proving they are fresh and write-once.
+      Nothing
+        | lauWrites u -> False
         | otherwise   -> True
 
 ------------------------------------------------------------------------
@@ -503,7 +510,7 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes =
 -- and type environment attached to that procedure by the lowering pass.
 parallelizeProc2 :: Proc -> Proc
 parallelizeProc2 proc =
-  let typeEnv    = recoverProcTypeEnv2 M.empty proc
+  let typeEnv    = recoverProcTypeEnv2 M.empty M.empty proc
       allocSizes = collectArrayAllocSizes (procBody proc)
   in  proc { procBody = parallelizeProcWithFacts
                           (procArrayFacts proc) typeEnv allocSizes (procBody proc) }

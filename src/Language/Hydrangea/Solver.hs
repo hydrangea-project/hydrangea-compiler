@@ -217,8 +217,14 @@ hypVars tagged = S.unions [predVars p | Hyp p <- tagged]
 checkTaggedPredicates :: [TaggedPred]
   -> IO (Either ([Pred], Maybe [(Var, Integer)]) ([TaggedPred], [String]))
 checkTaggedPredicates tagged = do
-  let hyps = [p | Hyp p <- tagged]
-      obls = [p | Obl p <- tagged]
+  -- Deduplicate before solving.  Monomorphic instantiation re-emits the same
+  -- predicates on every use of a zero-arg binding, so long dependency chains
+  -- (e.g. coo → packed_keys → perm → sorted_* → canonical → csr) accumulate
+  -- O(k) copies of every predicate for a k-step chain.  Deduplication here is
+  -- O(n log n) and avoids redundant Z3 calls for duplicate Obl predicates.
+  let tagged' = S.toList (S.fromList tagged)
+      hyps = [p | Hyp p <- tagged']
+      obls = [p | Obl p <- tagged']
       hVars = S.unions (map predVars hyps)
   -- 1. Eagerly evaluate constant hypotheses.
   let (constHyps, symHyps) = partitionConsts hyps
@@ -258,7 +264,7 @@ checkTaggedPredicates tagged = do
             else do
               -- 4. Generate warnings for obligations that could not be verified.
               let warnings = concatMap mkWarning results
-              return (Right (tagged, warnings))
+              return (Right (tagged', warnings))
   where
     mkWarning (obl, ObligationUnknown, False) =
       [ "note: could not verify '" ++ render (pPrint obl) ++ "'"

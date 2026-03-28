@@ -1,0 +1,570 @@
+(* render.hyd — Full-fidelity voxel renderer in Hydrangea.
+   Pipeline: scatter (voxel grid) → generate [H,W] (ray march per pixel, OpenMP-parallel)
+   Each pixel: foldl over fill [maxSteps] 0 (serial ray march)
+   On surface hit: nested foldl (binary-search refinement) + nested foldl (shadow sampling)
+
+   PAIRS vs TUPLES: all compound state uses pairs (a, b), never tuples.
+   The compiler pipeline treats CTTuple as a shape type whose elements are
+   always integers (indexed via .elems[]).  Using a tuple for float-bearing
+   state would truncate all float values to zero at store time.  Pairs lower
+   to CTPair with .fst/.snd access and preserve element types exactly.
+
+   GENERATE OUTPUT TYPE: render returns a generate [outH, outW] of float
+   luminance values (double), so its output array is CTArray CTDouble.
+   The CFGTyping fixpoint infers this via backward propagation through the
+   SArrayWrite: the double luminance written to the output array corrects the
+   stale CTArray CTInt64 that the lowering pass records before element types
+   are fully resolved.
+
+   PARALLELIZATION: the outer tile loop over pixels is parallelized with
+   #pragma omp parallel for via factsPermitParallelLoop.  This works because
+   the output array is fresh and write-once (marked at lowering time) and the
+   voxel scene array is only read inside the loop body (safe even without an
+   explicit afReadOnly fact).  The tile trip count (n+31)/32 is recognized as
+   variable-sized by tripCountFromIndexExpr after the IDiv/variable-dividend
+   fix in CFGAnalysis.
+
+   Helper functions (tri, rf_step, ss_step, ray_step) are top-level for
+   readability.  They all return scalars and take voxels as a parameter, so
+   they have no array-producer/consumer relationship that the fusion pass could
+   exploit; there is no fusion benefit to inlining them into render. *)
+
+(* ======= Voxel scene (same logic as voxel_scene.hyd) ======= *)
+
+let voxel_scene =
+  let n = 1080000 in
+  let nx = 224 in
+  let ny = 224 in
+  let nz = 168 in
+  let nvox = nx * ny * nz in
+  let contribs = n * 8 in
+  let imod x m = x - ((x / m) * m) in
+  let absi x = if x < 0 then 0 - x else x in
+  let obj p = imod p 5 in
+  let obj_ix p = p / 5 in
+  let sphere_x p =
+    let q = obj_ix p in
+    imod q 69 - 34 in
+  let sphere_y p =
+    let q = obj_ix p / 69 in
+    imod q 69 - 34 in
+  let sphere_z p =
+    let q = obj_ix p / (69 * 69) in
+    imod q 69 - 34 in
+  let sphere_r2 p =
+    let x = sphere_x p in
+    let y = sphere_y p in
+    let z = sphere_z p in
+    (x * x) + (y * y) + (z * z) in
+  let ring_x p =
+    let q = obj_ix p in
+    imod q 91 - 45 in
+  let ring_y p =
+    let q = obj_ix p / 91 in
+    imod q 91 - 45 in
+  let ring_z p =
+    let q = obj_ix p / (91 * 91) in
+    imod q 23 - 11 in
+  let ring_xy2 p =
+    let x = ring_x p in
+    let y = ring_y p in
+    (x * x) + (y * y) in
+  let tower_x p =
+    let q = obj_ix p in
+    imod q 23 - 11 in
+  let tower_y p =
+    let q = obj_ix p / 23 in
+    imod q 41 - 20 in
+  let tower_z p =
+    let q = obj_ix p / (23 * 41) in
+    imod q 119 - 59 in
+  let cap_r2 p =
+    let q = obj_ix p in
+    let x = imod q 51 - 25 in
+    let y = imod (q / 51) 51 - 25 in
+    (x * x) + (y * y) in
+  let cap_z p =
+    let q = obj_ix p / (51 * 51) in
+    imod q 23 - 11 in
+  let beam_x p =
+    let q = obj_ix p in
+    imod q 119 - 59 in
+  let beam_y p =
+    let q = obj_ix p / 119 in
+    imod q 119 - 59 in
+  let beam_z p =
+    let q = obj_ix p / (119 * 119) in
+    imod q 15 - 7 in
+  let base_x p =
+    if obj p = 0 then
+      64 + sphere_x p
+    else
+      if obj p = 1 then
+        151 + ring_x p
+      else
+        if obj p = 2 then
+          106 + tower_x p
+        else
+          if obj p = 3 then
+            106 + (imod (obj_ix p) 51 - 25)
+          else
+            126 + beam_x p in
+  let base_y p =
+    if obj p = 0 then
+      104 + sphere_y p
+    else
+      if obj p = 1 then
+        126 + ring_y p
+      else
+        if obj p = 2 then
+          70 + tower_y p
+        else
+          if obj p = 3 then
+            70 + (imod (obj_ix p / 51) 51 - 25)
+          else
+            70 + beam_y p in
+  let base_z p =
+    if obj p = 0 then
+      84 + sphere_z p
+    else
+      if obj p = 1 then
+        90 + ring_z p
+      else
+        if obj p = 2 then
+          73 + tower_z p
+        else
+          if obj p = 3 then
+            115 + cap_z p
+          else
+            50 + beam_z p in
+  let keep_point p =
+    if obj p = 0 then
+      sphere_r2 p < 31 * 31
+    else
+      if obj p = 1 then
+        if absi (ring_xy2 p - 36 * 36) < 240 then absi (ring_z p) < 7 else false
+      else
+        if obj p = 2 then
+          if absi (tower_x p) < 10 then
+            if absi (tower_y p) < 20 then absi (tower_z p) < 59 else false
+          else
+            false
+        else
+          if obj p = 3 then
+            if absi (cap_z p) < 11 then cap_r2 p < 25 * 25 else false
+          else
+            if absi (beam_x p + beam_y p) < 7 then
+              if absi (beam_z p) < 6 then absi (beam_x p) < 59 else false
+            else
+              false in
+  let point_weight p =
+    if obj p = 0 then
+      if sphere_r2 p < 31 * 31 then
+        1.25 +. 0.75 *. (1.0 -. float_of (sphere_r2 p) /. float_of (31 * 31))
+      else
+        0.0
+    else
+      if obj p = 1 then
+        if absi (ring_xy2 p - 36 * 36) < 240 then
+          if absi (ring_z p) < 7 then
+            1.2 +. 0.35 *. (1.0 -. float_of (absi (ring_xy2 p - 36 * 36)) /. 240.0)
+          else
+            0.0
+        else
+          0.0
+      else
+        if obj p = 2 then
+          if absi (tower_x p) < 10 then
+            if absi (tower_y p) < 20 then
+              if absi (tower_z p) < 59 then
+                1.35 +. 0.3 *. (1.0 -. float_of (absi (tower_z p)) /. 59.0)
+              else
+                0.0
+            else
+              0.0
+          else
+            0.0
+        else
+          if obj p = 3 then
+            if absi (cap_z p) < 11 then
+              if cap_r2 p < 25 * 25 then 1.1 else 0.0
+            else
+              0.0
+          else
+            if absi (beam_x p + beam_y p) < 7 then
+              if absi (beam_z p) < 6 then
+                if absi (beam_x p) < 59 then
+                  1.45 +. 0.25 *. (1.0 -. float_of (absi (beam_x p)) /. 59.0)
+                else
+                  0.0
+              else
+                0.0
+            else
+              0.0 in
+  let route_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let x = base_x p + bx in
+    let y = base_y p + by in
+    let z = base_z p + bz in
+    ((z * ny) + y) * nx + x in
+  let weight_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let fx = imod (p * 5 + 1) 4 in
+    let fy = imod (p * 7 + 2) 4 in
+    let fz = imod (p * 11 + 3) 4 in
+    let wx = (1 - bx) * (4 - fx) + bx * fx in
+    let wy = (1 - by) * (4 - fy) + by * fy in
+    let wz = (1 - bz) * (4 - fz) + bz * fz in
+    point_weight p *. float_of (wx * wy * wz) /. 64.0 in
+  let keep_of [i] =
+    let p = i / 8 in
+    keep_point p in
+  let voxels =
+    scatter_guarded (+.) (fill [nvox] 0.0)
+      (generate [contribs] route_of)
+      (generate [contribs] weight_of)
+      (generate [contribs] keep_of) in
+  reshape [nz, ny, nx] voxels
+
+(* ======= Trilinear interpolation (top-level to avoid nested fuseFix) ======= *)
+
+let tri voxels nx ny nz xf yf zf =
+  let bx = float_of (nx - 1) in
+  let by = float_of (ny - 1) in
+  let bz = float_of (nz - 1) in
+  let xc = if xf <. 0.0 then 0.0 else if xf >. bx then bx else xf in
+  let yc = if yf <. 0.0 then 0.0 else if yf >. by then by else yf in
+  let zc = if zf <. 0.0 then 0.0 else if zf >. bz then bz else zf in
+  let x0 = int_of_float (floor_f xc) in
+  let y0 = int_of_float (floor_f yc) in
+  let z0 = int_of_float (floor_f zc) in
+  let x1 = if x0 + 1 < nx then x0 + 1 else nx - 1 in
+  let y1 = if y0 + 1 < ny then y0 + 1 else ny - 1 in
+  let z1 = if z0 + 1 < nz then z0 + 1 else nz - 1 in
+  let tx = xc -. float_of x0 in
+  let ty = yc -. float_of y0 in
+  let tz = zc -. float_of z0 in
+  let c000 = check_index [z0, y0, x0] 0.0 voxels in
+  let c100 = check_index [z0, y0, x1] 0.0 voxels in
+  let c010 = check_index [z0, y1, x0] 0.0 voxels in
+  let c110 = check_index [z0, y1, x1] 0.0 voxels in
+  let c001 = check_index [z1, y0, x0] 0.0 voxels in
+  let c101 = check_index [z1, y0, x1] 0.0 voxels in
+  let c011 = check_index [z1, y1, x0] 0.0 voxels in
+  let c111 = check_index [z1, y1, x1] 0.0 voxels in
+  let c00 = c000 *. (1.0 -. tx) +. c100 *. tx in
+  let c10 = c010 *. (1.0 -. tx) +. c110 *. tx in
+  let c01 = c001 *. (1.0 -. tx) +. c101 *. tx in
+  let c11 = c011 *. (1.0 -. tx) +. c111 *. tx in
+  let c0  = c00 *. (1.0 -. ty) +. c10 *. ty in
+  let c1  = c01 *. (1.0 -. ty) +. c11 *. ty in
+  c0 *. (1.0 -. tz) +. c1 *. tz
+
+(* ======= Binary-search refinement step (top-level) ======= *)
+(* acc = (lo, hi) : Float * Float  (CTPair CTDouble CTDouble)
+   elem is unused (Int from fill [5] 0)
+   Must be a pair, not a tuple — tuples only hold integers. *)
+
+let rf_step voxels nx ny nz camX camY camZ dirX dirY dirZ threshold lh dummy =
+  let lo = fst lh in
+  let hi = snd lh in
+  let mid = (lo +. hi) /. 2.0 in
+  let mx = camX +. mid *. dirX in
+  let my = camY +. mid *. dirY in
+  let mz = camZ +. mid *. dirZ in
+  let md = tri voxels nx ny nz mx my mz in
+  if md >=. threshold then (lo, mid) else (mid, hi)
+
+(* ======= Shadow sampling step (top-level) ======= *)
+(* acc = occ : Float;  elem = si : Int (index 0..13 from generate [14]) *)
+
+let ss_step voxels nx ny nz hitX hitY hitZ ldX ldY ldZ occ si =
+  if occ >=. 1.0 then occ
+  else
+    let dist = float_of (si + 1) *. 1.5 in
+    let spx = hitX +. dist *. ldX in
+    let spy = hitY +. dist *. ldY in
+    let spz = hitZ +. dist *. ldZ in
+    let bx = float_of (nx - 1) in
+    let by = float_of (ny - 1) in
+    let bz = float_of (nz - 1) in
+    if spx <. 0.0 then occ
+    else if spx >. bx then occ
+    else if spy <. 0.0 then occ
+    else if spy >. by then occ
+    else if spz <. 0.0 then occ
+    else if spz >. bz then occ
+    else
+      let sd = tri voxels nx ny nz spx spy spz in
+      let add = sd /. 60.0 in
+      let cadd = if add <. 0.12 then add else 0.12 in
+      occ +. cadd
+
+(* ======= Ray-march step function (top-level) ======= *)
+(* State encoding: ((hit, shade), ((t, prevT), (prevDensity, havePrev)))
+     hit, havePrev : Int (0 or 1)
+     shade, t, prevT, prevDensity : Float
+   All nesting uses pairs (not tuples) so Float fields are preserved through
+   the CFGTyping fixpoint and stored with sizeof(double) in the output array.
+   The concrete lowered type is:
+     CTPair (CTPair CTInt64 CTDouble)
+             (CTPair (CTPair CTDouble CTDouble) (CTPair CTDouble CTInt64))
+   elem is unused (Int from fill [maxSteps] 0) *)
+
+let ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold coarseStep mediumStep fineStep ldX ldY ldZ acc dummy =
+  let hit = fst (fst acc) in
+  if hit > 0 then acc
+  else
+    let t = fst (fst (snd acc)) in
+    if t >. tExit then acc
+    else
+      let prevT       = snd (fst (snd acc)) in
+      let prevDensity = fst (snd (snd acc)) in
+      let havePrev    = snd (snd (snd acc)) in
+      let px = camX +. t *. dirX in
+      let py = camY +. t *. dirY in
+      let pz = camZ +. t *. dirZ in
+      let density = tri voxels nx ny nz px py pz in
+      let proximity = if prevDensity >. density then prevDensity else density in
+      let stepSize =
+        if proximity >=. threshold *. 0.75 then fineStep
+        else if proximity >=. threshold *. 0.25 then mediumStep
+        else coarseStep in
+      let crossing =
+        if havePrev > 0 then
+          if prevDensity <. threshold then density >=. threshold
+          else false
+        else false in
+      if crossing then
+        (* Binary-search surface refinement: 5 bisection steps *)
+        let hitT_pair = foldl
+          (let rf lh d = rf_step voxels nx ny nz camX camY camZ dirX dirY dirZ threshold lh d in rf)
+          (prevT, t)
+          (fill [5] 0) in
+        let hitT = (fst hitT_pair +. snd hitT_pair) /. 2.0 in
+        let hitX = camX +. hitT *. dirX in
+        let hitY = camY +. hitT *. dirY in
+        let hitZ = camZ +. hitT *. dirZ in
+        (* Gradient for surface normal (central differences at rounded hit pos) *)
+        let gx = int_of_float (floor_f (hitX +. 0.5)) in
+        let gy = int_of_float (floor_f (hitY +. 0.5)) in
+        let gz = int_of_float (floor_f (hitZ +. 0.5)) in
+        let gxc = if gx < 0 then 0 else if gx > nx - 1 then nx - 1 else gx in
+        let gyc = if gy < 0 then 0 else if gy > ny - 1 then ny - 1 else gy in
+        let gzc = if gz < 0 then 0 else if gz > nz - 1 then nz - 1 else gz in
+        let gxp = if gxc + 1 > nx - 1 then nx - 1 else gxc + 1 in
+        let gxm = if gxc - 1 < 0 then 0 else gxc - 1 in
+        let gyp = if gyc + 1 > ny - 1 then ny - 1 else gyc + 1 in
+        let gym = if gyc - 1 < 0 then 0 else gyc - 1 in
+        let gzp = if gzc + 1 > nz - 1 then nz - 1 else gzc + 1 in
+        let gzm = if gzc - 1 < 0 then 0 else gzc - 1 in
+        let gnx = check_index [gzc, gyc, gxp] 0.0 voxels -. check_index [gzc, gyc, gxm] 0.0 voxels in
+        let gny = check_index [gzc, gyp, gxc] 0.0 voxels -. check_index [gzc, gym, gxc] 0.0 voxels in
+        let gnz = check_index [gzp, gyc, gxc] 0.0 voxels -. check_index [gzm, gyc, gxc] 0.0 voxels in
+        let gnlen = sqrt (gnx *. gnx +. gny *. gny +. gnz *. gnz) in
+        let nlen = if gnlen <. 1.0e-9 then 1.0 else gnlen in
+        let normX = gnx /. nlen in
+        let normY = gny /. nlen in
+        let normZ = gnz /. nlen in
+        (* Diffuse lighting *)
+        let diffuse_raw = normX *. ldX +. normY *. ldY +. normZ *. ldZ in
+        let diffuse = if diffuse_raw >. 0.0 then diffuse_raw else 0.0 in
+        (* Shadow: 14 shadow ray steps *)
+        let occlusion = foldl
+          (let ss occ si = ss_step voxels nx ny nz hitX hitY hitZ ldX ldY ldZ occ si in ss)
+          0.0
+          (generate [14] (let sidx [si] = si in sidx)) in
+        let shadow_raw = 1.0 -. occlusion in
+        let shadow = if shadow_raw <. 0.18 then 0.18 else if shadow_raw >. 1.0 then 1.0 else shadow_raw in
+        (* Rim lighting *)
+        let ndotr_raw = normX *. (0.0 -. dirX) +. normY *. (0.0 -. dirY) +. normZ *. (0.0 -. dirZ) in
+        let rim_base = if ndotr_raw <. 0.0 then 0.0 else 1.0 -. ndotr_raw in
+        let rim_base2 = if rim_base <. 0.0 then 0.0 else rim_base in
+        let rim = rim_base2 *. rim_base2 in
+        (* Specular via half-vector *)
+        let hvxr = ldX -. dirX in
+        let hvyr = ldY -. dirY in
+        let hvzr = ldZ -. dirZ in
+        let hvlen = sqrt (hvxr *. hvxr +. hvyr *. hvyr +. hvzr *. hvzr) in
+        let hvls = if hvlen <. 1.0e-9 then 1.0 else hvlen in
+        let hvX = hvxr /. hvls in
+        let hvY = hvyr /. hvls in
+        let hvZ = hvzr /. hvls in
+        let spec_raw = normX *. hvX +. normY *. hvY +. normZ *. hvZ in
+        let spec_dot = if spec_raw <. 0.0 then 0.0 else spec_raw in
+        let s2 = spec_dot *. spec_dot in
+        let s4 = s2 *. s2 in
+        let s8 = s4 *. s4 in
+        let s16 = s8 *. s8 in
+        let specular = s16 *. s4 *. s2 in
+        (* Depth fade and edge softness *)
+        let tExit_s = tExit +. 1.0e-6 in
+        let df_raw = 1.0 -. hitT /. tExit_s in
+        let depthFade = if df_raw <. 0.35 then 0.35 else if df_raw >. 1.0 then 1.0 else df_raw in
+        let edge_raw = (density -. threshold) /. 0.55 in
+        let edge = if edge_raw <. 0.0 then 0.0 else if edge_raw >. 1.0 then 1.0 else edge_raw in
+        let shade = depthFade *. (0.14 +. shadow *. (0.18 +. 0.82 *. diffuse) +.
+                                  0.18 *. rim +. 0.22 *. specular) in
+        let final_shade = shade *. (0.62 +. 0.38 *. edge) in
+        ((1, final_shade), ((t +. stepSize, t), (density, 1)))
+      else
+        ((0, 0.0), ((t +. stepSize, t), (density, 1)))
+
+(* ======= Top-level render: generate [outH, outW] of luminance values ======= *)
+
+let render =
+  let voxels = voxel_scene in
+  let nx = 224 in
+  let ny = 224 in
+  let nz = 168 in
+  let outW = 1920 in
+  let outH = 1080 in
+  let maxSteps = 800 in
+
+  (* Camera position *)
+  let halfX = float_of nx /. 2.0 in
+  let halfY = float_of ny /. 2.0 in
+  let halfZ = float_of nz /. 2.0 in
+  let camX = halfX -. 0.94 *. float_of nx in
+  let camY = halfY -. 0.16 *. float_of ny in
+  let camZ = halfZ -. 1.08 *. float_of nz in
+
+  (* Camera forward = normalize(target - camPos) *)
+  let targetX = halfX +. 4.0 in
+  let targetY = halfY -. 9.0 in
+  let targetZ = halfZ +. 2.0 in
+  let fdx = targetX -. camX in
+  let fdy = targetY -. camY in
+  let fdz = targetZ -. camZ in
+  let fdlen = sqrt (fdx *. fdx +. fdy *. fdy +. fdz *. fdz) in
+  let fwdX = fdx /. fdlen in
+  let fwdY = fdy /. fdlen in
+  let fwdZ = fdz /. fdlen in
+
+  (* Camera right = normalize(cross(forward, world_up=(0,1,0)))
+     cross(fwd,(0,1,0)) = (-fwdZ, 0, fwdX) *)
+  let rlen = sqrt (fwdZ *. fwdZ +. fwdX *. fwdX) in
+  let rightX = (0.0 -. fwdZ) /. rlen in
+  let rightY = 0.0 in
+  let rightZ = fwdX /. rlen in
+
+  (* Camera up = normalize(cross(right, forward))
+     cross((rx,0,rz),(fx,fy,fz)) = (-rz*fy, rz*fx - rx*fz, rx*fy) *)
+  let upx_r = (0.0 -. rightZ) *. fwdY in
+  let upy_r = rightZ *. fwdX -. rightX *. fwdZ in
+  let upz_r = rightX *. fwdY in
+  let uplen = sqrt (upx_r *. upx_r +. upy_r *. upy_r +. upz_r *. upz_r) in
+  let upX = upx_r /. uplen in
+  let upY = upy_r /. uplen in
+  let upZ = upz_r /. uplen in
+
+  (* Normalized light direction *)
+  let ldr = 0.45 in
+  let ldg = 0.0 -. 0.35 in
+  let ldb = 0.82 in
+  let ldlen = sqrt (ldr *. ldr +. ldg *. ldg +. ldb *. ldb) in
+  let ldX = ldr /. ldlen in
+  let ldY = ldg /. ldlen in
+  let ldZ = ldb /. ldlen in
+
+  (* Render parameters *)
+  let coarseStep = 0.55 in
+  let mediumStep = 0.28 in
+  let fineStep   = 0.12 in
+  let focalScale = 0.63 in
+  let threshold  = 0.42 in
+  let aspect     = float_of outW /. float_of outH in
+
+  (* Box bounds *)
+  let boxMaxX = float_of (nx - 1) in
+  let boxMaxY = float_of (ny - 1) in
+  let boxMaxZ = float_of (nz - 1) in
+
+  (* Per-pixel ray function.  generate [outH, outW] parallelizes this over
+     pixels with #pragma omp parallel for (outer tile loop).  Parallelization
+     is legal because the output array is fresh+write-once and the voxel scene
+     is read-only inside the loop body.
+     The slab intersection logic is inlined as pure let-bindings.
+     Returns a Float luminance value for one pixel. *)
+  let ray_fn [py, px] =
+    let sx = ((float_of px +. 0.5) /. float_of outW -. 0.5) *. aspect *. 1.05 in
+    let sy = ((float_of py +. 0.5) /. float_of outH -. 0.5) *. 1.05 in
+
+    (* Ray direction = normalize(forward + focalScale*sx*right - focalScale*sy*up) *)
+    let rax = fwdX +. focalScale *. sx *. rightX -. focalScale *. sy *. upX in
+    let ray = fwdY +. focalScale *. sx *. rightY -. focalScale *. sy *. upY in
+    let raz = fwdZ +. focalScale *. sx *. rightZ -. focalScale *. sy *. upZ in
+    let ralen = sqrt (rax *. rax +. ray *. ray +. raz *. raz) in
+    let dirX = rax /. ralen in
+    let dirY = ray /. ralen in
+    let dirZ = raz /. ralen in
+
+    (* Ray-box slab test, X axis *)
+    let xpair =
+      if abs_f dirX <. 1.0e-9 then
+        if camX >=. 0.0 then if camX <=. boxMaxX then (0.0, 1.0e30) else (0.0, 0.0 -. 1.0)
+        else (0.0, 0.0 -. 1.0)
+      else
+        let xt0 = (0.0 -. camX) /. dirX in
+        let xt1 = (boxMaxX -. camX) /. dirX in
+        let xtlo = if xt0 <. xt1 then xt0 else xt1 in
+        let xthi = if xt0 >. xt1 then xt0 else xt1 in
+        let xnE = if xtlo >. 0.0 then xtlo else 0.0 in
+        let xnX = if xthi <. 1.0e30 then xthi else 1.0e30 in
+        (xnE, xnX) in
+    let sE1 = fst xpair in
+    let sX1 = snd xpair in
+
+    (* Y axis *)
+    let ypair =
+      if abs_f dirY <. 1.0e-9 then
+        if camY >=. 0.0 then if camY <=. boxMaxY then (sE1, sX1) else (sE1, 0.0 -. 1.0)
+        else (sE1, 0.0 -. 1.0)
+      else
+        let yt0 = (0.0 -. camY) /. dirY in
+        let yt1 = (boxMaxY -. camY) /. dirY in
+        let ytlo = if yt0 <. yt1 then yt0 else yt1 in
+        let ythi = if yt0 >. yt1 then yt0 else yt1 in
+        let ynE = if ytlo >. sE1 then ytlo else sE1 in
+        let ynX = if ythi <. sX1 then ythi else sX1 in
+        (ynE, ynX) in
+    let sE2 = fst ypair in
+    let sX2 = snd ypair in
+
+    (* Z axis *)
+    let zpair =
+      if abs_f dirZ <. 1.0e-9 then
+        if camZ >=. 0.0 then if camZ <=. boxMaxZ then (sE2, sX2) else (sE2, 0.0 -. 1.0)
+        else (sE2, 0.0 -. 1.0)
+      else
+        let zt0 = (0.0 -. camZ) /. dirZ in
+        let zt1 = (boxMaxZ -. camZ) /. dirZ in
+        let ztlo = if zt0 <. zt1 then zt0 else zt1 in
+        let zthi = if zt0 >. zt1 then zt0 else zt1 in
+        let znE = if ztlo >. sE2 then ztlo else sE2 in
+        let znX = if zthi <. sX2 then zthi else sX2 in
+        (znE, znX) in
+    let tEnter = fst zpair in
+    let tExit  = snd zpair in
+
+    if tEnter >. tExit then 0.0
+    else
+      let tStart = if tEnter >. 0.0 then tEnter else 0.0 in
+      (* State: ((hit, shade), ((t, prevT), (prevDensity, havePrev))) *)
+      let initState = ((0, 0.0), ((tStart, tStart), (0.0, 0))) in
+      (* Thin wrapper so inlineBinaryFn sees a 2-arg function. *)
+      let finalState = foldl
+        (let step acc d = ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold coarseStep mediumStep fineStep ldX ldY ldZ acc d in step)
+        initState
+        (fill [maxSteps] 0) in
+      snd (fst finalState) in
+
+  generate [outH, outW] ray_fn

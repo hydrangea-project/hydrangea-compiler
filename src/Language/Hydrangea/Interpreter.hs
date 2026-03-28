@@ -839,7 +839,8 @@ evalUnOp (Erf   _) (VFloat f) = pure $ VFloat (erf' f)
               u  = 1.061405429
               poly = t * (p + t * (q + t * (r + t * (s + t * u))))
           in 1.0 - poly * exp (-(x * x))
-evalUnOp (FloatOf _) (VInt n) = pure $ VFloat (fromIntegral n)
+evalUnOp (FloatOf _) (VInt n)   = pure $ VFloat (fromIntegral n)
+evalUnOp (IntOf _)   (VFloat f) = pure $ VInt (truncate f)
 evalUnOp op val =
   Left $ TypeError $ "Cannot apply " ++ show op ++ " to " ++ show val
 

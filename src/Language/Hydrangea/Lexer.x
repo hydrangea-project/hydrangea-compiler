@@ -97,7 +97,8 @@ tokens :-
 <0> floor_f  { tok FloorF }
 <0> ceil_f   { tok CeilF }
 <0> erf      { tok Erf }
-<0> float_of { tok FloatOf }
+<0> float_of    { tok FloatOf }
+<0> int_of_float { tok IntOf }
 <0> int     { tok TInt }
 <0> bool    { tok TBool }
 <0> float   { tok TFloat }
@@ -331,6 +332,7 @@ data Token
   | CeilF
   | Erf
   | FloatOf
+  | IntOf
   | ReadArray
   | ReadArrayFloat
   | WriteArray

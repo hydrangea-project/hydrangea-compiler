@@ -837,6 +837,7 @@ infer (EUnOp r uop e) =
     CeilF  _  -> check e UTyFloat >> return UTyFloat
     Erf  _    -> check e UTyFloat >> return UTyFloat
     FloatOf _ -> check e UTyInt   >> return UTyFloat
+    IntOf _   -> check e UTyFloat >> return UTyInt
 infer (EApp r e1 e2) = do
   ty1 <- infer e1
   ty2 <- infer e2
@@ -1547,7 +1548,18 @@ infer (ELetIn r dec e) = do
       case skolemAnn of
         Just ann -> wrange rr (funTy =:= ann) >> return ann
         Nothing  -> return (if null pats then inferredBodyTy else funTy)
-  sch <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
+  -- For monomorphic inner let-bindings (no generalized type variables), emit
+  -- the captured predicates exactly once via 'tell' and store a zero-predicate
+  -- scheme.  This prevents exponential blowup when a variable is used multiple
+  -- times: 'instantiate' re-emits predicates on every use, so storing them in
+  -- the scheme would multiply the predicate count by the number of uses.
+  -- For polymorphic bindings (xs non-empty) the existing behaviour is correct:
+  -- each instantiation renames the predicate variables to match the fresh type
+  -- variable substitution, so re-emission is intentional.
+  Forall xs _ ty <- generalize rhsTy
+  sch <- case xs of
+    [] -> tell rhsPreds >> return (Forall [] [] ty)
+    _  -> return (Forall xs rhsPreds ty)
   withBinding v sch $ wrange r $ infer e
 infer (EBoundLetIn _ x boundExp rhs body) = do
   rhsTy <- infer rhs

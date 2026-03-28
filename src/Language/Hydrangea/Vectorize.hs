@@ -470,7 +470,7 @@ vectorizeProcWithCalls callTypes proc =
   where
     defaultContext = VectorContext False
     enterLoop _ = VectorContext True
-    typeEnv = recoverProcTypeEnv2 callTypes proc
+    typeEnv = recoverProcTypeEnv2 callTypes M.empty proc
     accessFacts = procVectorAccessFacts proc
 
     rewriteStmt :: VectorContext -> Stmt -> [Stmt]

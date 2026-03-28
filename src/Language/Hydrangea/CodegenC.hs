@@ -26,7 +26,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CElemType(..), CType(..), CVar, RHS(..), Redop(..), UnOp(..), ctypeToElemType)
 import Language.Hydrangea.CFG qualified as C2
 import Language.Hydrangea.CFGAnalysis (usedVarsAtom2, usedVarsStmts2)
-import Language.Hydrangea.CFGTyping (inferProgramReturnTypes2, recoverProcTypeEnv2)
+import Language.Hydrangea.CFGTyping (CallParamTypes, TypeEnv, buildCallParamTypes, inferProgramReturnTypes2, recoverProcTypeEnv2)
 import Prelude hiding ((<>))
 import Text.PrettyPrint.HughesPJClass
 
@@ -182,7 +182,8 @@ genProgram2 :: CodegenOptions -> C2.Program -> Either String CodegenArtifacts
 genProgram2 opts prog@(C2.Program procs) = do
   let retKinds = procReturnKinds2 prog
       retTypes = inferProgramReturnTypes2 prog
-      missingArrayElemVars = collectMissingArrayElemVars retTypes procs
+      callParamTypes = buildCallParamTypes retTypes procs
+      missingArrayElemVars = collectMissingArrayElemVars retTypes callParamTypes procs
       needsOmp  = any (\(C2.Proc { C2.procBody = body }) -> hasParallelStmt2 body) procs
       needsMath = any (\(C2.Proc { C2.procBody = body }) -> hasMathOp body) procs
       ompInclude  = if needsOmp  then text "#include <omp.h>"   else empty
@@ -191,7 +192,8 @@ genProgram2 opts prog@(C2.Program procs) = do
       timeInclude = case mBench of
         Nothing -> empty
         Just _  -> text "#include <time.h>"
-      pairStructs = genPairStructDefs prog
+      recoveredEnvs = map (recoverProcTypeEnv2 retTypes callParamTypes) procs
+      pairStructs = genPairStructDefs prog recoveredEnvs
       recordStructs = genRecordStructDefs prog
       structuredArrayPrints = genStructuredArrayPrintDefs retTypes
       missingArrayElemDoc
@@ -239,7 +241,7 @@ genProgram2 opts prog@(C2.Program procs) = do
           $$ structuredArrayPrints
           $$ text ""
           $$ benchCacheGlobal
-          $$ vcat (punctuate (text "") (map (genProc2 mBench retKinds retTypes) procs))
+          $$ vcat (punctuate (text "") (map (genProc2 mBench retKinds retTypes callParamTypes) procs))
           $$ case exportSpec of
                Nothing -> empty
                Just spec -> text "" $$ genExportWrapper spec
@@ -456,9 +458,9 @@ genMain2 mBench retKinds retTypes procs =
             text "int64_t" <+> text (cName ++ "_result") <+> text "=" <+> text cName <> text "();"
               $$ text "hyd_print_int(" <> text (cName ++ "_result") <> text ");"
 
-genProc2 :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> C2.Proc -> Doc
-genProc2 mBench retKinds retTypes proc@(C2.Proc { C2.procName = name, C2.procParams = params, C2.procBody = body }) =
-  let typeEnv = recoverProcTypeEnv2 retTypes proc
+genProc2 :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> C2.Proc -> Doc
+genProc2 mBench retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = name, C2.procParams = params, C2.procBody = body }) =
+  let typeEnv = recoverProcTypeEnv2 retTypes callParamTypes proc
       -- Authoritative classification from the recovered type environment.
       (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) = typeEnvToVarSets typeEnv
       recoveredArrayElemTypes = inferArrayElemTypesFromStmts retTypes body (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
@@ -1137,7 +1139,7 @@ classifyVarKinds2 retKinds stmts = fixpoint S.empty (initFloatArrays stmts)
             usedAsFloat = case rhs of
               RBinOp op a1 a2 | isFloatArithBinOp op ->
                 atomVars a1 `S.union` atomVars a2
-              RUnOp op a | op `elem` [CSqrt, CExpF, CLog, CSin, CCos, CAbsF, CFloorF, CCeilF, CErf] ->
+              RUnOp op a | op `elem` [CSqrt, CExpF, CLog, CSin, CCos, CAbsF, CFloorF, CCeilF, CErf, CIntOf] ->
                 atomVars a
               RUnOp CNeg a | isFloatAtom fv a -> atomVars a
               _ -> S.empty
@@ -1182,9 +1184,10 @@ procReturnKinds2 :: C2.Program -> Map CVar VarKind
 procReturnKinds2 prog@(C2.Program procs) = foldl addProc Map.empty procs
   where
     callTypes = inferProgramReturnTypes2 prog
+    callParamTypes = buildCallParamTypes callTypes procs
     addProc rk proc@(C2.Proc { C2.procName = name }) = Map.insert name (retKindOf rk proc) rk
     retKindOf rk proc@(C2.Proc { C2.procBody = body, C2.procTypeEnv = typeEnv }) =
-      let recoveredTypeEnv = recoverProcTypeEnv2 callTypes proc
+      let recoveredTypeEnv = recoverProcTypeEnv2 callTypes callParamTypes proc
           (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) =
             typeEnvToVarSets (typeEnv `Map.union` recoveredTypeEnv)
           arrVars      = arrVarsTE    `S.union` arrayVarsProc2 proc
@@ -1293,20 +1296,24 @@ collectPairTypesFromCType _ = []
 
 -- | Collect all distinct pair kinds used in the program and emit their struct
 -- typedefs in dependency order (inner structs before outer structs).
--- Scans both the CFG body (for RPairMake sites) and the procTypeEnv (for pair
--- parameters/return values that never appear in a make statement).
-genPairStructDefs :: C2.Program -> Doc
-genPairStructDefs (C2.Program procs) =
+-- Scans the CFG body (for RPairMake sites), the procTypeEnv (for pair
+-- parameters/return values that never appear in a make statement), and the
+-- recovered type environments (which may include pair types discovered by
+-- backward type inference not present at lowering time).
+genPairStructDefs :: C2.Program -> [TypeEnv] -> Doc
+genPairStructDefs (C2.Program procs) recoveredEnvs =
   let allPairs = concatMap transitivePairTypes topLevelTypes
       -- deduplicate while preserving order (first occurrence wins)
       ordered = nubBy (\a b -> fst a == fst b && snd a == snd b) allPairs
   in if null ordered then empty
      else text "" $$ vcat (map (uncurry genPairStructDef) ordered)
   where
-    topLevelTypes = concatMap collectPairTypesProc procs
-    collectPairKinds (C2.Proc { C2.procBody = body, C2.procTypeEnv = tenv }) =
-      collectPairKindsStmts body `S.union` collectPairKindsTypeEnv tenv
-    collectPairTypesProc proc = map (\(ct1, ct2) -> CEPair ct1 ct2) (S.toList (collectPairKinds proc))
+    topLevelTypes = concatMap collectPairTypesProc (zip procs recoveredEnvs)
+    collectPairKinds (C2.Proc { C2.procBody = body, C2.procTypeEnv = tenv }, recEnv) =
+      collectPairKindsStmts body
+        `S.union` collectPairKindsTypeEnv tenv
+        `S.union` collectPairKindsTypeEnv recEnv
+    collectPairTypesProc procEnv = map (\(ct1, ct2) -> CEPair ct1 ct2) (S.toList (collectPairKinds procEnv))
     -- Collect pairs from RPairMake in the body.
     collectPairKindsStmts = foldMap collectPairKindsStmt
     collectPairKindsStmt st = case st of
@@ -1543,12 +1550,12 @@ inferArrayElemTypesFromStmts retTypes stmts initial = go initial
         in Map.union knownThn knownEls
       _ -> known
 
-collectMissingArrayElemVars :: Map CVar CType -> [C2.Proc] -> [String]
-collectMissingArrayElemVars retTypes procs =
+collectMissingArrayElemVars :: Map CVar CType -> CallParamTypes -> [C2.Proc] -> [String]
+collectMissingArrayElemVars retTypes callParamTypes procs =
   map BS.unpack (S.toList (foldMap missingForProc procs))
   where
     missingForProc proc =
-      let typeEnv = recoverProcTypeEnv2 retTypes proc
+      let typeEnv = recoverProcTypeEnv2 retTypes callParamTypes proc
           arrayElemTypes = inferArrayElemTypesFromStmts retTypes (C2.procBody proc) (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
       in missingArrayVarsInStmts arrayElemTypes (C2.procBody proc)
 
@@ -1635,6 +1642,7 @@ genUnOp CFloorF = text "floor"
 genUnOp CCeilF  = text "ceil"
 genUnOp CErf    = text "erf"
 genUnOp CFloatOf = text "(double)"
+genUnOp CIntOf   = text "(int64_t)"
 
 -- | Collect all variables assigned anywhere in a list of statements,
 -- including inside nested SIf and SLoop bodies. Used to hoist variable

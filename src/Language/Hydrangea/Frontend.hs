@@ -28,7 +28,11 @@ import Language.Hydrangea.CodegenC (codegenProgram2, codegenProgram2Prune)
 
 -- | Normalize and fuse declarations before lowering or code generation.
 preprocessDecs :: [Dec Range] -> [Dec Range]
-preprocessDecs = fuseDecs . normalizeShapesDecs . uniquifyDecs
+preprocessDecs decs =
+  let u = uniquifyDecs decs
+      n = normalizeShapesDecs u
+      f = fuseDecs n
+  in f
 
 formatInferResult :: Either err a -> (err -> String) -> Either String a
 formatInferResult result formatErr =
@@ -144,7 +148,9 @@ lowerToCFG2WithConcreteTypes typeEnv = lowerDecs2WithTypeEnv typeEnv . preproces
 inferAndLowerToCFG2 :: InferOptions -> [Dec Range] -> IO C2.Program
 inferAndLowerToCFG2 opts decs = do
   typeEnv <- inferTopLevelTypesWithOptions opts decs
-  pure (lowerToCFG2WithConcreteTypes typeEnv decs)
+  let pre = preprocessDecs decs
+  let prog = lowerDecs2WithTypeEnv typeEnv pre
+  pure prog
 
 -- | Lower declarations to CFG using inferred top-level concrete types.
 lowerToCFG2WithTypes :: [Dec Range] -> IO C2.Program

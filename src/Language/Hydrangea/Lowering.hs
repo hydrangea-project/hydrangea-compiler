@@ -211,6 +211,11 @@ lowerExp expr = case expr of
   EUnOp _ (CeilF  _) e -> lowerMathUnOp CCeilF  e
   EUnOp _ (Erf   _) e -> lowerMathUnOp CErf   e
   EUnOp _ (FloatOf _) e -> lowerMathUnOp CFloatOf e
+  EUnOp _ (IntOf _) e -> do
+    (s, a) <- lowerExp e
+    t <- freshCVar "t"
+    registerCType t CTInt64
+    pure (s ++ [SAssign t (RUnOp CIntOf a)], AVar t)
 
   EOp _ op -> do
     t <- freshCVar "op"
@@ -510,6 +515,49 @@ lowerExp expr = case expr of
                 )
             ]
          , AVar outArr
+         )
+
+  -- Optimized: foldl over fill avoids allocating a temporary array.
+  -- The fill element is loop-invariant; assign it once before the loop.
+  EFoldl _ fnExp initExp (EFill _ shapeExp valExp) -> do
+    (si, ai)  <- lowerExp initExp
+    (ss, as') <- lowerExp shapeExp
+    (sv, av)  <- lowerExp valExp
+    n     <- freshCVar "foldl_n"
+    acc   <- freshCVar "foldl_acc"
+    k     <- freshCVar "foldl_k"
+    elem' <- freshCVar "foldl_elem"
+    propagatePairInfo acc ai
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    pure ( si ++ ss ++ sv
+         ++ [ SAssign n     (RShapeSize as')
+            , SAssign acc   (RAtom ai)
+            , SAssign elem' (RAtom av)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                bodyStmts
+            ]
+         , AVar acc
+         )
+
+  -- Optimized: foldl over generate avoids allocating a temporary array.
+  -- The generator body is inlined directly into the loop.
+  EFoldl _ fnExp initExp (EGenerate _ shapeExp genFnExp) -> do
+    (si, ai)  <- lowerExp initExp
+    (ss, as') <- lowerExp shapeExp
+    n     <- freshCVar "foldl_n"
+    acc   <- freshCVar "foldl_acc"
+    k     <- freshCVar "foldl_k"
+    elem' <- freshCVar "foldl_elem"
+    propagatePairInfo acc ai
+    genStmts  <- inlineArrayFn1D genFnExp k elem'
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    pure ( si ++ ss
+         ++ [ SAssign n   (RShapeSize as')
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                ( genStmts ++ bodyStmts )
+            ]
+         , AVar acc
          )
 
   EFoldl _ fnExp initExp arrExp -> do
@@ -1857,8 +1905,15 @@ atomToIndexExpr _ = IConst 0
 
 bindCopyVar :: CVar -> Atom -> LowerM [Stmt]
 bindCopyVar dst src = do
-  srcTy <- ctypeOfAtom src
-  registerCType dst srcTy
+  -- Only propagate a concrete type when the source atom has one registered.
+  -- For AVar atoms not yet in lsTypeEnv (e.g. array parameters inlined from
+  -- a callee), ctypeOfAtom would return the CTInt64 default, incorrectly
+  -- poisoning the destination's type in procTypeEnv and blocking later
+  -- backward-propagation through RArrayLoad / RArrayShape.
+  mSrcTy <- case src of
+    AVar v  -> gets (M.lookup v . lsTypeEnv)
+    _       -> Just <$> ctypeOfAtom src
+  mapM_ (registerCType dst) mSrcTy
   propagatePairInfo dst src
   pure [SAssign dst (RAtom src)]
 
