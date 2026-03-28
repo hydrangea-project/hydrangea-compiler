@@ -13,6 +13,10 @@
 -- * 'LoopSpec' \/ 'ExecPolicy' — n-dimensional loop descriptors with
 --   serial, parallel, and vector execution hints.
 -- * 'Stmt' \/ 'Proc' \/ 'Program' — the minimal statement IR for lowered programs.
+--
+-- * /Naming convention/ — functions operating directly on this CFG IR use
+--   a @2@ suffix for boring historical reasons. There used to be two separate
+--   CFG layers, but the first was folded into the second.
 module Language.Hydrangea.CFG
   ( CVar
   , IndexExpr(..)

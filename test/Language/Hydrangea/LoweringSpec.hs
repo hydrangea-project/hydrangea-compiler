@@ -31,11 +31,10 @@ parseSource str = runAlex str parseDecs
 contains :: String -> String -> Bool
 contains substr = isInfixOf substr
 
+returnedVar :: Proc -> Maybe ByteString
 returnedVar Proc { procBody = stmts } = case reverse stmts of
   SReturn (AVar v):_ -> Just v
   _ -> Nothing
-
-returnedVar :: Proc -> Maybe ByteString
 
 lookupArrayFact :: ByteString -> Proc -> Maybe ArrayFact
 lookupArrayFact v Proc { procArrayFacts = facts } = Map.lookup v facts
@@ -153,16 +152,16 @@ spec = do
       length procs `shouldBe` 1
       let Proc { procBody = stmts } = head procs
       -- Should contain array_alloc and SLoop
-      any isArrayAlloc stmts `shouldBe` True
-      any isSLoop stmts `shouldBe` True
+      any (\s -> case s of { SAssign _ (RArrayAlloc _) -> True; _ -> False }) stmts `shouldBe` True
+      any (\s -> case s of { SLoop _ _ -> True; _ -> False }) stmts `shouldBe` True
       loopRoles stmts `shouldBe` [LoopMap]
-      
+
     it "lowers generate array" $ do
       prog <- lowerFromSource "let arr = generate [3] (let f [i] = i + 1 in f)"
       let Program procs = prog
       length procs `shouldBe` 1
       let Proc { procBody = stmts } = head procs
-      any isSLoop stmts `shouldBe` True
+      any (\s -> case s of { SLoop _ _ -> True; _ -> False }) stmts `shouldBe` True
       loopRoles stmts `shouldBe` [LoopMap]
       
     it "lowers map over array" $ do
@@ -260,7 +259,7 @@ spec = do
       -- The last statement should be SReturn of a non-shape atom.
       -- We verify indirectly: compiling this to C and running should not crash;
       -- at the CFG level, the proc must have at least one array alloc (from fill).
-      any isArrayAlloc stmts `shouldBe` True
+      any (\s -> case s of { SAssign _ (RArrayAlloc _) -> True; _ -> False }) stmts `shouldBe` True
 
     it "scatter_generate (via fusion) lowers with combine applied" $ do
       -- Fused scatter_generate: scatter (+) (fill [3] 0) idx (map f src)
@@ -396,14 +395,6 @@ spec = do
           afFreshAlloc fact `shouldBe` True
           afWriteOnce fact `shouldBe` True
         Nothing -> expectationFailure "expected array facts for gather result"
-isArrayAlloc :: Stmt -> Bool
-isArrayAlloc (SAssign _ (RArrayAlloc _)) = True
-isArrayAlloc _ = False
-
-isSLoop :: Stmt -> Bool
-isSLoop (SLoop _ _) = True
-isSLoop _ = False
-
 countSLoops :: [Stmt] -> Int
 countSLoops = sum . map countInStmt
   where

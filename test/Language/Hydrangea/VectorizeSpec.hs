@@ -141,6 +141,8 @@ spec = describe "Vectorize" $ do
             [loop]
     hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) lowered `shouldBe` True
     hasRHS (\rhs -> case rhs of C.RVecStore {} -> True; _ -> False) lowered `shouldBe` True
+    -- The loop policy stays Serial; only the RHS load/store ops become
+    -- vector IR.  An explicit Vector loop policy is not emitted here.
     hasLoop (\ls -> lsExec ls == Vector (VectorSpec 2 TailNone)) lowered `shouldBe` False
 
   it "uses lowering-provided dense index aliases to broaden explicit vectorization" $ do

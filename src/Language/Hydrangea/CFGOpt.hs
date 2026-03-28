@@ -512,7 +512,8 @@ optimizeOnce =
   . copyProp2
 
 -- | Run 'optimizeOnce' to a fixpoint (or until the iteration limit of
--- 100 is reached).
+-- 100 is reached).  In practice the pipeline usually converges in only
+-- a few iterations.
 optimizeFixpoint :: [Stmt] -> [Stmt]
 optimizeFixpoint = go 100
   where

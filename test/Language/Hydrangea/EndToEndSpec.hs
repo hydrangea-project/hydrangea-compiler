@@ -17,7 +17,7 @@ import Language.Hydrangea.Syntax (Dec(..))
 import System.IO.Temp (withSystemTempDirectory)
 import System.FilePath ((</>))
 import System.Directory (copyFile)
-import Control.Monad (when)
+import Control.Monad (forM_, when)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -273,85 +273,32 @@ spec = do
 
   describe "Example programs" $ do
 
-    it "arith.hyd - arithmetic expressions" $ withCC $ do
-      src <- BS.readFile "examples/arith.hyd"
-      checkInlineSrc src
-
-    it "arrays.hyd - fill + map" $ withCC $ do
-      src <- BS.readFile "examples/arrays.hyd"
-      checkInlineSrc src
-
-    it "complete.hyd - closures, partial application, map" $ withCC $ do
-      src <- BS.readFile "examples/complete.hyd"
-      checkInlineSrc src
-
-    it "dot.hyd - generate + zipwith + reduce (no CSV)" $ withCC $ do
-      src <- BS.readFile "examples/dot.hyd"
-      checkInlineSrc src
-
-    it "float_test.hyd - float arithmetic" $ withCC $ do
-      src <- BS.readFile "examples/float_test.hyd"
-      checkInlineSrc src
-
-    it "reduce_reg.hyd - basic reduce" $ withCC $ do
-      src <- BS.readFile "examples/reduce_reg.hyd"
-      checkInlineSrc src
-
-    it "pair_test.hyd - pair construction and projection" $ withCC $ do
-      src <- BS.readFile "examples/pair_test.hyd"
-      checkInlineSrc src
-
-    it "pair_fold_simple.hyd - foldl with pair accumulator" $ withCC $ do
-      src <- BS.readFile "examples/pair_fold_simple.hyd"
-      checkInlineSrc src
-
-    it "scatter_parallel_direct.hyd - direct parallel scatter example" $ withCC $ do
-      src <- BS.readFile "examples/scatter_parallel_direct.hyd"
-      checkInlineSrc src
-
-    it "scatter_parallel_atomic.hyd - atomic scatter-add example" $ withCC $ do
-      src <- BS.readFile "examples/scatter_parallel_atomic.hyd"
-      checkInlineSrc src
-
-    it "scatter_parallel_privatized.hyd - privatized scatter-reduce example" $ withCC $ do
-      src <- BS.readFile "examples/scatter_parallel_privatized.hyd"
-      checkInlineSrc src
-
-    it "scatter_guarded_fused.hyd - guarded scatter fusion example" $ withCC $ do
-      src <- BS.readFile "examples/scatter_guarded_fused.hyd"
-      checkInlineSrc src
-
-    it "stencil_1d.hyd - 1D stencil with clamp boundary" $ withCC $ do
-      src <- BS.readFile "examples/stencil_1d.hyd"
-      checkInlineSrc src
-
-    it "stencil_2d.hyd - 2D Laplacian stencil" $ withCC $ do
-      src <- BS.readFile "examples/stencil_2d.hyd"
-      checkInlineSrc src
-
-    it "scan_prefix_sum.hyd - exclusive scan / offsets example" $ withCC $ do
-      src <- BS.readFile "examples/scan_prefix_sum.hyd"
-      checkInlineSrc src
-
-    it "sort_indices_gather.hyd - permutation sort plus gather example" $ withCC $ do
-      src <- BS.readFile "examples/sort_indices_gather.hyd"
-      checkInlineSrc src
-
-    it "coo_sort_row_major.hyd - record-based COO canonical sort example" $ withCC $ do
-      src <- BS.readFile "examples/coo_sort_row_major.hyd"
-      checkInlineSrc src
-
-    it "coo_to_csr_pipeline.hyd - COO canonicalization plus CSR conversion" $ withCC $ do
-      src <- BS.readFile "examples/coo_to_csr_pipeline.hyd"
-      checkInlineSrc src
-
-    it "segmented_group_sum.hyd - grouped aggregation over explicit offsets" $ withCC $ do
-      src <- BS.readFile "examples/segmented_group_sum.hyd"
-      checkInlineSrc src
-
-    it "graph_messages_csr.hyd - CSR-backed flat messages plus segmented reduction" $ withCC $ do
-      src <- BS.readFile "examples/graph_messages_csr.hyd"
-      checkInlineSrc src
+    let exampleFiles =
+          [ ("arith.hyd",                      "arithmetic expressions")
+          , ("arrays.hyd",                     "fill + map")
+          , ("complete.hyd",                   "closures, partial application, map")
+          , ("dot.hyd",                        "generate + zipwith + reduce (no CSV)")
+          , ("float_test.hyd",                 "float arithmetic")
+          , ("reduce_reg.hyd",                 "basic reduce")
+          , ("pair_test.hyd",                  "pair construction and projection")
+          , ("pair_fold_simple.hyd",           "foldl with pair accumulator")
+          , ("scatter_parallel_direct.hyd",    "direct parallel scatter example")
+          , ("scatter_parallel_atomic.hyd",    "atomic scatter-add example")
+          , ("scatter_parallel_privatized.hyd","privatized scatter-reduce example")
+          , ("scatter_guarded_fused.hyd",      "guarded scatter fusion example")
+          , ("stencil_1d.hyd",                 "1D stencil with clamp boundary")
+          , ("stencil_2d.hyd",                 "2D Laplacian stencil")
+          , ("scan_prefix_sum.hyd",            "exclusive scan / offsets example")
+          , ("sort_indices_gather.hyd",        "permutation sort plus gather example")
+          , ("coo_sort_row_major.hyd",         "record-based COO canonical sort example")
+          , ("coo_to_csr_pipeline.hyd",        "COO canonicalization plus CSR conversion")
+          , ("segmented_group_sum.hyd",        "grouped aggregation over explicit offsets")
+          , ("graph_messages_csr.hyd",         "CSR-backed flat messages plus segmented reduction")
+          ]
+    forM_ exampleFiles $ \(filename, description) ->
+      it (filename ++ " - " ++ description) $ withCC $ do
+        src <- BS.readFile ("examples/" ++ filename)
+        checkInlineSrc src
 
   -- ---- Inline micro-tests: one kernel type per describe --------------------
 

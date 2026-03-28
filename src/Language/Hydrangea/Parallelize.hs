@@ -30,7 +30,7 @@ module Language.Hydrangea.Parallelize
   ) where
 
 import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
+import Data.Map.Strict qualified as M
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..))
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGTyping (recoverProcTypeEnv2)
@@ -120,10 +120,10 @@ accumulateArrayUsage u accessType = case accessType of
 
 -- | Build a per-array read/write summary for all accesses in a loop body.
 collectLoopArrayUsage :: [Stmt] -> Map CVar LoopArrayUsage
-collectLoopArrayUsage = foldl' record Map.empty . extractAccesses2
+collectLoopArrayUsage = foldl' record M.empty . extractAccesses2
   where
     record m acc =
-      Map.insertWith mergeUsage (aa2ArrayVar acc)
+      M.insertWith mergeUsage (aa2ArrayVar acc)
         (accumulateArrayUsage emptyLoopArrayUsage (aa2AccessType acc)) m
 
     mergeUsage a b = LoopArrayUsage
@@ -154,7 +154,7 @@ passesConservativeDependenceCheck spec body =
     hasBlockingDependence =
       any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward) deps
     hasReadWriteHazard =
-      any (\u -> lauReads u && lauWrites u) (Map.elems usage)
+      any (\u -> lauReads u && lauWrites u) (M.elems usage)
 
 -- | Returns 'True' when lowering-provided array facts are sufficient to
 -- prove that the loop body is embarrassingly parallel.  Every array
@@ -163,11 +163,11 @@ passesConservativeDependenceCheck spec body =
 -- the same array are conservatively rejected.
 factsPermitParallelLoop :: ArrayFacts -> [Stmt] -> Bool
 factsPermitParallelLoop arrayFacts body =
-  not (Map.null usage) && all arraySafe (Map.toList usage)
+  not (M.null usage) && all arraySafe (M.toList usage)
   where
     usage = collectLoopArrayUsage body
 
-    arraySafe (arr, u) = case Map.lookup arr arrayFacts of
+    arraySafe (arr, u) = case M.lookup arr arrayFacts of
       Nothing   -> False
       Just fact
         | lauWrites u -> afFreshAlloc fact && afWriteOnce fact && not (lauReads u)
@@ -182,7 +182,7 @@ factsPermitParallelLoop arrayFacts body =
 -- environment, or return 'Nothing' for atoms that cannot be expressed.
 resolveAtomIndex :: Map CVar IndexExpr -> Atom -> Maybe IndexExpr
 resolveAtomIndex env atom = case atom of
-  AVar v -> Just (Map.findWithDefault (IVar v) v env)
+  AVar v -> Just (M.findWithDefault (IVar v) v env)
   AInt n -> Just (IConst n)
   _      -> Nothing
 
@@ -207,10 +207,10 @@ resolveRHSIndex env rhs = case rhs of
 -- list for pure scalar assignments.  Used to inline index arithmetic
 -- when examining array write indices.
 buildIndexEnv :: [Stmt] -> Map CVar IndexExpr
-buildIndexEnv = foldl' step Map.empty
+buildIndexEnv = foldl' step M.empty
   where
     step env (SAssign v rhs) = case resolveRHSIndex env rhs of
-      Just expr -> Map.insert v expr env
+      Just expr -> M.insert v expr env
       Nothing   -> env
     step env _ = env
 
@@ -262,11 +262,11 @@ factsPermitDirectScatterLoop arrayFacts spec body =
     Just info ->
       let dest  = skiDestArray info
           usage = collectLoopArrayUsage body
-          destSafe = case (Map.lookup dest usage, Map.lookup dest arrayFacts) of
+          destSafe = case (M.lookup dest usage, M.lookup dest arrayFacts) of
             (Just u, Just fact) ->
               lauReads u && lauWrites u && afFreshAlloc fact && afWriteOnce fact
             _ -> False
-      in  destSafe && all (safeNonDest dest) (Map.toList usage)
+      in  destSafe && all (safeNonDest dest) (M.toList usage)
   where
     safeNonDest dest (arr, u)
       | arr == dest = True   -- destination is checked by destSafe above
@@ -343,11 +343,11 @@ factsPermitAtomicScatterLoop arrayFacts typeEnv spec body =
       let dest   = saDestArray info
           elemTy = saValueType info
           usage  = collectLoopArrayUsage body
-          destSafe = case (Map.lookup dest usage, Map.lookup dest arrayFacts, Map.lookup dest typeEnv) of
+          destSafe = case (M.lookup dest usage, M.lookup dest arrayFacts, M.lookup dest typeEnv) of
             (Just u, Just fact, Just (CTArray ty)) | ty == elemTy ->
               lauReads u && lauWrites u && afFreshAlloc fact && afWriteOnce fact
             _ -> False
-      in  destSafe && all (safeNonDest dest) (Map.toList usage)
+      in  destSafe && all (safeNonDest dest) (M.toList usage)
   where
     safeNonDest dest (arr, u)
       | arr == dest = True
@@ -359,27 +359,27 @@ factsPermitAtomicScatterLoop arrayFacts typeEnv spec body =
 -- decide whether a scatter destination is small enough to privatize per
 -- thread.
 collectArrayAllocSizes :: [Stmt] -> Map CVar Integer
-collectArrayAllocSizes = snd . go Map.empty Map.empty
+collectArrayAllocSizes = snd . go M.empty M.empty
   where
     go tuples allocs [] = (tuples, allocs)
     go tuples allocs (stmt : rest) = case stmt of
       SAssign v (RTuple atoms) ->
         let tuples' = case constantProduct atoms of
-              Just sz -> Map.insert v sz tuples
+              Just sz -> M.insert v sz tuples
               Nothing -> tuples
         in  go tuples' allocs rest
       SAssign v (RArrayAlloc (AVar shpVar)) ->
-        let allocs' = case Map.lookup shpVar tuples of
-              Just sz -> Map.insert v sz allocs
+        let allocs' = case M.lookup shpVar tuples of
+              Just sz -> M.insert v sz allocs
               Nothing -> allocs
         in  go tuples allocs' rest
       SLoop _ body ->
-        let (_, bodyAllocs) = go tuples Map.empty body
-        in  go tuples (Map.union allocs bodyAllocs) rest
+        let (_, bodyAllocs) = go tuples M.empty body
+        in  go tuples (M.union allocs bodyAllocs) rest
       SIf _ thn els ->
-        let (_, thnAllocs) = go tuples Map.empty thn
-            (_, elsAllocs) = go tuples Map.empty els
-        in  go tuples (Map.unions [allocs, thnAllocs, elsAllocs]) rest
+        let (_, thnAllocs) = go tuples M.empty thn
+            (_, elsAllocs) = go tuples M.empty els
+        in  go tuples (M.unions [allocs, thnAllocs, elsAllocs]) rest
       _ -> go tuples allocs rest
 
     constantProduct atoms = product <$> traverse atomInt atoms
@@ -399,18 +399,18 @@ factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
     Just info ->
       let dest  = saDestArray info
           usage = collectLoopArrayUsage body
-      in  case (Map.lookup dest usage, Map.lookup dest arrayFacts, Map.lookup dest typeEnv) of
+      in  case (M.lookup dest usage, M.lookup dest arrayFacts, M.lookup dest typeEnv) of
             (Just u, Just fact, Just (CTArray CTInt64)) ->
               lauReads u
               && lauWrites u
               && afFreshAlloc fact
               && afWriteOnce fact
               && profitable dest
-              && all (safeNonDest dest) (Map.toList usage)
+              && all (safeNonDest dest) (M.toList usage)
             _ -> False
   where
     profitable dest =
-      case (Map.lookup dest allocSizes, tripCountValue2 (loopTripCount2 spec)) of
+      case (M.lookup dest allocSizes, tripCountValue2 (loopTripCount2 spec)) of
         (Just sz, Just tc) -> sz > 0 && sz <= 64 && tc >= max 32 (sz * 4)
         _                  -> not (hasExternalReads dest body)
 
@@ -503,7 +503,7 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes =
 -- and type environment attached to that procedure by the lowering pass.
 parallelizeProc2 :: Proc -> Proc
 parallelizeProc2 proc =
-  let typeEnv    = recoverProcTypeEnv2 Map.empty proc
+  let typeEnv    = recoverProcTypeEnv2 M.empty proc
       allocSizes = collectArrayAllocSizes (procBody proc)
   in  proc { procBody = parallelizeProcWithFacts
                           (procArrayFacts proc) typeEnv allocSizes (procBody proc) }

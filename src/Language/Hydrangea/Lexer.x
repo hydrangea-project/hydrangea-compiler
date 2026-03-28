@@ -380,13 +380,6 @@ tokFloat inp@(_, _, str, _) len =
     , rtRange = mkRange inp len
     }
 
-tokString :: AlexAction RangedToken
-tokString inp@(_, _, str, _) len =
-  pure RangedToken
-    { rtToken = String $ BS.take len str
-    , rtRange = mkRange inp len
-    }
-
 enterString :: AlexAction RangedToken
 enterString inp@(pos, _, _, _) len = do
   modify $ \s -> s{stringStart = pos, stringBuffer = '"' : stringBuffer s}
