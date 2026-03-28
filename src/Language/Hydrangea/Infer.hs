@@ -713,6 +713,25 @@ shapeArityFromType r ty = do
           _ -> throwError $ MiscError (Just r)
   go ty'
 
+-- | Count the number of consecutive Int-argument layers at the front of a
+-- (possibly refined) function type.  Used to determine the rank of a stencil
+-- from the accessor type it accepts.
+-- E.g. Int -> Int -> Float gives 2; Int -> Float gives 1; Float gives 0.
+countIntAccessorArgs :: UType -> Int
+countIntAccessorArgs ty = case stripRefineTop ty of
+  UTyFun arg rest -> case stripRefineTop arg of
+    UTyInt -> 1 + countIntAccessorArgs rest
+    _      -> 0
+  _ -> 0
+
+-- | Strip the first n function-argument layers from a type, returning the
+-- result type.  peelNArgs 2 (Int -> Int -> Float) = Float.
+peelNArgs :: Int -> UType -> UType
+peelNArgs 0 ty = ty
+peelNArgs n ty = case stripRefineTop ty of
+  UTyFun _ rest -> peelNArgs (n - 1) rest
+  _             -> ty
+
 -- | Extract a refined array: returns optional array binder, shape, and element.
 asArrayType :: Range -> UType -> Infer (Maybe Var, UType, UType)
 asArrayType r ty = do
@@ -1516,16 +1535,27 @@ infer (EStencil _ bnd fnExp arrExp) = do
   inferBnd bnd
   arrTy <- infer arrExp
   (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  sTy'  <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  -- Infer the stencil function FIRST, then determine rank from its accessor
+  -- argument type.  This avoids the bug where normalizeShapeToTupleOf would
+  -- incorrectly constrain an unknown array shape (e.g. a foldl accumulator
+  -- parameter whose shape is a fresh type variable) to rank-1 by unifying the
+  -- shape variable with UTyInt.
+  outTy     <- fresh
+  fty       <- infer fnExp
+  accessorTy <- fresh
+  _ <- wrange (firstParam fnExp) $ fty =:= UTyFun accessorTy outTy
+  accessorTy' <- applyBindings accessorTy
   -- Stencil is currently limited to 1-D and 2-D arrays.
-  rank  <- shapeArityFromType (firstParam arrExp) sTy'
+  let rank = countIntAccessorArgs accessorTy'
   when (rank < 1 || rank > 2) $
     throwError $ MiscError (Just (firstParam arrExp))
-  let accessorTy = foldr UTyFun eTy (replicate rank UTyInt)
-  outTy <- fresh
-  fty   <- infer fnExp
-  _ <- wrange (firstParam fnExp) $ fty =:= UTyFun accessorTy outTy
-  (arrVar, arrTyOut) <- freshRefined (UTyArray sTy' outTy)
+  -- Build the concrete shape type and constrain the input array shape.
+  let shapeTy = foldr UTyCons UTyUnit (replicate rank UTyInt)
+  _ <- wrange (firstParam arrExp) $ sTy =:= shapeTy
+  -- The accessor's return type must match the array element type.
+  let accessorRetTy = peelNArgs rank accessorTy'
+  _ <- wrange (firstParam arrExp) $ accessorRetTy =:= eTy
+  (arrVar, arrTyOut) <- freshRefined (UTyArray shapeTy outTy)
   case mArrVar of
     Nothing -> return arrTyOut
     Just srcVar -> do

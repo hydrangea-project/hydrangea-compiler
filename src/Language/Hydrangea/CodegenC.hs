@@ -63,6 +63,7 @@ data ExportSpec = ExportSpec
   , exportProcName :: String
   , exportWrapperName :: String
   , exportReturnType :: String
+  , exportParams :: [(String, String)]  -- ^ [(sanitized_c_name, c_type_string)]
   }
 
 -- | Codegen-oriented classification of CFG variables.
@@ -259,17 +260,18 @@ resolveExportSpec retKinds retTypes procs kernelName =
   case filter (\proc -> C2.procName proc == kernelName) procs of
     [] ->
       Left $ "Unknown exported kernel: " ++ BS.unpack kernelName
-    proc : _
-      | not (null (C2.procParams proc)) ->
-          Left $
-            "Exported kernel must be a zero-argument top-level binding: "
-              ++ BS.unpack kernelName
-      | otherwise ->
-          pure ExportSpec
+    proc : _ ->
+      let resolveParamType p =
+            case Map.lookup p (C2.procTypeEnv proc) of
+              Just ct -> cTypeName ct
+              Nothing -> "int64_t"
+          params = [ (sanitize p, resolveParamType p) | p <- C2.procParams proc ]
+      in pure ExportSpec
             { exportKernelName = kernelName
             , exportProcName = sanitize (C2.procName proc)
             , exportWrapperName = "hyd_export_" ++ sanitizeExportName kernelName
             , exportReturnType = procReturnTypeName retKinds retTypes (C2.procName proc)
+            , exportParams = params
             }
 
 procReturnTypeName :: Map CVar VarKind -> Map CVar CType -> CVar -> String
@@ -288,14 +290,24 @@ procReturnTypeName retKinds retTypes name =
 
 genExportWrapper :: ExportSpec -> Doc
 genExportWrapper spec =
-  text (exportReturnType spec) <+> text (exportWrapperName spec) <> text "(void) {"
-    $$ nest 4
-      (text "return" <+> text (exportProcName spec) <> text "();")
-    $$ text "}"
+  let ps = exportParams spec
+      cParams = case ps of
+        [] -> text "void"
+        _  -> hsep (punctuate comma [text ct <+> text cn | (cn, ct) <- ps])
+      cArgs = case ps of
+        [] -> empty
+        _  -> hsep (punctuate comma (map (text . fst) ps))
+  in text (exportReturnType spec) <+> text (exportWrapperName spec) <> parens cParams <+> text "{"
+       $$ nest 4 (text "return" <+> text (exportProcName spec) <> parens cArgs <> text ";")
+       $$ text "}"
 
 genHeader :: Doc -> Doc -> ExportSpec -> Doc
 genHeader pairStructs recordStructs spec =
   let guardName = exportHeaderGuard spec
+      ps = exportParams spec
+      cParams = case ps of
+        [] -> text "void"
+        _  -> hsep (punctuate comma [text ct <+> text cn | (cn, ct) <- ps])
   in text "#ifndef" <+> text guardName
        $$ text "#define" <+> text guardName
        $$ text ""
@@ -307,7 +319,7 @@ genHeader pairStructs recordStructs spec =
        $$ text ""
        $$ pairStructs
        $$ recordStructs
-       $$ text (exportReturnType spec) <+> text (exportWrapperName spec) <> text "(void);"
+       $$ text (exportReturnType spec) <+> text (exportWrapperName spec) <> parens cParams <> text ";"
        $$ text ""
        $$ text "#ifdef __cplusplus"
        $$ text "}"
@@ -527,7 +539,10 @@ genProc2 mBench retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = n
                 KPair _ _ -> S.empty
                 KRecord _ -> S.empty
                 _ -> localArrayVars
-        in cleanupArrayVarsDoc varsToFree
+            -- Free the non-returned component of any pair-of-arrays accumulator.
+            discardedPairDoc =
+              discardedArrayPairComponentDoc bodyWithoutReturn retAtom pairVars
+        in cleanupArrayVarsDoc varsToFree $$ discardedPairDoc
       returnDoc retAtom = text "return" <+> genAtom retAtom <> text ";"
       procBodyMemo =
         case finalReturn of
@@ -599,7 +614,19 @@ genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
   C2.SAssign _ rhs@(RVecStore _ _ _) ->
     genRHS arrayElemTypes floatArrVars rhs <> text ";"
   C2.SAssign v rhs
-    | v `S.member` declared -> text (sanitize v) <+> text "=" <+> genAssignRHS rhs <> text ";"
+    | v `S.member` declared ->
+      -- When a declared pair-of-arrays variable is overwritten, free the old
+      -- array components first to prevent a heap leak.
+      let freeOldPair = case Map.lookup v pairVars of
+            Just (CEArray, CEArray) ->
+              text "hyd_array_free(" <> text (sanitize v) <> text ".fst);"
+                $$ text "hyd_array_free(" <> text (sanitize v) <> text ".snd);"
+            Just (CEArray, _) ->
+              text "hyd_array_free(" <> text (sanitize v) <> text ".fst);"
+            Just (_, CEArray) ->
+              text "hyd_array_free(" <> text (sanitize v) <> text ".snd);"
+            _ -> empty
+      in freeOldPair $$ text (sanitize v) <+> text "=" <+> genAssignRHS rhs <> text ";"
     | otherwise ->
         let cv = sanitize v
             decl = varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
@@ -1004,13 +1031,10 @@ arrayVarsProc2 (C2.Proc { C2.procBody = body }) = arrayVarsStmts2 body
 
 localArrayVarsProc2 :: Map CVar CType -> C2.Proc -> Set CVar
 localArrayVarsProc2 typeEnv (C2.Proc { C2.procBody = body }) =
-  S.fromList
-    [ v
-    | C2.SAssign v rhs <- body
-    , isLocalArray v
-    , ownsArrayHeader rhs
-    ]
+  rawLocals `S.difference` consumedByArrayPair
   where
+    rawLocals = S.fromList
+      [ v | C2.SAssign v rhs <- body, isLocalArray v, ownsArrayHeader rhs ]
     isLocalArray v = case Map.lookup v typeEnv of
       Just (CTArray _) -> True
       _ -> False
@@ -1018,6 +1042,41 @@ localArrayVarsProc2 typeEnv (C2.Proc { C2.procBody = body }) =
       RArrayAlloc {} -> True
       RCall {} -> True
       _ -> False
+    -- Arrays fed directly as CEArray fields into RPairMake at the function's
+    -- top level are "owned" by the pair.  They will be freed by the intra-loop
+    -- pair-update frees (fix 1) in the first iteration, so must not also be
+    -- freed by the post-return cleanup to avoid a double-free.
+    consumedByArrayPair = S.fromList
+      [ v
+      | C2.SAssign _ (RPairMake ct1 ct2 a1 a2) <- body
+      , (ct, a) <- [(ct1, a1), (ct2, a2)]
+      , ct == CEArray
+      , AVar v <- [a]
+      ]
+
+-- | Emit frees for the non-returned array component(s) of any pair-of-arrays
+-- variable whose one component is the returned atom.  This handles the case
+-- where a foldl accumulator of type (Array, Array) has its snd (or fst)
+-- extracted as the return value — the other component must be freed to avoid
+-- a post-loop heap leak.
+discardedArrayPairComponentDoc :: [C2.Stmt] -> Atom -> Map CVar (CElemType, CElemType) -> Doc
+discardedArrayPairComponentDoc stmts retAtom pairVars =
+  case retAtom of
+    AVar retVar -> vcat (fstFrees ++ sndFrees)
+      where
+        fstFrees =
+          [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".fst);"
+          | C2.SAssign rv (RPairSnd _ (AVar pairVar)) <- stmts
+          , rv == retVar
+          , Just (CEArray, _) <- [Map.lookup pairVar pairVars]
+          ]
+        sndFrees =
+          [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".snd);"
+          | C2.SAssign rv (RPairFst _ (AVar pairVar)) <- stmts
+          , rv == retVar
+          , Just (_, CEArray) <- [Map.lookup pairVar pairVars]
+          ]
+    _ -> empty
 
 arrayVarsStmts2 :: [C2.Stmt] -> Set CVar
 arrayVarsStmts2 = foldMap arrayVarsStmt2
@@ -1254,10 +1313,11 @@ recordStructName fields = "hyd_record_" ++ concatMap (\(field, fieldTy) -> sanit
 -- | Letter abbreviation for a CElemType, used in struct name mangling.
 -- For nested pairs this recurses: CEPair CEFloat CEInt → "pfi".
 celemTypeLetter :: CElemType -> String
-celemTypeLetter CEInt           = "i"
-celemTypeLetter CEFloat         = "f"
-celemTypeLetter CEBool          = "b"
+celemTypeLetter CEInt            = "i"
+celemTypeLetter CEFloat          = "f"
+celemTypeLetter CEBool           = "b"
 celemTypeLetter (CEPair ct1 ct2) = "p" ++ celemTypeLetter ct1 ++ celemTypeLetter ct2
+celemTypeLetter CEArray          = "a"
 
 -- | C type string for a CElemType.
 celemTypeCType :: CElemType -> String
@@ -1265,6 +1325,7 @@ celemTypeCType CEInt            = "int64_t"
 celemTypeCType CEFloat          = "double"
 celemTypeCType CEBool           = "int64_t"
 celemTypeCType (CEPair ct1 ct2) = pairStructName ct1 ct2
+celemTypeCType CEArray          = "hyd_array_t*"
 
 -- | Struct typedef name for a pair type, e.g. @hyd_pair_fi_t@.
 pairStructName :: CElemType -> CElemType -> String

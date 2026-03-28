@@ -41,7 +41,7 @@ data Atom = AVar CVar | AInt Integer | AFloat Double | ABool Bool | AUnit | AStr
 -- | Element type descriptor for pair construction, used to carry type
 -- information through the CFG IR so the code generator can emit the
 -- correct C struct type without a separate type environment.
-data CElemType = CEInt | CEFloat | CEBool | CEPair CElemType CElemType
+data CElemType = CEInt | CEFloat | CEBool | CEPair CElemType CElemType | CEArray
   deriving (Eq, Show, Ord)
 
 -- | Comprehensive concrete C type for all values that appear in generated code.
@@ -63,19 +63,22 @@ data CType
 
 -- | Lift a 'CElemType' (pair-component descriptor) to the full 'CType'.
 elemTypeToCType :: CElemType -> CType
-elemTypeToCType CEInt           = CTInt64
-elemTypeToCType CEFloat         = CTDouble
-elemTypeToCType CEBool          = CTBool
+elemTypeToCType CEInt            = CTInt64
+elemTypeToCType CEFloat          = CTDouble
+elemTypeToCType CEBool           = CTBool
 elemTypeToCType (CEPair ct1 ct2) = CTPair (elemTypeToCType ct1) (elemTypeToCType ct2)
+elemTypeToCType CEArray          = CTArray CTDouble  -- opaque: used only as pair field type
 
 -- | Project a 'CType' back to 'CElemType', if it is representable as one.
 -- Returns 'Nothing' for types that cannot appear as pair components
--- (arrays, tuples, records).
+-- (tuples, records).  Arrays map to 'CEArray' so that pairs of arrays can be
+-- represented and lowered to the correct @hyd_pair_aa_t@ struct.
 ctypeToElemType :: CType -> Maybe CElemType
 ctypeToElemType CTInt64           = Just CEInt
 ctypeToElemType CTDouble          = Just CEFloat
 ctypeToElemType CTBool            = Just CEBool
 ctypeToElemType (CTPair ct1 ct2)  = CEPair <$> ctypeToElemType ct1 <*> ctypeToElemType ct2
+ctypeToElemType (CTArray _)       = Just CEArray
 ctypeToElemType _                 = Nothing
 
 -- | Right-hand-side expressions for @SAssign@ in the CFG core. These are

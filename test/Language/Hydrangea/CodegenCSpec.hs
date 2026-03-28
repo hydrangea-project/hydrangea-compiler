@@ -345,7 +345,7 @@ spec = describe "CodegenC" $ do
         c `shouldNotSatisfy` isInfixOf "int main(void)"
         mHeader `shouldSatisfy` maybe False (isInfixOf "int64_t hyd_export_main(void);")
 
-  it "rejects exporting a non-zero-argument kernel" $ do
+  it "exports a parameterized kernel with forwarded arguments" $ do
     let prog = Program [mkProc "kernel" ["n"] [SReturn (C.AVar "n")]]
         artifacts =
           codegenProgram2WithOptions
@@ -354,8 +354,9 @@ spec = describe "CodegenC" $ do
               , codegenExportKernel = Just "kernel"
               }
             prog
-    artifacts `shouldSatisfy`
-      (\result -> case result of
-          Left msg -> "zero-argument" `isInfixOf` msg
-          Right _ -> False
-      )
+    case artifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c, codegenHeader = mHeader } -> do
+        c `shouldSatisfy` isInfixOf "int64_t hyd_export_kernel(int64_t n)"
+        c `shouldSatisfy` isInfixOf "return kernel(n);"
+        mHeader `shouldSatisfy` maybe False (isInfixOf "int64_t hyd_export_kernel(int64_t n);")

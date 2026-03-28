@@ -76,6 +76,7 @@ shouldConsiderLoop :: Int -> LoopSpec -> [Stmt] -> Bool
 shouldConsiderLoop depth spec body =
   lsExec spec == Serial
     && lsRole spec /= LoopReductionWrapper
+    && lsRole spec /= LoopMap         -- plain map loops don't benefit from tiling
     && boundsAreIteratorIndependent spec
     && all (supportsAtomBound . simplifyIndexExpr) (lsBounds spec)
     && (depth > 0 || hasNestedLoop body || length (lsIters spec) > 1)

@@ -1,0 +1,77 @@
+(* gray_scott.hyd - Gray-Scott reaction-diffusion in Hydrangea.
+   Pipeline: foldl over n_steps time steps, each step applies:
+     U' = U + dt * (Du * L(U) - U*V^2 + f * (1-U))
+     V' = V + dt * (Dv * L(V) + U*V^2 - (f+k) * V)
+   where L is the 5-point discrete Laplacian with periodic boundary.
+
+   Each step uses generate with inline index accesses (including neighbor
+   reads for the Laplacian), producing only 2 output arrays per step with
+   no intermediate allocations.  Use --no-solver-check to suppress SMT. *)
+
+let imod x m = x - ((x / m) * m)
+
+(* Grid dimensions and simulation parameters *)
+let grid_h = 256
+let grid_w = 256
+let du     = 0.21
+let dv     = 0.105
+let feed   = 0.0545
+let kill   = 0.0620
+let dt     = 1.0
+let n_steps = 5000
+
+(* Initial conditions: U=1 everywhere;
+   V=0.5 inside a center disk of radius 20, plus sparse seed points. *)
+let init_u = fill [grid_h, grid_w] 1.0
+
+let init_v =
+  generate [grid_h, grid_w]
+    (let f [i, j] =
+       let di = i - grid_h / 2 in
+       let dj = j - grid_w / 2 in
+       if di * di + dj * dj < 20 * 20 then 0.5
+       else if imod (i * 251 + j * 127) 100 < 2 then 0.5
+       else 0.0
+     in f)
+
+(* One simulation step.
+   Uses generate with inline index for the Laplacian and the update,
+   so only new_u and new_v are allocated — no lap, vv, uvv intermediates. *)
+let gs_step uv dummy =
+  let u = fst uv in
+  let v = snd uv in
+
+  let new_u = generate [grid_h, grid_w]
+    (let f [i, j] =
+       let im1  = imod (i - 1 + grid_h) grid_h in
+       let ip1  = imod (i + 1) grid_h in
+       let jm1  = imod (j - 1 + grid_w) grid_w in
+       let jp1  = imod (j + 1) grid_w in
+       let u_ij = index [i, j] u in
+       let v_ij = index [i, j] v in
+       let lap  = index [im1, j] u +. index [ip1, j] u
+               +. index [i, jm1] u +. index [i, jp1] u
+               -. (4.0 *. u_ij) in
+       let uvv  = u_ij *. v_ij *. v_ij in
+       u_ij +. dt *. (du *. lap -. uvv +. feed *. (1.0 -. u_ij))
+     in f) in
+
+  let new_v = generate [grid_h, grid_w]
+    (let f [i, j] =
+       let im1  = imod (i - 1 + grid_h) grid_h in
+       let ip1  = imod (i + 1) grid_h in
+       let jm1  = imod (j - 1 + grid_w) grid_w in
+       let jp1  = imod (j + 1) grid_w in
+       let u_ij = index [i, j] u in
+       let v_ij = index [i, j] v in
+       let lap  = index [im1, j] v +. index [ip1, j] v
+               +. index [i, jm1] v +. index [i, jp1] v
+               -. (4.0 *. v_ij) in
+       let uvv  = u_ij *. v_ij *. v_ij in
+       v_ij +. dt *. (dv *. lap +. uvv -. (feed +. kill) *. v_ij)
+     in f) in
+
+  (new_u, new_v)
+
+(* Run n_steps iterations; export the final V concentration as [grid_h, grid_w]. *)
+let gray_scott = snd (foldl gs_step (init_u, init_v) (fill [n_steps] 0))

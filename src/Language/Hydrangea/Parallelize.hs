@@ -496,14 +496,32 @@ parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
 
 parallelizeProcWithFacts
   :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> [Stmt] -> [Stmt]
-parallelizeProcWithFacts arrayFacts typeEnv allocSizes =
-  rewriteStmts2With False (const True) rewriteStmt
+parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
   where
-    rewriteStmt insideLoop stmt = case stmt of
+    -- insideParallel: True only when we are inside a loop that will receive
+    -- #pragma omp parallel for.  Being inside a *serial* loop (e.g. the foldl
+    -- outer loop) does not block inner LoopMap loops from being parallelized.
+    go insideParallel = concatMap (goStmt insideParallel)
+
+    goStmt insideParallel stmt = case stmt of
       SLoop spec body ->
-        case parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body of
-          Just (spec', body') -> [SLoop spec' body']
-          Nothing             -> [SLoop spec  body]
+        -- Tentatively check whether this loop will be parallelized (using the
+        -- original body) so we can set the correct context for the inner loops.
+        let outerWillParallel = case parallelizeLoop arrayFacts typeEnv allocSizes
+                                       insideParallel spec body of
+              Just _  -> True
+              Nothing -> False
+            -- Block inner parallelism when:
+            --   (a) the outer loop will be parallel (prevents nested omp regions), or
+            --   (b) the outer loop is a LoopReductionWrapper (inner LoopReduction must
+            --       use OpenMP reduction semantics, not generic parallel).
+            outerBlocksInner = outerWillParallel || lsRole spec == LoopReductionWrapper
+            -- Recurse into body with updated context.
+            body' = go (insideParallel || outerBlocksInner) body
+        -- Now apply parallelization to the outer loop using the traversed body.
+        in case parallelizeLoop arrayFacts typeEnv allocSizes insideParallel spec body' of
+             Just (spec', _) -> [SLoop spec' body']
+             Nothing         -> [SLoop spec  body']
       _ -> [stmt]
 
 -- | Rewrite eligible serial loops in one procedure using the array facts

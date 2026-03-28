@@ -327,34 +327,79 @@ lowerExp expr = case expr of
 
   EGenerate _ shape fnExp -> do
     (ss, as') <- lowerExp shape
-    arr <- freshCVar "arr"
-    n <- freshCVar "n"
-    i <- freshCVar "i"
-    idx <- freshCVar "idx"
+    arr  <- freshCVar "arr"
+    idx  <- freshCVar "idx"
     _val <- freshCVar "val"
-    bodyStmts <- case shapeRankExp shape of
-      Just 1 -> inlineArrayFn1D fnExp i _val
+    (setupStmts, loopStmt) <- case shapeRankExp shape of
+      -- 1D: flat loop, pass flat index directly to the body function.
+      Just 1 -> do
+        i <- freshCVar "i"
+        n <- freshCVar "n"
+        bodyStmts <- inlineArrayFn1D fnExp i _val
+        valTy <- ctypeOfAtom (AVar _val)
+        registerCType arr (CTArray valTy)
+        markArrayFreshWriteOnce arr
+        markContiguousWriteArray arr
+        pure ( [ SAssign arr (RArrayAlloc as')
+               , SAssign n   (RShapeSize as')
+               ]
+             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+                 (bodyStmts ++ [SArrayWrite (AVar arr) (AVar i) (AVar _val)])
+             )
+      -- 2D: nested (i, j) loops; avoids the flat→ND→flat roundtrip.
+      Just 2 -> do
+        i    <- freshCVar "i"
+        j    <- freshCVar "j"
+        dim0 <- freshCVar "dim0"
+        dim1 <- freshCVar "dim1"
+        mul  <- freshCVar "mul"
+        flat <- freshCVar "flat"
+        registerCType dim0 CTInt64
+        registerCType dim1 CTInt64
+        registerCType mul  CTInt64
+        registerCType flat CTInt64
+        registerCType idx  CTTuple
+        bodyStmts <- inlineArrayFn fnExp idx _val
+        valTy <- ctypeOfAtom (AVar _val)
+        registerCType arr (CTArray valTy)
+        markArrayFreshWriteOnce arr
+        markContiguousWriteArray arr
+        pure ( [ SAssign arr  (RArrayAlloc as')
+               , SAssign dim0 (RProj 0 as')
+               , SAssign dim1 (RProj 1 as')
+               ]
+             , SLoop (LoopSpec [i, j]
+                               [atomToIndexExpr (AVar dim0), atomToIndexExpr (AVar dim1)]
+                               Serial Nothing LoopMap)
+                 ( SAssign idx (RTuple [AVar i, AVar j])
+                   : bodyStmts
+                   ++ [ SAssign mul  (RBinOp CMul (AVar i) (AVar dim1))
+                      , SAssign flat (RBinOp CAdd (AVar mul) (AVar j))
+                      , SArrayWrite (AVar arr) (AVar flat) (AVar _val)
+                      ]
+                 )
+             )
+      -- N-D (n>2 or unknown rank): flat loop with flat→ND decomposition.
       _ -> do
+        i <- freshCVar "i"
+        n <- freshCVar "n"
         registerCType idx CTTuple
         noteDenseLinearIndex idx i
-        inlineArrayFn fnExp idx _val
-    valTy <- ctypeOfAtom (AVar _val)
-    registerCType arr (CTArray valTy)
-    markArrayFreshWriteOnce arr
-    markContiguousWriteArray arr
-    pure ( ss
-         ++ [ SAssign arr (RArrayAlloc as')
-            , SAssign n (RShapeSize as')
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
-                ( (case shapeRankExp shape of
-                      Just 1 -> []
-                      _ -> [SAssign idx (RFlatToNd (AVar i) as')])
-                  ++ bodyStmts
-                  ++ [SArrayWrite (AVar arr) (AVar i) (AVar _val)]
-                )
-            ]
-         , AVar arr
-         )
+        bodyStmts <- inlineArrayFn fnExp idx _val
+        valTy <- ctypeOfAtom (AVar _val)
+        registerCType arr (CTArray valTy)
+        markArrayFreshWriteOnce arr
+        markContiguousWriteArray arr
+        pure ( [ SAssign arr (RArrayAlloc as')
+               , SAssign n   (RShapeSize as')
+               ]
+             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+                 ( SAssign idx (RFlatToNd (AVar i) as')
+                   : bodyStmts
+                   ++ [SArrayWrite (AVar arr) (AVar i) (AVar _val)]
+                 )
+             )
+    pure (ss ++ setupStmts ++ [loopStmt], AVar arr)
 
   EFill _ shape valExp -> do
     (ss, as') <- lowerExp shape
@@ -1737,6 +1782,7 @@ elemTypeOfAtom (AVar v)   = gets $ \st ->
   case M.lookup v (lsTypeEnv st) of
     Just ct | Just et <- ctypeToElemType ct -> et
     Just CTDouble -> CEFloat
+    Just (CTArray _) -> CEArray
     _ -> CEInt
 elemTypeOfAtom _          = pure CEInt
 
@@ -1851,6 +1897,7 @@ elemTypeToCTypeMaybe ceTy = case ceTy of
   CEFloat -> Just CTDouble
   CEBool -> Just CTBool
   CEPair ct1 ct2 -> Just (CTPair (elemTypeToCType ct1) (elemTypeToCType ct2))
+  CEArray -> Just (CTArray CTDouble)
 
 lowerBinOp :: Operator a -> BinOp
 lowerBinOp (Plus _) = CAdd
