@@ -198,7 +198,7 @@ spec = describe "Vectorize" $ do
             [loop]
     case lowered of
       [SLoop loweredSpec loweredBody] -> do
-        lsExec loweredSpec `shouldBe` Vector (VectorSpec 2 TailNone)
+        lsExec loweredSpec `shouldBe` Vector (VectorSpec 4 TailNone)
         hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) loweredBody `shouldBe` False
         hasRHS (\rhs -> case rhs of C.RVecStore {} -> True; _ -> False) loweredBody `shouldBe` False
       other -> expectationFailure ("unexpected indirect-access lowering: " <> show other)
@@ -213,7 +213,7 @@ spec = describe "Vectorize" $ do
             ]
     case vectorizeStmts2 [loop] of
       [SLoop loweredSpec loweredBody] -> do
-        lsExec loweredSpec `shouldBe` Vector (VectorSpec 2 TailNone)
+        lsExec loweredSpec `shouldBe` Vector (VectorSpec 4 TailNone)
         hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) loweredBody `shouldBe` False
         hasRHS (\rhs -> case rhs of C.RVecStore {} -> True; _ -> False) loweredBody `shouldBe` False
       other -> expectationFailure ("unexpected statement-only fallback: " <> show other)

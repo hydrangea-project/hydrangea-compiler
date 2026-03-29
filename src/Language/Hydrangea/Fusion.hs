@@ -1806,6 +1806,13 @@ fuseIndex a idx arr =
             EMap _ f xs -> pure (EApp a f (EIndex a idx xs))
             -- index i (zipWith f xs ys) => f (index i xs) (index i ys)
             EZipWith _ f xs ys -> pure (EApp a (EApp a f (EIndex a idx xs)) (EIndex a idx ys))
+            -- index i (gather idx' xs) => index [index i idx'] xs
+            -- Handles the case where xs is opaque (e.g. a variable): rather than
+            -- materialising the full gather array, turn it into a double indirect load.
+            -- The inner result is wrapped in EVec so the lowering uses it as a flat
+            -- index directly (via the EVec _ [idx1Exp] fast-path) rather than trying
+            -- to convert a scalar int64 through hyd_nd_to_flat.
+            EGather _ idx' xs -> pure (EIndex a (EVec a [EIndex a idx idx']) xs)
             _ -> pure (EIndex a idx arr)
 
 fuseReplicate :: (Eq a) => a -> [ShapeDim a] -> Exp a -> FusionM (Exp a)

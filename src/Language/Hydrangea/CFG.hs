@@ -14,9 +14,8 @@
 --   serial, parallel, and vector execution hints.
 -- * 'Stmt' \/ 'Proc' \/ 'Program' — the minimal statement IR for lowered programs.
 --
--- * /Naming convention/ — functions operating directly on this CFG IR use
---   a @2@ suffix for boring historical reasons. There used to be two separate
---   CFG layers, but the first was folded into the second.
+-- * /Naming convention/ — functions operating on this CFG IR use a @2@ suffix,
+--   a legacy of a former two-layer CFG that was later unified.
 module Language.Hydrangea.CFG
   ( CVar
   , IndexExpr(..)
@@ -119,6 +118,7 @@ exprRank ex = case ex of
   ISub{} -> 1
   ICall{} -> 3
   _ -> 2
+
 -- | Flatten and normalise an addition into a canonical 'IAdd' tree with the
 -- constant term last.
 simplifyAdd :: IndexExpr -> IndexExpr -> IndexExpr

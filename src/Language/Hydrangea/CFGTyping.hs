@@ -169,11 +169,7 @@ inferStmtTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> Stmt -> TypeEnv
 inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
   SAssign v rhs -> inferAssignTypes callTypes callParamTypes typeEnv v rhs
   SArrayWrite arr _ val ->
-    -- Use M.insert (not conservative bindVarType) so the fixpoint can correct
-    -- stale lowering-time array element types (e.g. CTArray CTInt64 recorded
-    -- at lowering time when the element type was not yet known, later corrected
-    -- to CTArray CTDouble when the written value's type propagates through the
-    -- fixpoint).
+    -- Derive the array element type from the written value.
     case (arr, inferAtomType2 typeEnv val) of
       (AVar arrV, Just eltTy) -> M.insert arrV (CTArray eltTy) typeEnv
       _ -> typeEnv
@@ -191,13 +187,8 @@ inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
 inferAssignTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> CVar -> C.RHS -> TypeEnv
 inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RAtom atom ->
-    -- For pair-typed atoms, trust the source type over a potentially stale
-    -- procTypeEnv entry for the destination (e.g. foldl accumulator vars that
-    -- were recorded with a default pair type at lowering time).  We use M.insert
-    -- instead of the conservative bindVarType so that the correct pair type
-    -- propagates forward into the loop body.
-    -- For non-pair types (scalars, CTTuple, CTArray) the conservative bindVarType
-    -- is sufficient and avoids accidentally overriding correctly-inferred types.
+    -- Pair types propagate from source to destination; other types use the
+    -- conservative binding to preserve already-inferred information.
     case inferAtomType2 typeEnv atom of
       Just ct@(CTPair _ _) ->
         bindAtomType atom ct (M.insert v ct typeEnv)
@@ -216,8 +207,8 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
     case op of
       CNeg ->
         case inferAtomType2 typeEnv a <|> M.lookup v typeEnv of
-          Just ct@(CTDouble) -> bindAtomType a ct (bindVarType v ct typeEnv)
-          Just ct@(CTInt64) -> bindAtomType a ct (bindVarType v ct typeEnv)
+          Just ct@CTDouble -> bindAtomType a ct (bindVarType v ct typeEnv)
+          Just ct@CTInt64  -> bindAtomType a ct (bindVarType v ct typeEnv)
           _ -> typeEnv
       _ ->
         let typeEnv1 = maybe typeEnv (\ct -> bindVarType v ct typeEnv) (inferUnOpResultType op)
@@ -237,28 +228,18 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RArrayShape _ ->
     bindVarType v CTTuple typeEnv
   C.RProj i src ->
-    -- Tuples are shape/index containers (int elements). Pairs may contain
-    -- non-integer elements.  Only commit to CTInt64 when we can confirm the
-    -- source is CTTuple; for unknown sources, defer so the usage context can
-    -- propagate the correct element type in later fixpoint iterations.
-    -- Use M.insert for CTPair results so the fixpoint can correct stale
-    -- lowering-time types (e.g. a foldl accumulator whose snd was recorded as
-    -- CTInt64 before the pair element type was known).
+    -- Tuple projections yield CTInt64 (tuples hold shape/index integers).
+    -- Pair projections are re-derived from the current pair element types.
     case inferAtomType2 typeEnv src of
       Just CTTuple             -> bindVarType v CTInt64 typeEnv
       Just (CTPair ct1 ct2)    -> M.insert v (if i == 0 then ct1 else ct2) typeEnv
       _ -> typeEnv
   C.RPairMake _ _ a1 a2 ->
-    -- Re-derive the pair type from the current (possibly improved) element
-    -- types.  Use M.insert instead of bindVarType to allow correcting an entry
-    -- that was recorded with the CTInt64 default at lowering time.
+    -- Re-derive the pair type from the current element types.
     case (inferAtomType2 typeEnv a1, inferAtomType2 typeEnv a2) of
       (Just ct1, Just ct2) -> M.insert v (CTPair ct1 ct2) typeEnv
       _ -> typeEnv
   C.RPairFst _ct a ->
-    -- Use M.insert so that when the source pair type is corrected by the fixpoint
-    -- (e.g. foldl_acc starts as CTPair CTDouble CTInt64 then becomes
-    -- CTPair CTDouble CTDouble), the result type is updated accordingly.
     case inferAtomType2 typeEnv a of
       Just (CTPair ct1 _) -> M.insert v ct1 typeEnv
       _ -> typeEnv
@@ -294,9 +275,8 @@ collectProjAssigns = concatMap go
       _ -> []
 
 -- | After a fixpoint pass, infer source pair types from known RProj result types.
--- For each source variable that appears as both `RProj 0 src` and `RProj 1 src`
--- and whose result variables have known types, bind src -> CTPair ct0 ct1.
--- Uses M.insert (not conservative bindVarType) to allow correcting stale entries.
+-- For each source variable that appears as both @RProj 0 src@ and @RProj 1 src@
+-- and whose result variables have known types, bind src to @CTPair ct0 ct1@.
 inferProjSourceTypes :: TypeEnv -> [(CVar, Integer, CVar)] -> TypeEnv
 inferProjSourceTypes typeEnv projAssigns =
   foldl bindIfKnown typeEnv (M.toList projBySource)
@@ -306,9 +286,8 @@ inferProjSourceTypes typeEnv projAssigns =
                             M.insertWith M.union src (M.singleton i v) m)
                          M.empty projAssigns
     bindIfKnown env (src, iToV) =
-      -- Only infer a pair type when the source variable has no type yet.
-      -- If it is already typed (e.g. CTTuple from hyd_flat_to_nd, CTArray, etc.)
-      -- we must not override it — that would break tuple element access in codegen.
+      -- Only infer a pair type when the source has no existing type;
+      -- an existing CTTuple or CTArray must not be overridden.
       case M.lookup src env of
         Just _ -> env   -- already typed; leave it alone
         Nothing ->
@@ -325,8 +304,8 @@ inferStmtListTypes callTypes callParamTypes initialEnv stmts = outerGo initialEn
     innerGo typeEnv =
       let typeEnv' = foldl (inferStmtTypes callTypes callParamTypes) typeEnv stmts
       in if typeEnv' == typeEnv then typeEnv else innerGo typeEnv'
-    -- Outer loop: after inner fixpoint, infer source pair types from RProj uses.
-    -- If any new pair types were discovered, run inner fixpoint again.
+    -- Outer fixpoint: after propagating types, infer source pair types from
+    -- RProj uses. Repeat if any new pair types are discovered.
     outerGo typeEnv =
       let after = innerGo typeEnv
           withPairs = inferProjSourceTypes after projAssigns

@@ -311,9 +311,9 @@ spec = describe "CodegenC" $ do
               , SAssign "arr" (C.RArrayAlloc (C.AVar "shape"))
               , SAssign "out" (C.RArrayAlloc (C.AVar "shape"))
               , SAssign "n" (C.RAtom (C.AInt 8))
-              , SAssign "i__vec_trips" (C.RBinOp C.CDiv (C.AVar "n") (C.AInt 2))
+              , SAssign "i__vec_trips" (C.RBinOp C.CDiv (C.AVar "n") (C.AInt 4))
               , SLoop (LoopSpec ["i__vec_i"] [IVar "i__vec_trips"] Serial Nothing LoopPlain)
-                  [ SAssign "i__vec_base" (C.RBinOp C.CMul (C.AVar "i__vec_i") (C.AInt 2))
+                  [ SAssign "i__vec_base" (C.RBinOp C.CMul (C.AVar "i__vec_i") (C.AInt 4))
                   , SAssign "x__vec" (C.RVecLoad (C.AVar "arr") (C.AVar "i__vec_base"))
                   , SAssign "bias__vec" (C.RVecSplat (C.AFloat 1.0))
                   , SAssign "y__vec" (C.RVecBinOp C.CAddF (C.AVecVar "x__vec") (C.AVecVar "bias__vec"))
@@ -323,10 +323,10 @@ spec = describe "CodegenC" $ do
               ]
           ]
         c = codegenProgram2 prog
-    c `shouldSatisfy` isInfixOf "hyd_float64x2_t x__vec"
-    c `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64"
-    c `shouldSatisfy` isInfixOf "hyd_vec_add_f64"
-    c `shouldSatisfy` isInfixOf "hyd_vec_storeu_f64"
+    c `shouldSatisfy` isInfixOf "hyd_float64x4_t x__vec"
+    c `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"
+    c `shouldSatisfy` isInfixOf "hyd_vec_add_f64x4"
+    c `shouldSatisfy` isInfixOf "hyd_vec_storeu_f64x4"
 
   it "emits export wrapper and suppresses main in export mode" $ do
     let prog = Program [mkProc "main" [] [SReturn (C.AInt 42)]]

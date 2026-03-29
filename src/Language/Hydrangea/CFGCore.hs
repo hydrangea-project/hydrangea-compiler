@@ -44,12 +44,10 @@ data Atom = AVar CVar | AInt Integer | AFloat Double | ABool Bool | AUnit | AStr
 data CElemType = CEInt | CEFloat | CEBool | CEPair CElemType CElemType | CEArray
   deriving (Eq, Show, Ord)
 
--- | Comprehensive concrete C type for all values that appear in generated code.
--- This is the authoritative type representation threaded from type inference
--- through lowering into the CFG and code generator.
+-- | Concrete C type for all values appearing in generated code.
+-- Covers scalars, arrays, shape tuples, pairs, and named struct records.
 --
--- 'CTRecord' is a forward-compatible placeholder for named struct types
--- (records); it carries an ordered list of (field name, field type) pairs.
+-- 'CTRecord' carries an ordered list of (field name, field type) pairs.
 data CType
   = CTInt64                           -- ^ int64_t
   | CTDouble                          -- ^ double
@@ -81,9 +79,8 @@ ctypeToElemType (CTPair ct1 ct2)  = CEPair <$> ctypeToElemType ct1 <*> ctypeToEl
 ctypeToElemType (CTArray _)       = Just CEArray
 ctypeToElemType _                 = Nothing
 
--- | Right-hand-side expressions for @SAssign@ in the CFG core. These are
--- intentionally low-level to map directly to imperative operations and
--- code generation templates.
+-- | Right-hand-side expressions for @SAssign@ in the CFG. These map
+-- directly to imperative operations and code generation templates.
 data RHS
   = RAtom Atom
   | RBinOp BinOp Atom Atom

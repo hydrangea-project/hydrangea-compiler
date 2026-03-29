@@ -229,3 +229,33 @@ spec = do
           csrc `shouldNotSatisfy` isInfixOf "#error"
           csrc `shouldSatisfy` isInfixOf "((hyd_pair_ii_t*)(void*)"
           csrc `shouldSatisfy` isInfixOf ".snd"
+
+    -- Regression test for the procReturnKinds2 / retKindOf bug where a
+    -- function returning (snd param, fresh_array) got a wrong return-type
+    -- declaration (hyd_pair_ia_t) that disagreed with the body
+    -- (hyd_pair_aa_t).  Root cause: retKindOf used
+    -- (procTypeEnv `Map.union` recoveredTypeEnv), which let a stale
+    -- lowering-time CEInt tag for the projected pair element override the
+    -- correct CEArray type recovered by the fixpoint.
+    it "function returning (snd-of-pair-param, fresh-array) has hyd_pair_aa_t return type" $ do
+      -- Use float arithmetic to anchor element types so inference can determine
+      -- that uv : (float[n,m], float[n,m]).
+      let src = unlines
+            [ "let n = 4"
+            , "let m = 4"
+            , "let step uv dummy ="
+            , "  let curr = snd uv in"
+            , "  let next = generate [n, m]"
+            , "    (let f [i, j] = index [i, j] curr +. 0.0 in f) in"
+            , "  (curr, next)"
+            ]
+      case readDecs (BS.pack src) of
+        Left err -> expectationFailure $ "Parse error: " ++ err
+        Right ds -> do
+          csrc <- compileToCOptIO False ds
+          -- Return type must be hyd_pair_aa_t, not hyd_pair_ia_t.
+          -- Before the fix, procReturnKinds2 would incorrectly classify the
+          -- return as (CEInt, CEArray) because procTypeEnv was left-biased
+          -- over the type recovery fixpoint result.
+          csrc `shouldSatisfy`    isInfixOf "hyd_pair_aa_t step"
+          csrc `shouldNotSatisfy` isInfixOf "hyd_pair_ia_t step"

@@ -26,22 +26,6 @@ import Language.Hydrangea.Vectorize
 fixpointOpt :: [Stmt] -> [Stmt]
 fixpointOpt = optimizeStmts2
 
--- | Pipeline entrypoints used by the frontend and codegen. These functions
--- apply a sequence of transformations in a stable order: optimize, then
--- optionally vectorize, then optionally parallelize. The `fullPipeline2`
--- variant performs all stages and a final optimization fixpoint. The
--- functions are intentionally small wrappers so the pipeline order is easy
--- to adjust and document.
-
--- Exported pipelines (short docs):
--- * @optimizePipeline2@ — run CFG local optimisations followed by automatic
---   tiling for eligible map-reduction kernels.
--- * @vectorizePipeline2@ — run vectorisation after a preliminary
---   optimization pass.
--- * @parallelPipeline2@ — run vectorization and parallelization after optimization.
--- * @fullPipeline2@ — optimize, vectorize, parallelize and run a final
---   optimization fixpoint.
-
 -- | Optimization-only pipeline.
 optimizePipeline2 :: [Stmt] -> [Stmt]
 optimizePipeline2 stmts =

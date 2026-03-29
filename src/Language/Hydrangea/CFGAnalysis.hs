@@ -207,7 +207,6 @@ usedVarsRHS2 rhs = case rhs of
   RPairFst _ a -> usedVarsAtom2 a
   RPairSnd _ a -> usedVarsAtom2 a
 
-
 -- | Collect variables referenced by an 'IndexExpr'
 usedVarsIndexExpr :: IndexExpr -> Set ByteString
 usedVarsIndexExpr ie = case ie of
@@ -222,7 +221,6 @@ usedVarsIndexExpr ie = case ie of
   IFlatToNd a b -> usedVarsIndexExpr a `S.union` usedVarsIndexExpr b
   INdToFlat a b -> usedVarsIndexExpr a `S.union` usedVarsIndexExpr b
   ICall _ es -> S.unions (map usedVarsIndexExpr es)
-
 
 -- | Variables referenced by a statement (reads + bounds used in loops).
 usedVarsStmt2 :: Stmt -> Set ByteString

@@ -703,6 +703,20 @@ spec = do
         )
         (\fused -> hasScatterGenerate fused `shouldBe` True)
 
+    it "same-source maps: index side is also lazified (no intermediate EMap)" $ do
+      -- After the Case 6a improvement, the route array is generated lazily too,
+      -- so no EMap should survive in the fused output.
+      expectFusionSensible
+        ( "let arr = generate [3] (let f [i] = i in f) in"
+          <> " let routeFn x = [x] in"
+          <> " let valueFn x = x + 10 in"
+          <> " let c x y = x + y in"
+          <> " scatter c (fill [3] 0) (map routeFn arr) (map valueFn arr)"
+        )
+        (\fused -> do
+            hasScatterGenerate fused `shouldBe` True
+            hasMap fused `shouldBe` False)
+
     it "does not fire when index and values come from different sources" $ do
       -- Rule 6 should NOT fire when the two EMap expressions have different sources.
       -- Rule 3 (map absorption) fires instead, producing EScatter (not EScatterGenerate).

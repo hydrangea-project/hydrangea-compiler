@@ -431,9 +431,6 @@ procSize = sum . map stmtSize
 
 -- | A procedure is inlineable when its body is small (≤ 5 by 'procSize')
 -- and it does not call itself recursively.
---
--- The @_allProcs@ argument is reserved for future cross-procedure
--- analysis such as mutual-recursion detection.
 isInlineable :: Proc -> Map ByteString Proc -> Bool
 isInlineable Proc { procName = name, procBody = body } _allProcs =
   procSize body <= 5 && not (callsItself name body)
@@ -470,11 +467,11 @@ inlineStmts procs = concatMap inlineOne
       SAssign v (RCall fn args)
         | Just proc <- M.lookup fn procs
         , isInlineable proc procs ->
-            let inlined   = inlineCall proc args
-                retAtom   = case if null inlined then Nothing else Just (last inlined) of
-                              Just (SReturn a) -> a
-                              _                -> AInt 0
-                prefix    = if null inlined then [] else init inlined
+            let inlined = inlineCall proc args
+                retAtom = case reverse inlined of
+                  SReturn a : _ -> a
+                  _             -> AInt 0
+                prefix  = if null inlined then [] else init inlined
             in  prefix ++ [SAssign v (RAtom retAtom)]
       SLoop spec body  -> [SLoop spec (inlineStmts procs body)]
       SIf cond thn els -> [SIf cond (inlineStmts procs thn) (inlineStmts procs els)]
