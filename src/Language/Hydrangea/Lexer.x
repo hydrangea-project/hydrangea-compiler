@@ -55,6 +55,7 @@ tokens :-
 <0> zipwith  { tok ZipWith }
 <0> reduce   { tok Reduce }
 <0> reduce_generate { tok ReduceGenerate }
+<0> foldl_while { tok FoldlWhile }
 <0> foldl    { tok Foldl }
 <0> scan     { tok Scan }
 <0> segmented_reduce { tok SegmentedReduce }
@@ -294,6 +295,7 @@ data Token
   | Reduce
   | ReduceGenerate
   | Foldl
+  | FoldlWhile
   | Scan
   | SegmentedReduce
   | SortIndices

@@ -278,6 +278,22 @@ evalExp expr env = case expr of
                    [0 .. fromIntegral n - 1]
           _ -> throwError $ InvalidArrayOperation "foldl: array must be 1-dimensional"
       _ -> throwError $ TypeError "foldl: third argument must be an array"
+  EFoldlWhile _ predExpr fnExpr initExpr arrExpr -> do
+    vPred <- evalExp predExpr env
+    vFn   <- evalExp fnExpr env
+    vInit <- evalExp initExpr env
+    varr  <- evalExp arrExpr env
+    case varr of
+      VArray shape vals ->
+        case shape of
+          [n] -> let step acc k = do
+                       vContinue <- evalApp vPred acc env
+                       case vContinue of
+                         VBool False -> pure acc
+                         _ -> evalApp vFn acc env >>= \fnAcc -> evalApp fnAcc (vals !! k) env
+                 in foldM step vInit [0 .. fromIntegral n - 1]
+          _ -> throwError $ InvalidArrayOperation "foldl_while: array must be 1-dimensional"
+      _ -> throwError $ TypeError "foldl_while: third argument must be an array"
   EScan _ fnExpr initExpr arrExpr -> do
     vFn <- evalExp fnExpr env
     vInit <- evalExp initExpr env

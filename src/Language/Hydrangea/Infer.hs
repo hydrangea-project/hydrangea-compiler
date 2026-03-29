@@ -75,7 +75,7 @@ pattern UTyUnit = UTerm TyUnitF
 pattern UTyBool :: UType
 pattern UTyBool = UTerm TyBoolF
 
--- | Pattern synonym for an unification-level function type.
+-- | Pattern synonym for a unification-level function type.
 pattern UTyFun :: UType -> UType -> UType
 pattern UTyFun t1 t2 = UTerm (TyFunF t1 t2)
 
@@ -83,7 +83,7 @@ pattern UTyFun t1 t2 = UTerm (TyFunF t1 t2)
 pattern UTyCons :: UType -> UType -> UType
 pattern UTyCons t1 t2 = UTerm (TyConsF t1 t2)
 
--- | Pattern synonym for an unification-level pair type.
+-- | Pattern synonym for a unification-level pair type.
 pattern UTyPair :: UType -> UType -> UType
 pattern UTyPair t1 t2 = UTerm (TyPairF t1 t2)
 
@@ -99,7 +99,7 @@ pattern UTyArray shape elem = UTerm (TyArrayF shape elem)
 pattern UTyVar :: Var -> UType
 pattern UTyVar v = UTerm (TyVarF v)
 
--- | Pattern synonym for an unification-level refinement wrapper.
+-- | Pattern synonym for a unification-level refinement wrapper.
 pattern UTyRefine :: Var -> UType -> UType
 pattern UTyRefine v t = UTerm (TyRefineF v t)
 
@@ -244,7 +244,6 @@ freshPredVar = do
   lift $ put st {predVarCounter = n + 1}
   return $ BS.pack $ "p" ++ show n
 
-
 -- | Errors reported by type inference and refinement checking.
 data TypeError where
   UnboundVar :: Maybe Range -> ByteString -> TypeError
@@ -316,9 +315,7 @@ skolemize (Forall xs _ uty) = do
         UVar v -> UTyVar (mkVarName "s" v)
         UTerm _ -> error "toSkolem: expected a fresh unification variable"
 
--- | Replace quantified variables with skolem constants. Skolemization is
--- used when checking an inferred type against an annotated polymorphic
--- type so that the annotation's quantifiers cannot be instantiated.
+-- | Generate a fresh variable name by appending the integer identifier to a prefix.
 mkVarName :: ByteString -> IntVar -> Var
 mkVarName nm (IntVar v) = nm `BS.append` BS.pack (show (v + (maxBound :: Int) + 1))
 
@@ -359,17 +356,13 @@ addErrorRange r er = case er of
 
 -- | Run an inference action and annotate any thrown error with a source range.
 wrange :: Range -> Infer a -> Infer a
-wrange r m = do
-  catchError m (throwError . addErrorRange r)
+wrange r m = catchError m (throwError . addErrorRange r)
 
 -- | Infer an expression and unify it with an expected type.
 check :: Exp Range -> UType -> Infer ()
-check e ty = wrange (firstParam e) doCheck
-  where
-    doCheck = do
-      ty' <- infer e
-      _ <- ty =:= ty'
-      return ()
+check e ty = wrange (firstParam e) $ do
+  ty' <- infer e
+  void $ ty =:= ty'
 
 -- | Build a fresh cons-tuple spine large enough to support tuple projection.
 makeNFresh :: Integer -> Infer ([UType], UType)
@@ -426,10 +419,8 @@ expectedShapeFromExp :: Exp Range -> Infer UType
 expectedShapeFromExp (EVec _ elems) = do
   forM_ elems $ \el -> do
     ety <- infer el
-    _ <- wrange (firstParam el) $ ety =:= UTyInt
-    return ()
-  let tys = replicate (length elems) UTyInt
-  return $ mkTyConsFromVec tys
+    void $ wrange (firstParam el) $ ety =:= UTyInt
+  return $ mkTyConsFromVec (replicate (length elems) UTyInt)
 expectedShapeFromExp e = normalizeShapeToTupleOfInts (firstParam e) =<< infer e
 
 -- | Emit a known fact (hypothesis) into the writer.
@@ -440,7 +431,7 @@ emitHyp p = tell [Hyp p]
 emitObl :: Pred -> Infer ()
 emitObl p = tell [Obl p]
 
--- | Backward-compatible alias: emit as a hypothesis (facts established during inference).
+-- | Emit a predicate as a hypothesis (alias for 'emitHyp').
 emitPred :: Pred -> Infer ()
 emitPred = emitHyp
 
@@ -456,10 +447,10 @@ withValBound :: Var -> Term -> Infer a -> Infer a
 withValBound v t m = do
   emitHyp (PLe (TConst 0) (TVar v))
   emitHyp (PLt (TVar v) t)
-  st <- get
-  modify (\s -> s { valBoundCtx = M.insert v t (valBoundCtx s) })
+  old <- gets valBoundCtx
+  modify (\s -> s { valBoundCtx = M.insert v t old })
   x <- m
-  modify (\s -> s { valBoundCtx = valBoundCtx st })
+  modify (\s -> s { valBoundCtx = old })
   return x
 
 -- | Look up the value-bound annotation for a variable, if any.
@@ -503,12 +494,8 @@ termFromExp expr =
         Times _ -> return $ TMul t1 t2
         _ -> TVar <$> freshPredVar
     _ -> do
-      -- Infer the type of the expression and use its refinement pred var as the
-      -- SMT term.  This handles variables (EVar), record field projections, and
-      -- any other expression whose integer value is tracked through a pred var.
-      -- For EVar specifically, this returns the pred var from the variable's type
-      -- (e.g. UTyRefine pi Int → TVar pi) rather than the raw source name, so
-      -- obligations and hypotheses share the same SMT variable.
+      -- Infer the expression type and extract its refinement variable as the
+      -- SMT term, so that obligations and hypotheses share the same variable.
       ty <- infer expr
       ty' <- applyBindings ty
       case fst (unwrapRefine ty') of
@@ -677,15 +664,13 @@ inferBodyBoundChain _ = return Nothing
 chainExprBound :: Exp Range -> Infer (Maybe Term)
 chainExprBound (EBoundLetIn _ v boundExp _ body) = do
   bt <- termFromExp boundExp
-  st <- get
-  modify (\s -> s { valBoundCtx = M.insert v bt (valBoundCtx s) })
+  old <- gets valBoundCtx
+  modify (\s -> s { valBoundCtx = M.insert v bt old })
   result <- chainExprBound body
-  modify (\s -> s { valBoundCtx = valBoundCtx st })
+  modify (\s -> s { valBoundCtx = old })
   return result
 chainExprBound (ELetIn _ _ body) = chainExprBound body
-chainExprBound (EVar _ v) = do
-  mb <- lookupValBound v
-  return $ fmap toBound (BoundOf <$> mb)
+chainExprBound (EVar _ v) = lookupValBound v
 chainExprBound _ = return Nothing
 
 -- | Extract the body expression from an inline function @let f p = body in f@.
@@ -697,9 +682,7 @@ extractFnBody _                                = Nothing
 -- Returns @Just [b0, b1, ...]@ when every component has an inferrable bound,
 -- @Nothing@ otherwise (caller silently skips multi-dim bound emission).
 inferVecElemBounds :: Exp Range -> Infer (Maybe [Term])
-inferVecElemBounds (EVec _ es) = do
-  mBounds <- mapM inferValBound es
-  return $ sequence mBounds
+inferVecElemBounds (EVec _ es) = sequence <$> mapM inferValBound es
 inferVecElemBounds _ = return Nothing
 
 -- | Count the number of dimensions in a shape type after normalization.
@@ -895,9 +878,7 @@ infer (ERecord r fields) = do
   case findDuplicateField fields of
     Just field -> throwError $ DuplicateRecordField (Just r) field
     Nothing -> do
-      inferredFields <- mapM (\(field, expr) -> do
-        fieldTy <- infer expr
-        pure (field, fieldTy)) fields
+      inferredFields <- mapM (\(f, e) -> (f,) <$> infer e) fields
       return $ uTyRecord inferredFields
 infer (EShapeOf _ arrExp) = do
   arrTy <- infer arrExp
@@ -927,9 +908,8 @@ infer (EGenerate _ shapeExp fn) = do
     emitHyp (PLe (TConst 1) (TDim arrVar i))
   -- Emit bounds hypotheses for the generator function's index argument pred vars.
   -- For each dimension i, assert that the index component is in [0, TDim arrVar i).
-  -- We extract pred vars from the *function's* argument type (fty'), not from sTy',
-  -- because =:= strips refinements before structural unification so sTy' has its own
-  -- fresh pred vars rather than those of the function's declared arg type.
+  -- Pred vars are extracted from the function's argument type (fty'), since after
+  -- unification sTy' holds fresh pred vars distinct from those in the function's type.
   fty'' <- applyBindings fty
   let argDimVars = case stripRefineTop fty'' of
         UTyFun argTy _ -> extractShapeDimVars argTy
@@ -1219,6 +1199,18 @@ infer (EFoldl _ fn initExp arrExp) = do
   fty <- infer fn
   rank <- shapeArityFromType (firstParam arrExp) sTy'
   when (rank /= 1) $ throwError $ MiscError (Just (firstParam arrExp))
+  _ <- wrange (firstParam fn) $ fty =:= UTyFun initTy (UTyFun eTy initTy)
+  return initTy
+infer (EFoldlWhile _ predExp fn initExp arrExp) = do
+  arrTy  <- infer arrExp
+  initTy <- infer initExp
+  (_mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  pty <- infer predExp
+  fty <- infer fn
+  rank <- shapeArityFromType (firstParam arrExp) sTy'
+  when (rank /= 1) $ throwError $ MiscError (Just (firstParam arrExp))
+  _ <- wrange (firstParam predExp) $ pty =:= UTyFun initTy UTyBool
   _ <- wrange (firstParam fn) $ fty =:= UTyFun initTy (UTyFun eTy initTy)
   return initTy
 infer (EScan _ fn initExp arrExp) = do
@@ -1535,11 +1527,9 @@ infer (EStencil _ bnd fnExp arrExp) = do
   inferBnd bnd
   arrTy <- infer arrExp
   (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  -- Infer the stencil function FIRST, then determine rank from its accessor
-  -- argument type.  This avoids the bug where normalizeShapeToTupleOf would
-  -- incorrectly constrain an unknown array shape (e.g. a foldl accumulator
-  -- parameter whose shape is a fresh type variable) to rank-1 by unifying the
-  -- shape variable with UTyInt.
+  -- Infer the stencil function before normalizing the array shape, so the
+  -- accessor argument type determines the rank rather than prematurely
+  -- constraining an unknown shape variable to rank-1.
   outTy     <- fresh
   fty       <- infer fnExp
   accessorTy <- fresh
@@ -1750,9 +1740,8 @@ withPats ((PVec r vs) : ps) e = do
 inferFun :: Var -> Exp Range -> Infer UType
 inferFun arg e1 = do
   tyArg <- freshValue
-  withBinding arg (Forall [] [] tyArg) $ do
-    tyOut <- infer e1
-    return $ UTyFun tyArg tyOut
+  withBinding arg (Forall [] [] tyArg) $
+    UTyFun tyArg <$> infer e1
 
 -- | Run inference from an empty context and solve the resulting refinement predicates.
 runInfer :: Infer UType -> IO (Either TypeError Polytype)

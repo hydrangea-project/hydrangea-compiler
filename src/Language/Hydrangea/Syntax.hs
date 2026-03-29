@@ -268,6 +268,9 @@ data Exp a
   | -- | Strict left fold over a 1-D array; the accumulator type may differ from the element type.
     -- @foldl : (s -> a -> s) -> s -> Array[n, a] -> s@
     EFoldl a (Exp a) (Exp a) (Exp a)
+  | -- | Early-exiting left fold: stops iterating when the predicate on the accumulator is false.
+    -- @foldl_while : (s -> bool) -> (s -> a -> s) -> s -> Array[n, a] -> s@
+    EFoldlWhile a (Exp a) (Exp a) (Exp a) (Exp a)
   | -- | Exclusive prefix scan over a 1-D array.
     -- @scan : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]@
     -- The output at position @i@ is the state /before/ consuming element @i@.
@@ -407,6 +410,7 @@ firstParam e = case e of
   EReduce a _ _ _ -> a
   EReduceGenerate a _ _ _ _ -> a
   EFoldl a _ _ _ -> a
+  EFoldlWhile a _ _ _ _ -> a
   EScan a _ _ _ -> a
   ESegmentedReduce a _ _ _ _ -> a
   ESortIndices a _ -> a

@@ -172,6 +172,7 @@ normExp expr = case expr of
   EReduce a f z arr -> EReduce a <$> normExp f <*> normExp z <*> normExp arr
   EReduceGenerate a f z sz g -> EReduceGenerate a <$> normExp f <*> normExp z <*> normExp sz <*> normExp g
   EFoldl a f z arr -> EFoldl a <$> normExp f <*> normExp z <*> normExp arr
+  EFoldlWhile a p f z arr -> EFoldlWhile a <$> normExp p <*> normExp f <*> normExp z <*> normExp arr
   EScan a f z arr -> EScan a <$> normExp f <*> normExp z <*> normExp arr
   ESegmentedReduce a f z offsets vals ->
     ESegmentedReduce a <$> normExp f <*> normExp z <*> normExp offsets <*> normExp vals

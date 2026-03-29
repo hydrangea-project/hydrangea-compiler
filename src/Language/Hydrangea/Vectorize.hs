@@ -38,7 +38,9 @@
 module Language.Hydrangea.Vectorize
   ( vectorizeProc2
   , vectorizeProgram2
+  , vectorizeProgram2WithWidth
   , vectorizeStmts2
+  , defaultVectorWidth
   ) where
 
 import Data.Map.Strict (Map)
@@ -69,7 +71,7 @@ type VecEnv = Map CVar CVar
 type AccessFacts = Map CVar VectorAccessFact
 
 defaultVectorWidth :: Int
-defaultVectorWidth = 2
+defaultVectorWidth = 4
 
 extractAccesses2 :: [Stmt] -> [ArrayAccess2]
 extractAccesses2 = goSeq 0
@@ -128,15 +130,13 @@ isLegalVectorize body = not hasBlocking
     deps = findDependences2 accesses
     hasBlocking = any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward) deps
 
-chooseVectorWidth :: LoopSpec -> Int
-chooseVectorWidth spec = case analyzeLoop2 (SLoop spec []) of
-  Just info -> case isVectorizableLoop2 info of
-    True -> defaultVectorWidth
-    False -> 1
-  Nothing -> 1
+chooseVectorWidthWith :: Int -> LoopSpec -> Int
+chooseVectorWidthWith w spec = case analyzeLoop2 (SLoop spec []) of
+  Just info -> if isVectorizableLoop2 info then w else 1
+  Nothing   -> 1
 
-vectorCandidate :: VectorContext -> LoopSpec -> [Stmt] -> Maybe LoopSpec
-vectorCandidate ctx spec body
+vectorCandidate :: Int -> VectorContext -> LoopSpec -> [Stmt] -> Maybe LoopSpec
+vectorCandidate w ctx spec body
   | lsExec spec /= Serial = Nothing
   | length (lsIters spec) /= 1 = Nothing
   | containsNestedLoop body = Nothing
@@ -152,11 +152,12 @@ vectorCandidate ctx spec body
             _ -> TailRemainder
       in Just spec { lsExec = Vector (VectorSpec width tailPolicy) }
   where
-    width = chooseVectorWidth spec
+    width = chooseVectorWidthWith w spec
     preferSimdHere =
       case lsRole spec of
         LoopReduction -> True
         LoopPlain -> vcInsideLoop ctx || lsRed spec /= Nothing
+        LoopFold -> False
         LoopMap -> True
         LoopMapReduction -> False
         LoopReductionWrapper -> False
@@ -381,6 +382,7 @@ transformVectorStmt typeEnv accessFacts iter base env stmt = case stmt of
 
   SIf {} -> Nothing
   SLoop {} -> Nothing
+  SBreak -> Nothing
 
   SReturn a ->
     let a' = substScalarAtom iter base a
@@ -464,8 +466,8 @@ planVectorLoop typeEnv accessFacts spec body
   where
     typedArrays = bodyUsesOnlyDoubleArrays typeEnv body
 
-vectorizeProcWithCalls :: Map CVar CType -> Proc -> Proc
-vectorizeProcWithCalls callTypes proc =
+vectorizeProcWithCalls :: Int -> Map CVar CType -> Proc -> Proc
+vectorizeProcWithCalls w callTypes proc =
   proc { procBody = rewriteStmts2With defaultContext enterLoop rewriteStmt (procBody proc) }
   where
     defaultContext = VectorContext False
@@ -476,7 +478,7 @@ vectorizeProcWithCalls callTypes proc =
     rewriteStmt :: VectorContext -> Stmt -> [Stmt]
     rewriteStmt ctx stmt = case stmt of
       SLoop spec body ->
-        case vectorCandidate ctx spec body of
+        case vectorCandidate w ctx spec body of
           Just vectorSpec ->
             case planVectorLoop typeEnv accessFacts vectorSpec body of
               VectorExplicit lowered -> lowered
@@ -491,7 +493,13 @@ vectorizeProcWithCalls callTypes proc =
 -- This is useful for unit tests and for callers that do not have whole-program
 -- call information available.
 vectorizeProc2 :: Proc -> Proc
-vectorizeProc2 = vectorizeProcWithCalls M.empty
+vectorizeProc2 = vectorizeProcWithCalls defaultVectorWidth M.empty
+
+-- | Vectorize a whole program using the given SIMD lane width.
+vectorizeProgram2WithWidth :: Int -> Program -> Program
+vectorizeProgram2WithWidth w (Program procs) =
+  let callTypes = inferProgramReturnTypes2 (Program procs)
+  in Program (map (vectorizeProcWithCalls w callTypes) procs)
 
 -- | Vectorize a whole program.
 --
@@ -499,9 +507,7 @@ vectorizeProc2 = vectorizeProcWithCalls M.empty
 -- computes return types for direct calls between procedures, then uses those
 -- facts to enrich per-procedure legality checks for explicit vector lowering.
 vectorizeProgram2 :: Program -> Program
-vectorizeProgram2 (Program procs) =
-  let callTypes = inferProgramReturnTypes2 (Program procs)
-  in Program (map (vectorizeProcWithCalls callTypes) procs)
+vectorizeProgram2 = vectorizeProgram2WithWidth defaultVectorWidth
 
 -- | Backwards-compatible statement-list helper used in tests.
 --

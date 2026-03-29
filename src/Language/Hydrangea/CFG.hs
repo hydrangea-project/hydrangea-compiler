@@ -210,12 +210,14 @@ data ReductionSpec = ReductionSpec
 -- appropriate transformations:
 --
 -- * 'LoopPlain' — generic loop with no special source-level intent.
+-- * 'LoopFold' — sequential foldl loop; carries an accumulator, never parallelizable.
 -- * 'LoopMap' — per-output-element map\/generate kernel.
 -- * 'LoopReductionWrapper' — scalar wrapper around a reduction, usually from a 0-D source reduction.
 -- * 'LoopReduction' — the loop that performs the reduction.
 -- * 'LoopMapReduction' — outer map whose body contains a per-element reduction.
 data LoopRole
   = LoopPlain
+  | LoopFold
   | LoopMap
   | LoopReductionWrapper
   | LoopReduction
@@ -249,6 +251,7 @@ data Stmt
   | SLoop LoopSpec [Stmt]      -- ^ Execute a body over an n-dimensional iteration space.
   | SIf Atom [Stmt] [Stmt]     -- ^ Conditional control flow.
   | SReturn Atom               -- ^ Return a value from a procedure.
+  | SBreak                     -- ^ Break out of the enclosing loop.
   deriving (Eq, Show)
 
 -- | Walk a statement list, applying @rewrite@ to each statement after recursing

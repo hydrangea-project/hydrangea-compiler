@@ -9,7 +9,10 @@ module Language.Hydrangea.CFGPipeline
   ( -- * Pipelines
     optimizePipeline2
   , vectorizePipeline2
+  , vectorizePipelineWithWidth
   , parallelPipeline2
+  , parallelPipelineWithWidth
+  , metalPipeline2
   , fullPipeline2
   ) where
 
@@ -46,16 +49,31 @@ optimizePipeline2 stmts =
       stmts'' = tileStmts2 stmts'
   in  optimizeStmts2 stmts''
 
+-- | Run optimization followed by vectorization using the given SIMD lane width.
+vectorizePipelineWithWidth :: Int -> Program -> Program
+vectorizePipelineWithWidth w (Program procs) =
+  let optimized = [proc { procBody = optimizePipeline2 (procBody proc) } | proc <- procs]
+  in  vectorizeProgram2WithWidth w (Program optimized)
+
 -- | Run optimization followed by vectorization.
 vectorizePipeline2 :: Program -> Program
-vectorizePipeline2 (Program procs) =
-  let optimized = [proc { procBody = optimizePipeline2 (procBody proc) } | proc <- procs]
-  in  vectorizeProgram2 (Program optimized)
+vectorizePipeline2 = vectorizePipelineWithWidth defaultVectorWidth
+
+-- | Run optimization followed by loop parallelization using the given SIMD lane width.
+parallelPipelineWithWidth :: Int -> Program -> Program
+parallelPipelineWithWidth w prog =
+  parallelizeProgram2 (vectorizePipelineWithWidth w prog)
 
 -- | Run optimization followed by loop parallelization.
 parallelPipeline2 :: Program -> Program
-parallelPipeline2 prog =
-  parallelizeProgram2 (vectorizePipeline2 prog)
+parallelPipeline2 = parallelPipelineWithWidth defaultVectorWidth
+
+-- | Optimize and parallelize without SIMD vectorization. Suitable for GPU
+-- backends where SIMD is handled by the hardware (e.g. Metal/MSL).
+metalPipeline2 :: Program -> Program
+metalPipeline2 (Program procs) =
+  let optimized = [proc { procBody = optimizePipeline2 (procBody proc) } | proc <- procs]
+  in  parallelizeProgram2 (Program optimized)
 
 -- | Run the full CFG pipeline: optimize, vectorize, parallelize, then clean up again.
 fullPipeline2 :: Program -> Program

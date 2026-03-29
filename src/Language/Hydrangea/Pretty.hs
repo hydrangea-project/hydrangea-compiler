@@ -111,6 +111,7 @@ instance Pretty (Exp a) where
   pPrint (EReduceGenerate _ f z shape gen) =
     text "reduce_generate" <+> pPrint f <+> pPrint z <+> pPrint shape <+> pPrint gen
   pPrint (EFoldl _ f z arr) = text "foldl" <+> pPrint f <+> pPrint z <+> pPrint arr
+  pPrint (EFoldlWhile _ p f z arr) = text "foldl_while" <+> pPrint p <+> pPrint f <+> pPrint z <+> pPrint arr
   pPrint (EScan _ f z arr) = text "scan" <+> pPrint f <+> pPrint z <+> pPrint arr
   pPrint (ESegmentedReduce _ f z offsets vals) =
     text "segmented_reduce" <+> pPrint f <+> pPrint z <+> pPrint offsets <+> pPrint vals

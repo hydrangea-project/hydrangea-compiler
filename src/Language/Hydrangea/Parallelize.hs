@@ -446,7 +446,18 @@ factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
 shouldParallelizeLoop :: Bool -> LoopSpec -> Bool
 shouldParallelizeLoop insideLoop spec = case lsRole spec of
   LoopReductionWrapper -> False
+  LoopFold             -> False  -- foldl/scan loops carry an accumulator; never parallelizable
   _                    -> not insideLoop
+
+-- | Returns 'True' when any statement in the list (or in nested conditionals,
+-- but not nested loops) contains a 'SBreak'.  Loops containing breaks cannot
+-- be parallelized because OpenMP does not allow @break@ inside parallel regions.
+bodyContainsBreak :: [Stmt] -> Bool
+bodyContainsBreak = any go
+  where
+    go SBreak           = True
+    go (SIf _ thn els)  = any go thn || any go els
+    go _                = False
 
 -- | Attempt to annotate a single loop with a parallel execution policy.
 -- Returns 'Nothing' if the loop is already non-serial, is nested inside
@@ -464,6 +475,7 @@ parallelizeLoop
 parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
   | lsExec spec /= Serial                    = Nothing
   | not (shouldParallelizeLoop insideLoop spec) = Nothing
+  | bodyContainsBreak body                   = Nothing
   | not eligible                             = Nothing
   | otherwise = Just (spec { lsExec = Parallel (ParallelSpec strategy Nothing) }, body)
   where

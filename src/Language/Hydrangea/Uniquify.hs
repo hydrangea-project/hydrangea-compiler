@@ -95,6 +95,7 @@ uniqExp expr =
     EReduce a f z arr -> EReduce a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     EReduceGenerate a f z shape gen -> EReduceGenerate a <$> uniqExp f <*> uniqExp z <*> uniqExp shape <*> uniqExp gen
     EFoldl a f z arr -> EFoldl a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
+    EFoldlWhile a p f z arr -> EFoldlWhile a <$> uniqExp p <*> uniqExp f <*> uniqExp z <*> uniqExp arr
     EScan a f z arr -> EScan a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> uniqExp f <*> uniqExp z <*> uniqExp offsets <*> uniqExp vals
@@ -242,6 +243,7 @@ collectVarsExp expr =
     EReduce _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EReduceGenerate _ f z shape gen -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp shape `S.union` collectVarsExp gen
     EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals

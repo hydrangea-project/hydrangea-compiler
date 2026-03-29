@@ -235,6 +235,7 @@ usedVarsStmt2 stmt = case stmt of
     in bodyVars `S.union` boundVars
   SIf cond thn els -> S.union (usedVarsAtom2 cond) (S.unions (map usedVarsStmt2 (thn ++ els)))
   SReturn a -> usedVarsAtom2 a
+  SBreak -> S.empty
 
 -- | Variables referenced across a sequence of statements.
 usedVarsStmts2 :: [Stmt] -> Set ByteString

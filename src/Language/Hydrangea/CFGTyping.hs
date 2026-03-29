@@ -185,6 +185,8 @@ inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
     in elsEnv
   SReturn _ ->
     typeEnv
+  SBreak ->
+    typeEnv
 
 inferAssignTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> CVar -> C.RHS -> TypeEnv
 inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of

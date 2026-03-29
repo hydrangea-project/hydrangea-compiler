@@ -98,6 +98,7 @@ collectVarsExp expr =
     EReduce _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EReduceGenerate _ f z shape gen -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp shape `S.union` collectVarsExp gen
     EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals
@@ -203,6 +204,7 @@ freeVarsExp expr =
     EReduce _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EReduceGenerate _ f z shape gen -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp shape `S.union` freeVarsExp gen
     EFoldl _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
+    EFoldlWhile _ p f z arr -> freeVarsExp p `S.union` freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EScan _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp offsets `S.union` freeVarsExp vals
@@ -289,6 +291,7 @@ boundVarsExp expr =
     EReduce _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EReduceGenerate _ f z shape gen -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp shape `S.union` boundVarsExp gen
     EFoldl _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
+    EFoldlWhile _ p f z arr -> boundVarsExp p `S.union` boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EScan _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp offsets `S.union` boundVarsExp vals
@@ -379,6 +382,7 @@ countVarExp v expr =
     EReduce _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
     EReduceGenerate _ f z shape gen -> countVarExp v f + countVarExp v z + countVarExp v shape + countVarExp v gen
     EFoldl _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
+    EFoldlWhile _ p f z arr -> countVarExp v p + countVarExp v f + countVarExp v z + countVarExp v arr
     EScan _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
     ESegmentedReduce _ f z offsets vals ->
       countVarExp v f + countVarExp v z + countVarExp v offsets + countVarExp v vals
@@ -467,6 +471,7 @@ substExp v replacement expr =
     EReduce a f z arr -> EReduce a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EReduceGenerate a f z shape gen -> EReduceGenerate a (substExp v replacement f) (substExp v replacement z) (substExp v replacement shape) (substExp v replacement gen)
     EFoldl a f z arr -> EFoldl a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
+    EFoldlWhile a p f z arr -> EFoldlWhile a (substExp v replacement p) (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EScan a f z arr -> EScan a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a (substExp v replacement f) (substExp v replacement z)
@@ -578,6 +583,7 @@ isArrayExp expr =
     EReduce {} -> True
     EReduceGenerate {} -> True
     EFoldl {} -> False
+    EFoldlWhile {} -> False
     EScan {} -> True
     ESegmentedReduce {} -> False
     ESortIndices {} -> True
@@ -1068,6 +1074,7 @@ normExp expr =
     EReduce a f z arr -> EReduce a <$> normExp f <*> normExp z <*> normExp arr
     EReduceGenerate a f z s g -> EReduceGenerate a <$> normExp f <*> normExp z <*> normExp s <*> normExp g
     EFoldl a f z arr -> EFoldl a <$> normExp f <*> normExp z <*> normExp arr
+    EFoldlWhile a p f z arr -> EFoldlWhile a <$> normExp p <*> normExp f <*> normExp z <*> normExp arr
     EScan a f z arr -> EScan a <$> normExp f <*> normExp z <*> normExp arr
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> normExp f <*> normExp z <*> normExp offsets <*> normExp vals
@@ -1286,6 +1293,7 @@ fuseOnce expr =
     EReduceGenerate a f z shape gen ->
       EReduceGenerate a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce shape <*> fuseOnce gen
     EFoldl a f z arr -> EFoldl a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
+    EFoldlWhile a p f z arr -> EFoldlWhile a <$> fuseOnce p <*> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EScan a f z arr -> EScan a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce offsets <*> fuseOnce vals
@@ -1581,26 +1589,35 @@ fuseScatterKernel a sk =
         _ ->
           -- Rule 6: scatter_reindex — when both index and values are EMap over
           -- the same source array (possibly with different mapping functions),
-          -- avoid materialising the intermediate mapped-values array by converting
-          -- to EScatterGenerate with an inline value generator.
+          -- avoid materialising both intermediate mapped arrays by converting
+          -- to EScatterGenerate with inline generators for both index and values.
           --
           --   scatter c d (map t1 src) (map t2 src)
-          --   => let valFn i = t2 (index i src)
-          --      in scatter_generate c d (map t1 src) valFn
+          --   => let idxFn i = t1 (index i src)
+          --          valFn i = t2 (index i src)
+          --          idxGen  = generate (shape_of src) idxFn
+          --      in scatter_generate c d idxGen valFn
           --
           -- This is more general than the strict Rocq scatter_reindex (which
           -- requires t1 = t2); it fires whenever both arrays share the same
           -- source, covering the common histogram/segmented-reduction pattern:
           --   scatter (+) zeros (map bin arr) (map weight arr)
+          -- Both the route array and the values array are now generated lazily,
+          -- consistent with Cases 6b and 6c.
           case (skGuard sk, skIndex sk, skValues sk) of
-            (Nothing, EMap _ _t1 rawIdx, EMap _ t2 rawVals)
+            (Nothing, EMap _ t1 rawIdx, EMap _ t2 rawVals)
               | fmap (const ()) rawIdx == fmap (const ()) rawVals -> do
-                  (fn, i) <- mkLet1 a
-                  let body = EApp a t2 (EIndex a (EVar a i) rawVals)
-                      dec  = mkDec1 a fn i body
-                  pure $ ELetIn a dec
-                           (EScatterGenerate a (skCombine sk) (skDefault sk)
-                                               (skIndex sk) (EVar a fn))
+                  (idxFn, idxI) <- mkLet1 a
+                  (valFn, valI) <- mkLet1 a
+                  let idxBody = EApp a t1 (EIndex a (EVar a idxI) rawIdx)
+                      idxDec  = mkDec1 a idxFn idxI idxBody
+                      valBody = EApp a t2 (EIndex a (EVar a valI) rawVals)
+                      valDec  = mkDec1 a valFn valI valBody
+                      idxGen  = EGenerate a (EShapeOf a rawIdx) (EVar a idxFn)
+                  pure $ ELetIn a idxDec
+                           (ELetIn a valDec
+                             (EScatterGenerate a (skCombine sk) (skDefault sk)
+                                                 idxGen (EVar a valFn)))
             (Nothing, EZipWith _ routeFn xs ys, EZipWith _ valueFn xs' ys')
               | fmap (const ()) xs == fmap (const ()) xs'
               , fmap (const ()) ys == fmap (const ()) ys' -> do

@@ -169,6 +169,8 @@ copyProp2 = go M.empty
         in  SIf cond' thn' els' : go env' rest
       SReturn a ->
         SReturn (substAtom2 env a) : go env rest
+      SBreak ->
+        SBreak : go env rest
 
 ------------------------------------------------------------------------
 -- Dead assignment elimination
@@ -218,6 +220,8 @@ daeBackwards liveAfter (stmt : rest) =
          in  (SIf cond thn' els' : rest', liveBefore)
        SReturn a ->
          (stmt : rest', usedVarsAtom2 a)
+       SBreak ->
+         (stmt : rest', live)
 
 -- | Liveness pass for loop bodies, where variables in @loopCarried@ must
 -- be preserved across iterations regardless of apparent local liveness.
@@ -258,6 +262,8 @@ daeLoopBody loopCarried (stmt : rest) =
          in  (SIf cond thn' els' : rest', liveBefore)
        SReturn a ->
          (stmt : rest', usedVarsAtom2 a)
+       SBreak ->
+         (stmt : rest', live)
 
 -- | Remove dead pure assignments from a statement list.
 deadAssignElim2 :: [Stmt] -> [Stmt]
@@ -407,6 +413,8 @@ cseStmts2 = go M.empty
         in  SIf cond thn' els' : go env' rest
       SReturn a ->
         SReturn a : go env rest
+      SBreak ->
+        SBreak : go env rest
 
 ------------------------------------------------------------------------
 -- Function inlining
@@ -452,6 +460,7 @@ inlineCall Proc { procParams = params, procBody = body } args =
     substStmt env (SIf cond thn els)        =
       SIf (substAtom2 env cond) (map (substStmt env) thn) (map (substStmt env) els)
     substStmt env (SReturn a)               = SReturn (substAtom2 env a)
+    substStmt _   SBreak                    = SBreak
 
 -- | Inline all calls to inlineable procedures throughout a statement list.
 inlineStmts :: Map ByteString Proc -> [Stmt] -> [Stmt]

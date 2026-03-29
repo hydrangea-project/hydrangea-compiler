@@ -51,6 +51,7 @@ collectTopLevelRefs topNames expr bound =
     EReduce _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
     EReduceGenerate _ f z s g -> go f bound `S.union` go z bound `S.union` go s bound `S.union` go g bound
     EFoldl _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
+    EFoldlWhile _ p f z a -> go p bound `S.union` go f bound `S.union` go z bound `S.union` go a bound
     EScan _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
     ESegmentedReduce _ f z offsets vals ->
       go f bound `S.union` go z bound `S.union` go offsets bound `S.union` go vals bound

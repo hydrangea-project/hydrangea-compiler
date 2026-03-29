@@ -52,6 +52,7 @@ import Language.Hydrangea.Syntax
   reduce     { L.RangedToken L.Reduce _ }
   reduce_generate { L.RangedToken L.ReduceGenerate _ }
   foldl      { L.RangedToken L.Foldl _ }
+  foldl_while { L.RangedToken L.FoldlWhile _ }
   scan       { L.RangedToken L.Scan _ }
   segmented_reduce { L.RangedToken L.SegmentedReduce _ }
   sort_indices { L.RangedToken L.SortIndices _ }
@@ -248,6 +249,7 @@ expspecial :: { Exp L.Range }
   | reduce atom atom atom      { EReduce (L.rtRange $1 <-> info $4) $2 $3 $4 }
   | reduce_generate atom atom atom atom { EReduceGenerate (L.rtRange $1 <-> info $5) $2 $3 $4 $5 }
   | foldl atom atom atom       { EFoldl (L.rtRange $1 <-> info $4) $2 $3 $4 }
+  | foldl_while atom atom atom atom { EFoldlWhile (L.rtRange $1 <-> info $5) $2 $3 $4 $5 }
   | scan atom atom atom        { EScan (L.rtRange $1 <-> info $4) $2 $3 $4 }
   | segmented_reduce atom atom atom atom
       { ESegmentedReduce (L.rtRange $1 <-> info $5) $2 $3 $4 $5 }

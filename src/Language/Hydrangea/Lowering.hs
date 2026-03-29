@@ -578,7 +578,7 @@ lowerExp expr = case expr of
          ++ [ SAssign n     (RShapeSize as')
             , SAssign acc   (RAtom ai)
             , SAssign elem' (RAtom av)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
                 bodyStmts
             ]
          , AVar acc
@@ -599,7 +599,7 @@ lowerExp expr = case expr of
     pure ( si ++ ss
          ++ [ SAssign n   (RShapeSize as')
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
                 ( genStmts ++ bodyStmts )
             ]
          , AVar acc
@@ -619,7 +619,7 @@ lowerExp expr = case expr of
          ++ [ SAssign shp (RArrayShape aa)
             , SAssign n (RShapeLast (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
                 ( [ SAssign elem' (RArrayLoad aa (AVar k))
                   ]
                   ++ bodyStmts
@@ -627,6 +627,84 @@ lowerExp expr = case expr of
              ]
          , AVar acc
          )
+  -- foldl_while: early-exit fold. Emits a break when the predicate on the
+  -- accumulator is false before processing the next element.
+  EFoldlWhile _ predExp fnExp initExp (EFill _ shapeExp valExp) -> do
+    (si, ai)  <- lowerExp initExp
+    (ss, as') <- lowerExp shapeExp
+    (sv, av)  <- lowerExp valExp
+    n      <- freshCVar "foldl_n"
+    acc    <- freshCVar "foldl_acc"
+    k      <- freshCVar "foldl_k"
+    elem'  <- freshCVar "foldl_elem"
+    predV  <- freshCVar "foldl_pred"
+    propagatePairInfo acc ai
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    predStmts <- inlineScalarFn predExp acc predV
+    pure ( si ++ ss ++ sv
+         ++ [ SAssign n     (RShapeSize as')
+            , SAssign acc   (RAtom ai)
+            , SAssign elem' (RAtom av)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                ( predStmts
+                  ++ [SIf (AVar predV) [] [SBreak]]
+                  ++ bodyStmts
+                )
+            ]
+         , AVar acc
+         )
+
+  EFoldlWhile _ predExp fnExp initExp (EGenerate _ shapeExp genFnExp) -> do
+    (si, ai)  <- lowerExp initExp
+    (ss, as') <- lowerExp shapeExp
+    n      <- freshCVar "foldl_n"
+    acc    <- freshCVar "foldl_acc"
+    k      <- freshCVar "foldl_k"
+    elem'  <- freshCVar "foldl_elem"
+    predV  <- freshCVar "foldl_pred"
+    propagatePairInfo acc ai
+    genStmts  <- inlineArrayFn1D genFnExp k elem'
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    predStmts <- inlineScalarFn predExp acc predV
+    pure ( si ++ ss
+         ++ [ SAssign n   (RShapeSize as')
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                ( predStmts
+                  ++ [SIf (AVar predV) [] [SBreak]]
+                  ++ genStmts
+                  ++ bodyStmts
+                )
+            ]
+         , AVar acc
+         )
+
+  EFoldlWhile _ predExp fnExp initExp arrExp -> do
+    (si, ai) <- lowerExp initExp
+    (sa, aa) <- lowerExp arrExp
+    shp   <- freshCVar "foldl_shp"
+    n     <- freshCVar "foldl_n"
+    acc   <- freshCVar "foldl_acc"
+    k     <- freshCVar "foldl_k"
+    elem' <- freshCVar "foldl_elem"
+    predV <- freshCVar "foldl_pred"
+    propagatePairInfo acc ai
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    predStmts <- inlineScalarFn predExp acc predV
+    pure ( si ++ sa
+         ++ [ SAssign shp (RArrayShape aa)
+            , SAssign n (RShapeLast (AVar shp))
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                ( predStmts
+                  ++ [SIf (AVar predV) [] [SBreak]]
+                  ++ [SAssign elem' (RArrayLoad aa (AVar k))]
+                  ++ bodyStmts
+                )
+            ]
+         , AVar acc
+         )
+
   EScan _ fnExp initExp arrExp -> do
     (si, ai) <- lowerExp initExp
     (sa, aa) <- lowerExp arrExp
@@ -646,7 +724,7 @@ lowerExp expr = case expr of
             , SAssign n (RShapeLast (AVar shp))
             , SAssign outArr (RArrayAlloc (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
                 ( [ SAssign elem' (RArrayLoad aa (AVar k))
                   , SArrayWrite (AVar outArr) (AVar k) (AVar acc)
                   ]
@@ -2083,6 +2161,7 @@ renameVarInStmt old new stmt =
     SLoop spec body -> SLoop (renameLoopSpec old new spec) (map (renameVarInStmt old new) body)
     SIf cond tBranch eBranch -> SIf (renameVarInAtom old new cond) (map (renameVarInStmt old new) tBranch) (map (renameVarInStmt old new) eBranch)
     SReturn a -> SReturn (renameVarInAtom old new a)
+    SBreak -> SBreak
 
 renameVarInStmts :: CVar -> CVar -> [Stmt] -> [Stmt]
 renameVarInStmts old new = map (renameVarInStmt old new)

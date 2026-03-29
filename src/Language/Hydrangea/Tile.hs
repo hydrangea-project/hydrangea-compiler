@@ -191,6 +191,7 @@ assignOrigIter td =
 tiledLoopRole :: LoopRole -> LoopRole
 tiledLoopRole role = case role of
   LoopPlain -> LoopPlain
+  LoopFold -> LoopFold
   LoopMap -> LoopMap
   LoopReductionWrapper -> LoopMap
   LoopReduction -> LoopMap
