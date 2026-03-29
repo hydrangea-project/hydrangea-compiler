@@ -27,9 +27,10 @@ module Language.Hydrangea.CodegenMSL
   , codegenMSL
   ) where
 
+import Control.Applicative ((<|>))
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
-import Data.List (intercalate, nub)
+import Data.List (intercalate, maximumBy, nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
@@ -42,6 +43,7 @@ import Language.Hydrangea.CFG qualified as C2
 import Language.Hydrangea.CFGAnalysis (usedVarsStmts2)
 import Language.Hydrangea.CFGTyping
   ( TypeEnv, inferProgramReturnTypes2, recoverProcTypeEnv2, buildCallParamTypes
+  , lookupArrayElemType2
   )
 import Language.Hydrangea.CodegenC
   ( CodegenOptions(..), CodegenArtifacts(..), VarKind(..)
@@ -52,7 +54,7 @@ import Language.Hydrangea.CodegenC
   , inferArrayElemTypesFromStmts
   , procReturnKinds2
   , isFloatArithBinOp, isMathFloatOp
-  , pairStructName, celemTypeLetter
+  , pairStructName, celemTypeLetter, celemTypeCType
   , cTypeName
   , detectAtomicScatterAddLoop
   )
@@ -95,14 +97,32 @@ codegenMSL opts prog@(C2.Program procs) = do
                        (Map.fromList [(v, elt) | (v, CTArray elt) <- Map.toList typeEnv])
       (inputArrays, outputArrays, scalarInputs, inBodyHoisted) =
         classifyKernelParams preLoopStmts mapLoopBody mapLoopSpec typeEnv retKinds
-      -- Hoist in-body zero-arg array calls to pre-loop for the harness
+      -- Hoist in-body zero-arg calls to pre-loop for the harness
       effectivePreLoop = preLoopStmts ++ inBodyHoisted
+      hoistedCallMap = buildHoistedCallMap inBodyHoisted
+      -- Proc parameters: declare them in the harness with default values.
+      -- Scalar proc params used in the kernel body also become scalar Metal inputs.
+      procParams' = C2.procParams kernelProc
+      procParamScalars = [ v | v <- procParams'
+                             , case Map.lookup v typeEnv of
+                                 Just (CTArray _) -> False
+                                 Just (CTPair _ _) -> False
+                                 _ -> True ]
+      -- Add proc-param scalars that are used (directly or transitively) to scalar inputs
+      procParamScalarsUsed = [ v | v <- procParamScalars
+                                 , v `Set.member` usedVarsStmts2 (effectivePreLoop ++ mapLoopBody) ]
+      allScalarInputs = scalarInputs ++ procParamScalarsUsed
+      -- Pre-loop array aliases: RAtom assignments aliasing an input array.
+      -- Needed so the kernel emits #defines for e.g. curr__uniq_5_shape → t15_shape.
+      inputArraySet = Set.fromList inputArrays
+      preLoopAliases = collectArrayAliases inputArraySet effectivePreLoop
   helperC <- genHelperC procs kernelName retKinds
   let kernelSrc  = genMSLKernelSrc kernelName mapLoopSpec mapLoopBody typeEnv
-                     arrayElemTys inputArrays outputArrays scalarInputs
+                     arrayElemTys inputArrays outputArrays allScalarInputs
+                     hoistedCallMap preLoopAliases
       harnessSrc = genObjCHarnessSrc prog kernelProc kernelName effectivePreLoop
                      mapLoopSpec retAtom typeEnv arrayElemTys retKinds retTypes
-                     inputArrays outputArrays scalarInputs helperC
+                     inputArrays outputArrays allScalarInputs procParams' helperC
   Right MSLArtifacts
     { mslKernelSource  = kernelSrc
     , mslHarnessSource = harnessSrc
@@ -120,9 +140,14 @@ findKernelProc opts procs =
         []    -> Left $ "MSL backend: kernel proc not found: " ++ BS.unpack name
         (p:_) -> Right p
     Nothing ->
-      case filter (procHasMapLoop . C2.procBody) procs of
+      let candidates = filter (procHasMapLoop . C2.procBody) procs
+          -- Prefer the "main" proc if it's a candidate; otherwise use last candidate
+          -- (last is typically the final top-level binding, the program output)
+      in case candidates of
         []    -> Left "MSL backend: no proc with a map loop found in program"
-        (p:_) -> Right p
+        _     -> case filter (\p -> C2.procName p == "main") candidates of
+                   (p:_) -> Right p
+                   []    -> Right (last candidates)
   where
     procHasMapLoop = any isKernelLoopStmt
     isKernelLoopStmt (C2.SLoop spec _) =
@@ -131,29 +156,33 @@ findKernelProc opts procs =
     isKernelLoopStmt _ = False
 
 -- | Split proc body into (preLoopStmts, loopSpec, loopBody, retAtom).
--- Selects the *last* kernel-eligible loop in the proc body, treating
--- everything before it (including earlier loops) as pre-loop CPU work.
+-- Selects the largest kernel-eligible loop (by body size) in the proc body,
+-- treating everything before and after it as pre-loop / post-loop CPU work.
 analyzeKernelProc :: [C2.Stmt] -> Either String ([C2.Stmt], C2.LoopSpec, [C2.Stmt], Maybe Atom)
 analyzeKernelProc body = do
   let (bodyNoRet, retAtom) = splitFinalReturn body
-  case findLastKernelLoop bodyNoRet of
+  case findBestKernelLoop bodyNoRet of
     Nothing ->
       Left "MSL backend: no parallelizable loop found in kernel proc body"
     Just (preLoop, spec, loopBody) ->
-      case C2.lsIters spec of
-        [_] -> Right (preLoop, spec, loopBody, retAtom)
-        _   -> Left "MSL backend: multi-dimensional map loops not yet supported"
+      Right (preLoop, spec, loopBody, retAtom)
   where
-    -- Find the last kernel-eligible loop, returning (preLoop, spec, body)
-    findLastKernelLoop stmts =
+    -- Find the largest kernel-eligible loop by body statement count,
+    -- returning (stmts before it, spec, body).
+    findBestKernelLoop stmts =
       let indexed = zip [0..] stmts
           candidates = [ (i, spec, lb)
                        | (i, C2.SLoop spec lb) <- indexed
                        , isKernelLoopStmt (C2.SLoop spec lb)
                        ]
+          stmtCount = length . concatMap collectAllStmts
+          collectAllStmts (C2.SLoop _ b) = b ++ concatMap collectAllStmts b
+          collectAllStmts (C2.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
+          collectAllStmts s = [s]
       in case candidates of
            [] -> Nothing
-           _  -> let (i, spec, lb) = last candidates
+           _  -> let best = maximumBy (\(_, _, b1) (_, _, b2) -> compare (stmtCount b1) (stmtCount b2)) candidates
+                     (i, spec, lb) = best
                  in Just (take i stmts, spec, lb)
     isKernelLoopStmt (C2.SLoop spec _) =
       C2.lsRole spec `elem` [C2.LoopMap, C2.LoopMapReduction] ||
@@ -189,7 +218,9 @@ classifyKernelParams
   -> ([CVar], [CVar], [CVar], [C2.Stmt])
 classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
   let iterVars       = Set.fromList (C2.lsIters loopSpec)
-      loopUsedVars   = usedVarsStmts2 loopBody `Set.difference` iterVars
+      -- Include variables from loop bounds (needed for multi-dim decomposition)
+      boundVars      = Set.fromList [ v | C2.IVar v <- C2.lsBounds loopSpec ]
+      loopUsedVars   = (usedVarsStmts2 loopBody `Set.union` boundVars) `Set.difference` iterVars
       -- Also scan for written arrays inside nested loops
       loopWrittenAll = collectWrittenArrays loopBody
       -- Input arrays: results of zero-arg RCall in pre-loop, or allocated and
@@ -201,30 +232,83 @@ classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
       preLoopAllocReadArrays = [ v | C2.SAssign v (RArrayAlloc _) <- preLoopStmts
                                    , v `Set.member` loopUsedVars
                                    , v `Set.notMember` loopWrittenAll ]
-      preLoopInputArrays = nub (preLoopCallArrays ++ preLoopAllocReadArrays)
-      -- In-body zero-arg array calls: RCall fn [] inside loop body where fn returns an array.
+      -- Arrays extracted from pair proc params via RProj (not RAtom aliases —
+      -- those are handled by collectArrayAliases / #define in the kernel body).
+      preLoopProjArrays = [ v | C2.SAssign v (RProj _ _) <- preLoopStmts
+                              , v `Set.member` loopUsedVars
+                              , v `Set.notMember` loopWrittenAll
+                              , isArrayVar v ]
+      preLoopInputArrays = nub (preLoopCallArrays ++ preLoopAllocReadArrays ++ preLoopProjArrays)
+      -- In-body zero-arg calls: RCall fn [] anywhere inside loop body (recursively).
       -- These are memoized calls that need to be hoisted to CPU pre-loop and passed as buffers.
-      inBodyHoisted = [ stmt
-                      | stmt@(C2.SAssign v (RCall fn [])) <- loopBody
-                      , isArrayFn fn
-                      , v `Set.notMember` Set.fromList preLoopInputArrays ]
-      inBodyInputArrays = [ v | C2.SAssign v (RCall _ []) <- inBodyHoisted ]
+      -- Split into array calls (input buffers) and scalar calls (constant buffers).
+      allZeroArgCalls = collectZeroArgCalls loopBody
+      inBodyHoistedAll = [ stmt
+                         | stmt@(C2.SAssign v (RCall fn [])) <- allZeroArgCalls
+                         , v `Set.notMember` Set.fromList preLoopInputArrays ]
+      inBodyHoistedArrays = [ stmt
+                            | stmt@(C2.SAssign v (RCall fn [])) <- inBodyHoistedAll
+                            , isArrayFn fn ]
+      inBodyHoistedScalars = [ stmt
+                             | stmt@(C2.SAssign v (RCall fn [])) <- inBodyHoistedAll
+                             , not (isArrayFn fn) ]
+      inBodyInputArrays = [ v | C2.SAssign v (RCall _ []) <- inBodyHoistedArrays ]
+      inBodyScalarVars  = [ v | C2.SAssign v (RCall _ []) <- inBodyHoistedScalars ]
       inputArrays    = preLoopInputArrays ++ inBodyInputArrays
       -- Output arrays: RArrayAlloc in pre-loop, written in loop
       outputArrays = [ v | C2.SAssign v (RArrayAlloc _) <- preLoopStmts
                          , v `Set.member` loopWrittenAll ]
       allArrVars   = Set.fromList inputArrays `Set.union` Set.fromList outputArrays
       -- Scalar inputs: non-array pre-loop vars used in loop body
-      scalarInputs = [ v | C2.SAssign v _ <- preLoopStmts
-                         , v `Set.member` loopUsedVars
-                         , v `Set.notMember` allArrVars
-                         , not (isArrayVar v) ]
-  in (nub inputArrays, nub outputArrays, nub scalarInputs, inBodyHoisted)
+      preLoopScalarInputs = [ v | C2.SAssign v _ <- preLoopStmts
+                                , v `Set.member` loopUsedVars
+                                , v `Set.notMember` allArrVars
+                                , not (isArrayVar v) ]
+      scalarInputs = preLoopScalarInputs ++ inBodyScalarVars
+  in (nub inputArrays, nub outputArrays, nub scalarInputs, inBodyHoistedAll)
   where
     isArrayVar v = case Map.lookup v typeEnv of
       Just (CTArray _) -> True
       _ -> Map.findWithDefault KScalar v retKinds `elem` [KArray, KFloatArray]
     isArrayFn fn = Map.findWithDefault KScalar fn retKinds `elem` [KArray, KFloatArray]
+
+-- | Recursively collect zero-arg RCall statements from a statement list.
+-- Returns one statement per unique function name (the first occurrence).
+collectZeroArgCalls :: [C2.Stmt] -> [C2.Stmt]
+collectZeroArgCalls stmts = Map.elems (Map.fromListWith (\_ first -> first) pairs)
+  where
+    pairs = [(fn, stmt) | stmt@(C2.SAssign _ (RCall fn [])) <- allCalls stmts]
+    allCalls = concatMap go
+    go stmt@(C2.SAssign _ (RCall _ [])) = [stmt]
+    go (C2.SLoop _ body)       = allCalls body
+    go (C2.SIf _ thn els)      = allCalls thn ++ allCalls els
+    go _                       = []
+
+-- | Build a mapping from function name → canonical hoisted variable.
+-- Used to replace in-kernel zero-arg calls with the hoisted variable.
+buildHoistedCallMap :: [C2.Stmt] -> Map CVar CVar
+buildHoistedCallMap hoisted = Map.fromList [(fn, v) | C2.SAssign v (RCall fn []) <- hoisted]
+
+-- | Collect array alias assignments: v = RAtom (AVar arr) where arr is a known array.
+-- Returns (alias, original) pairs. Recursively follows alias chains.
+collectArrayAliases :: Set CVar -> [C2.Stmt] -> [(CVar, CVar)]
+collectArrayAliases knownArrays stmts = go knownArrays stmts []
+  where
+    go _known [] acc = acc
+    go known (stmt : rest) acc = case stmt of
+      C2.SAssign v (RAtom (AVar src)) | src `Set.member` known ->
+        go (Set.insert v known) rest ((v, src) : acc)
+      C2.SLoop _ body ->
+        let inner = go known body []
+            known' = known `Set.union` Set.fromList (map fst inner)
+        in go known' rest (inner ++ acc)
+      C2.SIf _ thn els ->
+        let innerT = go known thn []
+            innerE = go known els []
+            known' = known `Set.union` Set.fromList (map fst innerT)
+                       `Set.union` Set.fromList (map fst innerE)
+        in go known' rest (innerT ++ innerE ++ acc)
+      _ -> go known rest acc
 
 collectWrittenArrays :: [C2.Stmt] -> Set CVar
 collectWrittenArrays = foldMap go
@@ -233,6 +317,54 @@ collectWrittenArrays = foldMap go
     go (C2.SLoop _ body)             = collectWrittenArrays body
     go (C2.SIf _ thn els)            = collectWrittenArrays thn `Set.union` collectWrittenArrays els
     go _                             = Set.empty
+
+-- ---------------------------------------------------------------------------
+-- MSL pair struct support
+
+-- | Collect all pair types from the typeEnv for variables assigned in the statement list.
+-- Returns pairs in dependency order (leaf types first).
+collectPairTypesFromEnv :: TypeEnv -> [C2.Stmt] -> [(CElemType, CElemType)]
+collectPairTypesFromEnv typeEnv stmts =
+  let allVars = collectAssignedVars stmts
+      pairTypesRaw = nub
+        [ (ce1, ce2)
+        | v <- allVars
+        , Just (CTPair t1 t2) <- [Map.lookup v typeEnv]
+        , Just ce1 <- [ctypeToElemType t1]
+        , Just ce2 <- [ctypeToElemType t2]
+        ]
+      -- Transitively collect sub-pair types in dependency order
+      transitive = concatMap (\(ce1, ce2) -> transitivePairTypesM ce1 ++ transitivePairTypesM ce2 ++ [(ce1, ce2)]) pairTypesRaw
+  in nub transitive
+
+-- | Collect transitive sub-pair types for a CElemType.
+transitivePairTypesM :: CElemType -> [(CElemType, CElemType)]
+transitivePairTypesM (CEPair ct1 ct2) =
+  transitivePairTypesM ct1 ++ transitivePairTypesM ct2 ++ [(ct1, ct2)]
+transitivePairTypesM _ = []
+
+-- | Generate MSL struct definitions for all pair types used.
+genMSLPairStructDefs :: [(CElemType, CElemType)] -> String
+genMSLPairStructDefs [] = ""
+genMSLPairStructDefs pairTypes = unlines
+  [ "// Pair struct definitions"
+  ] ++ concatMap genDef pairTypes
+  where
+    genDef (ct1, ct2) =
+      "struct " ++ mslPairStructName ct1 ct2 ++ " { " ++
+      mslElemCType ct1 ++ " fst; " ++ mslElemCType ct2 ++ " snd; };\n"
+
+-- | MSL pair struct name.
+mslPairStructName :: CElemType -> CElemType -> String
+mslPairStructName ct1 ct2 = "hyd_pair_" ++ celemTypeLetter ct1 ++ celemTypeLetter ct2 ++ "_t"
+
+-- | MSL element type from CElemType.
+mslElemCType :: CElemType -> String
+mslElemCType CEInt = "long"
+mslElemCType CEFloat = "float"  -- demoted from double
+mslElemCType CEBool = "int"
+mslElemCType (CEPair ct1 ct2) = mslPairStructName ct1 ct2
+mslElemCType CEArray = "long"  -- can't have arrays inside MSL structs
 
 -- ---------------------------------------------------------------------------
 -- MSL type helpers
@@ -245,6 +377,9 @@ mslTypeName CTDouble  = "float"   -- demoted
 mslTypeName CTBool    = "int"
 mslTypeName CTUnit    = "int"
 mslTypeName CTTuple   = "hyd_tuple_t"
+mslTypeName (CTPair t1 t2)
+  | Just ce1 <- ctypeToElemType t1
+  , Just ce2 <- ctypeToElemType t2 = mslPairStructName ce1 ce2
 mslTypeName _         = "long"
 
 -- | MSL buffer element type for an array.
@@ -271,14 +406,20 @@ genMSLKernelSrc
   -> [CVar]          -- ^ Input array params (in order)
   -> [CVar]          -- ^ Output array params (in order)
   -> [CVar]          -- ^ Scalar input params (in order)
+  -> Map CVar CVar   -- ^ Hoisted zero-arg call map (fn → canonical var)
+  -> [(CVar, CVar)]  -- ^ Pre-loop array aliases (alias, source)
   -> String
 genMSLKernelSrc kernelName loopSpec loopBody typeEnv arrayElemTys
-                inputArrays outputArrays scalarInputs =
+                inputArrays outputArrays scalarInputs hoistedCallMap preLoopAliases =
+  let pairTypes = collectPairTypesFromEnv typeEnv loopBody
+      pairDefs = genMSLPairStructDefs pairTypes
+  in
   unlines
     [ "#include <metal_stdlib>"
     , "using namespace metal;"
     , ""
     , mslShapeHelpers
+    , pairDefs
     , ""
     , "kernel void " ++ sanitize kernelName ++ "("
     ] ++
@@ -286,30 +427,53 @@ genMSLKernelSrc kernelName loopSpec loopBody typeEnv arrayElemTys
   unlines
     [ "{"
     ] ++
-  genMSLBody (head (C2.lsIters loopSpec)) (C2.lsExec loopSpec) inputArrSet outputArrSet typeEnv arrayElemTys loopBody ++
+  iterDecompLines ++
+  genMSLBody gidVar (C2.lsExec loopSpec) hoistedVarSet outputArrSet typeEnv arrayElemTys hoistedCallMap preLoopAliases loopBody ++
   "}\n"
   where
-    inputArrSet  = Set.fromList inputArrays
+    -- All hoisted vars (input arrays + scalar inputs): skip their in-body assignments
+    hoistedVarSet = Set.fromList inputArrays `Set.union` Set.fromList scalarInputs
     outputArrSet = Set.fromList outputArrays
-    iter = head (C2.lsIters loopSpec)
+    iters  = C2.lsIters loopSpec
+    bounds = C2.lsBounds loopSpec
+    -- For multi-dim loops, use a synthetic flat gid variable
+    isMultiDim = length iters > 1
+    gidVar = if isMultiDim then "_flat_gid" else head iters
+
+    -- Decompose flat gid into individual iterators (row-major order)
+    -- iter[n-1] = _flat_gid % bound[n-1]; remaining /= bound[n-1]; ...
+    iterDecompLines
+      | not isMultiDim = ""
+      | otherwise =
+          "    uint _rem = _flat_gid;\n" ++
+          concatMap (\(it, bd) ->
+            "    uint " ++ sanitize it ++ " = _rem % (uint)(" ++ genMSLIndexExpr bd ++ ");\n" ++
+            "    _rem /= (uint)(" ++ genMSLIndexExpr bd ++ ");\n"
+          ) (reverse (zip iters bounds))
 
     -- Buffer index assignment
+    -- Input arrays: data buffer + shape buffer for each
     inputBufs  = zipWith (\v i -> (v, i)) inputArrays [0..]
-    outputBufs = zipWith (\v i -> (v, i)) outputArrays [length inputArrays..]
-    scalarBufs = zipWith (\v i -> (v, i)) scalarInputs [length inputArrays + length outputArrays..]
+    inputShapeBufs = zipWith (\v i -> (v, i)) inputArrays [length inputArrays..]
+    nInputBufs = length inputArrays * 2  -- data + shape per input
+    outputBufs = zipWith (\v i -> (v, i)) outputArrays [nInputBufs..]
+    scalarBufs = zipWith (\v i -> (v, i)) scalarInputs [nInputBufs + length outputArrays..]
 
-    allParams = inputParams ++ outputParams ++ scalarParams ++ [gidParam]
+    allParams = inputParams ++ inputShapeParams ++ outputParams ++ scalarParams ++ [gidParam]
 
     inputParams  = [ "device const " ++ mslElemTy v ++ "* " ++ sanitize v ++ "_data [[buffer("
                      ++ show i ++ ")]]"
                    | (v, i) <- inputBufs ]
+    inputShapeParams = [ "constant hyd_tuple_t& " ++ sanitize v ++ "_shape [[buffer("
+                         ++ show i ++ ")]]"
+                       | (v, i) <- inputShapeBufs ]
     outputParams = [ "device " ++ mslElemTy v ++ "* " ++ sanitize v ++ "_data [[buffer("
                      ++ show i ++ ")]]"
                    | (v, i) <- outputBufs ]
     scalarParams = [ "constant " ++ mslScalarTy v ++ "& " ++ sanitize v ++ " [[buffer("
                      ++ show i ++ ")]]"
                    | (v, i) <- scalarBufs ]
-    gidParam     = "uint " ++ sanitize iter ++ " [[thread_position_in_grid]]"
+    gidParam     = "uint " ++ sanitize gidVar ++ " [[thread_position_in_grid]]"
 
     mslElemTy v = case Map.lookup v arrayElemTys of
       Just elt -> mslTypeName elt
@@ -336,17 +500,40 @@ collectAssignedVars = nub . concatMap go
 genMSLBody
   :: CVar            -- ^ Loop iterator (= gid in the kernel)
   -> C2.ExecPolicy   -- ^ Execution policy of the outermost loop
-  -> Set CVar        -- ^ Input array vars
+  -> Set CVar        -- ^ Hoisted vars to skip in kernel body
   -> Set CVar        -- ^ Output array vars
   -> TypeEnv
   -> Map CVar CType
+  -> Map CVar CVar   -- ^ Hoisted zero-arg call map (fn → canonical var)
+  -> [(CVar, CVar)]  -- ^ Pre-loop array aliases (alias, source)
   -> [C2.Stmt]
   -> String
-genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys stmts =
-  let allVars = collectAssignedVars stmts
-      -- Pre-declare all variables (except input arrays which are buffer params)
+genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap preLoopAliases stmts =
+  let -- Collect array aliases: only from actual array variables (not scalars in inArrs)
+      actualArrayVars = Set.filter isArrayInEnv (inArrs `Set.union` outArrs)
+      isArrayInEnv v = case Map.lookup v typeEnv of
+        Just (CTArray _) -> True
+        _ -> case Map.lookup v arrayElemTys of
+          Just _ -> True
+          _ -> False
+      bodyAliases = collectArrayAliases actualArrayVars stmts
+      arrayAliases = nub (preLoopAliases ++ bodyAliases)
+      allInArrs = inArrs `Set.union` Set.fromList (map fst arrayAliases)
+      -- Resolve alias chains to root array
+      aliasMap0 = Map.fromList arrayAliases
+      resolveAlias v = case Map.lookup v aliasMap0 of
+        Just parent -> resolveAlias parent
+        Nothing -> v
+      -- Emit #define for each alias so v_data → root_data, v_shape → root_shape
+      aliasDefLines = concatMap (\(v, _src) ->
+        let root = resolveAlias v
+        in "    #define " ++ sanitize v ++ "_data " ++ sanitize root ++ "_data\n" ++
+           "    #define " ++ sanitize v ++ "_shape " ++ sanitize root ++ "_shape\n"
+        ) arrayAliases
+      allVars = collectAssignedVars stmts
+      -- Pre-declare all variables (except input arrays and their aliases)
       declLines = concatMap (\v ->
-        if v `Set.member` inArrs
+        if v `Set.member` allInArrs
         then ""
         else "    " ++ mslVarDecl v typeEnv ++ " " ++ sanitize v ++ ";\n"
         ) allVars
@@ -354,20 +541,20 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys stmts =
         Just _ ->
           case detectAtomicScatterAddLoop stmts of
             Just (prefix, mGuard, arrAtom, idxAtom, valAtom) ->
-              let prefixStr = concatMap (genMSLStmt 1 iter inArrs outArrs typeEnv arrayElemTys) prefix
-                  atomicLine = genMSLAtomicAdd 1 iter inArrs typeEnv arrayElemTys arrAtom idxAtom valAtom
+              let prefixStr = concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap) prefix
+                  atomicLine = genMSLAtomicAdd 1 iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom
               in case mGuard of
                    Nothing -> prefixStr ++ atomicLine
                    Just cond ->
                      prefixStr ++
                      "    if (" ++ genMSLAtom iter cond ++ ") {\n" ++
-                     genMSLAtomicAdd 2 iter inArrs typeEnv arrayElemTys arrAtom idxAtom valAtom ++
+                     genMSLAtomicAdd 2 iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom ++
                      "    }\n"
             Nothing ->
-              concatMap (genMSLStmt 1 iter inArrs outArrs typeEnv arrayElemTys) stmts
+              concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap) stmts
         Nothing ->
-          concatMap (genMSLStmt 1 iter inArrs outArrs typeEnv arrayElemTys) stmts
-  in declLines ++ bodyLines
+          concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap) stmts
+  in declLines ++ aliasDefLines ++ bodyLines
   where
     scatterStrategy = case execPolicy of
       C2.Parallel p -> case C2.psStrategy p of
@@ -407,17 +594,23 @@ genMSLAtomicAdd depth iter inArrs typeEnv _arrayElemTys arrAtom idxAtom valAtom 
        -- Integer atomic add
        ind ++ "atomic_fetch_add_explicit((device atomic_int*)&" ++ arrName ++ "[" ++ idx ++ "], (int)(" ++ val ++ "), memory_order_relaxed);\n"
 
-genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> C2.Stmt -> String
-genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys stmt =
+genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar CVar -> C2.Stmt -> String
+genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap stmt =
   let ind = replicate (depth * 4) ' '
+      recurse = genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap
   in case stmt of
     C2.SAssign v _
       | v `Set.member` inArrs ->
-          -- This array is a pre-fetched Metal buffer parameter; skip the call in the kernel.
+          -- This is a hoisted Metal buffer/constant parameter; skip the call in the kernel.
           ""
+    -- Zero-arg call whose function was hoisted: replace with canonical hoisted var
+    C2.SAssign v (RCall fn [])
+      | Just canonVar <- Map.lookup fn hoistedCallMap
+      , v /= canonVar ->
+          ind ++ sanitize v ++ " = " ++ sanitize canonVar ++ ";\n"
     C2.SAssign v rhs ->
           ind ++ sanitize v ++ " = " ++
-          genMSLRHS iter inArrs outArrs typeEnv arrayElemTys rhs ++ ";\n"
+          genMSLRHS v iter inArrs outArrs typeEnv arrayElemTys rhs ++ ";\n"
 
     C2.SArrayWrite (AVar arr) idx val ->
       let suffix = sanitize arr ++ "_data"
@@ -441,12 +634,12 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys stmt =
                 Nothing -> ""
               loopLine = ind ++ "for (uint " ++ ci ++ " = 0; " ++ ci ++ " < " ++
                          genMSLIndexExpr b ++ "; " ++ ci ++ "++) {\n"
-              bodyLines = concatMap (genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys) body
+              bodyLines = concatMap recurse body
               closeLine = ind ++ "}\n"
           in initLine ++ loopLine ++ bodyLines ++ closeLine
         _ ->
           -- Multi-dim inner loops: emit nested for loops
-          let bodyLines = concatMap (genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys) body
+          let bodyLines = concatMap recurse body
               mkLoop (ci, b) inner =
                 ind ++ "for (uint " ++ sanitize ci ++ " = 0; " ++ sanitize ci ++ " < " ++
                 genMSLIndexExpr b ++ "; " ++ sanitize ci ++ "++) {\n" ++ inner ++ ind ++ "}\n"
@@ -454,11 +647,11 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys stmt =
 
     C2.SIf cond thn els ->
       ind ++ "if (" ++ genMSLAtom iter cond ++ ") {\n" ++
-      concatMap (genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys) thn ++
+      concatMap recurse thn ++
       (case els of
          [] -> ind ++ "}\n"
          _  -> ind ++ "} else {\n" ++
-               concatMap (genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys) els ++
+               concatMap recurse els ++
                ind ++ "}\n")
 
     C2.SReturn a ->
@@ -476,8 +669,8 @@ mslVarDecl v typeEnv = case Map.lookup v typeEnv of
   Nothing -> "long"
 
 -- | Generate MSL for a right-hand-side expression.
-genMSLRHS :: CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> RHS -> String
-genMSLRHS iter inArrs outArrs typeEnv arrayElemTys rhs = case rhs of
+genMSLRHS :: CVar -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> RHS -> String
+genMSLRHS assignedVar iter inArrs outArrs typeEnv arrayElemTys rhs = case rhs of
   RAtom a -> genMSLAtom iter a
   RBinOp op a1 a2 ->
     "(" ++ genMSLAtom iter a1 ++ " " ++ mslBinOp op ++ " " ++ genMSLAtom iter a2 ++ ")"
@@ -489,6 +682,10 @@ genMSLRHS iter inArrs outArrs typeEnv arrayElemTys rhs = case rhs of
     sanitize arr ++ "_data[" ++ genMSLAtom iter idx ++ "]"
   RArrayLoad arr idx ->
     genMSLAtom iter arr ++ "[" ++ genMSLAtom iter idx ++ "]"
+  RArrayShape arr ->
+    -- Array shapes need to be available in the kernel.
+    -- For arrays with known shapes (passed as constant buffers), reference the shape directly.
+    genMSLAtom iter arr ++ "_shape"
   RShapeSize shp ->
     "hyd_shape_size_t(" ++ genMSLAtom iter shp ++ ")"
   RShapeInit shp ->
@@ -499,8 +696,13 @@ genMSLRHS iter inArrs outArrs typeEnv arrayElemTys rhs = case rhs of
     "((uint)(" ++ genMSLAtom iter i ++ ") * (uint)(" ++ genMSLAtom iter w ++ "))"
   RCall fn args ->
     sanitize fn ++ "(" ++ intercalate ", " (map (genMSLAtom iter) args) ++ ")"
-  RPairMake _ _ a1 a2 ->
-    "{.fst = " ++ genMSLAtom iter a1 ++ ", .snd = " ++ genMSLAtom iter a2 ++ "}"
+  RPairMake ct1 ct2 a1 a2 ->
+    let structName = case Map.lookup assignedVar typeEnv of
+          Just (CTPair t1 t2) | Just ce1 <- ctypeToElemType t1
+                              , Just ce2 <- ctypeToElemType t2 ->
+            mslPairStructName ce1 ce2
+          _ -> mslPairStructName ct1 ct2
+    in "((" ++ structName ++ "){.fst = " ++ genMSLAtom iter a1 ++ ", .snd = " ++ genMSLAtom iter a2 ++ "})"
   RPairFst _ a -> genMSLAtom iter a ++ ".fst"
   RPairSnd _ a -> genMSLAtom iter a ++ ".snd"
   RProj i (AVar src)
@@ -641,11 +843,12 @@ genObjCHarnessSrc
   -> [CVar]             -- ^ Input arrays
   -> [CVar]             -- ^ Output arrays
   -> [CVar]             -- ^ Scalar inputs
+  -> [CVar]             -- ^ Proc parameters (declared with defaults)
   -> String             -- ^ Helper C source (already generated)
   -> String
 genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
                   typeEnv arrayElemTys retKinds _retTypes
-                  inputArrays outputArrays scalarInputs helperC =
+                  inputArrays outputArrays scalarInputs procParams helperC =
   unlines $
     [ "// Hydrangea Metal harness — generated by the MSL backend."
     , "#include \"hydrangea_runtime.h\""
@@ -663,12 +866,15 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
     , "    @autoreleasepool {"
     , "    const char* _metallib = argc > 1 ? argv[1] : \"kernel.metallib\";"
     , ""
-    , "    // --- CPU pre-loop setup ---"
+    , "    // --- Proc parameters (defaults) ---"
+    ] ++
+    procParamLines ++
+    [ "    // --- CPU pre-loop setup ---"
     ] ++
     preLoopLines ++
     [ ""
-    , "    // Grid size from loop bound"
-    , "    long _n = (long)" ++ genMSLIndexExpr (head (C2.lsBounds loopSpec)) ++ ";"
+    , "    // Grid size from loop bound(s)"
+    , "    long _n = " ++ gridSizeExpr ++ ";"
     , ""
     , "    // --- Metal device and pipeline setup ---"
     , "    id<MTLDevice> _dev = MTLCreateSystemDefaultDevice();"
@@ -695,6 +901,7 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
     , "    // --- Create Metal buffers ---"
     ] ++
     inputBufLines ++
+    inputShapeBufLines ++
     outputBufLines ++
     scalarBufLines ++
     [ ""
@@ -721,17 +928,39 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
     ]
   where
     iter = head (C2.lsIters loopSpec)
-    totalBufs = length inputArrays + length outputArrays + length scalarInputs
+    nInputArrays = length inputArrays
+    totalBufs = nInputArrays * 2 + length outputArrays + length scalarInputs  -- data + shape per input
+
+    -- Proc parameter declarations with default values
+    procParamLines = concatMap declProcParam procParams
+    declProcParam v =
+      let ty = case Map.lookup v typeEnv of
+                 Just ct -> ct
+                 Nothing -> CTInt64
+          cTy = cTypeName ty
+          defVal = case ty of
+            CTDouble -> "0.0"
+            CTBool   -> "0"
+            CTArray _ -> "NULL"
+            CTPair _ _ -> "((" ++ cTypeName ty ++ "){0})"
+            _        -> "0LL"
+      in [ "    " ++ cTy ++ " " ++ sanitize v ++ " = " ++ defVal ++ ";" ]
+
+    -- Grid size expression: product of all loop bounds
+    gridSizeExpr = case C2.lsBounds loopSpec of
+      [b] -> "(long)" ++ genMSLIndexExpr b
+      bs  -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
 
     -- Pre-loop C statements (skip output array allocations)
-    preLoopLines = concatMap (genPreLoopLine typeEnv retKinds (Set.fromList outputArrays)) preLoopStmts
+    preLoopLines = concatMap (genPreLoopLine typeEnv retKinds (Set.fromList outputArrays) Set.empty) preLoopStmts
 
     -- Input buffer creation + fill
     -- Note: CPU arrays storing CTDouble use 8-byte doubles, but Metal uses 4-byte floats.
     -- We must convert element-by-element for float arrays.
     inputBufLines = concat
       [ [ "    // Input buffer " ++ show i ++ ": " ++ sanitize v
-        , "    size_t _buf" ++ show i ++ "_sz = (size_t)(_n * sizeof(" ++ elemTy ++ "));"
+        , "    long _inN" ++ show i ++ " = hyd_shape_size(" ++ sanitize v ++ "->shape);"
+        , "    size_t _buf" ++ show i ++ "_sz = (size_t)(_inN" ++ show i ++ " * sizeof(" ++ elemTy ++ "));"
         , "    id<MTLBuffer> _buf" ++ show i ++ " = [_dev newBufferWithLength:_buf" ++ show i
           ++ "_sz options:MTLResourceStorageModeShared];"
         ] ++ fillLine i v elemTy
@@ -742,11 +971,20 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
         fillLine i v "float" =
           -- CPU stores double (8 bytes); Metal reads float (4 bytes): convert
           [ "    { double* _fsrc = (double*)" ++ sanitize v ++ "->data; float* _fdst = (float*)_buf" ++ show i ++ ".contents;"
-          , "      for (long _fci = 0; _fci < _n; _fci++) _fdst[_fci] = (float)_fsrc[_fci]; }"
+          , "      for (long _fci = 0; _fci < _inN" ++ show i ++ "; _fci++) _fdst[_fci] = (float)_fsrc[_fci]; }"
           ]
         fillLine i v _ =
           -- Same element size on CPU and GPU (int64 / long): plain memcpy
           [ "    memcpy(_buf" ++ show i ++ ".contents, " ++ sanitize v ++ "->data, _buf" ++ show i ++ "_sz);" ]
+
+    -- Shape buffers for input arrays
+    inputShapeBufLines = concat
+      [ [ "    // Shape buffer " ++ show i ++ ": " ++ sanitize v ++ " shape"
+        , "    id<MTLBuffer> _buf" ++ show i ++ " = [_dev newBufferWithBytes:&" ++ sanitize v
+          ++ "->shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"
+        ]
+      | (v, i) <- zip inputArrays [nInputArrays..]
+      ]
 
     -- Output buffer creation
     -- Map from output array name → shape variable used in its RArrayAlloc
@@ -760,7 +998,7 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
           ++ "_sz options:MTLResourceStorageModeShared];"
         , "    memset(_buf" ++ show i ++ ".contents, 0, _buf" ++ show i ++ "_sz);"
         ]
-      | (v, i) <- zip outputArrays [length inputArrays..]
+      | (v, i) <- zip outputArrays [nInputArrays * 2..]
       , let elemTy = mslElemTy v
       ]
     -- Output size: use the allocation shape if known, otherwise fall back to _n
@@ -775,7 +1013,7 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
         , "    id<MTLBuffer> _buf" ++ show i ++ " = [_dev newBufferWithBytes:&_scalar" ++ show i
           ++ " length:sizeof(" ++ scalarTy v ++ ") options:MTLResourceStorageModeShared];"
         ]
-      | (v, i) <- zip scalarInputs [length inputArrays + length outputArrays..]
+      | (v, i) <- zip scalarInputs [nInputArrays * 2 + length outputArrays..]
       ]
 
     -- setBuffer calls
@@ -787,7 +1025,7 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
     -- Output printing
     printLines = concat
       [ genOutputPrintLines v i
-      | (v, i) <- zip outputArrays [length inputArrays..]
+      | (v, i) <- zip outputArrays [nInputArrays * 2..]
       ]
 
     mslElemTy v = case Map.lookup v arrayElemTys of
@@ -817,14 +1055,18 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
 
 -- | Generate a single pre-loop C statement for the ObjC harness main.
 -- Returns empty list for output array allocations (replaced by Metal buffers).
-genPreLoopLine :: TypeEnv -> Map CVar VarKind -> Set CVar -> C2.Stmt -> [String]
-genPreLoopLine typeEnv retKinds skipAlloc stmt = case stmt of
+-- @preDeclared@ is the set of variables already declared (e.g. by an outer SIf).
+genPreLoopLine :: TypeEnv -> Map CVar VarKind -> Set CVar -> Set CVar -> C2.Stmt -> [String]
+genPreLoopLine typeEnv retKinds skipAlloc preDeclared stmt = case stmt of
   C2.SAssign v (RArrayAlloc _) | v `Set.member` skipAlloc ->
     []  -- output array: skip CPU alloc, will be Metal buffer
-  C2.SAssign v rhs ->
-    [ "    " ++ preLoopCType typeEnv retKinds v rhs ++ " " ++ sanitize v ++ " = " ++
-      genPreLoopRHS retKinds rhs ++ ";"
-    ]
+  C2.SAssign v rhs
+    | v `Set.member` preDeclared ->
+        [ "    " ++ sanitize v ++ " = " ++
+          genPreLoopRHS typeEnv retKinds v rhs ++ ";" ]
+    | otherwise ->
+        [ "    " ++ preLoopCType typeEnv retKinds v rhs ++ " " ++ sanitize v ++ " = " ++
+          genPreLoopRHS typeEnv retKinds v rhs ++ ";" ]
   C2.SLoop spec body
     -- Skip pre-loop loops that only write to output arrays (Metal buffers)
     | let written = collectWrittenArrays body
@@ -832,29 +1074,37 @@ genPreLoopLine typeEnv retKinds skipAlloc stmt = case stmt of
     , written `Set.isSubsetOf` skipAlloc ->
         []
   C2.SLoop spec body ->
-    genPreLoopCLoop 1 typeEnv retKinds skipAlloc spec body
+    genPreLoopCLoop 1 typeEnv retKinds skipAlloc preDeclared spec body
   C2.SArrayWrite arr idx val ->
     [ "    " ++ genPreLoopCArrayWrite arr idx val ]
   C2.SIf cond thn els ->
-    [ "    if (" ++ genCAtom cond ++ ") {" ] ++
-    concatMap (genPreLoopLine typeEnv retKinds skipAlloc) thn ++
-    (case els of
-       [] -> [ "    }" ]
-       _  -> [ "    } else {" ] ++
-              concatMap (genPreLoopLine typeEnv retKinds skipAlloc) els ++
-              [ "    }" ])
+    let -- Pre-declare all variables assigned inside the if branches
+        ifVars = Set.fromList (collectAssignedVars thn ++ collectAssignedVars els)
+        newDecls = ifVars `Set.difference` preDeclared
+        declLines = [ "    " ++ preLoopCTypeVar typeEnv retKinds v (thn ++ els)
+                      ++ " " ++ sanitize v ++ ";"
+                    | v <- Set.toList newDecls ]
+        inner = preDeclared `Set.union` newDecls
+    in declLines ++
+       [ "    if (" ++ genCAtom cond ++ ") {" ] ++
+       concatMap (genPreLoopLine typeEnv retKinds skipAlloc inner) thn ++
+       (case els of
+          [] -> [ "    }" ]
+          _  -> [ "    } else {" ] ++
+                 concatMap (genPreLoopLine typeEnv retKinds skipAlloc inner) els ++
+                 [ "    }" ])
   _ -> []
 
 -- | Emit a C for-loop for pre-loop execution.
-genPreLoopCLoop :: Int -> TypeEnv -> Map CVar VarKind -> Set CVar -> C2.LoopSpec -> [C2.Stmt] -> [String]
-genPreLoopCLoop depth typeEnv retKinds skipAlloc spec body =
+genPreLoopCLoop :: Int -> TypeEnv -> Map CVar VarKind -> Set CVar -> Set CVar -> C2.LoopSpec -> [C2.Stmt] -> [String]
+genPreLoopCLoop depth typeEnv retKinds skipAlloc preDeclared spec body =
   let ind = replicate ((depth + 1) * 4) ' '
       red = C2.lsRed spec
       initLines = case red of
         Just r ->
           let accTy = case Map.lookup (C2.rsAccVar r) typeEnv of
                 Just ct -> cTypeName ct
-                Nothing -> "int64_t"
+                Nothing -> error ("genPreLoopCLoop: reduction accumulator type unknown for " ++ show (C2.rsAccVar r))
           in [ind ++ accTy ++ " " ++ sanitize (C2.rsAccVar r) ++ " = " ++
               genPreLoopCIndexExpr (C2.rsInit r) ++ ";"]
         Nothing -> []
@@ -863,14 +1113,14 @@ genPreLoopCLoop depth typeEnv retKinds skipAlloc spec body =
           [ind ++ "for (int64_t " ++ sanitize i ++ " = 0; " ++
            sanitize i ++ " < " ++ genPreLoopCIndexExpr b ++ "; " ++
            sanitize i ++ "++) {"] ++
-          concatMap (genPreLoopLine typeEnv retKinds skipAlloc) body ++
+          concatMap (genPreLoopLine typeEnv retKinds skipAlloc preDeclared) body ++
           [ind ++ "}"]
         (iters, bounds) ->
           let mkLoop (ci, b) inner =
                 [ind ++ "for (int64_t " ++ sanitize ci ++ " = 0; " ++
                  sanitize ci ++ " < " ++ genPreLoopCIndexExpr b ++ "; " ++
                  sanitize ci ++ "++) {"] ++ inner ++ [ind ++ "}"]
-          in foldr mkLoop (concatMap (genPreLoopLine typeEnv retKinds skipAlloc) body) (zip iters bounds)
+          in foldr mkLoop (concatMap (genPreLoopLine typeEnv retKinds skipAlloc preDeclared) body) (zip iters bounds)
   in initLines ++ loopLines
 
 -- | Render a C array write for pre-loop.
@@ -921,18 +1171,41 @@ preLoopCType typeEnv retKinds v rhs =
       RUnOp op _
         | isMathFloatOp op -> "double"
         | otherwise        -> "int64_t"
-      RArrayLoad {} -> "int64_t"
+      RArrayLoad arr _ -> case lookupArrayElemType2 typeEnv arr of
+        Just eltTy -> cTypeName eltTy
+        Nothing    -> error ("preLoopCType: RArrayLoad element type unknown for array " ++ show arr)
       RFlatToNd {}  -> "hyd_tuple_t"
       RNdToFlat {}  -> "int64_t"
       R2DToFlat {}  -> "int64_t"
-      RPairMake {}  -> "int64_t"  -- fallback; actual type determined by context
-      RPairFst {}   -> "int64_t"
-      RPairSnd {}   -> "int64_t"
-      _ -> "int64_t"
+      RPairMake ct1 ct2 _ _ -> pairStructName ct1 ct2
+      RPairFst ct _   -> celemTypeCType ct
+      RPairSnd ct _   -> celemTypeCType ct
+      _ -> error ("preLoopCType: cannot determine type for variable " ++ show v ++ " with rhs " ++ show rhs)
+
+-- | Determine the C type for a variable from typeEnv, falling back to scanning
+-- statements for an assignment to find the RHS-based type.
+preLoopCTypeVar :: TypeEnv -> Map CVar VarKind -> CVar -> [C2.Stmt] -> String
+preLoopCTypeVar typeEnv retKinds v stmts =
+  case Map.lookup v typeEnv of
+    Just ct -> cTypeName ct
+    Nothing ->
+      -- Scan statements for an assignment to v to find the RHS type
+      case findAssignRHS v stmts of
+        Just rhs -> preLoopCType typeEnv retKinds v rhs
+        Nothing  -> error ("preLoopCTypeVar: no assignment found and type unknown for variable " ++ show v)
+  where
+    findAssignRHS target = go
+      where
+        go [] = Nothing
+        go (C2.SAssign v' rhs : _) | v' == target = Just rhs
+        go (C2.SIf _ thn els : rest) = go thn <|> go els <|> go rest
+        go (C2.SLoop _ body : rest) = go body <|> go rest
+        go (_ : rest) = go rest
 
 -- | C expression for a pre-loop RHS (used in ObjC harness main).
-genPreLoopRHS :: Map CVar VarKind -> RHS -> String
-genPreLoopRHS retKinds rhs = case rhs of
+-- Takes the typeEnv and assigned variable to resolve pair struct types.
+genPreLoopRHS :: TypeEnv -> Map CVar VarKind -> CVar -> RHS -> String
+genPreLoopRHS typeEnv retKinds v rhs = case rhs of
   RAtom a           -> genCAtom a
   RCall fn []       -> sanitize fn ++ "()"
   RCall fn args     -> sanitize fn ++ "(" ++ intercalate ", " (map genCAtom args) ++ ")"
@@ -947,7 +1220,15 @@ genPreLoopRHS retKinds rhs = case rhs of
   RTuple atoms      -> "hyd_tuple_make(" ++ show (length atoms) ++
                        (if null atoms then "" else ", " ++
                          intercalate ", " (map (\a -> "(int64_t)" ++ genCAtom a) atoms)) ++ ")"
-  RProj i a         -> genCAtom a ++ ".elems[" ++ show i ++ "]"
+  RProj i a ->
+    let isPair = case a of
+          AVar src -> case Map.lookup src typeEnv of
+            Just (CTPair _ _) -> True
+            _ -> False
+          _ -> False
+    in if isPair
+       then genCAtom a ++ (if i == 0 then ".fst" else ".snd")
+       else genCAtom a ++ ".elems[" ++ show i ++ "]"
   RArrayLoad (AVar arr) idx ->
     "((int64_t*)" ++ sanitize arr ++ "->data)[" ++ genCAtom idx ++ "]"
   RArrayLoad arr idx ->
@@ -955,8 +1236,13 @@ genPreLoopRHS retKinds rhs = case rhs of
   RFlatToNd flat shp -> "hyd_flat_to_nd(" ++ genCAtom flat ++ ", " ++ genCAtom shp ++ ")"
   RNdToFlat AUnit _ -> "0LL"
   RNdToFlat nd shp  -> "hyd_nd_to_flat(" ++ genCAtom nd ++ ", " ++ genCAtom shp ++ ")"
-  RPairMake _ _ a1 a2 -> "((" ++ pairTy ++ "){.fst = " ++ genCAtom a1 ++ ", .snd = " ++ genCAtom a2 ++ "})"
-    where pairTy = "hyd_pair_ii_t" -- fallback; actual type determined by context
+  RPairMake ct1 ct2 a1 a2 ->
+    let structName = case Map.lookup v typeEnv of
+          Just (CTPair et1 et2) | Just ce1 <- ctypeToElemType et1
+                                , Just ce2 <- ctypeToElemType et2 ->
+            pairStructName ce1 ce2
+          _ -> pairStructName ct1 ct2
+    in "((" ++ structName ++ "){.fst = " ++ genCAtom a1 ++ ", .snd = " ++ genCAtom a2 ++ "})"
   RPairFst _ a -> genCAtom a ++ ".fst"
   RPairSnd _ a -> genCAtom a ++ ".snd"
   RRecord fields ->

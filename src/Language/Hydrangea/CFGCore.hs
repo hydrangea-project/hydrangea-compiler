@@ -57,6 +57,7 @@ data CType
   | CTArray CType                     -- ^ hyd_array_t* of element type
   | CTPair CType CType                -- ^ hyd_pair_XY_t struct
   | CTRecord [(ByteString, CType)]    -- ^ named struct (for future records)
+  | CTUnknown                         -- ^ type not yet determined; must not reach codegen
   deriving (Eq, Ord, Show)
 
 -- | Lift a 'CElemType' (pair-component descriptor) to the full 'CType'.
@@ -77,6 +78,7 @@ ctypeToElemType CTDouble          = Just CEFloat
 ctypeToElemType CTBool            = Just CEBool
 ctypeToElemType (CTPair ct1 ct2)  = CEPair <$> ctypeToElemType ct1 <*> ctypeToElemType ct2
 ctypeToElemType (CTArray _)       = Just CEArray
+ctypeToElemType CTUnknown         = Nothing
 ctypeToElemType _                 = Nothing
 
 -- | Right-hand-side expressions for @SAssign@ in the CFG. These map

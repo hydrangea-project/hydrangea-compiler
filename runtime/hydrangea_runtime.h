@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include "simde/x86/sse2.h"
+#include "simde/x86/avx.h"
 
 #define HYD_MAX_DIMS 8
 
@@ -17,6 +18,7 @@
 
 typedef simde__m128d hyd_float64x2_t;
 typedef simde__m128 hyd_float32x4_t;
+typedef simde__m256d hyd_float64x4_t;
 
 static inline hyd_float64x2_t hyd_vec_loadu_f64(double* addr) {
     return simde_mm_loadu_pd(addr);
@@ -104,6 +106,80 @@ static inline double hyd_vec_reduce_add_f64(hyd_float64x2_t v) {
 
 static inline double hyd_vec_reduce_mul_f64(hyd_float64x2_t v) {
     return simde_mm_cvtsd_f64(v) * simde_mm_cvtsd_f64(simde_mm_unpackhi_pd(v, v));
+}
+
+static inline hyd_float64x4_t hyd_vec_loadu_f64x4(double* addr) {
+    return simde_mm256_loadu_pd(addr);
+}
+
+static inline void hyd_vec_storeu_f64x4(double* addr, hyd_float64x4_t v) {
+    simde_mm256_storeu_pd(addr, v);
+}
+
+static inline hyd_float64x4_t hyd_vec_add_f64x4(hyd_float64x4_t a, hyd_float64x4_t b) {
+    return simde_mm256_add_pd(a, b);
+}
+
+static inline hyd_float64x4_t hyd_vec_sub_f64x4(hyd_float64x4_t a, hyd_float64x4_t b) {
+    return simde_mm256_sub_pd(a, b);
+}
+
+static inline hyd_float64x4_t hyd_vec_mul_f64x4(hyd_float64x4_t a, hyd_float64x4_t b) {
+    return simde_mm256_mul_pd(a, b);
+}
+
+static inline hyd_float64x4_t hyd_vec_div_f64x4(hyd_float64x4_t a, hyd_float64x4_t b) {
+    return simde_mm256_div_pd(a, b);
+}
+
+static inline hyd_float64x4_t hyd_vec_set1_f64x4(double v) {
+    return simde_mm256_set1_pd(v);
+}
+
+static inline hyd_float64x4_t hyd_vec_zero_f64x4(void) {
+    return simde_mm256_setzero_pd();
+}
+
+static inline hyd_float64x4_t hyd_vec_sqrt_f64x4(hyd_float64x4_t v) {
+    return simde_mm256_sqrt_pd(v);
+}
+
+static inline hyd_float64x4_t hyd_vec_log_f64x4(hyd_float64x4_t v) {
+    double lanes[4];
+    simde_mm256_storeu_pd(lanes, v);
+    lanes[0] = log(lanes[0]); lanes[1] = log(lanes[1]);
+    lanes[2] = log(lanes[2]); lanes[3] = log(lanes[3]);
+    return simde_mm256_loadu_pd(lanes);
+}
+
+static inline hyd_float64x4_t hyd_vec_exp_f64x4(hyd_float64x4_t v) {
+    double lanes[4];
+    simde_mm256_storeu_pd(lanes, v);
+    lanes[0] = exp(lanes[0]); lanes[1] = exp(lanes[1]);
+    lanes[2] = exp(lanes[2]); lanes[3] = exp(lanes[3]);
+    return simde_mm256_loadu_pd(lanes);
+}
+
+static inline hyd_float64x4_t hyd_vec_erf_f64x4(hyd_float64x4_t v) {
+    double lanes[4];
+    simde_mm256_storeu_pd(lanes, v);
+    lanes[0] = erf(lanes[0]); lanes[1] = erf(lanes[1]);
+    lanes[2] = erf(lanes[2]); lanes[3] = erf(lanes[3]);
+    return simde_mm256_loadu_pd(lanes);
+}
+
+static inline double hyd_vec_reduce_add_f64x4(hyd_float64x4_t v) {
+    simde__m128d lo = simde_mm256_extractf128_pd(v, 0);
+    simde__m128d hi = simde_mm256_extractf128_pd(v, 1);
+    simde__m128d s  = simde_mm_add_pd(lo, hi);
+    return simde_mm_cvtsd_f64(s) + simde_mm_cvtsd_f64(simde_mm_unpackhi_pd(s, s));
+}
+
+static inline double hyd_vec_reduce_mul_f64x4(hyd_float64x4_t v) {
+    simde__m128d lo = simde_mm256_extractf128_pd(v, 0);
+    simde__m128d hi = simde_mm256_extractf128_pd(v, 1);
+    simde__m128d p  = simde_mm_mul_pd(lo, hi);
+    return simde_mm_cvtsd_f64(p) * simde_mm_cvtsd_f64(simde_mm_unpackhi_pd(p, p));
 }
 
 static inline hyd_float64x2_t hyd_vec_sqrt_f64(hyd_float64x2_t v) {

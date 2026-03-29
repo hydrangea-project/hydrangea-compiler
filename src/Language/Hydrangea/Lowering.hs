@@ -55,6 +55,13 @@ freshCVar prefix = do
   modify' $ \s -> s { lsFresh = n + 1 }
   pure $ BS.append prefix (BS.pack (show n))
 
+-- | Allocate a fresh loop-iterator variable and register it as @CTInt64@.
+freshIterVar :: ByteString -> LowerM CVar
+freshIterVar prefix = do
+  v <- freshCVar prefix
+  registerCType v CTInt64
+  pure v
+
 registerFn :: Var -> [Pat Range] -> Exp Range -> LowerM ()
 registerFn name pats body =
   modify' $ \s -> s { lsFnEnv = M.insert name (pats, body) (lsFnEnv s) }
@@ -173,12 +180,13 @@ lowerExp expr = case expr of
     (s2, a2) <- lowerExp e2
     t <- freshCVar "t"
     let bop = lowerBinOp op
-    when (isFloatBinOp bop) $ registerCType t CTDouble
+    mapM_ (registerCType t) (binopResultCType bop)
     pure (s1 ++ s2 ++ [SAssign t (RBinOp bop a1 a2)], AVar t)
 
   EUnOp _ (Not _) e -> do
     (s, a) <- lowerExp e
     t <- freshCVar "t"
+    registerCType t CTBool
     pure (s ++ [SAssign t (RUnOp CNot a)], AVar t)
 
   EUnOp _ (Fst _) e -> do
@@ -250,13 +258,18 @@ lowerExp expr = case expr of
     t <- freshCVar "t"
     aTy <- ctypeOfAtom a
     when (i == 0) $ propagateDenseLinearIndex t a
+    -- Check if the atom is *positively confirmed* to be a scalar int.
+    -- We must not skip the projection for variables whose type is unknown
+    -- (defaulting to CTInt64) since they may actually be tuples (e.g.
+    -- fused generate index parameters).
+    isConfirmedScalar <- isAtomConfirmedScalar s a
     let singletonProjAtom =
           case reverse s of
             (SAssign v (RTuple [inner]) : _) | a == AVar v -> Just inner
             _ -> Nothing
     let rhs
           | i == 0, Just inner <- singletonProjAtom = RAtom inner
-          | i == 0 && aTy == CTInt64 = RAtom a
+          | i == 0 && isConfirmedScalar = RAtom a
           | otherwise = RProj i a
     pure (s ++ [SAssign t rhs], AVar t)
 
@@ -294,6 +307,8 @@ lowerExp expr = case expr of
     (sc, ac) <- lowerExp cond
     (st, at') <- lowerExp thn
     r <- freshCVar "r"
+    thnTy <- ctypeOfAtom at'
+    when (thnTy /= CTUnknown) $ registerCType r thnTy
     pure (sc ++ [SIf ac (st ++ [SAssign r (RAtom at')]) [SAssign r (RAtom AUnit)]], AVar r)
 
   EIfThenElse _ cond thn els -> do
@@ -301,6 +316,14 @@ lowerExp expr = case expr of
     (st, at') <- lowerExp thn
     (se, ae) <- lowerExp els
     r <- freshCVar "r"
+    -- Propagate the result type from either branch so downstream code does not
+    -- see CTUnknown when this if-else is used as a record field or array body.
+    thnTy <- ctypeOfAtom at'
+    elsTy <- ctypeOfAtom ae
+    let rTy = case (thnTy, elsTy) of
+                (CTUnknown, t) -> t
+                (t, _)        -> t
+    when (rTy /= CTUnknown) $ registerCType r rTy
     pure (sc ++ [SIf ac (st ++ [SAssign r (RAtom at')]) (se ++ [SAssign r (RAtom ae)])], AVar r)
 
   ELetIn _ (Dec _ name pats _ body) rest
@@ -333,7 +356,7 @@ lowerExp expr = case expr of
     (setupStmts, loopStmt) <- case shapeRankExp shape of
       -- 1D: flat loop, pass flat index directly to the body function.
       Just 1 -> do
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         n <- freshCVar "n"
         bodyStmts <- inlineArrayFn1D fnExp i _val
         valTy <- ctypeOfAtom (AVar _val)
@@ -348,8 +371,8 @@ lowerExp expr = case expr of
              )
       -- 2D: nested (i, j) loops; avoids the flat→ND→flat roundtrip.
       Just 2 -> do
-        i    <- freshCVar "i"
-        j    <- freshCVar "j"
+        i    <- freshIterVar "i"
+        j    <- freshIterVar "j"
         dim0 <- freshCVar "dim0"
         dim1 <- freshCVar "dim1"
         mul  <- freshCVar "mul"
@@ -381,7 +404,7 @@ lowerExp expr = case expr of
              )
       -- N-D (n>2 or unknown rank): flat loop with flat→ND decomposition.
       _ -> do
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         n <- freshCVar "n"
         registerCType idx CTTuple
         noteDenseLinearIndex idx i
@@ -406,7 +429,7 @@ lowerExp expr = case expr of
     (sv, av) <- lowerExp valExp
     arr <- freshCVar "arr"
     n <- freshCVar "n"
-    i <- freshCVar "i"
+    i <- freshIterVar "i"
     valTy <- ctypeOfAtom av
     registerCType arr (CTArray valTy)
     markArrayFreshWriteOnce arr
@@ -425,7 +448,7 @@ lowerExp expr = case expr of
     shp <- freshCVar "shp"
     arr <- freshCVar "arr"
     n <- freshCVar "n"
-    i <- freshCVar "i"
+    i <- freshIterVar "i"
     elem' <- freshCVar "elem"
     val <- freshCVar "val"
     bodyStmts <- inlineScalarFn fnExp elem' val
@@ -454,7 +477,7 @@ lowerExp expr = case expr of
     shp <- freshCVar "shp"
     arr <- freshCVar "arr"
     n <- freshCVar "n"
-    i <- freshCVar "i"
+    i <- freshIterVar "i"
     e1 <- freshCVar "e"
     e2 <- freshCVar "e"
     val <- freshCVar "val"
@@ -490,7 +513,7 @@ lowerExp expr = case expr of
     redDim <- freshCVar "red_dim"
     outN <- freshCVar "out_n"
     outArr <- freshCVar "out_arr"
-    j <- freshCVar "j"
+    j <- freshIterVar "j"
     acc <- freshCVar "acc"
     k <- freshCVar "k"
     base <- freshCVar "base"
@@ -527,7 +550,7 @@ lowerExp expr = case expr of
     redDim <- freshCVar "red_dim"
     outN <- freshCVar "out_n"
     outArr <- freshCVar "out_arr"
-    j <- freshCVar "j"
+    j <- freshIterVar "j"
     acc <- freshCVar "acc"
     k <- freshCVar "k"
     base <- freshCVar "base"
@@ -983,7 +1006,7 @@ lowerExp expr = case expr of
         (ss, as') <- lowerExp shapeExp
         redDim <- freshCVar "red_dim"
         outN <- freshCVar "out_n"
-        j <- freshCVar "j"
+        j <- freshIterVar "j"
         acc <- freshCVar "acc"
         k <- freshCVar "k"
         base <- freshCVar "base"
@@ -1087,7 +1110,7 @@ lowerExp expr = case expr of
     outArr <- freshCVar "outArr"
     outShp <- freshCVar "outShp"
     outN <- freshCVar "outN"
-    i <- freshCVar "i"
+    i <- freshIterVar "i"
     outIdx <- freshCVar "outIdx"
     srcTuple <- freshCVar "srcTuple"
     flatSrc <- freshCVar "flatSrc"
@@ -1133,7 +1156,7 @@ lowerExp expr = case expr of
     outShp <- freshCVar "oshp"
     arr <- freshCVar "arr"
     n <- freshCVar "n"
-    i <- freshCVar "i"
+    i <- freshIterVar "i"
     outIdx <- freshCVar "oidx"
     flatSrc <- freshCVar "fs"
     val <- freshCVar "val"
@@ -1169,8 +1192,8 @@ lowerExp expr = case expr of
     out <- freshCVar "out"
     nDst <- freshCVar "n"
     nSrc <- freshCVar "n"
-    j <- freshCVar "j"
-    i <- freshCVar "i"
+    j <- freshIterVar "j"
+    i <- freshIterVar "i"
     elemD <- freshCVar "elem"
     idx <- freshCVar "idx"
     permIdx <- freshCVar "pidx"
@@ -1201,7 +1224,7 @@ lowerExp expr = case expr of
     (sv, av) <- lowerExp valsExp
     shp <- freshCVar "shp"
     n <- freshCVar "n"
-    i <- freshCVar "i"
+    i <- freshIterVar "i"
     val <- freshCVar "val"
     oldVal <- freshCVar "old"
     newVal <- freshCVar "new"
@@ -1228,7 +1251,7 @@ lowerExp expr = case expr of
         (sd, ad) <- lowerExp defaultsExp
         (sshp, ashp) <- lowerExp shpExp
         n <- freshCVar "n"
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
         guardVal <- freshCVar "guard"
@@ -1267,7 +1290,7 @@ lowerExp expr = case expr of
         (sg, ag) <- lowerExp guardExp
         shp <- freshCVar "shp"
         n <- freshCVar "n"
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         guardVal <- freshCVar "guard"
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
@@ -1300,7 +1323,7 @@ lowerExp expr = case expr of
         (sd, ad) <- lowerExp defaultsExp
         (sshp, ashp) <- lowerExp shpExp
         n <- freshCVar "n"
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
         val <- freshCVar "val"
@@ -1330,7 +1353,7 @@ lowerExp expr = case expr of
         (ssrc, asrc) <- lowerExp srcArrExp
         shp <- freshCVar "shp"
         n <- freshCVar "n"
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
         elem' <- freshCVar "elem"
@@ -1365,7 +1388,7 @@ lowerExp expr = case expr of
         (si, ai) <- lowerExp idxArrExp
         shp <- freshCVar "shp"
         n <- freshCVar "n"
-        i <- freshCVar "i"
+        i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
         val <- freshCVar "val"
@@ -1400,7 +1423,7 @@ lowerExp expr = case expr of
     srcShp <- freshCVar "srcShp"
     arr    <- freshCVar "arr"
     n      <- freshCVar "n"
-    i      <- freshCVar "i"
+    i      <- freshIterVar "i"
     ndIdx  <- freshCVar "ndIdx"
     flat   <- freshCVar "flat"
     val    <- freshCVar "val"
@@ -1478,7 +1501,7 @@ lowerExp expr = case expr of
     shp    <- freshCVar "shp"
     outArr <- freshCVar "arr"
     n      <- freshCVar "n"
-    i      <- freshCVar "i"
+    i      <- freshIterVar "i"
     (preLoopStmts, idxVars, dimVars) <- case rank of
       2 -> do
         n0   <- freshCVar "n0"
@@ -1765,7 +1788,7 @@ handleApp fn arg = case fn of
     (s2, a2) <- lowerExp arg
     t <- freshCVar "t"
     let bop = lowerBinOp op
-    when (isFloatBinOp bop) $ registerCType t CTDouble
+    mapM_ (registerCType t) (binopResultCType bop)
     pure (s1 ++ s2 ++ [SAssign t (RBinOp bop a1 a2)], AVar t)
 
   EApp _ (EVar _ fName) firstArg -> do
@@ -1845,12 +1868,13 @@ isShapeAllDim (ShapeAll _) = True
 isShapeAllDim _ = False
 
 ctypeOfAtom :: Atom -> LowerM CType
-ctypeOfAtom (AFloat _) = pure CTDouble
-ctypeOfAtom (ABool _) = pure CTBool
-ctypeOfAtom AUnit = pure CTUnit
+ctypeOfAtom (AFloat _)  = pure CTDouble
+ctypeOfAtom (ABool _)   = pure CTBool
+ctypeOfAtom AUnit       = pure CTUnit
 ctypeOfAtom (AString _) = pure CTInt64
-ctypeOfAtom (AVar v) = gets $ fromMaybe CTInt64 . M.lookup v . lsTypeEnv
-ctypeOfAtom _ = pure CTInt64
+ctypeOfAtom (AInt _)    = pure CTInt64
+ctypeOfAtom (AVar v)    = gets $ fromMaybe CTUnknown . M.lookup v . lsTypeEnv
+ctypeOfAtom (AVecVar _) = pure CTUnknown
 
 -- | Determine the @CElemType@ of an atom for use in @RPairMake@.
 elemTypeOfAtom :: Atom -> LowerM CElemType
@@ -1863,6 +1887,35 @@ elemTypeOfAtom (AVar v)   = gets $ \st ->
     Just (CTArray _) -> CEArray
     _ -> CEInt
 elemTypeOfAtom _          = pure CEInt
+
+-- | Check if an atom is positively confirmed to be a scalar integer.
+-- Returns True only when we have evidence the atom is not a tuple.
+-- Used by EProj lowering to decide whether @proj 0 x@ can be elided.
+isAtomConfirmedScalar :: [Stmt] -> Atom -> LowerM Bool
+isAtomConfirmedScalar _ (AInt {})  = pure True
+isAtomConfirmedScalar _ (AFloat {}) = pure True
+isAtomConfirmedScalar _ (ABool {}) = pure True
+isAtomConfirmedScalar stmts (AVar v) = do
+  -- Check (a): was the variable produced by a definitively scalar RHS?
+  let byRHS = case reverse stmts of
+        (SAssign v' rhs' : _) | v == v' -> case rhs' of
+          RAtom (AInt {})  -> True
+          RAtom (AFloat {}) -> True
+          RBinOp {}        -> True
+          RUnOp {}         -> True
+          RArrayLoad {}    -> True
+          RCall {}         -> True
+          _                -> False
+        _ -> False
+  if byRHS then pure True else do
+    -- Check (b): is the variable explicitly registered in the type env?
+    mTy <- gets (M.lookup v . lsTypeEnv)
+    pure $ case mTy of
+      Just CTInt64  -> True
+      Just CTDouble -> True
+      Just CTBool   -> True
+      _             -> False
+isAtomConfirmedScalar _ _ = pure False
 
 -- | Register a concrete @CType@ for a variable in @lsTypeEnv@.
 registerCType :: CVar -> CType -> LowerM ()
@@ -2009,6 +2062,21 @@ isFloatBinOp CSubF = True
 isFloatBinOp CMulF = True
 isFloatBinOp CDivF = True
 isFloatBinOp _     = False
+
+-- | The result 'CType' of a binary operator, if statically known.
+binopResultCType :: BinOp -> Maybe CType
+binopResultCType op = case op of
+  CAdd  -> Just CTInt64;  CSub -> Just CTInt64;  CMul -> Just CTInt64
+  CDiv  -> Just CTInt64;  CMod -> Just CTInt64
+  CEq   -> Just CTBool;   CNeq -> Just CTBool
+  CLt   -> Just CTBool;   CLe  -> Just CTBool
+  CGt   -> Just CTBool;   CGe  -> Just CTBool
+  CAnd  -> Just CTBool;   COr  -> Just CTBool
+  CAddF -> Just CTDouble; CSubF -> Just CTDouble
+  CMulF -> Just CTDouble; CDivF -> Just CTDouble
+  CEqF  -> Just CTBool;   CNeqF -> Just CTBool
+  CLtF  -> Just CTBool;   CLeF  -> Just CTBool
+  CGtF  -> Just CTBool;   CGeF  -> Just CTBool
 
 -- | Lower a unary math function (Float -> Float) to a CFG RUnOp.
 lowerMathUnOp :: UnOp -> Exp Range -> LowerM ([Stmt], Atom)

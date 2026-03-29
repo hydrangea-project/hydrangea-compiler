@@ -19,6 +19,7 @@ module Language.Hydrangea.CodegenC
   , sanitize
   , sanitizeFieldName
   , celemTypeLetter
+  , celemTypeCType
   , pairStructName
   , recordStructName
   , cTypeName
@@ -113,6 +114,7 @@ ctypeToVarKind (CTPair t1 t2)   = do
   et2 <- ctypeToElemType t2
   return (KPair et1 et2)
 ctypeToVarKind (CTRecord fields) = Just (KRecord fields)
+ctypeToVarKind CTUnknown         = Nothing
 
 -- | Derive the classification sets/maps used by genStmts2 from a type environment.
 -- Returns (arrVars, tupVars, pairVars, recordVars, floatVars, floatArrVars).
@@ -1293,11 +1295,20 @@ procReturnKinds2 prog@(C2.Program procs) = foldl addProc Map.empty procs
         Nothing | isDirectFloatReturn body -> KFloat
         _ -> KScalar
 
+-- | Reserved C / POSIX identifiers that would clash with system headers.
+cReservedNames :: S.Set String
+cReservedNames = S.fromList
+  [ "main", "kill", "exit", "abort", "signal", "read", "write", "open"
+  , "close", "stat", "time", "wait", "link", "fork", "exec", "free"
+  , "malloc", "calloc", "realloc", "printf", "scanf", "puts", "gets"
+  , "strlen", "strcmp", "memcpy", "memset", "remove", "rename"
+  ]
+
 sanitize :: CVar -> String
 sanitize bs = case BS.unpack bs of
   [] -> "_empty"
-  "main" -> "hyd_main"  -- avoid conflict with C's int main()
-  s -> map (\c -> if isAlphaNum c || c == '_' then c else '_') s
+  s | s `S.member` cReservedNames -> "hyd_" ++ s
+    | otherwise -> map (\c -> if isAlphaNum c || c == '_' then c else '_') s
 
 sanitizeExportName :: BS.ByteString -> String
 sanitizeExportName bs = case BS.unpack bs of
@@ -1320,6 +1331,7 @@ cTypeTag CTTuple = "t"
 cTypeTag (CTArray elt) = "a" ++ cTypeTag elt
 cTypeTag (CTPair t1 t2) = "p" ++ cTypeTag t1 ++ cTypeTag t2
 cTypeTag (CTRecord fields) = "r" ++ concatMap (\(field, fieldTy) -> sanitizeFieldName field ++ "_" ++ cTypeTag fieldTy ++ "_") fields
+cTypeTag CTUnknown = error "internal error: CTUnknown reached codegen type tag"
 
 cTypeName :: CType -> String
 cTypeName CTInt64 = "int64_t"
@@ -1331,8 +1343,9 @@ cTypeName (CTArray _) = "hyd_array_t*"
 cTypeName (CTPair t1 t2)
   | Just et1 <- ctypeToElemType t1
   , Just et2 <- ctypeToElemType t2 = pairStructName et1 et2
-  | otherwise = "int64_t"
+  | otherwise = error ("internal error: CTPair with non-representable component in codegen: " ++ show t1 ++ ", " ++ show t2)
 cTypeName (CTRecord fields) = recordStructName fields
+cTypeName CTUnknown = error "internal error: CTUnknown reached codegen (type was not propagated)"
 
 recordStructName :: [(BS.ByteString, CType)] -> String
 recordStructName fields = "hyd_record_" ++ concatMap (\(field, fieldTy) -> sanitizeFieldName field ++ "_" ++ cTypeTag fieldTy ++ "_") fields ++ "t"
