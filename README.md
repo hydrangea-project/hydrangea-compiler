@@ -1,6 +1,6 @@
 # Hydrangea
 
-Hydrangea is an experimental compiler for a functional, higher-order, rank-polymorphic array programming language. It aims to make array code feel concise and compositional while still compiling to optimized C with fusion, SIMD vectorization, and OpenMP parallelization.
+Hydrangea is an experimental compiler for a functional, higher-order, rank-polymorphic array programming language. It aims to make array code feel concise and compositional while still compiling to optimized C with fusion, SIMD vectorization, and OpenMP parallelization, with an experimental Apple Metal backend now in progress.
 
 ## Overview
 
@@ -9,6 +9,7 @@ Hydrangea combines:
 - ML-style syntax with Hindley-Milner type inference
 - Fusion of array combinators such as `map`, `zipWith`, `generate`, and `gather`
 - C code generation with SIMD vectorization and OpenMP parallelization
+- An experimental, work-in-progress Apple Metal backend for GPU-oriented execution on macOS
 
 ## Repository Structure
 
@@ -23,8 +24,9 @@ Hydrangea combines:
 │   ├── Vectorize.hs          # Vectorization pass
 │   ├── Parallelize.hs        # Parallelization pass
 │   ├── CodegenC.hs           # C code generation
+│   ├── CodegenMSL.hs         # Experimental Apple Metal / MSL code generation
 │   └── ...
-├── app/                      # Executable entry point
+├── app/                      # Executable entry point and backend drivers
 ├── test/                     # HSpec test suite
 ├── examples/                 # Sample Hydrangea programs (*.hyd)
 ├── runtime/                  # C runtime support
@@ -37,6 +39,7 @@ Hydrangea combines:
 
 - GHC 9.4+ and Cabal
 - C compiler with OpenMP support (for parallel execution)
+- On macOS, Xcode command-line tools are required for the experimental Metal backend (`xcrun`, `clang`, Metal toolchain)
 
 ### Cabal Commands
 
@@ -76,6 +79,22 @@ clang usually does not provide OpenMP support.
 The repository also includes a `.devcontainer/` setup for editors such as VS Code. It provides
 GHC 9.10.1 together with Cabal, GCC, OpenMP support via GCC, and `z3`.
 
+## Backends
+
+Hydrangea currently has two code generation targets:
+
+- **C backend** — the primary and more mature path, generating C that can be compiled and run with SIMD and OpenMP support.
+- **Apple Metal backend (experimental / WIP)** — generates a `.metal` compute kernel plus an Objective-C harness and drives the Metal toolchain via `xcrun`. This path is currently aimed at macOS / Apple Silicon workflows and has a narrower supported feature set than the C backend.
+
+The current Metal backend implementation is intentionally limited. In `CodegenMSL.hs`, the documented initial scope includes:
+
+- 1-D parallel or map-style kernels
+- Scalar and 1-D array inputs and outputs
+- `Int64` and `Double`-based programs, with Metal codegen demoting `Double` to `float`
+- Inner serial loops and conditionals inside the selected kernel body
+
+It is still a work in progress and should be treated as experimental.
+
 ## Command-Line Usage
 
 ```bash
@@ -99,6 +118,7 @@ If no file is provided, reads from stdin.
 | `--output-h=<file>` | Write the generated export header to a file; requires `--export-kernel` |
 | `--compile-only` | Compile generated C to a binary, but do not execute it |
 | `--keep-c` | Keep intermediate `hydrangea_out.c` and `hydrangea_out` artifacts in the current directory |
+| `--keep-metal` | Keep intermediate Metal artifacts in the current directory as `hydrangea_out.metal` and `hydrangea_out.m` |
 
 #### Program selection and optimization
 
@@ -108,8 +128,10 @@ If no file is provided, reads from stdin.
 | `--all-top-level-procs` | Preserve every top-level declaration instead of pruning to `main` |
 | `--no-parallel` | Disable OpenMP-oriented parallelization and compile generated C without `-fopenmp` |
 | `--no-solver-check` | Skip refinement-solver discharge after type inference |
+| `--simd-width=<2|4>` | Select the SIMD vector width used by the C backend (default: `4`) |
 | `--prune-dead-procs` | Prune unused generated procedures during code generation |
 | `--kernel=<name>` | Assert that the named top-level kernel fully fused away references to other original top-level bindings; fails if fusion leaves dependencies behind |
+| `--metal-kernel=<name>` | When using `--metal`, choose which lowered procedure should be emitted as the Metal kernel; otherwise the backend selects a candidate automatically |
 
 #### Export, backend, and benchmarking
 
@@ -120,8 +142,9 @@ If no file is provided, reads from stdin.
 | `--benchmark=<name>` | Generate benchmark scaffolding for the named zero-argument top-level procedure and report timing statistics |
 | `--bench-warmup=<n>` | Use `n` warmup iterations for `--benchmark` (default: `3`) |
 | `--bench-iters=<n>` | Use `n` timed measurement iterations for `--benchmark` (default: `10`) |
+| `--metal` | Use the experimental Apple Metal backend instead of the default C backend |
 
-Without `--interp`, the default mode type-checks, compiles, and runs the selected `main` entrypoint.
+Without `--interp`, the default mode type-checks, compiles, and runs the selected program. By default this uses the C backend; `--metal` switches to the experimental Metal backend.
 
 ### Examples
 
@@ -131,6 +154,9 @@ cabal run hydrangea-compiler -- --interp examples/simple.hyd
 
 # Generate and display C code
 cabal run hydrangea-compiler -- --emit-c examples/mat_mul.hyd
+
+# Generate C with a narrower SIMD width
+cabal run hydrangea-compiler -- --emit-c --simd-width=2 examples/mat_mul.hyd
 
 # Validate that a fused kernel has no remaining top-level dependencies
 cabal run hydrangea-compiler -- --kernel=dot examples/dot.hyd
@@ -164,6 +190,17 @@ cabal run hydrangea-compiler -- --no-parallel examples/mat_mul.hyd
 
 # Force a specific C compiler for generated code
 cabal run hydrangea-compiler -- --cc=gcc-15 examples/mat_mul.hyd
+
+# Run the experimental Metal backend on macOS
+cabal run hydrangea-compiler -- --metal examples/dot.hyd
+
+# Select a specific Metal kernel and keep the generated .metal/.m sources
+cabal run hydrangea-compiler -- \
+  --metal \
+  --metal-kernel=dot \
+  --keep-metal \
+  --compile-only \
+  examples/dot.hyd
 
 # Build the voxel PPM demo (defaults to a high-detail 1920x1080 render)
 demo/voxel_ppm/build.sh
@@ -211,7 +248,7 @@ The `examples/` directory contains sample Hydrangea programs:
 7. **Analysis** - Loop analysis for vectorization
 8. **Vectorization** - SIMD vectorization
 9. **Parallelization** - OpenMP parallelization
-10. **Code Generation** - C code with SIMD intrinsics
+10. **Code Generation** - Primarily C code with SIMD intrinsics, plus an experimental Metal/MSL backend on macOS
 
 ## License
 

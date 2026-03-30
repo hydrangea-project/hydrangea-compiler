@@ -10,6 +10,7 @@
 module Main where
 
 import CBackend (compileAndRunC)
+import MetalBackend (compileAndRunMetal)
 import Control.Monad (forM_, when)
 import Data.ByteString.Lazy.Char8 (unpack)
 import Data.ByteString.Lazy.Char8 qualified as BS
@@ -24,19 +25,24 @@ import Language.Hydrangea.CodegenC
   , codegenProgram2WithOptionsPrune
   , defaultCodegenOptions
   )
+import Language.Hydrangea.CodegenMSL (MSLOptions(..), defaultMSLOptions, codegenMSL)
 import Language.Hydrangea.ErrorFormat (formatEvalError, formatTypeError)
 import Language.Hydrangea.Frontend
   ( compileToCOptIOWithOptions
   , compileToCOptParallelIOWithOptions
+  , compileToCOptIOWithCodegenOptions
+  , compileToCOptParallelIOWithCodegenOptions
   , evalDecsFrontend
   , lowerToCFG2
   , lowerToCFG2OptWithTypesWithOptions
   , lowerToCFG2WithTypesWithOptions
   , optimizeCFG2
   , optimizeParallelCFG2
+  , optimizeMetalCFG2
   , readDecs
   )
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions, runInferDecsWithOptions)
+import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Language.Hydrangea.Fusion (fuseDecs)
 import Language.Hydrangea.Uniquify (uniquifyDecs)
 import Language.Hydrangea.Pretty
@@ -65,6 +71,7 @@ usage = unwords
   , "[" ++ allTopLevelProcsFlag ++ "]"
   , "[--no-parallel]"
   , "[--no-solver-check]"
+  , "[--simd-width=<2|4>]"
   , "[--kernel=<name>]"
   , "[" ++ mainFlag ++ "]"
   , "[--prune-dead-procs]"
@@ -74,6 +81,9 @@ usage = unwords
   , "[--benchmark=<name>]"
   , "[--bench-warmup=<n>]"
   , "[--bench-iters=<n>]"
+  , "[--metal]"
+  , "[--metal-kernel=<name>]"
+  , "[--keep-metal]"
   , "[file]"
   ]
 
@@ -109,6 +119,15 @@ main = do
       benchmarkFlag = flagValue "--benchmark=" flags
       benchWarmupFlag = flagValue "--bench-warmup=" flags
       benchItersFlag = flagValue "--bench-iters=" flags
+      simdWidthFlag = flagValue "--simd-width=" flags
+      simdWidth = case simdWidthFlag of
+        Nothing  -> defaultVectorWidth
+        Just "2" -> 2
+        Just "4" -> 4
+        Just bad -> error $ "--simd-width must be 2 or 4, got: " ++ bad
+      useMetal = "--metal" `elem` flags
+      metalKernelFlag = flagValue "--metal-kernel=" flags
+      keepMetal = "--keep-metal" `elem` flags
       inferOptions = defaultInferOptions {inferSolveRefinements = solveRefinements}
   (input, mpath) <- readInput paths
 
@@ -121,14 +140,15 @@ main = do
           , bcMeasureIters = maybe 10 read benchItersFlag
           }
       exportCodegenOptions =
-        case exportKernelFlag of
+        (case exportKernelFlag of
           Nothing -> defaultCodegenOptions { codegenBenchmark = benchmarkConfig }
           Just name ->
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenExportKernel = Just (BS.pack name)
               , codegenBenchmark = benchmarkConfig
-              }
+              })
+        { codegenSimdWidth = simdWidth }
 
   when (isJust outputHFile && not (isJust exportKernelFlag)) $
     dieWithMessage "--output-h requires --export-kernel."
@@ -152,7 +172,8 @@ main = do
   case readDecs input of
     Left perr -> dieWithMessage $ "Parse error: " ++ perr
     Right parsedDecs -> do
-      decs <- case selectProgramDecs flags parsedDecs of
+      let selectFlags = if useMetal then allTopLevelProcsFlag : flags else flags
+      decs <- case selectProgramDecs selectFlags parsedDecs of
         Left err -> dieWithMessage err
         Right pr -> pure pr
       let reportTypeError terr = dieWithMessage (formatTypeError mpath (Just input) terr)
@@ -169,9 +190,10 @@ main = do
                 Left err -> dieWithMessage err
                 Right () -> pure ()
           compileSelectedC =
-            if parallel
-              then compileToCOptParallelIOWithOptions inferOptions pruneDead decs
-              else compileToCOptIOWithOptions inferOptions pruneDead decs
+            let codegenOpts = defaultCodegenOptions { codegenSimdWidth = simdWidth }
+            in if parallel
+              then compileToCOptParallelIOWithCodegenOptions inferOptions codegenOpts pruneDead decs
+              else compileToCOptIOWithCodegenOptions inferOptions codegenOpts pruneDead decs
           renderResult (v, p, mval) =
             case mval of
               Nothing -> putStrLn $ unpack v ++ " : evaluation error"
@@ -254,6 +276,19 @@ main = do
                     hasError = any (\(_, _, mval) -> mval == Nothing) results
                 mapM_ renderResult results
                 when hasError exitFailure
+          else if useMetal then do
+            _ <- runCheckedInference
+            prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
+            let optimized = optimizeMetalCFG2 prog
+                metalOpts = defaultMSLOptions
+                  { mslKernelToEmit = fmap BS.pack metalKernelFlag }
+            case codegenMSL metalOpts optimized of
+              Left err -> dieWithMessage ("Metal codegen error: " ++ err)
+              Right metalArtifacts -> do
+                ec <- compileAndRunMetal metalArtifacts keepMetal compileOnly
+                case ec of
+                  ExitSuccess -> pure ()
+                  ExitFailure _ -> exitWith ec
           else do
             _ <- runCheckedInference
             ensureSelectedKernelIsFused

@@ -44,6 +44,7 @@ library
                    , Language.Hydrangea.Parallelize
                    , Language.Hydrangea.CFGPipeline
                    , Language.Hydrangea.CodegenC
+                   , Language.Hydrangea.CodegenMSL
                    , Language.Hydrangea.Dependence
                    , Language.Hydrangea.ErrorFormat
     build-depends:   base  >= 4.17 && < 5
@@ -77,6 +78,7 @@ executable hydrangea-compiler
     hs-source-dirs:   app
     default-language: GHC2021
     other-modules:    CBackend
+                    , MetalBackend
 
 test-suite hydrangea-test
     import:           warnings
