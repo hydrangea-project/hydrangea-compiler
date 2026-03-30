@@ -469,8 +469,16 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
          , "    id<MTLComputeCommandEncoder> _enc = [_cmd computeCommandEncoder];"
          , "    [_enc setComputePipelineState:_hyd_pso];"
          ] ++
+         -- setBuffer for array data, shape, and output buffers
          [ "    [_enc setBuffer:_buf" ++ show i ++ " offset:0 atIndex:" ++ show i ++ "];"
-         | i <- [0 .. nIn * 2 + length outputArrs + length scals - 1]
+         | i <- [0 .. nIn * 2 + length outputArrs - 1]
+         ] ++
+         -- setBytes for scalar constants (no buffer allocation needed)
+         [ let sty = case Map.lookup v typeEnv of
+                       Just ct -> mslTypeName ct
+                       Nothing -> "long"
+           in "    [_enc setBytes:&_scalar" ++ show i ++ " length:sizeof(" ++ sty ++ ") atIndex:" ++ show i ++ "];"
+         | (v, i) <- zip scals [nIn * 2 + length outputArrs..]
          ] ++
          [ "    NSUInteger _tgs = MIN(256UL, _hyd_pso.maxTotalThreadsPerThreadgroup);"
          , "    if (_tgs == 0) _tgs = 1;"
@@ -559,15 +567,13 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
          , "    memset(_buf" ++ show i ++ ".contents, 0, _buf" ++ show i ++ "_sz);"
          ]
 
-    -- Scalar buffer
+    -- Scalar: declare local variable only (passed via setBytes, no buffer alloc)
     genScalarBuf (v, i) =
       let sty = case Map.lookup v typeEnv of
                   Just ct -> mslTypeName ct
                   Nothing -> "long"
       in [ "    // Scalar: " ++ sanitize v
          , "    " ++ sty ++ " _scalar" ++ show i ++ " = " ++ sanitize v ++ ";"
-         , "    id<MTLBuffer> _buf" ++ show i ++ " = [_hyd_dev newBufferWithBytes:&_scalar"
-           ++ show i ++ " length:sizeof(" ++ sty ++ ") options:MTLResourceStorageModeShared];"
          ]
 
     -- Read back GPU output arrays from Metal buffers (float→double).
@@ -1213,11 +1219,12 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap pr
         then ""
         else "    " ++ mslVarDecl v typeEnv ++ " " ++ sanitize v ++ ";\n"
         ) allVars
+      tupDefs = collectTupleDefs stmts
       bodyLines = case scatterStrategy of
         Just _ ->
           case detectAtomicScatterAddLoop stmts of
             Just (prefix, mGuard, arrAtom, idxAtom, valAtom) ->
-              let prefixStr = concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap) prefix
+              let prefixStr = concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) prefix
                   atomicLine = genMSLAtomicAdd 1 iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom
               in case mGuard of
                    Nothing -> prefixStr ++ atomicLine
@@ -1227,9 +1234,9 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap pr
                      genMSLAtomicAdd 2 iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom ++
                      "    }\n"
             Nothing ->
-              concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap) stmts
+              concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) stmts
         Nothing ->
-          concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap) stmts
+          concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) stmts
   in declLines ++ aliasDefLines ++ bodyLines
   where
     scatterStrategy = case execPolicy of
@@ -1270,10 +1277,10 @@ genMSLAtomicAdd depth iter inArrs typeEnv _arrayElemTys arrAtom idxAtom valAtom 
        -- Integer atomic add
        ind ++ "atomic_fetch_add_explicit((device atomic_int*)&" ++ arrName ++ "[" ++ idx ++ "], (int)(" ++ val ++ "), memory_order_relaxed);\n"
 
-genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar CVar -> C2.Stmt -> String
-genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap stmt =
+genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar CVar -> Map CVar [Atom] -> C2.Stmt -> String
+genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDefs stmt =
   let ind = replicate (depth * 4) ' '
-      recurse = genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap
+      recurse = genMSLStmt (depth+1) iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDefs
   in case stmt of
     C2.SAssign v _
       | v `Set.member` inArrs ->
@@ -1286,7 +1293,7 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap stmt =
           ind ++ sanitize v ++ " = " ++ sanitize canonVar ++ ";\n"
     C2.SAssign v rhs ->
           ind ++ sanitize v ++ " = " ++
-          genMSLRHS v iter inArrs outArrs typeEnv arrayElemTys rhs ++ ";\n"
+          genMSLRHS v iter inArrs outArrs typeEnv arrayElemTys tupleDefs rhs ++ ";\n"
 
     C2.SArrayWrite (AVar arr) idx val ->
       let suffix = sanitize arr ++ "_data"
@@ -1344,9 +1351,19 @@ mslVarDecl v typeEnv = case Map.lookup v typeEnv of
   Just ct -> mslTypeName ct
   Nothing -> "long"
 
+-- | Collect all @RTuple@ definitions from a statement list (recursively).
+-- Used to inline @RNdToFlat@ for known-arity tuples.
+collectTupleDefs :: [C2.Stmt] -> Map CVar [Atom]
+collectTupleDefs = foldMap go
+  where
+    go (C2.SAssign v (RTuple atoms)) = Map.singleton v atoms
+    go (C2.SLoop _ body)             = collectTupleDefs body
+    go (C2.SIf _ thn els)            = collectTupleDefs thn <> collectTupleDefs els
+    go _                             = Map.empty
+
 -- | Generate MSL for a right-hand-side expression.
-genMSLRHS :: CVar -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> RHS -> String
-genMSLRHS assignedVar iter inArrs outArrs typeEnv arrayElemTys rhs = case rhs of
+genMSLRHS :: CVar -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar [Atom] -> RHS -> String
+genMSLRHS assignedVar iter inArrs outArrs typeEnv arrayElemTys tupleDefs rhs = case rhs of
   RAtom a -> genMSLAtom iter a
   RBinOp op a1 a2 ->
     "(" ++ genMSLAtom iter a1 ++ " " ++ mslBinOp op ++ " " ++ genMSLAtom iter a2 ++ ")"
@@ -1407,6 +1424,18 @@ genMSLRHS assignedVar iter inArrs outArrs typeEnv arrayElemTys rhs = case rhs of
     "hyd_flat_to_nd((long)(" ++ genMSLAtom iter flat ++ "), " ++ genMSLAtom iter shp ++ ")"
   RNdToFlat AUnit _ ->
     "0"
+  RNdToFlat (AVar nd) shp
+    | Just atoms <- Map.lookup nd tupleDefs, length atoms >= 2 ->
+        -- Inline row-major arithmetic: ((a0 * shape[1] + a1) * shape[2] + a2) ...
+        let shpStr = genMSLAtom iter shp
+            n = length atoms
+            elemStr i = "(long)(" ++ genMSLAtom iter (atoms !! i) ++ ")"
+            dimStr i = shpStr ++ ".elems[" ++ show i ++ "]"
+            -- Build Horner form: (...((a0 * d1 + a1) * d2 + a2) ... * d_{n-1} + a_{n-1})
+            go acc i
+              | i >= n    = acc
+              | otherwise = go ("((" ++ acc ++ ") * " ++ dimStr i ++ " + " ++ elemStr i ++ ")") (i + 1)
+        in go (elemStr 0) 1
   RNdToFlat nd shp ->
     "hyd_nd_to_flat(" ++ genMSLAtom iter nd ++ ", " ++ genMSLAtom iter shp ++ ")"
   _ -> "0 /* unhandled RHS */"
@@ -1682,20 +1711,22 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
       Just shpAtom -> "hyd_shape_size(" ++ genCAtom shpAtom ++ ")"
       Nothing -> "_n"
 
-    -- Scalar buffer creation (constant buffers)
+    -- Scalar declarations (passed via setBytes, no buffer allocation)
     scalarBufLines = concat
-      [ [ "    // Scalar buffer " ++ show i ++ ": " ++ sanitize v
+      [ [ "    // Scalar " ++ show i ++ ": " ++ sanitize v
         , "    " ++ scalarTy v ++ " _scalar" ++ show i ++ " = " ++ sanitize v ++ ";"
-        , "    id<MTLBuffer> _buf" ++ show i ++ " = [_dev newBufferWithBytes:&_scalar" ++ show i
-          ++ " length:sizeof(" ++ scalarTy v ++ ") options:MTLResourceStorageModeShared];"
         ]
       | (v, i) <- zip scalarInputs [nInputArrays * 2 + length outputArrays..]
       ]
 
-    -- setBuffer calls
+    -- setBuffer for array/shape/output buffers, setBytes for scalars
+    scalarStartIdx = nInputArrays * 2 + length outputArrays
     setBufLines =
       [ "    [_enc setBuffer:_buf" ++ show i ++ " offset:0 atIndex:" ++ show i ++ "];"
-      | i <- [0 .. totalBufs - 1]
+      | i <- [0 .. scalarStartIdx - 1]
+      ] ++
+      [ "    [_enc setBytes:&_scalar" ++ show i ++ " length:sizeof(" ++ scalarTy v ++ ") atIndex:" ++ show i ++ "];"
+      | (v, i) <- zip scalarInputs [scalarStartIdx..]
       ]
 
     -- Output printing

@@ -8,17 +8,26 @@
 #include <string>
 #include <vector>
 
-#ifdef USE_METAL
-#include "voxel_live_metal.h"
-#else
-#include "voxel_live.h"
+// The correct header is force-included via -include in the build script.
+// Fall back to the default names for the old build.sh / metal_build.sh scripts.
+#if !defined(HYDRANGEA_EXPORT_VOXEL_RENDER_H) && !defined(HYDRANGEA_METAL_EXPORT_VOXEL_RENDER_H)
+  #ifdef USE_METAL
+  #include "voxel_live_metal.h"
+  #else
+  #include "voxel_live.h"
+  #endif
 #endif
 
 // ---------------------------------------------------------------------------
-// Render dimensions — must match voxel_live.hyd constants
+// Render dimensions — must match voxel_live.hyd constants.
+// Override at compile time with -DRENDER_W=640 -DRENDER_H=480.
 // ---------------------------------------------------------------------------
-static constexpr int RENDER_W = 320;
-static constexpr int RENDER_H = 240;
+#ifndef RENDER_W
+#define RENDER_W 640
+#endif
+#ifndef RENDER_H
+#define RENDER_H 480
+#endif
 
 // ---------------------------------------------------------------------------
 // Colormap: luminance → warm volcanic orange/gold palette
@@ -113,7 +122,10 @@ int main(int /*argc*/, char** /*argv*/) {
       const char* base = SDL_GetBasePath();
       if (base) { exe_dir = base; SDL_free(const_cast<char*>(base)); }
     }
-    std::string metallib = exe_dir + "voxel_live.metallib";
+#ifndef METALLIB_NAME
+#define METALLIB_NAME "voxel_live.metallib"
+#endif
+    std::string metallib = exe_dir + METALLIB_NAME;
     if (hyd_metal_init(metallib.c_str()) != 0) {
       SDL_Log("Metal init failed");
       SDL_DestroyTexture(tex);

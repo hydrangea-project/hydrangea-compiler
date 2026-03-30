@@ -1,6 +1,6 @@
 (* voxel_live.hyd — Fast interactive voxel renderer for SDL demo.
    Scene: two objects (sphere + torus), 64×64×48 voxel grid, n=200,000 point cloud.
-   Render: 640×480 pixels, simplified ray march (no shadows, no binary-search, no specular).
+   Render: 320×240 pixels, simplified ray march (no shadows, no binary-search, no specular).
    Camera orbits around scene centre based on frame counter using sin/cos.
 
    ARCHITECTURE — same as render.hyd:
@@ -13,7 +13,7 @@
 
    Exported function:
      C signature:  hyd_pair_aa_t hyd_export_voxel_render(int64_t dummy_state, int64_t frame);
-   result.fst = luminance array [480,640], result.snd = fresh 1-element dummy.
+   result.fst = luminance array [240,320], result.snd = fresh 1-element dummy.
 
    PAIRS vs TUPLES: all compound state uses pairs (not tuples) to preserve float fields
    through the CFGTyping fixpoint.  See render.hyd for the full explanation.
@@ -137,14 +137,14 @@ let tri voxels nx ny nz xf yf zf =
   let tx = xc -. float_of x0 in
   let ty = yc -. float_of y0 in
   let tz = zc -. float_of z0 in
-  let c000 = check_index [z0, y0, x0] 0.0 voxels in
-  let c100 = check_index [z0, y0, x1] 0.0 voxels in
-  let c010 = check_index [z0, y1, x0] 0.0 voxels in
-  let c110 = check_index [z0, y1, x1] 0.0 voxels in
-  let c001 = check_index [z1, y0, x0] 0.0 voxels in
-  let c101 = check_index [z1, y0, x1] 0.0 voxels in
-  let c011 = check_index [z1, y1, x0] 0.0 voxels in
-  let c111 = check_index [z1, y1, x1] 0.0 voxels in
+  let c000 = index [z0, y0, x0] voxels in
+  let c100 = index [z0, y0, x1] voxels in
+  let c010 = index [z0, y1, x0] voxels in
+  let c110 = index [z0, y1, x1] voxels in
+  let c001 = index [z1, y0, x0] voxels in
+  let c101 = index [z1, y0, x1] voxels in
+  let c011 = index [z1, y1, x0] voxels in
+  let c111 = index [z1, y1, x1] voxels in
   let c00 = c000 *. (1.0 -. tx) +. c100 *. tx in
   let c10 = c010 *. (1.0 -. tx) +. c110 *. tx in
   let c01 = c001 *. (1.0 -. tx) +. c101 *. tx in
@@ -193,9 +193,9 @@ let ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold stepS
         let gym = if gyc - 1 < 0 then 0 else gyc - 1 in
         let gzp = if gzc + 1 > nz - 1 then nz - 1 else gzc + 1 in
         let gzm = if gzc - 1 < 0 then 0 else gzc - 1 in
-        let gnx = check_index [gzc, gyc, gxp] 0.0 voxels -. check_index [gzc, gyc, gxm] 0.0 voxels in
-        let gny = check_index [gzc, gyp, gxc] 0.0 voxels -. check_index [gzc, gym, gxc] 0.0 voxels in
-        let gnz = check_index [gzp, gyc, gxc] 0.0 voxels -. check_index [gzm, gyc, gxc] 0.0 voxels in
+        let gnx = index [gzc, gyc, gxp] voxels -. index [gzc, gyc, gxm] voxels in
+        let gny = index [gzc, gyp, gxc] voxels -. index [gzc, gym, gxc] voxels in
+        let gnz = index [gzp, gyc, gxc] voxels -. index [gzm, gyc, gxc] voxels in
         let gnlen = sqrt (gnx *. gnx +. gny *. gny +. gnz *. gnz) in
         let nlen = if gnlen <. 1.0e-9 then 1.0 else gnlen in
         let normX = gnx /. nlen in
@@ -218,8 +218,8 @@ let voxel_render dummy_state frame =
   let nx     = 64 in
   let ny     = 64 in
   let nz     = 48 in
-  let outW   = 640 in
-  let outH   = 480 in
+  let outW   = 320 in
+  let outH   = 240 in
   let maxSteps  = 200 in
   let threshold = 0.42 in
 
