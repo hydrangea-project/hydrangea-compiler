@@ -1,0 +1,42 @@
+(* Sparse Matrix-Vector Multiplication (SpMV) benchmark.
+   CSR (Compressed Sparse Row) format:
+     values[]     -- non-zero values      (length: nnz)
+     col_idx[]    -- column indices       (length: nnz)
+     row_ptr[]    -- row pointers         (length: nrows + 1)
+     x[]          -- input dense vector   (length: ncols)
+
+   y[i] = sum_{k=row_ptr[i]}^{row_ptr[i+1]-1} values[k] * x[col_idx[k]]
+
+   Parameterized via environment variables:
+     SPMV_NROWS -- number of rows
+     SPMV_NCOLS -- number of columns
+     SPMV_NNZ   -- number of non-zeros
+
+   The outer generate [nrows] should be parallelised.
+   The inner reduce_generate has a variable trip-count (row length).
+*)
+
+let nrows = get_env_int "SPMV_NROWS"
+let nnz   = get_env_int "SPMV_NNZ"
+let ncols = get_env_int "SPMV_NCOLS"
+
+let values  = read_array_float [nnz]        "bench/spmv/values.csv"
+let col_idx = read_array       [nnz]        "bench/spmv/col_idx.csv"
+let row_ptr = read_array       [nrows + 1]  "bench/spmv/row_ptr.csv"
+let x_vec   = read_array_float [ncols]      "bench/spmv/x.csv"
+
+(* SpMV: y[i] = dot(row_i of A, x). 
+   reduce_generate returns a 0D array; index () extracts the scalar. *)
+let y =
+  generate [nrows]
+    (fn [i] =>
+      let row_start = index [i]     row_ptr in
+      let row_end   = index [i + 1] row_ptr in
+      let row_len   = row_end - row_start in
+      index () (reduce_generate (+.) 0.0 [row_len]
+        (fn [k] =>
+          let k_abs = k + row_start in
+          let col   = index [k_abs] col_idx in
+          index [k_abs] values *. index [col] x_vec)))
+
+let main = write_array_float y "bench/spmv/out.csv"
