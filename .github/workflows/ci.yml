@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+env:
+  GHC_VERSION: "9.10.1"
+  CABAL_VERSION: "3.10"
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,8 +19,8 @@ jobs:
       - name: Set up GHC and Cabal
         uses: haskell-actions/setup@v2
         with:
-          ghc-version: "9.4.8"
-          cabal-version: "3.10"
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
 
       - name: Cache Cabal store and build artifacts
         uses: actions/cache@v4
@@ -25,9 +29,9 @@ jobs:
             ~/.cabal/packages
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-ghc-9.4.8-cabal-${{ hashFiles('**/*.cabal', 'cabal.project', 'cabal.project.freeze') }}
+          key: ${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-cabal-${{ hashFiles('**/*.cabal', 'cabal.project', 'cabal.project.freeze') }}
           restore-keys: |
-            ${{ runner.os }}-ghc-9.4.8-cabal-
+            ${{ runner.os }}-ghc-${{ env.GHC_VERSION }}-cabal-
 
       - name: Install system dependencies
         run: |
