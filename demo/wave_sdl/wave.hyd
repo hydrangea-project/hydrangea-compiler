@@ -1,0 +1,54 @@
+(* wave.hyd - One step of the 2D wave equation for the SDL live viewer.
+   Exports wave_step: (prev, curr) → (curr, next).
+
+   Leapfrog scheme:
+     u_next[i,j] = decay * (2*u[i,j] - u_prev[i,j]) + c2 * L(u)[i,j]
+   where L is the 5-point discrete Laplacian with clamped (Neumann) boundary,
+   c2 = (c*dt/dx)^2 is the squared CFL number, and decay is a per-step
+   energy dissipation factor.
+
+   Clamped boundary (du/dn = 0): out-of-bounds neighbors clamp to the nearest
+   edge cell.  Waves reflect off walls and die out rather than wrapping around
+   and building up standing-wave chaos.
+
+   State convention: fst = u_prev (t-1), snd = u_curr (t).
+   Return value:     fst = u_curr (t),   snd = u_next (t+1).
+
+   Use --no-solver-check to suppress SMT. *)
+
+let grid_h = 512
+let grid_w = 512
+let c2     = 0.16   (* (c*dt/dx)^2 = 0.4^2; CFL-stable for 2D *)
+let decay  = 0.998  (* per-step energy dissipation; waves fade in ~200 frames *)
+
+let clamp_h x = if x < 0 then 0 else if x >= grid_h then grid_h - 1 else x
+let clamp_w x = if x < 0 then 0 else if x >= grid_w then grid_w - 1 else x
+
+(* One simulation step.
+   prev_curr : (prev, curr) pair of [grid_h, grid_w] float arrays
+   dummy     : ignored int (foldl compatibility)
+   Returns   : (curr, next) pair *)
+let wave_step prev_curr dummy =
+  let prev = fst prev_curr in
+  let curr = snd prev_curr in
+
+  let next = generate [grid_h, grid_w]
+    (let f [i, j] =
+       let im1  = clamp_h (i - 1) in
+       let ip1  = clamp_h (i + 1) in
+       let jm1  = clamp_w (j - 1) in
+       let jp1  = clamp_w (j + 1) in
+       let u_ij = index [i, j] curr in
+       let u_pr = index [i, j] prev in
+       let lap  = index [im1, j] curr +. index [ip1, j] curr
+               +. index [i, jm1] curr +. index [i, jp1] curr
+               -. (4.0 *. u_ij) in
+       decay *. (2.0 *. u_ij -. u_pr) +. c2 *. lap
+     in f) in
+
+  (* Copy curr into a fresh array so the caller can safely free both inputs.
+     Also avoids the type-inference ambiguity of returning a projected array. *)
+  let curr_out = generate [grid_h, grid_w]
+    (let g [i, j] = index [i, j] curr in g) in
+
+  (curr_out, next)
