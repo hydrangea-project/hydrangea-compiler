@@ -25,7 +25,7 @@ import Language.Hydrangea.CodegenC
   , codegenProgram2WithOptionsPrune
   , defaultCodegenOptions
   )
-import Language.Hydrangea.CodegenMSL (MSLOptions(..), defaultMSLOptions, codegenMSL)
+import Language.Hydrangea.CodegenMSL (MSLArtifacts(..), MSLOptions(..), defaultMSLOptions, codegenMSL)
 import Language.Hydrangea.ErrorFormat (formatEvalError, formatTypeError)
 import Language.Hydrangea.Frontend
   ( compileToCOptIOWithOptions
@@ -49,6 +49,7 @@ import Language.Hydrangea.Pretty
 import Language.Hydrangea.Prune (checkKernelFused)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitWith, ExitCode(..))
+import System.FilePath (replaceExtension)
 import System.IO (hPutStrLn, stderr)
 import Text.PrettyPrint.HughesPJClass
 
@@ -83,7 +84,10 @@ usage = unwords
   , "[--bench-iters=<n>]"
   , "[--metal]"
   , "[--metal-kernel=<name>]"
+  , "[--export-metal-kernel=<name>]"
+  , "[--output-metal=<file>]"
   , "[--keep-metal]"
+  , "[--no-multi-kernel]"
   , "[file]"
   ]
 
@@ -127,7 +131,10 @@ main = do
         Just bad -> error $ "--simd-width must be 2 or 4, got: " ++ bad
       useMetal = "--metal" `elem` flags
       metalKernelFlag = flagValue "--metal-kernel=" flags
+      exportMetalKernelFlag = flagValue "--export-metal-kernel=" flags
+      outputMetalFile = flagValue "--output-metal=" flags
       keepMetal = "--keep-metal" `elem` flags
+      noMultiKernel = "--no-multi-kernel" `elem` flags
       inferOptions = defaultInferOptions {inferSolveRefinements = solveRefinements}
   (input, mpath) <- readInput paths
 
@@ -150,11 +157,17 @@ main = do
               })
         { codegenSimdWidth = simdWidth }
 
-  when (isJust outputHFile && not (isJust exportKernelFlag)) $
-    dieWithMessage "--output-h requires --export-kernel."
+  when (isJust outputHFile && not (isJust exportKernelFlag) && not (isJust exportMetalKernelFlag)) $
+    dieWithMessage "--output-h requires --export-kernel or --export-metal-kernel."
 
   when (isJust exportKernelFlag && not (emitC || isJust outputCFile)) $
     dieWithMessage "--export-kernel currently supports C emission only; use it with --emit-c or --output-c."
+
+  when (isJust exportMetalKernelFlag && not useMetal) $
+    dieWithMessage "--export-metal-kernel requires --metal."
+
+  when (isJust exportMetalKernelFlag && not (isJust outputCFile)) $
+    dieWithMessage "--export-metal-kernel requires --output-c=<file> for the .m harness."
 
   let generateExportArtifacts decs = do
         prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
@@ -233,7 +246,7 @@ main = do
             Nothing -> do
               csrc <- compileSelectedC
               putStrLn csrc
-      forM_ outputCFile $ \outPath -> do
+      forM_ outputCFile $ \outPath -> when (not (isJust exportMetalKernelFlag)) $ do
         _ <- runCheckedInference
         ensureSelectedKernelIsFused
         case exportKernelFlag of
@@ -257,13 +270,14 @@ main = do
               csrc <- compileSelectedC
               writeFile outPath csrc
               putStrLn $ "Wrote C to " ++ outPath
-      let defaultMode =
+      let metalExportMode = isJust exportMetalKernelFlag
+          defaultMode =
             not printFused
               && not printCFG
               && not printCFGRaw
               && not emitC
-              && not (isJust outputCFile)
-              && not (isJust outputHFile)
+              && (not (isJust outputCFile) || metalExportMode)
+              && (not (isJust outputHFile) || metalExportMode)
       when defaultMode $ do
         if interp
           then do
@@ -281,14 +295,39 @@ main = do
             prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
             let optimized = optimizeMetalCFG2 prog
                 metalOpts = defaultMSLOptions
-                  { mslKernelToEmit = fmap BS.pack metalKernelFlag }
+                  { mslKernelToEmit = fmap BS.pack metalKernelFlag
+                  , mslMultiKernel = not noMultiKernel
+                  , mslExportKernel = fmap BS.pack exportMetalKernelFlag }
             case codegenMSL metalOpts optimized of
               Left err -> dieWithMessage ("Metal codegen error: " ++ err)
-              Right metalArtifacts -> do
-                ec <- compileAndRunMetal metalArtifacts keepMetal compileOnly
-                case ec of
-                  ExitSuccess -> pure ()
-                  ExitFailure _ -> exitWith ec
+              Right metalArtifacts -> case exportMetalKernelFlag of
+                Just _ -> do
+                  -- Export mode: write .metal, .m, .h files
+                  let metalPath = case outputMetalFile of
+                        Just p  -> p
+                        Nothing -> case outputCFile of
+                          Just p  -> replaceExtension p ".metal"
+                          Nothing -> "hydrangea_out.metal"
+                      harnessPath = case outputCFile of
+                        Just p  -> p
+                        Nothing -> "hydrangea_out.m"
+                      headerPath = case outputHFile of
+                        Just p  -> p
+                        Nothing -> replaceExtension harnessPath ".h"
+                  writeFile metalPath (mslKernelSource metalArtifacts)
+                  putStrLn $ "Wrote Metal kernel to " ++ metalPath
+                  writeFile harnessPath (mslHarnessSource metalArtifacts)
+                  putStrLn $ "Wrote Metal harness to " ++ harnessPath
+                  case mslHeaderSource metalArtifacts of
+                    Just h -> do
+                      writeFile headerPath h
+                      putStrLn $ "Wrote header to " ++ headerPath
+                    Nothing -> pure ()
+                Nothing -> do
+                  ec <- compileAndRunMetal metalArtifacts keepMetal compileOnly
+                  case ec of
+                    ExitSuccess -> pure ()
+                    ExitFailure _ -> exitWith ec
           else do
             _ <- runCheckedInference
             ensureSelectedKernelIsFused
