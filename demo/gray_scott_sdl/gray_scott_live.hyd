@@ -1,0 +1,60 @@
+(* gray_scott_live.hyd - Gray-Scott step kernel for the SDL live viewer.
+   Exports only gs_step: (U, V) → (U', V').
+   The C++ harness owns the simulation loop, state memory, and interactivity.
+
+   Kernel: one step of the Gray-Scott reaction-diffusion system:
+     U' = U + dt * (Du * L(U) - U*V^2 + f * (1-U))
+     V' = V + dt * (Dv * L(V) + U*V^2 - (f+k) * V)
+   where L is the 5-point discrete Laplacian with periodic boundary.
+
+   Use --no-solver-check to suppress SMT. *)
+
+let imod x m = x - ((x / m) * m)
+
+let grid_h = 256
+let grid_w = 256
+let du     = 0.21
+let dv     = 0.105
+let feed   = 0.0545
+let kill   = 0.0620
+let dt     = 1.0
+
+(* One simulation step.
+   uv  : (U, V) pair of [grid_h, grid_w] float arrays
+   dummy : ignored int (foldl compatibility)
+   Returns: (U', V') pair *)
+let gs_step uv dummy =
+  let u = fst uv in
+  let v = snd uv in
+
+  let new_u = generate [grid_h, grid_w]
+    (let f [i, j] =
+       let im1  = imod (i - 1 + grid_h) grid_h in
+       let ip1  = imod (i + 1) grid_h in
+       let jm1  = imod (j - 1 + grid_w) grid_w in
+       let jp1  = imod (j + 1) grid_w in
+       let u_ij = index [i, j] u in
+       let v_ij = index [i, j] v in
+       let lap  = index [im1, j] u +. index [ip1, j] u
+               +. index [i, jm1] u +. index [i, jp1] u
+               -. (4.0 *. u_ij) in
+       let uvv  = u_ij *. v_ij *. v_ij in
+       u_ij +. dt *. (du *. lap -. uvv +. feed *. (1.0 -. u_ij))
+     in f) in
+
+  let new_v = generate [grid_h, grid_w]
+    (let f [i, j] =
+       let im1  = imod (i - 1 + grid_h) grid_h in
+       let ip1  = imod (i + 1) grid_h in
+       let jm1  = imod (j - 1 + grid_w) grid_w in
+       let jp1  = imod (j + 1) grid_w in
+       let u_ij = index [i, j] u in
+       let v_ij = index [i, j] v in
+       let lap  = index [im1, j] v +. index [ip1, j] v
+               +. index [i, jm1] v +. index [i, jp1] v
+               -. (4.0 *. v_ij) in
+       let uvv  = u_ij *. v_ij *. v_ij in
+       v_ij +. dt *. (dv *. lap +. uvv -. (feed +. kill) *. v_ij)
+     in f) in
+
+  (new_u, new_v)
