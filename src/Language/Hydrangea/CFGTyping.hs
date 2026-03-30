@@ -43,10 +43,28 @@ type TypeEnv = Map CVar CType
 -- 'Nothing' entries indicate parameters whose types could not be determined.
 type CallParamTypes = Map CVar [Maybe CType]
 
+-- | Merge two CTypes, preferring Float over Int at every leaf position.
+-- The lowering pass defaults unknown types to Int, so when the fixpoint
+-- discovers a Float type through arithmetic, it should upgrade.
+mergeCType :: CType -> CType -> CType
+mergeCType (CTPair a1 a2) (CTPair b1 b2) = CTPair (mergeCType a1 b1) (mergeCType a2 b2)
+mergeCType CTInt64 CTDouble = CTDouble
+mergeCType CTDouble CTInt64 = CTDouble
+mergeCType _ b = b  -- default: prefer the new type
+
 bindVarType :: CVar -> CType -> TypeEnv -> TypeEnv
 bindVarType v ct typeEnv = case M.lookup v typeEnv of
   Nothing -> M.insert v ct typeEnv
   Just ct' | ct' == ct -> typeEnv
+  -- Merge pair types component-wise: the lowering pass sometimes registers
+  -- pair types with defaulted CEInt components (via elemTypeOfAtom) that are
+  -- wrong. The fixpoint discovers correct types later, so we merge them.
+  Just ct'@(CTPair _ _) | CTPair _ _ <- ct ->
+    let merged = mergeCType ct' ct
+    in if merged == ct' then typeEnv else M.insert v merged typeEnv
+  -- Allow Int→Float upgrade for scalars: lowering defaults to Int, but
+  -- float arithmetic discovers the correct type.
+  Just CTInt64 | ct == CTDouble -> M.insert v ct typeEnv
   _ -> typeEnv
 
 bindAtomType :: Atom -> CType -> TypeEnv -> TypeEnv
@@ -187,17 +205,21 @@ inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
 inferAssignTypes :: Map CVar CType -> CallParamTypes -> TypeEnv -> CVar -> C.RHS -> TypeEnv
 inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RAtom atom ->
-    -- Pair types propagate from source to destination; other types use the
-    -- conservative binding to preserve already-inferred information.
-    case inferAtomType2 typeEnv atom of
-      Just ct@(CTPair _ _) ->
+    -- For pair copies (e.g., fold accumulator init), merge types bidirectionally
+    -- so that correct types from fold bodies can flow back to initializers.
+    case (inferAtomType2 typeEnv atom, M.lookup v typeEnv) of
+      (Just sct@(CTPair _ _), Just dct@(CTPair _ _)) ->
+        let merged = mergeCType sct dct
+        in bindAtomType atom merged (M.insert v merged typeEnv)
+      (Just ct@(CTPair _ _), _) ->
         bindAtomType atom ct (M.insert v ct typeEnv)
-      Just ct ->
+      (_, Just ct@(CTPair _ _)) ->
+        bindAtomType atom ct typeEnv
+      (Just ct, _) ->
         bindAtomType atom ct (bindVarType v ct typeEnv)
-      Nothing ->
-        case M.lookup v typeEnv of
-          Just ct -> bindAtomType atom ct typeEnv
-          Nothing -> typeEnv
+      (Nothing, Just ct) ->
+        bindAtomType atom ct typeEnv
+      _ -> typeEnv
   C.RBinOp op a1 a2 ->
     let typeEnv1 = maybe typeEnv (\ct -> bindVarType v ct typeEnv) (inferBinOpResultType op)
     in case inferBinOpOperandType op of
@@ -234,11 +256,23 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
       Just CTTuple             -> bindVarType v CTInt64 typeEnv
       Just (CTPair ct1 ct2)    -> M.insert v (if i == 0 then ct1 else ct2) typeEnv
       _ -> typeEnv
-  C.RPairMake _ _ a1 a2 ->
-    -- Re-derive the pair type from the current element types.
+  C.RPairMake _et1 _et2 a1 a2 ->
+    -- Derive pair type from inferred element types.  The CElemType annotations
+    -- from lowering may be wrong (elemTypeOfAtom defaults to CEInt when the
+    -- type is unknown at lowering time), so we do NOT fall back to them.
+    -- Instead, when atom types are incomplete, check whether the result
+    -- variable already has a pair type from context (e.g., fold accumulator
+    -- back-propagation through RAtom) and use that to fill in missing types.
     case (inferAtomType2 typeEnv a1, inferAtomType2 typeEnv a2) of
-      (Just ct1, Just ct2) -> M.insert v (CTPair ct1 ct2) typeEnv
-      _ -> typeEnv
+      (Just ct1, Just ct2) ->
+        bindAtomType a1 ct1 (bindAtomType a2 ct2 (M.insert v (CTPair ct1 ct2) typeEnv))
+      (mct1, mct2) ->
+        case M.lookup v typeEnv of
+          Just (CTPair ct1 ct2) ->
+            let aCt1 = maybe ct1 id mct1
+                aCt2 = maybe ct2 id mct2
+            in bindAtomType a1 aCt1 (bindAtomType a2 aCt2 (M.insert v (CTPair aCt1 aCt2) typeEnv))
+          _ -> typeEnv
   C.RPairFst _ct a ->
     case inferAtomType2 typeEnv a of
       Just (CTPair ct1 _) -> M.insert v ct1 typeEnv

@@ -31,6 +31,7 @@ import Control.Applicative ((<|>))
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (intercalate, maximumBy, nub)
+import Data.Maybe (listToMaybe)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Set (Set)
@@ -73,21 +74,108 @@ data MSLOptions = MSLOptions
   { mslKernelToEmit :: Maybe CVar
     -- ^ If 'Just name', use that proc as the kernel. If 'Nothing', use the
     -- first proc with a top-level @LoopMap@ loop.
+  , mslMultiKernel  :: Bool
+    -- ^ When 'True' (default), automatically dispatch multiple GPU kernels
+    -- when the program has more than one GPU-eligible proc.
   }
 
 defaultMSLOptions :: MSLOptions
-defaultMSLOptions = MSLOptions { mslKernelToEmit = Nothing }
+defaultMSLOptions = MSLOptions { mslKernelToEmit = Nothing, mslMultiKernel = True }
+
+-- | Per-kernel analysis record.  Captures everything needed to generate the
+-- Metal kernel source and harness dispatch for one proc.
+data KernelAnalysis = KernelAnalysis
+  { kaProc           :: C2.Proc
+  , kaName           :: CVar
+  , kaPreLoopStmts   :: [C2.Stmt]
+  , kaLoopSpec       :: C2.LoopSpec
+  , kaLoopBody       :: [C2.Stmt]
+  , kaRetAtom        :: Maybe Atom
+  , kaTypeEnv        :: TypeEnv
+  , kaArrayElemTys   :: Map CVar CType
+  , kaInputArrays    :: [CVar]
+  , kaOutputArrays   :: [CVar]
+  , kaScalarInputs   :: [CVar]         -- ^ Includes proc-param scalars
+  , kaEffectivePreLoop :: [C2.Stmt]    -- ^ preLoopStmts ++ inBodyHoisted
+  , kaHoistedCallMap :: Map CVar CVar
+  , kaPreLoopAliases :: [(CVar, CVar)]
+  , kaPostLoopStmts  :: [C2.Stmt]      -- ^ Statements between kernel loop and return
+  , kaProcParams     :: [CVar]         -- ^ All proc params (for harness defaults)
+  }
+
+-- | Whether an input array originates from a CPU helper or a prior GPU kernel.
+data BufferOrigin = CPUProduced | GPUProduced CVar  -- ^ producing kernel name
 
 -- ---------------------------------------------------------------------------
 -- Top-level entry point
 
 -- | Translate a @C2.Program@ to Metal artifacts.
+-- Uses multi-kernel dispatch when multiple zero-arg procs have parallelizable
+-- loops; falls back to single-kernel for explicit @--metal-kernel@ selection
+-- or when only one proc is GPU-eligible.
 codegenMSL :: MSLOptions -> C2.Program -> Either String MSLArtifacts
-codegenMSL opts prog@(C2.Program procs) = do
+codegenMSL opts prog@(C2.Program procs) =
+  case mslKernelToEmit opts of
+    Just _ -> codegenMSLSingle opts prog  -- explicit kernel: single-kernel path
+    Nothing
+      | not (mslMultiKernel opts) -> codegenMSLSingle opts prog
+      | otherwise ->
+        let gpuProcs = findGPUEligibleProcs procs
+        in case gpuProcs of
+          []  -> Left "MSL backend: no proc with a parallelizable loop found"
+          [_] -> codegenMSLSingle opts prog  -- one GPU proc: existing path
+          _   -> codegenMSLMulti prog gpuProcs
+
+-- | Multi-kernel code path: dispatch multiple GPU kernels in sequence.
+codegenMSLMulti :: C2.Program -> [C2.Proc] -> Either String MSLArtifacts
+codegenMSLMulti prog@(C2.Program procs) gpuProcs = do
+  -- Analyze each GPU-eligible proc; silently drop those that fail analysis
+  let analyses = [ ka | p <- gpuProcs, Right ka <- [analyzeOneKernel prog p] ]
+  case analyses of
+    [] -> Left "MSL backend: no GPU-eligible proc passed kernel analysis"
+    [ka] -> codegenMSLSingle defaultMSLOptions prog  -- degenerate: one survived
+    kas -> do
+      let gpuNames = Set.fromList [kaName ka | ka <- kas]
+          bufOrigins = classifyBufferOrigins kas gpuNames
+          gpuBufAliases = buildGPUBufferAliases kas gpuNames
+          retKinds = procReturnKinds2 prog
+          retTypes = inferProgramReturnTypes2 prog
+      helperC <- genHelperC procs (kaName (last kas)) retKinds
+      let kernelSrc = genMultiKernelMSL kas
+          harnessSrc = genMultiKernelHarnessSrc prog kas bufOrigins gpuBufAliases
+                         retKinds retTypes helperC
+      Right MSLArtifacts
+        { mslKernelSource  = kernelSrc
+        , mslHarnessSource = harnessSrc
+        }
+
+-- | Single-kernel code path (existing behaviour).
+codegenMSLSingle :: MSLOptions -> C2.Program -> Either String MSLArtifacts
+codegenMSLSingle opts prog@(C2.Program procs) = do
   kernelProc <- findKernelProc opts procs
+  ka <- analyzeOneKernel prog kernelProc
+  let retKinds = procReturnKinds2 prog
+      retTypes = inferProgramReturnTypes2 prog
+  helperC <- genHelperC procs (kaName ka) retKinds
+  let kernelSrc  = genMSLKernelSrc (kaName ka) (kaLoopSpec ka) (kaLoopBody ka) (kaTypeEnv ka)
+                     (kaArrayElemTys ka) (kaInputArrays ka) (kaOutputArrays ka) (kaScalarInputs ka)
+                     (kaHoistedCallMap ka) (kaPreLoopAliases ka)
+      harnessSrc = genObjCHarnessSrc prog (kaProc ka) (kaName ka) (kaEffectivePreLoop ka)
+                     (kaLoopSpec ka) (kaRetAtom ka) (kaTypeEnv ka) (kaArrayElemTys ka)
+                     retKinds retTypes
+                     (kaInputArrays ka) (kaOutputArrays ka) (kaScalarInputs ka)
+                     (kaProcParams ka) helperC
+  Right MSLArtifacts
+    { mslKernelSource  = kernelSrc
+    , mslHarnessSource = harnessSrc
+    }
+
+-- | Analyze a single proc for Metal kernel generation.
+analyzeOneKernel :: C2.Program -> C2.Proc -> Either String KernelAnalysis
+analyzeOneKernel prog@(C2.Program procs) kernelProc = do
   let kernelName = C2.procName kernelProc
       body       = C2.procBody kernelProc
-  (preLoopStmts, mapLoopSpec, mapLoopBody, retAtom) <- analyzeKernelProc body
+  (preLoopStmts, mapLoopSpec, mapLoopBody, postLoopStmts, retAtom) <- analyzeKernelProc body
   () <- validateMSLLoopBody mapLoopBody
   let retTypes     = inferProgramReturnTypes2 prog
       retKinds     = procReturnKinds2 prog
@@ -97,35 +185,36 @@ codegenMSL opts prog@(C2.Program procs) = do
                        (Map.fromList [(v, elt) | (v, CTArray elt) <- Map.toList typeEnv])
       (inputArrays, outputArrays, scalarInputs, inBodyHoisted) =
         classifyKernelParams preLoopStmts mapLoopBody mapLoopSpec typeEnv retKinds
-      -- Hoist in-body zero-arg calls to pre-loop for the harness
       effectivePreLoop = preLoopStmts ++ inBodyHoisted
       hoistedCallMap = buildHoistedCallMap inBodyHoisted
-      -- Proc parameters: declare them in the harness with default values.
-      -- Scalar proc params used in the kernel body also become scalar Metal inputs.
       procParams' = C2.procParams kernelProc
       procParamScalars = [ v | v <- procParams'
                              , case Map.lookup v typeEnv of
                                  Just (CTArray _) -> False
                                  Just (CTPair _ _) -> False
                                  _ -> True ]
-      -- Add proc-param scalars that are used (directly or transitively) to scalar inputs
       procParamScalarsUsed = [ v | v <- procParamScalars
                                  , v `Set.member` usedVarsStmts2 (effectivePreLoop ++ mapLoopBody) ]
       allScalarInputs = scalarInputs ++ procParamScalarsUsed
-      -- Pre-loop array aliases: RAtom assignments aliasing an input array.
-      -- Needed so the kernel emits #defines for e.g. curr__uniq_5_shape → t15_shape.
       inputArraySet = Set.fromList inputArrays
       preLoopAliases = collectArrayAliases inputArraySet effectivePreLoop
-  helperC <- genHelperC procs kernelName retKinds
-  let kernelSrc  = genMSLKernelSrc kernelName mapLoopSpec mapLoopBody typeEnv
-                     arrayElemTys inputArrays outputArrays allScalarInputs
-                     hoistedCallMap preLoopAliases
-      harnessSrc = genObjCHarnessSrc prog kernelProc kernelName effectivePreLoop
-                     mapLoopSpec retAtom typeEnv arrayElemTys retKinds retTypes
-                     inputArrays outputArrays allScalarInputs procParams' helperC
-  Right MSLArtifacts
-    { mslKernelSource  = kernelSrc
-    , mslHarnessSource = harnessSrc
+  Right KernelAnalysis
+    { kaProc           = kernelProc
+    , kaName           = kernelName
+    , kaPreLoopStmts   = preLoopStmts
+    , kaLoopSpec       = mapLoopSpec
+    , kaLoopBody       = mapLoopBody
+    , kaRetAtom        = retAtom
+    , kaTypeEnv        = typeEnv
+    , kaArrayElemTys   = arrayElemTys
+    , kaInputArrays    = inputArrays
+    , kaOutputArrays   = outputArrays
+    , kaScalarInputs   = allScalarInputs
+    , kaEffectivePreLoop = effectivePreLoop
+    , kaHoistedCallMap = hoistedCallMap
+    , kaPreLoopAliases = preLoopAliases
+    , kaPostLoopStmts  = postLoopStmts
+    , kaProcParams     = procParams'
     }
 
 -- ---------------------------------------------------------------------------
@@ -155,20 +244,60 @@ findKernelProc opts procs =
       (case C2.lsExec spec of C2.Parallel _ -> True; _ -> False)
     isKernelLoopStmt _ = False
 
--- | Split proc body into (preLoopStmts, loopSpec, loopBody, retAtom).
+-- | Find all zero-arg procs with parallelizable loops (GPU-eligible).
+-- Returns procs in original definition order (callees before callers).
+findGPUEligibleProcs :: [C2.Proc] -> [C2.Proc]
+findGPUEligibleProcs procs =
+  [ p | p <- procs
+      , null (C2.procParams p)     -- zero-arg only
+      , gpuKernelCapturesAllWork (C2.procBody p)
+  ]
+  where
+    gpuKernelCapturesAllWork body =
+      let (bodyNoRet, _) = splitFinalReturn body
+      in case findKernelLoopIndex bodyNoRet of
+           Nothing -> False
+           Just idx ->
+             -- Reject procs where the GPU kernel would miss serial loops after it.
+             -- Such procs (e.g., scatter_guarded with a fill init + serial scatter)
+             -- need CPU execution for correctness.
+             let afterKernel = drop (idx + 1) bodyNoRet
+             in not (any hasLoopNested afterKernel)
+    findKernelLoopIndex stmts =
+      let indexed = zip [0..] stmts
+          candidates = [ (i, stmtCount lb)
+                       | (i, C2.SLoop spec lb) <- indexed
+                       , isKernelLoopStmt (C2.SLoop spec lb)
+                       ]
+          stmtCount = length . concatMap collectAllStmts
+          collectAllStmts (C2.SLoop _ b) = b ++ concatMap collectAllStmts b
+          collectAllStmts (C2.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
+          collectAllStmts s = [s]
+      in case candidates of
+           [] -> Nothing
+           _  -> Just (fst (maximumBy (\a b -> compare (snd a) (snd b)) candidates))
+    isKernelLoopStmt (C2.SLoop spec _) =
+      C2.lsRole spec `elem` [C2.LoopMap, C2.LoopMapReduction] ||
+      (case C2.lsExec spec of C2.Parallel _ -> True; _ -> False)
+    isKernelLoopStmt _ = False
+    hasLoopNested (C2.SLoop _ _) = True
+    hasLoopNested (C2.SIf _ thn els) = any hasLoopNested thn || any hasLoopNested els
+    hasLoopNested _ = False
+
+-- | Split proc body into (preLoopStmts, loopSpec, loopBody, postLoopStmts, retAtom).
 -- Selects the largest kernel-eligible loop (by body size) in the proc body,
 -- treating everything before and after it as pre-loop / post-loop CPU work.
-analyzeKernelProc :: [C2.Stmt] -> Either String ([C2.Stmt], C2.LoopSpec, [C2.Stmt], Maybe Atom)
+analyzeKernelProc :: [C2.Stmt] -> Either String ([C2.Stmt], C2.LoopSpec, [C2.Stmt], [C2.Stmt], Maybe Atom)
 analyzeKernelProc body = do
   let (bodyNoRet, retAtom) = splitFinalReturn body
   case findBestKernelLoop bodyNoRet of
     Nothing ->
       Left "MSL backend: no parallelizable loop found in kernel proc body"
-    Just (preLoop, spec, loopBody) ->
-      Right (preLoop, spec, loopBody, retAtom)
+    Just (preLoop, spec, loopBody, postLoop) ->
+      Right (preLoop, spec, loopBody, postLoop, retAtom)
   where
     -- Find the largest kernel-eligible loop by body statement count,
-    -- returning (stmts before it, spec, body).
+    -- returning (stmts before it, spec, body, stmts after it).
     findBestKernelLoop stmts =
       let indexed = zip [0..] stmts
           candidates = [ (i, spec, lb)
@@ -183,7 +312,7 @@ analyzeKernelProc body = do
            [] -> Nothing
            _  -> let best = maximumBy (\(_, _, b1) (_, _, b2) -> compare (stmtCount b1) (stmtCount b2)) candidates
                      (i, spec, lb) = best
-                 in Just (take i stmts, spec, lb)
+                 in Just (take i stmts, spec, lb, drop (i + 1) stmts)
     isKernelLoopStmt (C2.SLoop spec _) =
       C2.lsRole spec `elem` [C2.LoopMap, C2.LoopMapReduction] ||
       (case C2.lsExec spec of C2.Parallel _ -> True; _ -> False)
@@ -288,6 +417,49 @@ collectZeroArgCalls stmts = Map.elems (Map.fromListWith (\_ first -> first) pair
 -- Used to replace in-kernel zero-arg calls with the hoisted variable.
 buildHoistedCallMap :: [C2.Stmt] -> Map CVar CVar
 buildHoistedCallMap hoisted = Map.fromList [(fn, v) | C2.SAssign v (RCall fn []) <- hoisted]
+
+-- | Classify which input arrays come from CPU helpers vs. prior GPU kernels.
+-- Also returns a map from consumer variable to the producing kernel's output
+-- buffer variable, so the harness can reuse the GPU buffer directly.
+--
+-- @gpuKernelOutputs@ maps kernel proc name → its output arrays (from kaOutputArrays).
+classifyBufferOrigins
+  :: [KernelAnalysis]        -- ^ All GPU kernels, in execution order
+  -> Set CVar                -- ^ Set of GPU kernel proc names
+  -> Map CVar BufferOrigin   -- ^ For each input array across all kernels
+classifyBufferOrigins kernels gpuNames =
+  Map.fromList
+    [ (v, origin fn)
+    | ka <- kernels
+    , C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka
+    , v `elem` kaInputArrays ka
+    ]
+  where
+    origin fn
+      | fn `Set.member` gpuNames = GPUProduced fn
+      | otherwise                = CPUProduced
+
+-- | Build a mapping from a consumer's input variable to the producing kernel's
+-- output buffer variable.  E.g. if kernel B has @SAssign t4 (RCall "arr" [])@
+-- and kernel A ("arr") produces output @arr1@, then @t4 → arr1@.
+buildGPUBufferAliases
+  :: [KernelAnalysis]        -- ^ All GPU kernels
+  -> Set CVar                -- ^ GPU kernel proc names
+  -> Map CVar CVar           -- ^ consumer input var → producer output var
+buildGPUBufferAliases kernels gpuNames =
+  Map.fromList
+    [ (v, outVar)
+    | ka <- kernels
+    , C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka
+    , fn `Set.member` gpuNames
+    -- Find the producing kernel's output array.  For simple (single-array)
+    -- returns the first output array is the result.
+    , let producerOutputs = [ kaOutputArrays k | k <- kernels, kaName k == fn ]
+    , outVar <- case producerOutputs of
+        ([o]:_) -> [o]          -- single output array
+        (os:_)  -> take 1 os    -- multi-output: use first (conservative)
+        _       -> []
+    ]
 
 -- | Collect array alias assignments: v = RAtom (AVar arr) where arr is a known array.
 -- Returns (alias, original) pairs. Recursively follows alias chains.
@@ -414,6 +586,14 @@ genMSLKernelSrc kernelName loopSpec loopBody typeEnv arrayElemTys
   let pairTypes = collectPairTypesFromEnv typeEnv loopBody
       pairDefs = genMSLPairStructDefs pairTypes
   in
+  mslSharedHeader pairDefs ++
+  genMSLKernelFunction kernelName loopSpec loopBody typeEnv arrayElemTys
+    inputArrays outputArrays scalarInputs hoistedCallMap preLoopAliases
+
+-- | Shared Metal header (includes, shape helpers, erf).
+-- @pairDefs@ is the pair struct definitions needed by the kernel(s).
+mslSharedHeader :: String -> String
+mslSharedHeader pairDefs =
   unlines
     [ "#include <metal_stdlib>"
     , "using namespace metal;"
@@ -421,8 +601,16 @@ genMSLKernelSrc kernelName loopSpec loopBody typeEnv arrayElemTys
     , mslShapeHelpers
     , pairDefs
     , ""
-    , "kernel void " ++ sanitize kernelName ++ "("
-    ] ++
+    ]
+
+-- | Generate a single @kernel void@ function (no shared header).
+genMSLKernelFunction
+  :: CVar -> C2.LoopSpec -> [C2.Stmt] -> TypeEnv -> Map CVar CType
+  -> [CVar] -> [CVar] -> [CVar] -> Map CVar CVar -> [(CVar, CVar)]
+  -> String
+genMSLKernelFunction kernelName loopSpec loopBody typeEnv arrayElemTys
+                     inputArrays outputArrays scalarInputs hoistedCallMap preLoopAliases =
+  "kernel void " ++ sanitize kernelName ++ "(\n" ++
   intercalate ",\n" (map ("    " ++) allParams) ++ ")\n" ++
   unlines
     [ "{"
@@ -484,6 +672,22 @@ genMSLKernelSrc kernelName loopSpec loopBody typeEnv arrayElemTys
     mslScalarTy v = case Map.lookup v typeEnv of
       Just ct -> mslTypeName ct
       Nothing -> "long"
+
+-- | Generate a @.metal@ source with multiple @kernel void@ functions and
+-- a single shared header.
+genMultiKernelMSL :: [KernelAnalysis] -> String
+genMultiKernelMSL kernels =
+  let -- Collect pair types from all kernels (deduplicated)
+      allPairTypes = nub $ concatMap
+        (\ka -> collectPairTypesFromEnv (kaTypeEnv ka) (kaLoopBody ka)) kernels
+      pairDefs = genMSLPairStructDefs allPairTypes
+  in mslSharedHeader pairDefs ++
+     concatMap genOneKernel kernels
+  where
+    genOneKernel ka =
+      genMSLKernelFunction (kaName ka) (kaLoopSpec ka) (kaLoopBody ka)
+        (kaTypeEnv ka) (kaArrayElemTys ka) (kaInputArrays ka) (kaOutputArrays ka)
+        (kaScalarInputs ka) (kaHoistedCallMap ka) (kaPreLoopAliases ka)
 
 -- | Collect all variables assigned in a statement list (recursively).
 collectAssignedVars :: [C2.Stmt] -> [CVar]
@@ -1052,6 +1256,327 @@ genObjCHarnessSrc _prog _kernelProc kernelName preLoopStmts loopSpec _retAtom
          , "    }"
          , "    printf(\"]\\n\");"
          ]
+
+-- ---------------------------------------------------------------------------
+-- Multi-kernel ObjC harness generation
+
+-- | Generate a harness that dispatches multiple GPU kernels in sequence.
+-- Intermediate buffers stay on GPU; only the last kernel's outputs are read back.
+genMultiKernelHarnessSrc
+  :: C2.Program
+  -> [KernelAnalysis]       -- ^ Kernels in execution order
+  -> Map CVar BufferOrigin  -- ^ Buffer origin for each input array
+  -> Map CVar CVar          -- ^ GPU buffer aliases (consumer var → producer output var)
+  -> Map CVar VarKind       -- ^ Return kinds
+  -> Map CVar CType         -- ^ Program-level return types
+  -> String                 -- ^ Helper C source
+  -> String
+genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTypes helperC =
+  unlines $
+    -- Header
+    [ "// Hydrangea Metal harness (multi-kernel) — generated by the MSL backend."
+    , "#include \"hydrangea_runtime.h\""
+    , "#include <stdio.h>"
+    , "#include <string.h>"
+    , "#include <stdlib.h>"
+    , "#import <Foundation/Foundation.h>"
+    , "#import <Metal/Metal.h>"
+    , ""
+    , "// ---- CPU helper procs ----"
+    , helperC
+    , ""
+    , "// ---- Metal harness main ----"
+    , "int main(int argc, const char* argv[]) {"
+    , "    @autoreleasepool {"
+    , "    const char* _metallib = argc > 1 ? argv[1] : \"kernel.metallib\";"
+    , ""
+    , "    // --- Metal device and library setup ---"
+    , "    id<MTLDevice> _dev = MTLCreateSystemDefaultDevice();"
+    , "    if (!_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }"
+    , "    NSError* _err = nil;"
+    , "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:_metallib]];"
+    , "    id<MTLLibrary> _lib = [_dev newLibraryWithURL:_libURL error:&_err];"
+    , "    if (!_lib) {"
+    , "        fprintf(stderr, \"hydrangea: failed to load metallib: %s\\n\","
+    , "                [_err.localizedDescription UTF8String]);"
+    , "        return 1;"
+    , "    }"
+    , "    id<MTLCommandQueue> _queue = [_dev newCommandQueue];"
+    , ""
+    ] ++
+    -- Pipeline state objects (one per kernel)
+    concatMap genPSO indexedKernels ++
+    [""] ++
+    -- Per-kernel dispatch blocks
+    concatMap genKernelBlock indexedKernels ++
+    -- Print output (from last kernel only)
+    [ "    // --- Print output ---" ] ++
+    genLastKernelPrint ++
+    [ "    } // @autoreleasepool"
+    , "    return 0;"
+    , "}"
+    ]
+  where
+    indexedKernels = zip [0..] kernels
+    lastIdx = length kernels - 1
+
+    -- Naming: _k<idx>_<buftype><sub>
+    kPrefix :: Int -> String
+    kPrefix ki = "_k" ++ show ki ++ "_"
+
+    -- Generate pipeline state object for one kernel
+    genPSO (ki, ka) =
+      let p = kPrefix ki
+      in [ "    // Pipeline: " ++ sanitize (kaName ka)
+         , "    id<MTLFunction> " ++ p ++ "fn = [_lib newFunctionWithName:@\"" ++ sanitize (kaName ka) ++ "\"];"
+         , "    if (!" ++ p ++ "fn) { fprintf(stderr, \"hydrangea: kernel function '" ++ sanitize (kaName ka)
+           ++ "' not found\\n\"); return 1; }"
+         , "    id<MTLComputePipelineState> " ++ p ++ "pso ="
+         , "        [_dev newComputePipelineStateWithFunction:" ++ p ++ "fn error:&_err];"
+         , "    if (!" ++ p ++ "pso) { fprintf(stderr, \"hydrangea: pipeline error: %s\\n\","
+         , "            [_err.localizedDescription UTF8String]); return 1; }"
+         ]
+
+    -- Generate the full dispatch block for one kernel
+    genKernelBlock (ki, ka) =
+      let p = kPrefix ki
+          te = kaTypeEnv ka
+          ae = kaArrayElemTys ka
+          inArrs = kaInputArrays ka
+          outArrs = kaOutputArrays ka
+          scals = kaScalarInputs ka
+          nInArrs = length inArrs
+          -- Skip set: output arrays (Metal buffers, not CPU-allocated)
+          skipAlloc = Set.fromList outArrs
+          -- Also skip RCall to GPU-produced arrays in pre-loop
+          gpuProducedVars = Set.fromList
+            [ v | C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka
+                , case Map.lookup v bufferOrigins of
+                    Just (GPUProduced _) -> True
+                    _ -> False ]
+          -- Shape expressions for GPU-produced vars (from producer output shapes)
+          gpuKernelNames = Set.fromList [kaName k | k <- kernels]
+          gpuShapeExprs = Map.fromList
+            [ (v, findProducerShapeVar fn)
+            | C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka
+            , fn `Set.member` gpuKernelNames
+            ]
+      in
+      [ "", "    // ======== Kernel " ++ show ki ++ ": " ++ sanitize (kaName ka) ++ " ========" ] ++
+      -- Pre-loop (skip GPU-produced array calls and output allocs)
+      [ "    // CPU pre-loop" ] ++
+      concatMap (genMultiPreLoopLine te retKinds skipAlloc gpuProducedVars gpuShapeExprs Set.empty) (kaEffectivePreLoop ka) ++
+      -- Grid size
+      [ "    long " ++ p ++ "n = " ++ gridSizeExprFor ka ++ ";" ] ++
+      -- Input buffers
+      concatMap (genInputBuf ki p te ae) (zip inArrs [0..]) ++
+      -- Input shape buffers
+      concatMap (genInputShapeBuf ki p) (zip inArrs [nInArrs..]) ++
+      -- Output buffers
+      concatMap (genOutputBuf ki p ka te ae) (zip outArrs [nInArrs * 2..]) ++
+      -- Scalar buffers
+      concatMap (genScalarBuf ki p te) (zip scals [nInArrs * 2 + length outArrs..]) ++
+      -- Dispatch
+      genDispatch ki p ka (nInArrs * 2 + length outArrs + length scals)
+
+    gridSizeExprFor ka = case C2.lsBounds (kaLoopSpec ka) of
+      [b] -> "(long)" ++ genMSLIndexExpr b
+      bs  -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
+
+    -- Input buffer for one array. Reuse GPU buffer if the origin is a prior kernel.
+    genInputBuf ki p te ae (v, sub) =
+      let bufName = p ++ "buf" ++ show sub
+          elemTy = mslElemTyFor ae te v
+      in case Map.lookup v gpuAliases of
+        Just producerVar ->
+          -- Reuse the GPU buffer from the producing kernel
+          let producerBuf = findProducerBufName producerVar
+          in [ "    // Input " ++ sanitize v ++ " — reuse GPU buffer from " ++ sanitize producerVar
+             , "    id<MTLBuffer> " ++ bufName ++ " = " ++ producerBuf ++ ";"
+             ]
+        Nothing ->
+          -- CPU-produced: upload from hyd_array_t*
+          [ "    // Input " ++ sanitize v
+          , "    long " ++ p ++ "inN" ++ show sub ++ " = hyd_shape_size(" ++ sanitize v ++ "->shape);"
+          , "    size_t " ++ bufName ++ "_sz = (size_t)(" ++ p ++ "inN" ++ show sub ++ " * sizeof(" ++ elemTy ++ "));"
+          , "    id<MTLBuffer> " ++ bufName ++ " = [_dev newBufferWithLength:" ++ bufName ++ "_sz options:MTLResourceStorageModeShared];"
+          ] ++ fillLine (p ++ "inN" ++ show sub) bufName v elemTy
+
+    fillLine sizeVar bufName v "float" =
+      [ "    { double* _fsrc = (double*)" ++ sanitize v ++ "->data; float* _fdst = (float*)" ++ bufName ++ ".contents;"
+      , "      for (long _fci = 0; _fci < " ++ sizeVar ++ "; _fci++) _fdst[_fci] = (float)_fsrc[_fci]; }"
+      ]
+    fillLine _sizeVar bufName v _ =
+      [ "    memcpy(" ++ bufName ++ ".contents, " ++ sanitize v ++ "->data, " ++ bufName ++ "_sz);" ]
+
+    genInputShapeBuf ki p (v, sub) =
+      let bufName = p ++ "buf" ++ show sub
+      in case Map.lookup v gpuAliases of
+        Just producerVar ->
+          -- Reuse shape from producing kernel's output shape
+          let producerShapeBuf = findProducerShapeBufName producerVar
+          in [ "    id<MTLBuffer> " ++ bufName ++ " = " ++ producerShapeBuf ++ ";" ]
+        Nothing ->
+          [ "    // Shape: " ++ sanitize v
+          , "    id<MTLBuffer> " ++ bufName ++ " = [_dev newBufferWithBytes:&" ++ sanitize v
+            ++ "->shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"
+          ]
+
+    genOutputBuf ki p ka te ae (v, sub) =
+      let bufName = p ++ "buf" ++ show sub
+          elemTy = mslElemTyFor ae te v
+          outputAllocShapes = Map.fromList
+            [ (ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka ]
+          sizeExpr = case Map.lookup v outputAllocShapes of
+            Just shpAtom -> "hyd_shape_size(" ++ genCAtom shpAtom ++ ")"
+            Nothing -> p ++ "n"
+      in [ "    // Output " ++ sanitize v
+         , "    long " ++ p ++ "outN" ++ show sub ++ " = " ++ sizeExpr ++ ";"
+         , "    size_t " ++ bufName ++ "_sz = (size_t)(" ++ p ++ "outN" ++ show sub ++ " * sizeof(" ++ elemTy ++ "));"
+         , "    id<MTLBuffer> " ++ bufName ++ " = [_dev newBufferWithLength:" ++ bufName ++ "_sz options:MTLResourceStorageModeShared];"
+         , "    memset(" ++ bufName ++ ".contents, 0, " ++ bufName ++ "_sz);"
+         -- Also create a shape buffer for this output (needed if a downstream kernel references it)
+         , "    hyd_tuple_t " ++ p ++ "outShape" ++ show sub ++ " = " ++ outputShapeInit ka v ++ ";"
+         , "    id<MTLBuffer> " ++ p ++ "outShapeBuf" ++ show sub
+           ++ " = [_dev newBufferWithBytes:&" ++ p ++ "outShape" ++ show sub
+           ++ " length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"
+         ]
+
+    -- Build the shape from the allocation, or from a post-loop reshape if present.
+    -- Scatter kernels allocate a 1D buffer but reshape to N-D before returning;
+    -- downstream kernels need the N-D shape for correct indexing.
+    outputShapeInit ka v =
+      let outputAllocShapes = Map.fromList
+            [ (ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka ]
+          -- Check if the output array is reshaped in the post-loop before returning
+          reshapeShape = listToMaybe
+            [ shpAtom
+            | C2.SAssign _ (RCall "hyd_array_reshape_view" [arrAtom, shpAtom])
+                <- kaPostLoopStmts ka
+            , arrAtom == AVar v
+            ]
+      in case reshapeShape of
+        Just shpAtom -> genCAtom shpAtom
+        Nothing -> case Map.lookup v outputAllocShapes of
+          Just shpAtom -> genCAtom shpAtom
+          Nothing ->
+            -- Fallback: build from loop bounds
+            let bs = C2.lsBounds (kaLoopSpec ka)
+            in "hyd_tuple_make(" ++ show (length bs) ++ ", " ++
+               intercalate ", " ["(int64_t)" ++ genMSLIndexExpr b | b <- bs] ++ ")"
+
+    genScalarBuf ki p te (v, sub) =
+      let bufName = p ++ "buf" ++ show sub
+          sty = case Map.lookup v te of
+                  Just ct -> mslTypeName ct
+                  Nothing -> "long"
+      in [ "    // Scalar " ++ sanitize v
+         , "    " ++ sty ++ " " ++ p ++ "scalar" ++ show sub ++ " = " ++ sanitize v ++ ";"
+         , "    id<MTLBuffer> " ++ bufName ++ " = [_dev newBufferWithBytes:&" ++ p ++ "scalar" ++ show sub
+           ++ " length:sizeof(" ++ sty ++ ") options:MTLResourceStorageModeShared];"
+         ]
+      where te = kaTypeEnv (snd (indexedKernels !! ki))
+
+    genDispatch ki p ka nBufs =
+      [ "    // Dispatch " ++ sanitize (kaName ka)
+      , "    id<MTLCommandBuffer> " ++ p ++ "cmd = [_queue commandBuffer];"
+      , "    id<MTLComputeCommandEncoder> " ++ p ++ "enc = [" ++ p ++ "cmd computeCommandEncoder];"
+      , "    [" ++ p ++ "enc setComputePipelineState:" ++ p ++ "pso];"
+      ] ++
+      [ "    [" ++ p ++ "enc setBuffer:" ++ p ++ "buf" ++ show i ++ " offset:0 atIndex:" ++ show i ++ "];"
+      | i <- [0 .. nBufs - 1]
+      ] ++
+      [ "    NSUInteger " ++ p ++ "tgs = MIN(256UL, " ++ p ++ "pso.maxTotalThreadsPerThreadgroup);"
+      , "    if (" ++ p ++ "tgs == 0) " ++ p ++ "tgs = 1;"
+      , "    [" ++ p ++ "enc dispatchThreads:MTLSizeMake((NSUInteger)" ++ p ++ "n, 1, 1)"
+      , "      threadsPerThreadgroup:MTLSizeMake(" ++ p ++ "tgs, 1, 1)];"
+      , "    [" ++ p ++ "enc endEncoding];"
+      , "    [" ++ p ++ "cmd commit];"
+      , "    [" ++ p ++ "cmd waitUntilCompleted];"
+      ]
+
+    -- Find the buffer name for a producer's output variable
+    findProducerBufName :: CVar -> String
+    findProducerBufName prodVar =
+      head $ [ kPrefix ki ++ "buf" ++ show sub
+             | (ki, ka) <- indexedKernels
+             , let outArrs = kaOutputArrays ka
+                   nIn = length (kaInputArrays ka)
+             , (ov, sub) <- zip outArrs [nIn * 2..]
+             , ov == prodVar
+             ] ++ ["/* ERROR: producer buffer not found for " ++ sanitize prodVar ++ " */"]
+
+    findProducerShapeBufName :: CVar -> String
+    findProducerShapeBufName prodVar =
+      head $ [ kPrefix ki ++ "outShapeBuf" ++ show sub
+             | (ki, ka) <- indexedKernels
+             , let outArrs = kaOutputArrays ka
+                   nIn = length (kaInputArrays ka)
+             , (ov, sub) <- zip outArrs [nIn * 2..]
+             , ov == prodVar
+             ] ++ ["/* ERROR: producer shape buffer not found for " ++ sanitize prodVar ++ " */"]
+
+    -- Find the C variable name holding the shape for a producer kernel's output
+    findProducerShapeVar :: CVar -> String
+    findProducerShapeVar prodKernelName =
+      head $ [ kPrefix ki ++ "outShape" ++ show sub
+             | (ki, ka) <- indexedKernels
+             , kaName ka == prodKernelName
+             , let outArrs = kaOutputArrays ka
+                   nIn = length (kaInputArrays ka)
+             , (_ov, sub) <- zip outArrs [nIn * 2..]
+             ] ++ ["((hyd_tuple_t){0})"]
+
+    -- Print output from the last kernel only
+    genLastKernelPrint =
+      let (ki, ka) = last indexedKernels
+          p = kPrefix ki
+          ae = kaArrayElemTys ka
+          te = kaTypeEnv ka
+          outArrs = kaOutputArrays ka
+          nIn = length (kaInputArrays ka)
+      in concat
+        [ let sub = nIn * 2 + idx
+              bufName = p ++ "buf" ++ show sub
+              sizeVar = p ++ "outN" ++ show sub
+              elemTy = mslElemTyFor ae te v
+              fmt = if elemTy == "float" then "%.17g" else "%ld"
+              cast = if elemTy == "float" then "(double)" else "(long)"
+          in [ "    // Print output: " ++ sanitize v
+             , "    " ++ elemTy ++ "* " ++ p ++ "out" ++ show sub ++ " = (" ++ elemTy ++ "*)" ++ bufName ++ ".contents;"
+             , "    printf(\"[\");"
+             , "    for (long _pi = 0; _pi < " ++ sizeVar ++ "; _pi++) {"
+             , "        if (_pi > 0) printf(\", \");"
+             , "        printf(\"" ++ fmt ++ "\", " ++ cast ++ p ++ "out" ++ show sub ++ "[_pi]);"
+             , "    }"
+             , "    printf(\"]\\n\");"
+             ]
+        | (idx, v) <- zip [0..] outArrs
+        ]
+
+    mslElemTyFor ae te v = case Map.lookup v ae of
+      Just elt -> mslTypeName elt
+      Nothing  -> case Map.lookup v te of
+        Just (CTArray elt) -> mslTypeName elt
+        _                  -> "long"
+
+-- | Pre-loop line generator for multi-kernel harness.
+-- For GPU-produced arrays, emits a shape-only stub instead of calling the
+-- CPU helper, so downstream code can access @v->shape@.
+genMultiPreLoopLine
+  :: TypeEnv -> Map CVar VarKind -> Set CVar
+  -> Set CVar            -- ^ GPU-produced variables to stub
+  -> Map CVar String     -- ^ GPU-produced var → shape expression
+  -> Set CVar -> C2.Stmt -> [String]
+genMultiPreLoopLine typeEnv retKinds skipAlloc gpuProduced gpuShapeExprs preDeclared stmt = case stmt of
+  C2.SAssign v (RCall _ []) | v `Set.member` gpuProduced ->
+    -- Emit a shape-only stub so v->shape is valid
+    let shapeExpr = Map.findWithDefault "((hyd_tuple_t){0})" v gpuShapeExprs
+    in [ "    // GPU-produced array (stub for shape access)"
+       , "    hyd_array_t _stub_" ++ sanitize v ++ " = { .shape = " ++ shapeExpr ++ ", .data = NULL };"
+       , "    hyd_array_t* " ++ sanitize v ++ " = &_stub_" ++ sanitize v ++ ";"
+       ]
+  _ -> genPreLoopLine typeEnv retKinds skipAlloc preDeclared stmt
 
 -- | Generate a single pre-loop C statement for the ObjC harness main.
 -- Returns empty list for output array allocations (replaced by Metal buffers).
