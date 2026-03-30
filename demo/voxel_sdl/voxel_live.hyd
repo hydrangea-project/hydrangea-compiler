@@ -1,0 +1,354 @@
+(* voxel_live.hyd — Fast interactive voxel renderer for SDL demo.
+   Scene: two objects (sphere + torus), 64×64×48 voxel grid, n=200,000 point cloud.
+   Render: 320×240 pixels, simplified ray march (no shadows, no binary-search, no specular).
+   Camera orbits around scene centre based on frame counter using sin/cos.
+
+   ARCHITECTURE — same as render.hyd:
+     voxel_scene_fast   top-level binding (compiled as __cache_voxel_scene_fast lazy value)
+     tri / ray_step     top-level helper functions
+     voxel_render       exported function — references voxel_scene_fast, takes frame param
+   This prevents the fusion pass from inlining the scatter (scene build) into the per-pixel
+   ray march loop.  The compiler calls voxel_scene_fast() once on first invocation, then
+   caches the result; subsequent frames just read the cached array.
+
+   Exported function:
+     C signature:  hyd_pair_aa_t hyd_export_voxel_render(int64_t dummy_state, int64_t frame);
+   result.fst = luminance array [240,320], result.snd = fresh 1-element dummy.
+
+   PAIRS vs TUPLES: all compound state uses pairs (not tuples) to preserve float fields
+   through the CFGTyping fixpoint.  See render.hyd for the full explanation.
+
+   PARALLELIZATION: the outer generate [outH, outW] loop is parallelised with
+   #pragma omp parallel for (same mechanism as render.hyd — fresh write-once output array,
+   read-only voxel scene captured via top-level reference). *)
+
+(* ======= Voxel scene (top-level, cached after first call) ======= *)
+
+let voxel_scene_fast =
+  let n      = 200000 in
+  let nx     = 64 in
+  let ny     = 64 in
+  let nz     = 48 in
+  let nvox   = nx * ny * nz in
+  let contribs = n * 8 in
+  let imod x m = x - ((x / m) * m) in
+  let absi x = if x < 0 then 0 - x else x in
+  let obj p = imod p 2 in
+  let obj_ix p = p / 2 in
+
+  (* Object 0: sphere, scan cube 29×29×29, radius 14, centre (19, 32, 24) *)
+  let sphere_x p = imod (obj_ix p) 29 - 14 in
+  let sphere_y p = imod (obj_ix p / 29) 29 - 14 in
+  let sphere_z p = imod (obj_ix p / (29 * 29)) 29 - 14 in
+  let sphere_r2 p =
+    let x = sphere_x p in
+    let y = sphere_y p in
+    let z = sphere_z p in
+    (x * x) + (y * y) + (z * z) in
+
+  (* Object 1: torus, scan cube 29×29×9, ring radius 10, centre (45, 32, 24) *)
+  let ring_x p = imod (obj_ix p) 29 - 14 in
+  let ring_y p = imod (obj_ix p / 29) 29 - 14 in
+  let ring_z p = imod (obj_ix p / (29 * 29)) 9 - 4 in
+  let ring_xy2 p =
+    let x = ring_x p in
+    let y = ring_y p in
+    (x * x) + (y * y) in
+
+  let base_x p =
+    if obj p = 0 then 19 + sphere_x p
+    else 45 + ring_x p in
+  let base_y p =
+    if obj p = 0 then 32 + sphere_y p
+    else 32 + ring_y p in
+  let base_z p =
+    if obj p = 0 then 24 + sphere_z p
+    else 24 + ring_z p in
+
+  let keep_point p =
+    if obj p = 0 then sphere_r2 p < 14 * 14
+    else
+      if absi (ring_xy2 p - 100) < 36 then absi (ring_z p) < 4
+      else false in
+
+  let point_weight p =
+    if obj p = 0 then
+      if sphere_r2 p < 14 * 14 then
+        1.2 +. 0.8 *. (1.0 -. float_of (sphere_r2 p) /. 196.0)
+      else 0.0
+    else
+      if absi (ring_xy2 p - 100) < 36 then
+        if absi (ring_z p) < 4 then
+          1.15 +. 0.35 *. (1.0 -. float_of (absi (ring_xy2 p - 100)) /. 36.0)
+        else 0.0
+      else 0.0 in
+
+  let route_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let x = base_x p + bx in
+    let y = base_y p + by in
+    let z = base_z p + bz in
+    ((z * ny) + y) * nx + x in
+
+  let weight_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let fx = imod (p * 5 + 1) 4 in
+    let fy = imod (p * 7 + 2) 4 in
+    let fz = imod (p * 11 + 3) 4 in
+    let wx = (1 - bx) * (4 - fx) + bx * fx in
+    let wy = (1 - by) * (4 - fy) + by * fy in
+    let wz = (1 - bz) * (4 - fz) + bz * fz in
+    point_weight p *. float_of (wx * wy * wz) /. 64.0 in
+
+  let keep_of [i] =
+    let p = i / 8 in
+    keep_point p in
+
+  let voxels =
+    scatter_guarded (+.) (fill [nvox] 0.0)
+      (generate [contribs] route_of)
+      (generate [contribs] weight_of)
+      (generate [contribs] keep_of) in
+  reshape [nz, ny, nx] voxels
+
+(* ======= Trilinear interpolation (top-level) ======= *)
+
+let tri voxels nx ny nz xf yf zf =
+  let bx = float_of (nx - 1) in
+  let by = float_of (ny - 1) in
+  let bz = float_of (nz - 1) in
+  let xc = if xf <. 0.0 then 0.0 else if xf >. bx then bx else xf in
+  let yc = if yf <. 0.0 then 0.0 else if yf >. by then by else yf in
+  let zc = if zf <. 0.0 then 0.0 else if zf >. bz then bz else zf in
+  let x0 = int_of_float (floor_f xc) in
+  let y0 = int_of_float (floor_f yc) in
+  let z0 = int_of_float (floor_f zc) in
+  let x1 = if x0 + 1 < nx then x0 + 1 else nx - 1 in
+  let y1 = if y0 + 1 < ny then y0 + 1 else ny - 1 in
+  let z1 = if z0 + 1 < nz then z0 + 1 else nz - 1 in
+  let tx = xc -. float_of x0 in
+  let ty = yc -. float_of y0 in
+  let tz = zc -. float_of z0 in
+  let c000 = check_index [z0, y0, x0] 0.0 voxels in
+  let c100 = check_index [z0, y0, x1] 0.0 voxels in
+  let c010 = check_index [z0, y1, x0] 0.0 voxels in
+  let c110 = check_index [z0, y1, x1] 0.0 voxels in
+  let c001 = check_index [z1, y0, x0] 0.0 voxels in
+  let c101 = check_index [z1, y0, x1] 0.0 voxels in
+  let c011 = check_index [z1, y1, x0] 0.0 voxels in
+  let c111 = check_index [z1, y1, x1] 0.0 voxels in
+  let c00 = c000 *. (1.0 -. tx) +. c100 *. tx in
+  let c10 = c010 *. (1.0 -. tx) +. c110 *. tx in
+  let c01 = c001 *. (1.0 -. tx) +. c101 *. tx in
+  let c11 = c011 *. (1.0 -. tx) +. c111 *. tx in
+  let c0  = c00 *. (1.0 -. ty) +. c10 *. ty in
+  let c1  = c01 *. (1.0 -. ty) +. c11 *. ty in
+  c0 *. (1.0 -. tz) +. c1 *. tz
+
+(* ======= Simplified ray-march step (top-level) ======= *)
+(* Removed vs render.hyd: shadow sampling, binary-search refinement, specular,
+   adaptive step sizes, depth fade, edge softness.
+   Kept: surface crossing detection, gradient normal, diffuse + rim lighting.
+   State: ((hit: int, shade: float), ((t: float, prevT: float), (prevDensity: float, havePrev: int)))
+   All pairs, not tuples — floats must not be stored in CTTuple. *)
+
+let ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold stepSize ldX ldY ldZ acc dummy =
+  let hit = fst (fst acc) in
+  if hit > 0 then acc
+  else
+    let t = fst (fst (snd acc)) in
+    if t >. tExit then acc
+    else
+      let prevT       = snd (fst (snd acc)) in
+      let prevDensity = fst (snd (snd acc)) in
+      let havePrev    = snd (snd (snd acc)) in
+      let px = camX +. t *. dirX in
+      let py = camY +. t *. dirY in
+      let pz = camZ +. t *. dirZ in
+      let density = tri voxels nx ny nz px py pz in
+      let crossing =
+        if havePrev > 0 then
+          if prevDensity <. threshold then density >=. threshold
+          else false
+        else false in
+      if crossing then
+        (* Surface normal via central differences at rounded hit position *)
+        let gx = int_of_float (floor_f (px +. 0.5)) in
+        let gy = int_of_float (floor_f (py +. 0.5)) in
+        let gz = int_of_float (floor_f (pz +. 0.5)) in
+        let gxc = if gx < 0 then 0 else if gx > nx - 1 then nx - 1 else gx in
+        let gyc = if gy < 0 then 0 else if gy > ny - 1 then ny - 1 else gy in
+        let gzc = if gz < 0 then 0 else if gz > nz - 1 then nz - 1 else gz in
+        let gxp = if gxc + 1 > nx - 1 then nx - 1 else gxc + 1 in
+        let gxm = if gxc - 1 < 0 then 0 else gxc - 1 in
+        let gyp = if gyc + 1 > ny - 1 then ny - 1 else gyc + 1 in
+        let gym = if gyc - 1 < 0 then 0 else gyc - 1 in
+        let gzp = if gzc + 1 > nz - 1 then nz - 1 else gzc + 1 in
+        let gzm = if gzc - 1 < 0 then 0 else gzc - 1 in
+        let gnx = check_index [gzc, gyc, gxp] 0.0 voxels -. check_index [gzc, gyc, gxm] 0.0 voxels in
+        let gny = check_index [gzc, gyp, gxc] 0.0 voxels -. check_index [gzc, gym, gxc] 0.0 voxels in
+        let gnz = check_index [gzp, gyc, gxc] 0.0 voxels -. check_index [gzm, gyc, gxc] 0.0 voxels in
+        let gnlen = sqrt (gnx *. gnx +. gny *. gny +. gnz *. gnz) in
+        let nlen = if gnlen <. 1.0e-9 then 1.0 else gnlen in
+        let normX = gnx /. nlen in
+        let normY = gny /. nlen in
+        let normZ = gnz /. nlen in
+        let diffuse_raw = normX *. ldX +. normY *. ldY +. normZ *. ldZ in
+        let diffuse = if diffuse_raw >. 0.0 then diffuse_raw else 0.0 in
+        let ndotr_raw = normX *. (0.0 -. dirX) +. normY *. (0.0 -. dirY) +. normZ *. (0.0 -. dirZ) in
+        let rim_base = if ndotr_raw <. 0.0 then 0.0 else 1.0 -. ndotr_raw in
+        let rim = rim_base *. rim_base in
+        let shade = 0.20 +. 0.80 *. diffuse +. 0.15 *. rim in
+        ((1, shade), ((t +. stepSize, t), (density, 1)))
+      else
+        ((0, 0.0), ((t +. stepSize, t), (density, 1)))
+
+(* ======= Main exported function ======= *)
+
+let voxel_render dummy_state frame =
+  let voxels = voxel_scene_fast in   (* cached scene — computed once, reused each frame *)
+  let nx     = 64 in
+  let ny     = 64 in
+  let nz     = 48 in
+  let outW   = 320 in
+  let outH   = 240 in
+  let maxSteps  = 200 in
+  let threshold = 0.42 in
+
+  (* ---- Camera setup: orbit around scene centre ---- *)
+  let angle  = float_of frame *. 0.025 in
+  let halfX  = float_of nx /. 2.0 in
+  let halfY  = float_of ny /. 2.0 in
+  let halfZ  = float_of nz /. 2.0 in
+  let orbitR = 1.6 *. float_of nx in
+  let camX   = halfX +. orbitR *. sin angle in
+  let camY   = halfY -. 0.25 *. float_of ny in
+  let camZ   = halfZ -. orbitR *. cos angle in
+
+  (* Camera forward = normalize(target − camPos), target = scene centre *)
+  let fdx   = halfX -. camX in
+  let fdy   = halfY -. camY in
+  let fdz   = halfZ -. camZ in
+  let fdlen = sqrt (fdx *. fdx +. fdy *. fdy +. fdz *. fdz) in
+  let fwdX  = fdx /. fdlen in
+  let fwdY  = fdy /. fdlen in
+  let fwdZ  = fdz /. fdlen in
+
+  (* Camera right = normalize(cross(forward, world_up=(0,1,0)))
+     cross(fwd,(0,1,0)) = (−fwdZ, 0, fwdX) *)
+  let rlen   = sqrt (fwdZ *. fwdZ +. fwdX *. fwdX) in
+  let rightX = (0.0 -. fwdZ) /. rlen in
+  let rightY = 0.0 in
+  let rightZ = fwdX /. rlen in
+
+  (* Camera up = normalize(cross(right, forward))
+     cross((rx,0,rz),(fx,fy,fz)) = (−rz*fy, rz*fx − rx*fz, rx*fy) *)
+  let upx_r = (0.0 -. rightZ) *. fwdY in
+  let upy_r = rightZ *. fwdX -. rightX *. fwdZ in
+  let upz_r = rightX *. fwdY in
+  let uplen = sqrt (upx_r *. upx_r +. upy_r *. upy_r +. upz_r *. upz_r) in
+  let upX   = upx_r /. uplen in
+  let upY   = upy_r /. uplen in
+  let upZ   = upz_r /. uplen in
+
+  (* Normalised light direction *)
+  let ldr   = 0.5 in
+  let ldg   = 0.0 -. 0.4 in
+  let ldb   = 0.77 in
+  let ldlen = sqrt (ldr *. ldr +. ldg *. ldg +. ldb *. ldb) in
+  let ldX   = ldr /. ldlen in
+  let ldY   = ldg /. ldlen in
+  let ldZ   = ldb /. ldlen in
+
+  let stepSize   = 0.4 in
+  let focalScale = 0.63 in
+  let aspect     = float_of outW /. float_of outH in
+
+  let boxMaxX = float_of (nx - 1) in
+  let boxMaxY = float_of (ny - 1) in
+  let boxMaxZ = float_of (nz - 1) in
+
+  (* Per-pixel ray function.  generate [outH, outW] parallelises this with
+     #pragma omp parallel for (output fresh+write-once, voxel scene read-only). *)
+  let ray_fn [py, px] =
+    let sx = ((float_of px +. 0.5) /. float_of outW -. 0.5) *. aspect *. 1.05 in
+    let sy = ((float_of py +. 0.5) /. float_of outH -. 0.5) *. 1.05 in
+
+    let rax   = fwdX +. focalScale *. sx *. rightX -. focalScale *. sy *. upX in
+    let ray   = fwdY +. focalScale *. sx *. rightY -. focalScale *. sy *. upY in
+    let raz   = fwdZ +. focalScale *. sx *. rightZ -. focalScale *. sy *. upZ in
+    let ralen = sqrt (rax *. rax +. ray *. ray +. raz *. raz) in
+    let dirX  = rax /. ralen in
+    let dirY  = ray /. ralen in
+    let dirZ  = raz /. ralen in
+
+    (* Ray-box slab test, X axis *)
+    let xpair =
+      if abs_f dirX <. 1.0e-9 then
+        if camX >=. 0.0 then if camX <=. boxMaxX then (0.0, 1.0e30) else (0.0, 0.0 -. 1.0)
+        else (0.0, 0.0 -. 1.0)
+      else
+        let xt0  = (0.0 -. camX) /. dirX in
+        let xt1  = (boxMaxX -. camX) /. dirX in
+        let xtlo = if xt0 <. xt1 then xt0 else xt1 in
+        let xthi = if xt0 >. xt1 then xt0 else xt1 in
+        let xnE  = if xtlo >. 0.0 then xtlo else 0.0 in
+        let xnX  = if xthi <. 1.0e30 then xthi else 1.0e30 in
+        (xnE, xnX) in
+    let sE1 = fst xpair in
+    let sX1 = snd xpair in
+
+    (* Y axis *)
+    let ypair =
+      if abs_f dirY <. 1.0e-9 then
+        if camY >=. 0.0 then if camY <=. boxMaxY then (sE1, sX1) else (sE1, 0.0 -. 1.0)
+        else (sE1, 0.0 -. 1.0)
+      else
+        let yt0  = (0.0 -. camY) /. dirY in
+        let yt1  = (boxMaxY -. camY) /. dirY in
+        let ytlo = if yt0 <. yt1 then yt0 else yt1 in
+        let ythi = if yt0 >. yt1 then yt0 else yt1 in
+        let ynE  = if ytlo >. sE1 then ytlo else sE1 in
+        let ynX  = if ythi <. sX1 then ythi else sX1 in
+        (ynE, ynX) in
+    let sE2 = fst ypair in
+    let sX2 = snd ypair in
+
+    (* Z axis *)
+    let zpair =
+      if abs_f dirZ <. 1.0e-9 then
+        if camZ >=. 0.0 then if camZ <=. boxMaxZ then (sE2, sX2) else (sE2, 0.0 -. 1.0)
+        else (sE2, 0.0 -. 1.0)
+      else
+        let zt0  = (0.0 -. camZ) /. dirZ in
+        let zt1  = (boxMaxZ -. camZ) /. dirZ in
+        let ztlo = if zt0 <. zt1 then zt0 else zt1 in
+        let zthi = if zt0 >. zt1 then zt0 else zt1 in
+        let znE  = if ztlo >. sE2 then ztlo else sE2 in
+        let znX  = if zthi <. sX2 then zthi else sX2 in
+        (znE, znX) in
+    let tEnter = fst zpair in
+    let tExit  = snd zpair in
+
+    if tEnter >. tExit then 0.0
+    else
+      let tStart = if tEnter >. 0.0 then tEnter else 0.0 in
+      let initState = ((0, 0.0), ((tStart, tStart), (0.0, 0))) in
+      let finalState = foldl_while
+        (let not_hit s = fst (fst s) = 0 in not_hit)
+        (let step acc d = ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold stepSize ldX ldY ldZ acc d in step)
+        initState
+        (fill [maxSteps] 0) in
+      snd (fst finalState) in
+
+  let pixels    = generate [outH, outW] ray_fn in
+  let new_dummy = fill [1] 0.0 in
+  (pixels, new_dummy)

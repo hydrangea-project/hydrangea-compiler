@@ -377,8 +377,9 @@ let ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold coars
         (* Diffuse lighting *)
         let diffuse_raw = normX *. ldX +. normY *. ldY +. normZ *. ldZ in
         let diffuse = if diffuse_raw >. 0.0 then diffuse_raw else 0.0 in
-        (* Shadow: 14 shadow ray steps *)
-        let occlusion = foldl
+        (* Shadow: up to 14 shadow ray steps, exit early once fully occluded *)
+        let occlusion = foldl_while
+          (let not_full occ = occ <. 1.0 in not_full)
           (let ss occ si = ss_step voxels nx ny nz hitX hitY hitZ ldX ldY ldZ occ si in ss)
           0.0
           (generate [14] (let sidx [si] = si in sidx)) in
@@ -561,7 +562,9 @@ let render =
       (* State: ((hit, shade), ((t, prevT), (prevDensity, havePrev))) *)
       let initState = ((0, 0.0), ((tStart, tStart), (0.0, 0))) in
       (* Thin wrapper so inlineBinaryFn sees a 2-arg function. *)
-      let finalState = foldl
+      (* Ray march: up to maxSteps steps, exit early once surface is hit *)
+      let finalState = foldl_while
+        (let not_hit s = fst (fst s) = 0 in not_hit)
         (let step acc d = ray_step voxels nx ny nz camX camY camZ dirX dirY dirZ tExit threshold coarseStep mediumStep fineStep ldX ldY ldZ acc d in step)
         initState
         (fill [maxSteps] 0) in
