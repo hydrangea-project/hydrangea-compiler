@@ -39,6 +39,7 @@
               && !(lib.hasSuffix ".vos" pathStr);
         };
         openmpCompiler = pkgs.gcc;
+        solverTools = [ pkgs.z3 ];
         hydrangea = pkgs.haskellPackages.callCabal2nix "hydrangea" source { };
         hydrangeaCompiler = pkgs.symlinkJoin {
           name = "hydrangea-compiler";
@@ -46,7 +47,7 @@
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram "$out/bin/hydrangea-compiler" \
-              --prefix PATH : ${lib.makeBinPath [ openmpCompiler ]} \
+              --prefix PATH : ${lib.makeBinPath ([ openmpCompiler ] ++ solverTools)} \
               --set-default CC ${openmpCompiler}/bin/gcc
           '';
         };
@@ -75,6 +76,7 @@
             pkgs.haskellPackages.ghc
             pkgs.haskellPackages.happy
             openmpCompiler
+            pkgs.z3
           ];
           shellHook = ''
             export CC=${openmpCompiler}/bin/gcc
