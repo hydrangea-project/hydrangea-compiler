@@ -29,6 +29,7 @@ Hydrangea combines:
 ├── app/                      # Executable entry point and backend drivers
 ├── test/                     # HSpec test suite
 ├── examples/                 # Sample Hydrangea programs (*.hyd)
+├── demo/                     # More complex sample/demo applications
 ├── runtime/                  # C runtime support
 └── third_party/              # External dependencies (SIMDE)
 ```
@@ -224,18 +225,6 @@ cabal test -- --pattern "LexerSpec"
 # Run specific test by name
 cabal test -- --pattern "lexer tokenizes identifiers"
 ```
-
-## Example Programs
-
-The `examples/` directory contains sample Hydrangea programs:
-
-- `simple.hyd` - Basic arithmetic and functions
-- `arrays.hyd` - Array operations
-- `mat_mul.hyd` - Matrix multiplication
-- `mat_mul_fused.hyd` - Fused matrix multiplication
-- `mat_mul_parallel.hyd` - Parallel matrix multiplication
-- `dot.hyd` - Dot product
-- `complete.hyd` - Comprehensive example
 
 ## Compiler Pipeline
 
