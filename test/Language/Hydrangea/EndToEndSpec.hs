@@ -32,7 +32,20 @@ compileAndRunC src keepC compileOnly isParallel =
     writeFile cpath src
     let cc = "cc"
         ompFlags = if isParallel then ["-fopenmp"] else []
-        flags = ["-O2", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c"]
+        flags =
+          [ "-O2"
+          , "-std=c99"
+          ]
+          ++ ompFlags
+          ++
+          [ "-Iruntime"
+          , "-Ithird_party/simde"
+          , "-o"
+          , exe
+          , cpath
+          , "runtime/hyd_write_csv.c"
+          , "-lm"
+          ]
     (cExit, _cout, cerr) <- readProcessWithExitCode cc flags ""
     case cExit of
       ExitFailure {} -> do
