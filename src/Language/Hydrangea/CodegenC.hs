@@ -40,6 +40,10 @@ module Language.Hydrangea.CodegenC
   , genIndexExpr
   , genPairStructDefs
   , genRecordStructDefs
+  , ExportSpec(..)
+  , resolveExportSpec
+  , procReturnTypeName
+  , sanitizeExportName
   ) where
 
 import Data.ByteString.Lazy.Char8 qualified as BS

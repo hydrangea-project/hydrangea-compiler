@@ -30,6 +30,7 @@ module Language.Hydrangea.CodegenMSL
 import Control.Applicative ((<|>))
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
+import Data.Char (toUpper)
 import Data.List (intercalate, maximumBy, nub)
 import Data.Maybe (listToMaybe)
 import Data.Map.Strict (Map)
@@ -48,6 +49,7 @@ import Language.Hydrangea.CFGTyping
   )
 import Language.Hydrangea.CodegenC
   ( CodegenOptions(..), CodegenArtifacts(..), VarKind(..)
+  , ExportSpec(..), resolveExportSpec, procReturnTypeName, sanitizeExportName
   , defaultCodegenOptions, codegenProgram2WithOptions
   , sanitize, splitFinalReturn
   , typeEnvToVarSets, classifyVarKinds2
@@ -58,6 +60,7 @@ import Language.Hydrangea.CodegenC
   , pairStructName, celemTypeLetter, celemTypeCType
   , cTypeName
   , detectAtomicScatterAddLoop
+  , genPairStructDefs, genRecordStructDefs
   )
 
 -- ---------------------------------------------------------------------------
@@ -65,8 +68,9 @@ import Language.Hydrangea.CodegenC
 
 -- | Artifacts produced by the MSL codegen.
 data MSLArtifacts = MSLArtifacts
-  { mslKernelSource  :: String  -- ^ Contents of the @.metal@ kernel file.
-  , mslHarnessSource :: String  -- ^ Contents of the self-contained ObjC harness.
+  { mslKernelSource  :: String        -- ^ Contents of the @.metal@ kernel file.
+  , mslHarnessSource :: String        -- ^ Contents of the self-contained ObjC harness.
+  , mslHeaderSource  :: Maybe String  -- ^ Header file (present in export mode).
   }
 
 -- | Options controlling which proc is selected as the GPU kernel.
@@ -77,10 +81,17 @@ data MSLOptions = MSLOptions
   , mslMultiKernel  :: Bool
     -- ^ When 'True' (default), automatically dispatch multiple GPU kernels
     -- when the program has more than one GPU-eligible proc.
+  , mslExportKernel :: Maybe CVar
+    -- ^ If 'Just name', generate a reusable library with init/dispatch/cleanup
+    -- lifecycle functions instead of a standalone executable.
   }
 
 defaultMSLOptions :: MSLOptions
-defaultMSLOptions = MSLOptions { mslKernelToEmit = Nothing, mslMultiKernel = True }
+defaultMSLOptions = MSLOptions
+  { mslKernelToEmit = Nothing
+  , mslMultiKernel = True
+  , mslExportKernel = Nothing
+  }
 
 -- | Per-kernel analysis record.  Captures everything needed to generate the
 -- Metal kernel source and harness dispatch for one proc.
@@ -115,16 +126,19 @@ data BufferOrigin = CPUProduced | GPUProduced CVar  -- ^ producing kernel name
 -- or when only one proc is GPU-eligible.
 codegenMSL :: MSLOptions -> C2.Program -> Either String MSLArtifacts
 codegenMSL opts prog@(C2.Program procs) =
-  case mslKernelToEmit opts of
-    Just _ -> codegenMSLSingle opts prog  -- explicit kernel: single-kernel path
-    Nothing
-      | not (mslMultiKernel opts) -> codegenMSLSingle opts prog
-      | otherwise ->
-        let gpuProcs = findGPUEligibleProcs procs
-        in case gpuProcs of
-          []  -> Left "MSL backend: no proc with a parallelizable loop found"
-          [_] -> codegenMSLSingle opts prog  -- one GPU proc: existing path
-          _   -> codegenMSLMulti prog gpuProcs
+  case mslExportKernel opts of
+    Just _  -> codegenMSLExport opts prog  -- export-kernel mode
+    Nothing ->
+      case mslKernelToEmit opts of
+        Just _ -> codegenMSLSingle opts prog  -- explicit kernel: single-kernel path
+        Nothing
+          | not (mslMultiKernel opts) -> codegenMSLSingle opts prog
+          | otherwise ->
+            let gpuProcs = findGPUEligibleProcs procs
+            in case gpuProcs of
+              []  -> Left "MSL backend: no proc with a parallelizable loop found"
+              [_] -> codegenMSLSingle opts prog  -- one GPU proc: existing path
+              _   -> codegenMSLMulti prog gpuProcs
 
 -- | Multi-kernel code path: dispatch multiple GPU kernels in sequence.
 codegenMSLMulti :: C2.Program -> [C2.Proc] -> Either String MSLArtifacts
@@ -147,6 +161,7 @@ codegenMSLMulti prog@(C2.Program procs) gpuProcs = do
       Right MSLArtifacts
         { mslKernelSource  = kernelSrc
         , mslHarnessSource = harnessSrc
+        , mslHeaderSource  = Nothing
         }
 
 -- | Single-kernel code path (existing behaviour).
@@ -168,7 +183,464 @@ codegenMSLSingle opts prog@(C2.Program procs) = do
   Right MSLArtifacts
     { mslKernelSource  = kernelSrc
     , mslHarnessSource = harnessSrc
+    , mslHeaderSource  = Nothing
     }
+
+-- ---------------------------------------------------------------------------
+-- Export-kernel code path
+-- ---------------------------------------------------------------------------
+
+-- | Export mode: generate a reusable Metal library with init/dispatch/cleanup.
+codegenMSLExport :: MSLOptions -> C2.Program -> Either String MSLArtifacts
+codegenMSLExport opts prog@(C2.Program procs) = do
+  exportName <- case mslExportKernel opts of
+    Just n  -> Right n
+    Nothing -> Left "MSL export: no kernel name specified"
+  -- Find the proc to export
+  kp <- case filter (\p -> C2.procName p == exportName) procs of
+    (p:_) -> Right p
+    []    -> Left $ "MSL export: proc not found: " ++ BS.unpack exportName
+  ka <- analyzeOneKernel prog kp
+  let retKinds = procReturnKinds2 prog
+      retTypes = inferProgramReturnTypes2 prog
+      callParamTys = buildCallParamTypes retTypes procs
+  -- Resolve export spec (reuse CodegenC infrastructure)
+  spec <- resolveExportSpec retKinds retTypes callParamTys procs exportName
+  -- Build metal export spec with hyd_metal_ prefix
+  let metalSpec = spec { exportWrapperName = "hyd_metal_" ++ sanitizeExportName exportName }
+  -- Identify which input arrays are cached (zero-arg RCall returning arrays,
+  -- not derived from proc params). Only arrays get cached as GPU buffers;
+  -- scalar zero-arg calls are just CPU helper functions run each frame.
+  let procParamSet = Set.fromList (kaProcParams ka)
+      inputArraySet = Set.fromList (kaInputArrays ka)
+      cachedArrayBindings =
+        [ (v, fn) | C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka
+                   , v `Set.member` inputArraySet      -- must be a kernel input array
+                   , v `Set.notMember` procParamSet     -- not a proc param
+                   -- not derived from a proc param via RProj
+                   , not (any (derivesFromParam procParamSet v) (kaEffectivePreLoop ka))
+        ]
+  -- Generate .metal kernel source
+  helperC <- genHelperC procs (kaName ka) retKinds
+  let kernelSrc = genMSLKernelSrc (kaName ka) (kaLoopSpec ka) (kaLoopBody ka) (kaTypeEnv ka)
+                    (kaArrayElemTys ka) (kaInputArrays ka) (kaOutputArrays ka) (kaScalarInputs ka)
+                    (kaHoistedCallMap ka) (kaPreLoopAliases ka)
+      headerSrc = genMetalExportHeader metalSpec
+      harnessSrc = genExportObjCHarness prog ka metalSpec cachedArrayBindings
+                     retKinds retTypes helperC
+  Right MSLArtifacts
+    { mslKernelSource  = kernelSrc
+    , mslHarnessSource = harnessSrc
+    , mslHeaderSource  = Just headerSrc
+    }
+
+-- | Check if a variable derives from a proc parameter (e.g., via RProj).
+derivesFromParam :: Set CVar -> CVar -> C2.Stmt -> Bool
+derivesFromParam paramSet target (C2.SAssign v (RProj _ (AVar p))) =
+  v == target && p `Set.member` paramSet
+derivesFromParam paramSet target (C2.SAssign v (RAtom (AVar p))) =
+  v == target && p `Set.member` paramSet
+derivesFromParam _ _ _ = False
+
+-- | Generate the export header file (.h).
+genMetalExportHeader :: ExportSpec -> String
+genMetalExportHeader spec =
+  let guardName = "HYDRANGEA_METAL_EXPORT_" ++ map toUpper (sanitizeExportName (exportKernelName spec)) ++ "_H"
+      ps = exportParams spec
+      cParams = case ps of
+        [] -> "void"
+        _  -> intercalate ", " [ct ++ " " ++ cn | (cn, ct) <- ps]
+      -- Collect all type strings from return type and params, emit pair struct
+      -- typedefs for any that match the hyd_pair_*_t pattern.
+      allTypeStrs = exportReturnType spec : map snd ps
+      pairDefs = nub [ genPairTypedef name
+                     | name <- allTypeStrs
+                     , "hyd_pair_" `isPrefixOfStr` name
+                     ]
+  in unlines $
+    [ "#ifndef " ++ guardName
+    , "#define " ++ guardName
+    , ""
+    , "#include \"hydrangea_runtime.h\""
+    , ""
+    , "#ifdef __cplusplus"
+    , "extern \"C\" {"
+    , "#endif"
+    ]
+    ++ (if null pairDefs then [] else "" : pairDefs)
+    ++
+    [ ""
+    , "int hyd_metal_init(const char* metallib_path);"
+    , exportReturnType spec ++ " " ++ exportWrapperName spec ++ "(" ++ cParams ++ ");"
+    , "void hyd_metal_cleanup(void);"
+    , ""
+    , "#ifdef __cplusplus"
+    , "}"
+    , "#endif"
+    , ""
+    , "#endif"
+    ]
+
+-- | Check if a string starts with a prefix.
+isPrefixOfStr :: String -> String -> Bool
+isPrefixOfStr prefix str = take (length prefix) str == prefix
+
+-- | Generate a typedef for a pair struct from its name (e.g., "hyd_pair_aa_t").
+-- Parses the letter codes between "hyd_pair_" and "_t" to determine field types.
+genPairTypedef :: String -> String
+genPairTypedef name =
+  let -- Extract letter codes: "hyd_pair_XY_t" → "XY"
+      stripped = drop 9 name  -- drop "hyd_pair_"
+      codes = takeWhile (/= '_') stripped
+      letterToCType 'a' = "hyd_array_t*"
+      letterToCType 'i' = "int64_t"
+      letterToCType 'f' = "double"
+      letterToCType 'b' = "int64_t"
+      letterToCType _   = "int64_t"
+  in case codes of
+       [c1, c2] -> "typedef struct { " ++ letterToCType c1 ++ " fst; "
+                    ++ letterToCType c2 ++ " snd; } " ++ name ++ ";"
+       _ -> "/* unknown pair type: " ++ name ++ " */"
+
+-- | Generate the export ObjC harness (.m) with init/dispatch/cleanup lifecycle.
+--
+-- Architecture:
+-- * @hyd_metal_init@: set up Metal device/pipeline/queue, compute and upload
+--   cached array bindings (zero-arg array-returning procs) to persistent GPU buffers.
+-- * Dispatch function: run pre-loop to compute scalars and decompose params,
+--   upload dynamic input arrays, create output/scalar buffers, dispatch, read back.
+-- * @hyd_metal_cleanup@: nil out persistent Metal objects.
+genExportObjCHarness
+  :: C2.Program
+  -> KernelAnalysis
+  -> ExportSpec            -- ^ Metal export spec (hyd_metal_ prefix)
+  -> [(CVar, CVar)]       -- ^ Cached array bindings: (var, proc_name) pairs
+  -> Map CVar VarKind      -- ^ Return kinds
+  -> Map CVar CType        -- ^ Program-level return types
+  -> String               -- ^ Helper C source
+  -> String
+genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helperC =
+  unlines $
+    -- Header
+    [ "// Hydrangea Metal export harness — generated by the MSL backend."
+    , "#include \"hydrangea_runtime.h\""
+    , "#include <stdio.h>"
+    , "#include <string.h>"
+    , "#include <stdlib.h>"
+    , "#import <Foundation/Foundation.h>"
+    , "#import <Metal/Metal.h>"
+    , ""
+    , "// ---- CPU helper procs ----"
+    , helperC
+    , ""
+    , "// ---- Static Metal state ----"
+    , "static id<MTLDevice> _hyd_dev;"
+    , "static id<MTLLibrary> _hyd_lib;"
+    , "static id<MTLComputePipelineState> _hyd_pso;"
+    , "static id<MTLCommandQueue> _hyd_queue;"
+    ] ++
+    -- Static cached buffer declarations
+    concatMap genCachedBufDecl cachedArrayBindings ++
+    [ ""
+    , "// ---- hyd_metal_init ----"
+    , "int hyd_metal_init(const char* metallib_path) {"
+    , "    @autoreleasepool {"
+    , "    _hyd_dev = MTLCreateSystemDefaultDevice();"
+    , "    if (!_hyd_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }"
+    , "    NSError* _err = nil;"
+    , "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib_path]];"
+    , "    _hyd_lib = [_hyd_dev newLibraryWithURL:_libURL error:&_err];"
+    , "    if (!_hyd_lib) {"
+    , "        fprintf(stderr, \"hydrangea: failed to load metallib: %s\\n\","
+    , "                [_err.localizedDescription UTF8String]);"
+    , "        return 1;"
+    , "    }"
+    , "    id<MTLFunction> _fn = [_hyd_lib newFunctionWithName:@\"" ++ sanitize (kaName ka) ++ "\"];"
+    , "    if (!_fn) { fprintf(stderr, \"hydrangea: kernel function not found\\n\"); return 1; }"
+    , "    _hyd_pso = [_hyd_dev newComputePipelineStateWithFunction:_fn error:&_err];"
+    , "    if (!_hyd_pso) {"
+    , "        fprintf(stderr, \"hydrangea: pipeline error: %s\\n\","
+    , "                [_err.localizedDescription UTF8String]);"
+    , "        return 1;"
+    , "    }"
+    , "    _hyd_queue = [_hyd_dev newCommandQueue];"
+    ] ++
+    -- Compute and upload cached array bindings
+    concatMap genCachedBufInit cachedArrayBindings ++
+    [ "    } // @autoreleasepool"
+    , "    return 0;"
+    , "}"
+    , ""
+    , "// ---- dispatch function ----"
+    ] ++
+    genDispatchFn ++
+    [ ""
+    , "// ---- hyd_metal_cleanup ----"
+    , "void hyd_metal_cleanup(void) {"
+    , "    _hyd_pso = nil;"
+    , "    _hyd_queue = nil;"
+    , "    _hyd_lib = nil;"
+    ] ++
+    concatMap genCachedBufCleanup cachedArrayBindings ++
+    [ "    _hyd_dev = nil;"
+    , "}"
+    ]
+  where
+    typeEnv = kaTypeEnv ka
+    arrayElemTys = kaArrayElemTys ka
+    cachedSet = Set.fromList (map fst cachedArrayBindings)
+    inputArrs = kaInputArrays ka
+    outputArrs = kaOutputArrays ka
+    scals = kaScalarInputs ka
+    nIn = length inputArrs
+
+    mslElemTy v = case Map.lookup v arrayElemTys of
+      Just elt -> mslTypeName elt
+      Nothing  -> case Map.lookup v typeEnv of
+        Just (CTArray elt) -> mslTypeName elt
+        _                  -> "long"
+
+    -- Static declarations for cached GPU buffers
+    genCachedBufDecl (v, _fn) =
+      [ "static id<MTLBuffer> _hyd_cached_buf_" ++ sanitize v ++ ";"
+      , "static hyd_tuple_t _hyd_cached_shape_" ++ sanitize v ++ ";"
+      ]
+
+    -- Init: compute cached binding on CPU, upload to persistent GPU buffer
+    genCachedBufInit (v, fn) =
+      let elemTy = mslElemTy v
+      in [ "    // Cached binding: " ++ sanitize v ++ " = " ++ sanitize fn ++ "()"
+         , "    hyd_array_t* _cpu_" ++ sanitize v ++ " = " ++ sanitize fn ++ "();"
+         , "    _hyd_cached_shape_" ++ sanitize v ++ " = _cpu_" ++ sanitize v ++ "->shape;"
+         , "    long _cachedN_" ++ sanitize v ++ " = hyd_shape_size(_cpu_" ++ sanitize v ++ "->shape);"
+         , "    size_t _cachedSz_" ++ sanitize v ++ " = (size_t)(_cachedN_" ++ sanitize v
+           ++ " * sizeof(" ++ elemTy ++ "));"
+         , "    _hyd_cached_buf_" ++ sanitize v ++ " = [_hyd_dev newBufferWithLength:_cachedSz_"
+           ++ sanitize v ++ " options:MTLResourceStorageModeShared];"
+         ] ++ uploadCachedBuf v elemTy ++
+         [ "    hyd_array_free(_cpu_" ++ sanitize v ++ ");"
+         ]
+
+    uploadCachedBuf v "float" =
+      [ "    { double* _src = (double*)_cpu_" ++ sanitize v ++ "->data;"
+      , "      float* _dst = (float*)_hyd_cached_buf_" ++ sanitize v ++ ".contents;"
+      , "      for (long _i = 0; _i < _cachedN_" ++ sanitize v ++ "; _i++) _dst[_i] = (float)_src[_i]; }"
+      ]
+    uploadCachedBuf v _ =
+      [ "    memcpy(_hyd_cached_buf_" ++ sanitize v ++ ".contents, _cpu_" ++ sanitize v
+        ++ "->data, _cachedSz_" ++ sanitize v ++ ");"
+      ]
+
+    genCachedBufCleanup (v, _fn) =
+      [ "    _hyd_cached_buf_" ++ sanitize v ++ " = nil;" ]
+
+    -- The dispatch function runs the pre-loop (for scalars + pair decomposition),
+    -- then creates Metal buffers, dispatches, and reads back output.
+    genDispatchFn :: [String]
+    genDispatchFn =
+      let ps = exportParams spec
+          cParams = case ps of
+            [] -> "void"
+            _  -> intercalate ", " [ct ++ " " ++ cn | (cn, ct) <- ps]
+      in [ exportReturnType spec ++ " " ++ exportWrapperName spec ++ "(" ++ cParams ++ ") {"
+         , "    @autoreleasepool {"
+         ] ++
+         -- Run pre-loop: computes scalars, decomposes pairs, allocates output arrays.
+         -- Cached array RCalls are replaced with shape stubs (data comes from GPU buffer).
+         -- Output array allocations are skipped (replaced by Metal buffers).
+         concatMap (genExportPreLoopLine (Set.fromList outputArrs) cachedSet) (kaEffectivePreLoop ka) ++
+         [ ""
+         , "    // Grid size"
+         , "    long _n = " ++ gridSizeExpr ++ ";"
+         , ""
+         , "    // --- Create Metal buffers ---"
+         ] ++
+         -- Input buffers (cached or dynamic)
+         concatMap genInputBuf (zip inputArrs [0..]) ++
+         -- Shape buffers
+         concatMap genInputShapeBuf (zip inputArrs [nIn..]) ++
+         -- Output buffers
+         concatMap genOutputBuf (zip outputArrs [nIn * 2..]) ++
+         -- Scalar buffers
+         concatMap genScalarBuf (zip scals [nIn * 2 + length outputArrs..]) ++
+         [ ""
+         , "    // --- Dispatch ---"
+         , "    id<MTLCommandBuffer> _cmd = [_hyd_queue commandBuffer];"
+         , "    id<MTLComputeCommandEncoder> _enc = [_cmd computeCommandEncoder];"
+         , "    [_enc setComputePipelineState:_hyd_pso];"
+         ] ++
+         [ "    [_enc setBuffer:_buf" ++ show i ++ " offset:0 atIndex:" ++ show i ++ "];"
+         | i <- [0 .. nIn * 2 + length outputArrs + length scals - 1]
+         ] ++
+         [ "    NSUInteger _tgs = MIN(256UL, _hyd_pso.maxTotalThreadsPerThreadgroup);"
+         , "    if (_tgs == 0) _tgs = 1;"
+         , "    [_enc dispatchThreads:MTLSizeMake((NSUInteger)_n, 1, 1)"
+         , "      threadsPerThreadgroup:MTLSizeMake(_tgs, 1, 1)];"
+         , "    [_enc endEncoding];"
+         , "    [_cmd commit];"
+         , "    [_cmd waitUntilCompleted];"
+         , ""
+         ] ++
+         -- Read back outputs and construct return value
+         genReadback ++
+         -- Post-loop statements (dummy array allocations, reshaping, etc.)
+         -- Skip RPairMake (handled by return construction) and reshape_view
+         -- (handled by readback shape logic).
+         concatMap genPostLoopLine (kaPostLoopStmts ka) ++
+         genReturnConstruction ++
+         [ "    } // @autoreleasepool"
+         , "}"
+         ]
+
+    -- Pre-loop line for export dispatch: like genPreLoopLine but:
+    -- 1. Skips output array allocations (Metal buffers replace them)
+    -- 2. For cached array RCalls: emits a shape-only stub (GPU buffer has data)
+    genExportPreLoopLine :: Set CVar -> Set CVar -> C2.Stmt -> [String]
+    genExportPreLoopLine skipAlloc cachedVars stmt = case stmt of
+      C2.SAssign v (RArrayAlloc _) | v `Set.member` skipAlloc ->
+        []  -- output arrays: Metal buffer, skip CPU alloc
+      C2.SAssign v (RCall fn []) | v `Set.member` cachedVars ->
+        -- Cached array: use shape stub so downstream shape accesses work
+        [ "    // Cached array (GPU buffer): " ++ sanitize v
+        , "    hyd_array_t _stub_" ++ sanitize v ++ " = { .shape = _hyd_cached_shape_" ++ sanitize v ++ ", .data = NULL };"
+        , "    hyd_array_t* " ++ sanitize v ++ " = &_stub_" ++ sanitize v ++ ";"
+        ]
+      _ -> genPreLoopLine typeEnv retKinds skipAlloc Set.empty stmt
+
+    -- Grid size expression
+    gridSizeExpr = case C2.lsBounds (kaLoopSpec ka) of
+      [b] -> "(long)" ++ genMSLIndexExpr b
+      bs  -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
+
+    -- Input buffer: cached → reference static GPU buffer, dynamic → upload from hyd_array_t*
+    genInputBuf (v, i) =
+      let elemTy = mslElemTy v
+      in if v `Set.member` cachedSet
+         then [ "    // Cached input: " ++ sanitize v
+              , "    id<MTLBuffer> _buf" ++ show i ++ " = _hyd_cached_buf_" ++ sanitize v ++ ";"
+              ]
+         else [ "    // Dynamic input: " ++ sanitize v
+              , "    long _inN" ++ show i ++ " = hyd_shape_size(" ++ sanitize v ++ "->shape);"
+              , "    size_t _buf" ++ show i ++ "_sz = (size_t)(_inN" ++ show i ++ " * sizeof(" ++ elemTy ++ "));"
+              , "    id<MTLBuffer> _buf" ++ show i ++ " = [_hyd_dev newBufferWithLength:_buf"
+                ++ show i ++ "_sz options:MTLResourceStorageModeShared];"
+              ] ++ fillBuf i v elemTy
+
+    fillBuf i v "float" =
+      [ "    { double* _fsrc = (double*)" ++ sanitize v ++ "->data; float* _fdst = (float*)_buf" ++ show i ++ ".contents;"
+      , "      for (long _fci = 0; _fci < _inN" ++ show i ++ "; _fci++) _fdst[_fci] = (float)_fsrc[_fci]; }"
+      ]
+    fillBuf i v _ =
+      [ "    memcpy(_buf" ++ show i ++ ".contents, " ++ sanitize v ++ "->data, _buf" ++ show i ++ "_sz);" ]
+
+    -- Shape buffer: cached → stored shape, dynamic → array->shape
+    genInputShapeBuf (v, i) =
+      if v `Set.member` cachedSet
+      then [ "    id<MTLBuffer> _buf" ++ show i ++ " = [_hyd_dev newBufferWithBytes:&_hyd_cached_shape_"
+               ++ sanitize v ++ " length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"
+           ]
+      else [ "    id<MTLBuffer> _buf" ++ show i ++ " = [_hyd_dev newBufferWithBytes:&" ++ sanitize v
+               ++ "->shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"
+           ]
+
+    -- Output buffer
+    genOutputBuf (v, i) =
+      let elemTy = mslElemTy v
+          outputAllocShapes = Map.fromList
+            [ (ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka ]
+          sizeExpr = case Map.lookup v outputAllocShapes of
+            Just shpAtom -> "hyd_shape_size(" ++ genCAtom shpAtom ++ ")"
+            Nothing -> "_n"
+      in [ "    // Output: " ++ sanitize v
+         , "    long _outN" ++ show i ++ " = " ++ sizeExpr ++ ";"
+         , "    size_t _buf" ++ show i ++ "_sz = (size_t)(_outN" ++ show i ++ " * sizeof(" ++ elemTy ++ "));"
+         , "    id<MTLBuffer> _buf" ++ show i ++ " = [_hyd_dev newBufferWithLength:_buf"
+           ++ show i ++ "_sz options:MTLResourceStorageModeShared];"
+         , "    memset(_buf" ++ show i ++ ".contents, 0, _buf" ++ show i ++ "_sz);"
+         ]
+
+    -- Scalar buffer
+    genScalarBuf (v, i) =
+      let sty = case Map.lookup v typeEnv of
+                  Just ct -> mslTypeName ct
+                  Nothing -> "long"
+      in [ "    // Scalar: " ++ sanitize v
+         , "    " ++ sty ++ " _scalar" ++ show i ++ " = " ++ sanitize v ++ ";"
+         , "    id<MTLBuffer> _buf" ++ show i ++ " = [_hyd_dev newBufferWithBytes:&_scalar"
+           ++ show i ++ " length:sizeof(" ++ sty ++ ") options:MTLResourceStorageModeShared];"
+         ]
+
+    -- Read back GPU output arrays from Metal buffers (float→double).
+    genReadback :: [String]
+    genReadback = concat
+      [ let i = nIn * 2 + idx
+            elemTy = mslElemTy v
+            sizeVar = "_outN" ++ show i
+            outputAllocShapes = Map.fromList
+              [ (ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka ]
+            reshapeShape = listToMaybe
+              [ shpAtom
+              | C2.SAssign _ (RCall "hyd_array_reshape_view" [arrAtom, shpAtom])
+                  <- kaPostLoopStmts ka
+              , arrAtom == AVar v
+              ]
+            shapeExpr = case reshapeShape of
+              Just shpAtom -> genCAtom shpAtom
+              Nothing -> case Map.lookup v outputAllocShapes of
+                Just shpAtom -> genCAtom shpAtom
+                Nothing -> "hyd_tuple_make(1, (int64_t)" ++ sizeVar ++ ")"
+        in [ "    // Read back: " ++ sanitize v
+           , "    hyd_array_t* _result_" ++ sanitize v ++ " = hyd_array_alloc(" ++ shapeExpr ++ ");"
+           ] ++
+           (if elemTy == "float"
+            then [ "    { float* _gsrc = (float*)_buf" ++ show i ++ ".contents;"
+                 , "      double* _gdst = (double*)_result_" ++ sanitize v ++ "->data;"
+                 , "      for (long _ri = 0; _ri < " ++ sizeVar ++ "; _ri++) _gdst[_ri] = (double)_gsrc[_ri]; }"
+                 ]
+            else [ "    memcpy(_result_" ++ sanitize v ++ "->data, _buf" ++ show i
+                     ++ ".contents, " ++ sizeVar ++ " * sizeof(" ++ elemTy ++ "));"
+                 ])
+      | (idx, v) <- zip [0..] outputArrs
+      ]
+
+    -- Generate post-loop statements needed before return (e.g., dummy array allocs).
+    -- Skip RPairMake and reshape_view (handled by return construction / readback).
+    genPostLoopLine :: C2.Stmt -> [String]
+    genPostLoopLine (C2.SAssign _ (RPairMake {})) = []  -- handled by genReturnConstruction
+    genPostLoopLine (C2.SAssign _ (RCall "hyd_array_reshape_view" _)) = []  -- handled by readback
+    genPostLoopLine stmt = genPreLoopLine typeEnv retKinds Set.empty Set.empty stmt
+
+    -- Construct the return value from post-loop RPairMake or output arrays.
+    genReturnConstruction :: [String]
+    genReturnConstruction =
+      let retTy = exportReturnType spec
+          outputSet = Set.fromList outputArrs
+          pairMake = listToMaybe
+            [ (a1, a2) | C2.SAssign _ (RPairMake _ _ a1 a2) <- kaPostLoopStmts ka ]
+          atomToRetExpr (AVar v)
+            | v `Set.member` outputSet = "_result_" ++ sanitize v
+            | otherwise                = sanitize v  -- CPU-produced array
+          atomToRetExpr _ = "NULL"
+      in case pairMake of
+           Just (a1, a2) ->
+             [ "    " ++ retTy ++ " _ret = { .fst = " ++ atomToRetExpr a1
+               ++ ", .snd = " ++ atomToRetExpr a2 ++ " };"
+             , "    return _ret;"
+             ]
+           Nothing -> case outputArrs of
+             [v] | retTy == "hyd_array_t*" ->
+                     [ "    return _result_" ++ sanitize v ++ ";" ]
+                 | otherwise ->
+                     [ "    " ++ retTy ++ " _ret = { .fst = _result_" ++ sanitize v
+                       ++ ", .snd = _result_" ++ sanitize v ++ " };"
+                     , "    return _ret;"
+                     ]
+             [v1, v2] ->
+                     [ "    " ++ retTy ++ " _ret = { .fst = _result_" ++ sanitize v1
+                       ++ ", .snd = _result_" ++ sanitize v2 ++ " };"
+                     , "    return _ret;"
+                     ]
+             _ -> [ "    return _result_" ++ sanitize (head outputArrs) ++ ";" ]
 
 -- | Analyze a single proc for Metal kernel generation.
 analyzeOneKernel :: C2.Program -> C2.Proc -> Either String KernelAnalysis
