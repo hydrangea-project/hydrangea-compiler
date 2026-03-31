@@ -296,12 +296,19 @@ lowerExp expr = case expr of
   EPair _ e1 e2 -> do
     (s1, a1) <- lowerExp e1
     (s2, a2) <- lowerExp e2
-    cty1 <- elemTypeOfAtom a1
-    cty2 <- elemTypeOfAtom a2
+    met1 <- elemTypeOfAtom a1
+    met2 <- elemTypeOfAtom a2
     t <- freshCVar "pair"
-    let pct = CTPair (elemTypeToCType cty1) (elemTypeToCType cty2)
-    registerCType t pct
-    pure (s1 ++ s2 ++ [SAssign t (RPairMake cty1 cty2 a1 a2)], AVar t)
+    -- Use CEInt as a placeholder only when the real type is unknown; CFGTyping
+    -- will recover the correct type via its fixpoint.  Crucially, do NOT
+    -- register a pair type whose components default to CTInt64 — that would
+    -- poison procTypeEnv and prevent CFGTyping from converging to the correct type.
+    let et1 = fromMaybe CEInt met1
+        et2 = fromMaybe CEInt met2
+    case (met1, met2) of
+      (Just _, Just _) -> registerCType t (CTPair (elemTypeToCType et1) (elemTypeToCType et2))
+      _                -> pure ()  -- leave unregistered; CFGTyping recovers
+    pure (s1 ++ s2 ++ [SAssign t (RPairMake et1 et2 a1 a2)], AVar t)
 
   EIfThen _ cond thn -> do
     (sc, ac) <- lowerExp cond
@@ -738,8 +745,10 @@ lowerExp expr = case expr of
     k <- freshCVar "scan_k"
     elem' <- freshCVar "scan_elem"
     accTy <- ctypeOfAtom ai
-    registerCType acc accTy
-    registerCType outArr (CTArray accTy)
+    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
+    when (accTy /= CTUnknown) $ do
+      registerCType acc accTy
+      registerCType outArr (CTArray accTy)
     propagatePairInfo acc ai
     bodyStmts <- inlineBinaryFn fnExp acc elem' acc
     pure ( si ++ sa
@@ -775,8 +784,10 @@ lowerExp expr = case expr of
     elemIx <- freshCVar "segred_elem_ix"
     elem' <- freshCVar "segred_elem"
     accTy <- ctypeOfAtom ai
-    registerCType acc accTy
-    registerCType outArr (CTArray accTy)
+    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
+    when (accTy /= CTUnknown) $ do
+      registerCType acc accTy
+      registerCType outArr (CTArray accTy)
     propagatePairInfo acc ai
     bodyStmts <- inlineBinaryFn fnExp acc elem' acc
     pure
@@ -1877,16 +1888,18 @@ ctypeOfAtom (AVar v)    = gets $ fromMaybe CTUnknown . M.lookup v . lsTypeEnv
 ctypeOfAtom (AVecVar _) = pure CTUnknown
 
 -- | Determine the @CElemType@ of an atom for use in @RPairMake@.
-elemTypeOfAtom :: Atom -> LowerM CElemType
-elemTypeOfAtom (AFloat _) = pure CEFloat
-elemTypeOfAtom (ABool _)  = pure CEBool
+-- Returns 'Nothing' when the atom's type is unknown or not representable
+-- as a 'CElemType'.  Callers must not fall back to 'CEInt' silently;
+-- unregistered pair types are left for CFGTyping to recover correctly.
+elemTypeOfAtom :: Atom -> LowerM (Maybe CElemType)
+elemTypeOfAtom (AFloat _) = pure (Just CEFloat)
+elemTypeOfAtom (ABool _)  = pure (Just CEBool)
+elemTypeOfAtom (AInt _)   = pure (Just CEInt)
 elemTypeOfAtom (AVar v)   = gets $ \st ->
   case M.lookup v (lsTypeEnv st) of
-    Just ct | Just et <- ctypeToElemType ct -> et
-    Just CTDouble -> CEFloat
-    Just (CTArray _) -> CEArray
-    _ -> CEInt
-elemTypeOfAtom _          = pure CEInt
+    Just ct -> ctypeToElemType ct
+    Nothing -> Nothing
+elemTypeOfAtom _          = pure Nothing
 
 -- | Check if an atom is positively confirmed to be a scalar integer.
 -- Returns True only when we have evidence the atom is not a tuple.

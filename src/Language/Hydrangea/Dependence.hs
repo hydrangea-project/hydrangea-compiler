@@ -3,8 +3,8 @@
 -- |
 -- Module: Language.Hydrangea.Dependence
 --
--- Dependence analysis operating on CFG index expressions. Conservative initial
--- implementation: exact equality and simple affine (i vs i + const) checks.
+-- Dependence analysis operating on CFG index expressions. Uses exact equality
+-- and simple affine checks (e.g., i vs i + const).
 module Language.Hydrangea.Dependence
   ( ArrayAccess2(..)
   , AccessType2(..)
@@ -73,7 +73,7 @@ analyzeAffine :: IndexExpr -> IndexExpr -> (DependenceDirection2, Maybe [Integer
 analyzeAffine (ITuple as) (ITuple bs)
   | length as == length bs =
       let results = zipWith analyzeAffineSingle as bs
-      in if any (\r -> fst r == DDUnknown) results
+      in if any ((== DDUnknown) . fst) results
            then (DDUnknown, Nothing)
            else
              case sequence (map snd results) of

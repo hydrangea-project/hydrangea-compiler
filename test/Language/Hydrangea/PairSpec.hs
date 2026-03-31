@@ -259,3 +259,39 @@ spec = do
           -- over the type recovery fixpoint result.
           csrc `shouldSatisfy`    isInfixOf "hyd_pair_aa_t step"
           csrc `shouldNotSatisfy` isInfixOf "hyd_pair_ia_t step"
+
+  -- -------------------------------------------------------------------------
+  -- Regression: no CTInt64 fallback in elemTypeOfAtom / EScan registration
+  -- -------------------------------------------------------------------------
+  describe "no CTInt64 fallback regression" $ do
+
+    it "EPair with array param does not back-propagate CTInt64 and block array type recovery" $ do
+      -- Old code: elemTypeOfAtom on an unregistered AVar returned CEInt, causing
+      -- registerCType pair (CTPair CTInt64 CTDouble).  CFGTyping back-propagated
+      -- CTInt64 to the array param, and bindVarType had no CTInt64→CTArray upgrade
+      -- case, leaving the param declared as int64_t instead of hyd_array_t*.
+      let src = "let f arr = (arr, index [0] arr +. 0.0)"
+      case readDecs (BS.pack src) of
+        Left err -> expectationFailure $ "Parse error: " ++ err
+        Right ds -> do
+          csrc <- compileToCOptIO False ds
+          csrc `shouldSatisfy`    isInfixOf "hyd_array_t*"
+          csrc `shouldSatisfy`    isInfixOf "hyd_pair_af_t f"
+          csrc `shouldNotSatisfy` isInfixOf "hyd_pair_if_t f"
+
+    it "scan with unknown-type init param does not register CTUnknown (would crash codegen)" $ do
+      -- Old code: ctypeOfAtom on a param atom returned CTUnknown, then
+      -- registerCType acc CTUnknown was called unconditionally.  CFGTyping could
+      -- not upgrade CTUnknown→CTDouble, leaving outArr typed CTArray CTUnknown.
+      -- genArrayAllocExpr then called cTypeName CTUnknown → compiler error.
+      -- New code: CTUnknown registration is skipped; CFGTyping recovers the type.
+      let src = unlines
+            [ "let scan_prefix init arr = scan (fn acc x => acc +. x) init arr"
+            , "let dummy = 0"
+            ]
+      case readDecs (BS.pack src) of
+        Left err -> expectationFailure $ "Parse error: " ++ err
+        Right ds -> do
+          csrc <- compileToCOptIO False ds
+          csrc `shouldSatisfy`    isInfixOf "sizeof(double)"
+          csrc `shouldNotSatisfy` isInfixOf "sizeof(int64_t)"

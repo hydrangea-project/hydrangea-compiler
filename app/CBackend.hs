@@ -43,7 +43,7 @@ compileAndRunC mcc src keepC compileOnly parallel =
     envCC <- lookupEnv "CC"
     let ccCmd = selectCompiler mcc envCC
         ompFlags = if parallel then ["-fopenmp"] else []
-        flags = ["-O2", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c"]
+        flags = ["-O2", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
     -- If OpenMP is requested, probe whether the selected compiler accepts -fopenmp
     when parallel $ do
       let probeSrc = unlines

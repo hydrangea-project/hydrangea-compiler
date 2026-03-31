@@ -243,7 +243,11 @@ substScalarRHS iter base rhs = case rhs of
   C.R2DToFlat a b -> C.R2DToFlat (substScalarAtom iter base a) (substScalarAtom iter base b)
   C.RCall f args -> C.RCall f (map (substScalarAtom iter base) args)
   C.RVecUnOp op a -> C.RVecUnOp op (substScalarAtom iter base a)
-  other -> other
+  C.RVecLoad a b -> C.RVecLoad (substScalarAtom iter base a) (substScalarAtom iter base b)
+  C.RVecStore a b c -> C.RVecStore (substScalarAtom iter base a) (substScalarAtom iter base b) (substScalarAtom iter base c)
+  C.RVecBinOp op a b -> C.RVecBinOp op (substScalarAtom iter base a) (substScalarAtom iter base b)
+  C.RVecSplat a -> C.RVecSplat (substScalarAtom iter base a)
+  C.RVecReduce op a -> C.RVecReduce op (substScalarAtom iter base a)
 
 rhsRefsVector :: VecEnv -> C.RHS -> Bool
 rhsRefsVector env rhs = case rhs of
@@ -280,13 +284,20 @@ supportedVecBinOp op = op `elem` [CAddF, CSubF, CMulF, CDivF]
 supportedVecUnOp :: C.UnOp -> Bool
 supportedVecUnOp op = op `elem` [C.CSqrt, C.CExpF, C.CLog, C.CErf]
 
-toVectorOperand :: TypeEnv -> VecEnv -> CVar -> CVar -> CVar -> Atom -> Maybe ([Stmt], Atom)
-toVectorOperand typeEnv env iter base owner atom =
-  case substScalarAtom iter base atom of
+data VectorLowerCtx = VectorLowerCtx
+  { vlcTypeEnv     :: TypeEnv
+  , vlcAccessFacts :: AccessFacts
+  , vlcIter        :: CVar
+  , vlcBase        :: CVar
+  }
+
+toVectorOperand :: VectorLowerCtx -> VecEnv -> CVar -> Atom -> Maybe ([Stmt], Atom)
+toVectorOperand ctx env owner atom =
+  case substScalarAtom (vlcIter ctx) (vlcBase ctx) atom of
     AVar v | Just vv <- M.lookup v env ->
       Just ([], AVecVar vv)
     scalar
-      | isDoubleCompatibleAtom typeEnv scalar ->
+      | isDoubleCompatibleAtom (vlcTypeEnv ctx) scalar ->
           let splatVar = owner <> "__splat"
           in Just ([SAssign splatVar (C.RVecSplat scalar)], AVecVar splatVar)
       | otherwise ->
@@ -315,87 +326,92 @@ atomAccessFact :: AccessFacts -> Atom -> Maybe VectorAccessFact
 atomAccessFact accessFacts (AVar v) = M.lookup v accessFacts
 atomAccessFact _ _ = Nothing
 
-transformVectorStmt :: TypeEnv -> AccessFacts -> CVar -> CVar -> VecEnv -> Stmt -> Maybe (VecEnv, [Stmt])
-transformVectorStmt typeEnv accessFacts iter base env stmt = case stmt of
-  SAssign v (C.RArrayLoad arr@(AVar _) idx)
-    | arrayAllowsExplicitLoad typeEnv accessFacts arr -> do
-        idx' <- contiguousVectorIndex accessFacts iter base idx
-        let vv = vecTarget env v
-        pure (M.insert v vv env, [SAssign vv (C.RVecLoad arr idx')])
+transformVectorStmt :: VectorLowerCtx -> VecEnv -> Stmt -> Maybe (VecEnv, [Stmt])
+transformVectorStmt ctx env stmt =
+  let typeEnv    = vlcTypeEnv ctx
+      accessFacts = vlcAccessFacts ctx
+      iter       = vlcIter ctx
+      base       = vlcBase ctx
+  in case stmt of
+    SAssign v (C.RArrayLoad arr@(AVar _) idx)
+      | arrayAllowsExplicitLoad typeEnv accessFacts arr -> do
+          idx' <- contiguousVectorIndex accessFacts iter base idx
+          let vv = vecTarget env v
+          pure (M.insert v vv env, [SAssign vv (C.RVecLoad arr idx')])
 
-  SAssign v (C.RBinOp op a b)
-    | supportedVecBinOp op ->
-        let a' = substScalarAtom iter base a
-            b' = substScalarAtom iter base b
-            wantsVector = atomRefsVector env a' || atomRefsVector env b'
-        in if wantsVector
-             then do
-               let vv = vecTarget env v
-               (preA, va) <- toVectorOperand typeEnv env iter base (vv <> "__lhs") a
-               (preB, vb) <- toVectorOperand typeEnv env iter base (vv <> "__rhs") b
-               pure (M.insert v vv env, preA ++ preB ++ [SAssign vv (C.RVecBinOp op va vb)])
-             else pure (env, [SAssign v (C.RBinOp op a' b')])
+    SAssign v (C.RBinOp op a b)
+      | supportedVecBinOp op ->
+          let a' = substScalarAtom iter base a
+              b' = substScalarAtom iter base b
+              wantsVector = atomRefsVector env a' || atomRefsVector env b'
+          in if wantsVector
+               then do
+                 let vv = vecTarget env v
+                 (preA, va) <- toVectorOperand ctx env (vv <> "__lhs") a
+                 (preB, vb) <- toVectorOperand ctx env (vv <> "__rhs") b
+                 pure (M.insert v vv env, preA ++ preB ++ [SAssign vv (C.RVecBinOp op va vb)])
+               else pure (env, [SAssign v (C.RBinOp op a' b')])
 
-  SAssign v (C.RUnOp op a)
-    | supportedVecUnOp op ->
-        let a' = substScalarAtom iter base a
-            wantsVector = atomRefsVector env a'
-        in if wantsVector
-             then do
-               let vv = vecTarget env v
-               (preA, va) <- toVectorOperand typeEnv env iter base (vv <> "__arg") a
-               pure (M.insert v vv env, preA ++ [SAssign vv (C.RVecUnOp op va)])
-             else pure (env, [SAssign v (C.RUnOp op a')])
+    SAssign v (C.RUnOp op a)
+      | supportedVecUnOp op ->
+          let a' = substScalarAtom iter base a
+              wantsVector = atomRefsVector env a'
+          in if wantsVector
+               then do
+                 let vv = vecTarget env v
+                 (preA, va) <- toVectorOperand ctx env (vv <> "__arg") a
+                 pure (M.insert v vv env, preA ++ [SAssign vv (C.RVecUnOp op va)])
+               else pure (env, [SAssign v (C.RUnOp op a')])
 
-  SAssign v (C.RAtom a) ->
-    let a' = substScalarAtom iter base a
-    in case a' of
-         AVar src | Just vvSrc <- M.lookup src env ->
-           let vv = vecTarget env v
-           in pure (M.insert v vv env, [SAssign vv (C.RAtom (AVecVar vvSrc))])
-         _ ->
-           if atomRefsVector env a'
-             then Nothing
-             else pure (env, [SAssign v (C.RAtom a')])
+    SAssign v (C.RAtom a) ->
+      let a' = substScalarAtom iter base a
+      in case a' of
+           AVar src | Just vvSrc <- M.lookup src env ->
+             let vv = vecTarget env v
+             in pure (M.insert v vv env, [SAssign vv (C.RAtom (AVecVar vvSrc))])
+           _ ->
+             if atomRefsVector env a'
+               then Nothing
+               else pure (env, [SAssign v (C.RAtom a')])
 
-  SAssign v rhs ->
-    let rhs' = substScalarRHS iter base rhs
-    in if rhsRefsVector env rhs'
-         then Nothing
-         else pure (env, [SAssign v rhs'])
+    SAssign v rhs ->
+      let rhs' = substScalarRHS iter base rhs
+      in if rhsRefsVector env rhs'
+           then Nothing
+           else pure (env, [SAssign v rhs'])
 
-  SArrayWrite arr@(AVar _) idx val
-    | arrayAllowsExplicitWrite typeEnv accessFacts arr ->
-        let val' = substScalarAtom iter base val
-        in case val' of
-              AVar src | Just vv <- M.lookup src env
-                      , Just idx' <- contiguousVectorIndex accessFacts iter base idx ->
-                pure (env, [SAssign "__vec_store_discard" (C.RVecStore arr idx' (AVecVar vv))])
-              _ ->
-                let idx' = substScalarAtom iter base idx
-               in if atomRefsVector env val'
-                  then Nothing
-                  else pure (env, [SArrayWrite arr idx' val'])
+    SArrayWrite arr@(AVar _) idx val
+      | arrayAllowsExplicitWrite typeEnv accessFacts arr ->
+          let val' = substScalarAtom iter base val
+          in case val' of
+                AVar src | Just vv <- M.lookup src env
+                        , Just idx' <- contiguousVectorIndex accessFacts iter base idx ->
+                  pure (env, [SAssign "__vec_store_discard" (C.RVecStore arr idx' (AVecVar vv))])
+                _ ->
+                  let idx' = substScalarAtom iter base idx
+                 in if atomRefsVector env val'
+                    then Nothing
+                    else pure (env, [SArrayWrite arr idx' val'])
 
-  SArrayWrite arr _ _ ->
-    if atomRefsVector env arr then Nothing else pure (env, [stmt])
+    SArrayWrite arr _ _ ->
+      if atomRefsVector env arr then Nothing else pure (env, [stmt])
 
-  SIf {} -> Nothing
-  SLoop {} -> Nothing
-  SBreak -> Nothing
+    SIf {} -> Nothing
+    SLoop {} -> Nothing
+    SBreak -> Nothing
 
-  SReturn a ->
-    let a' = substScalarAtom iter base a
-    in if atomRefsVector env a'
-         then Nothing
-         else pure (env, [SReturn a'])
+    SReturn a ->
+      let a' = substScalarAtom iter base a
+      in if atomRefsVector env a'
+           then Nothing
+           else pure (env, [SReturn a'])
 
-transformVectorBody :: TypeEnv -> AccessFacts -> CVar -> CVar -> VecEnv -> [Stmt] -> Maybe [Stmt]
-transformVectorBody typeEnv accessFacts iter base env0 = go env0
+transformVectorBody :: VectorLowerCtx -> VecEnv -> [Stmt] -> Maybe [Stmt]
+transformVectorBody ctx env0 = go env0
   where
     go _ [] = Just []
     go env (stmt:rest) = do
-      (env', stmt') <- transformVectorStmt typeEnv accessFacts iter base env stmt
+      (env', stmt') <- transformVectorStmt ctx env stmt
       rest' <- go env' rest
       pure (stmt' ++ rest')
 
@@ -434,7 +450,8 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
           let accVec = vecVarName acc
               vecInit = SAssign accVec (C.RVecSplat initVal)
               vecEnv0 = M.singleton acc accVec
-          vecBody <- transformVectorBody typeEnv accessFacts iter vecBase vecEnv0 body
+              ctx = VectorLowerCtx typeEnv accessFacts iter vecBase
+          vecBody <- transformVectorBody ctx vecEnv0 body
           if not (hasExplicitVectorOps vecBody)
             then Nothing
             else do
@@ -445,7 +462,8 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
                     _ -> tailPrep ++ [SLoop tailLoopSpec tailBody]
               pure (vecTripsStmt : vecInit : vecLoop : reduceBack : tailStmts)
     Nothing -> do
-      vecBody <- transformVectorBody typeEnv accessFacts iter vecBase M.empty body
+      let ctx = VectorLowerCtx typeEnv accessFacts iter vecBase
+      vecBody <- transformVectorBody ctx M.empty body
       if not (hasExplicitVectorOps vecBody)
         then Nothing
         else do

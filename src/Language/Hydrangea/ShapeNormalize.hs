@@ -162,9 +162,7 @@ normExp expr = case expr of
   EVec a es -> EVec a <$> mapM normExp es
   EPair a e1 e2 -> EPair a <$> normExp e1 <*> normExp e2
   ERecord a fields ->
-    ERecord a <$> mapM (\(field, fieldExp) -> do
-      fieldExp' <- normExp fieldExp
-      pure (field, fieldExp')) fields
+    ERecord a <$> mapM (\(f, e) -> (f,) <$> normExp e) fields
   ERecordProj a e field -> ERecordProj a <$> normExp e <*> pure field
   EGenerate a sz f -> EGenerate a <$> normExp sz <*> normExp f
   EMap a f arr -> EMap a <$> normExp f <*> normExp arr

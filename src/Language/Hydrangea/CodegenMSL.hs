@@ -12,7 +12,7 @@
 --   procs, fills Metal buffers, dispatches the GPU kernel, and prints the
 --   result.
 --
--- Scope of the initial implementation:
+-- Supported kernel forms:
 --
 -- * 1-D parallel \/ vector map kernels (outermost @LoopMap@ loop).
 -- * Scalar and 1-D array inputs\/outputs.
@@ -28,10 +28,9 @@ module Language.Hydrangea.CodegenMSL
   ) where
 
 import Control.Applicative ((<|>))
-import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.Char (toUpper)
-import Data.List (intercalate, maximumBy, nub)
+import Data.List (intercalate, isPrefixOf, maximumBy, nub)
 import Data.Maybe (listToMaybe)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -49,18 +48,15 @@ import Language.Hydrangea.CFGTyping
   )
 import Language.Hydrangea.CodegenC
   ( CodegenOptions(..), CodegenArtifacts(..), VarKind(..)
-  , ExportSpec(..), resolveExportSpec, procReturnTypeName, sanitizeExportName
+  , ExportSpec(..), resolveExportSpec, sanitizeExportName
   , defaultCodegenOptions, codegenProgram2WithOptions
   , sanitize, splitFinalReturn
-  , typeEnvToVarSets, classifyVarKinds2
-  , arrayVarsProc2, pairVarsProc2
   , inferArrayElemTypesFromStmts
   , procReturnKinds2
   , isFloatArithBinOp, isMathFloatOp
   , pairStructName, celemTypeLetter, celemTypeCType
   , cTypeName
   , detectAtomicScatterAddLoop
-  , genPairStructDefs, genRecordStructDefs
   )
 
 -- ---------------------------------------------------------------------------
@@ -255,7 +251,7 @@ genMetalExportHeader spec =
       allTypeStrs = exportReturnType spec : map snd ps
       pairDefs = nub [ genPairTypedef name
                      | name <- allTypeStrs
-                     , "hyd_pair_" `isPrefixOfStr` name
+                     , "hyd_pair_" `isPrefixOf` name
                      ]
   in unlines $
     [ "#ifndef " ++ guardName
@@ -280,10 +276,6 @@ genMetalExportHeader spec =
     , ""
     , "#endif"
     ]
-
--- | Check if a string starts with a prefix.
-isPrefixOfStr :: String -> String -> Bool
-isPrefixOfStr prefix str = take (length prefix) str == prefix
 
 -- | Generate a typedef for a pair struct from its name (e.g., "hyd_pair_aa_t").
 -- Parses the letter codes between "hyd_pair_" and "_t" to determine field types.

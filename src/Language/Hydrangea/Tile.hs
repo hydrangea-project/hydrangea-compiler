@@ -60,7 +60,7 @@ tileStmts2 stmts = evalState (rewriteStmts2WithM 0 (+ 1) rewriteStmt stmts) (col
 rewriteStmt :: Int -> Stmt -> TileM [Stmt]
 rewriteStmt depth stmt = case stmt of
   SLoop spec body ->
-    maybe [SLoop spec body] id <$> tileLoop depth spec body
+    fromMaybe [SLoop spec body] <$> tileLoop depth spec body
   _ -> pure [stmt]
 
 tileLoop :: Int -> LoopSpec -> [Stmt] -> TileM (Maybe [Stmt])
@@ -133,7 +133,6 @@ chooseTileSize cfg spec bound
   where
     tileSize = case lsRole spec of
       LoopReduction -> tcReductionTile cfg
-      LoopMap -> tcDefaultTile cfg
       _ -> tcDefaultTile cfg
 
     usefulBound n expr = case expr of
@@ -182,7 +181,7 @@ buildStripMinedLoop spec body plans = do
 setupDim :: TiledDim -> [Stmt]
 setupDim td =
   [ SAssign (tdTileStart td) (RBinOp CMul (AVar (tdTileIter td)) (AInt (tdTileSize td))) ]
-    ++ minLenSetup (tdBoundAtom td) (tdTileStart td) (tdTileRemain td) (tdTileShort td) (tdTileLen td) (tdTileSize td)
+    ++ minLenSetup td
 
 assignOrigIter :: TiledDim -> Stmt
 assignOrigIter td =
@@ -197,14 +196,14 @@ tiledLoopRole role = case role of
   LoopReduction -> LoopMap
   LoopMapReduction -> LoopMap
 
-minLenSetup :: Atom -> CVar -> CVar -> CVar -> CVar -> Integer -> [Stmt]
-minLenSetup boundAtom tileStart tileRemain tileShort tileLen tileSize =
-  [ SAssign tileRemain (RBinOp CSub boundAtom (AVar tileStart))
-  , SAssign tileShort (RBinOp CLt (AVar tileRemain) (AInt tileSize))
+minLenSetup :: TiledDim -> [Stmt]
+minLenSetup td =
+  [ SAssign (tdTileRemain td) (RBinOp CSub (tdBoundAtom td) (AVar (tdTileStart td)))
+  , SAssign (tdTileShort td) (RBinOp CLt (AVar (tdTileRemain td)) (AInt (tdTileSize td)))
   , SIf
-      (AVar tileShort)
-      [SAssign tileLen (RAtom (AVar tileRemain))]
-      [SAssign tileLen (RAtom (AInt tileSize))]
+      (AVar (tdTileShort td))
+      [SAssign (tdTileLen td) (RAtom (AVar (tdTileRemain td)))]
+      [SAssign (tdTileLen td) (RAtom (AInt (tdTileSize td)))]
   ]
 
 tileCountExpr :: IndexExpr -> Integer -> IndexExpr

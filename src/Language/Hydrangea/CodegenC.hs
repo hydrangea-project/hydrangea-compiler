@@ -120,6 +120,23 @@ ctypeToVarKind (CTPair t1 t2)   = do
 ctypeToVarKind (CTRecord fields) = Just (KRecord fields)
 ctypeToVarKind CTUnknown         = Nothing
 
+-- | Per-procedure environment threaded through statement code generation.
+-- Bundles the classification maps and sets that are invariant within a single
+-- procedure and would otherwise be passed as individual parameters to every
+-- recursive helper.
+data CodegenEnv = CodegenEnv
+  { ceRetKinds       :: Map CVar VarKind
+  , ceArrayElemTypes :: Map CVar CType
+  , ceArrVars        :: Set CVar
+  , ceTupVars        :: Set CVar
+  , cePairVars       :: Map CVar (CElemType, CElemType)
+  , ceRecordVars     :: Map CVar [(BS.ByteString, CType)]
+  , ceFloatVars      :: Set CVar
+  , ceFloatArrVars   :: Set CVar
+  , ceVecVars        :: Map CVar Int
+  , ceTupleDefs      :: Map CVar [Atom]
+  }
+
 -- | Derive the classification sets/maps used by genStmts2 from a type environment.
 -- Returns (arrVars, tupVars, pairVars, recordVars, floatVars, floatArrVars).
 typeEnvToVarSets :: Map CVar CType
@@ -522,12 +539,12 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = nam
         | Just fields <- Map.lookup p recordVars = text (recordStructName fields) <+> text (sanitize p)
         | otherwise              = text "int64_t"       <+> text (sanitize p)
       retType = case procRetKind of
+        KArray      -> "hyd_array_t*"
         KFloatArray -> "hyd_array_t*"
-        KArray -> "hyd_array_t*"
-        KTuple -> "hyd_tuple_t"
+        KTuple      -> "hyd_tuple_t"
         KPair ct1 ct2 -> pairStructName ct1 ct2
         KRecord fields -> recordStructName fields
-        KFloat -> "double"
+        KFloat  -> "double"
         KScalar -> "int64_t"
       cName = sanitize name
       cParams = case params of
@@ -547,6 +564,18 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = nam
       localArrayVars = localArrayVarsProc2 typeEnv proc
       vecVars = classifyVecVars (codegenSimdWidth opts) body
       tupleDefs = collectTupleDefs body
+      env = CodegenEnv
+        { ceRetKinds       = retKinds
+        , ceArrayElemTypes = arrayElemTypes
+        , ceArrVars        = arrVars
+        , ceTupVars        = tupVars
+        , cePairVars       = pairVars
+        , ceRecordVars     = recordVars
+        , ceFloatVars      = floatVars
+        , ceFloatArrVars   = floatArrVars
+        , ceVecVars        = vecVars
+        , ceTupleDefs      = tupleDefs
+        }
       returnedArrayVars retAtom =
         case retAtom of
           AVar v -> case Map.lookup v typeEnv of
@@ -556,11 +585,11 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = nam
       cleanupDoc retAtom =
         let varsToFree =
               case procRetKind of
-                KArray -> localArrayVars `S.difference` returnedArrayVars retAtom
+                KArray      -> localArrayVars `S.difference` returnedArrayVars retAtom
                 KFloatArray -> localArrayVars `S.difference` returnedArrayVars retAtom
-                KPair _ _ -> S.empty
-                KRecord _ -> S.empty
-                _ -> localArrayVars
+                KPair _ _   -> S.empty
+                KRecord _   -> S.empty
+                _           -> localArrayVars
             -- Free the non-returned component of any pair-of-arrays accumulator.
             discardedPairDoc =
               discardedArrayPairComponentDoc bodyWithoutReturn retAtom pairVars
@@ -569,19 +598,19 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = nam
       procBodyMemo =
         case finalReturn of
           Just retAtom ->
-            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty (usedVarsAtom2 retAtom) tupleDefs bodyWithoutReturn
+            genStmts2 env S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
               $$ cleanupDoc retAtom
               $$ cacheVar <+> text "=" <+> genAtom retAtom <> text ";"
           Nothing ->
-            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty S.empty tupleDefs body
+            genStmts2 env S.empty S.empty body
       procBodyNormal =
         case finalReturn of
           Just retAtom ->
-            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty (usedVarsAtom2 retAtom) tupleDefs bodyWithoutReturn
+            genStmts2 env S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
               $$ cleanupDoc retAtom
               $$ returnDoc retAtom
           Nothing ->
-            genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars S.empty S.empty tupleDefs body
+            genStmts2 env S.empty S.empty body
   in if isBenchKernel && retType == "hyd_array_t*"
      then
        -- Benchmark kernel: check the file-scope cache (set after the timing loop
@@ -610,18 +639,18 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc { C2.procName = nam
          $$ nest 4 procBodyNormal
          $$ text "}"
 
-genStmts2 :: Map CVar VarKind -> Map CVar CType -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> Map CVar Int -> Set CVar -> Set CVar -> Map CVar [Atom] -> [C2.Stmt] -> Doc
-genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared liveAfter tupleDefs stmts =
+genStmts2 :: CodegenEnv -> Set CVar -> Set CVar -> [C2.Stmt] -> Doc
+genStmts2 env declared liveAfter stmts =
   case stmts of
     [] -> empty
     stmt : rest ->
       let stmtLiveAfter = usedVarsStmts2 rest `S.union` liveAfter
-          doc = genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared stmtLiveAfter tupleDefs stmt
+          doc = genStmt2 env declared stmtLiveAfter stmt
           declared' = case stmt of
             C2.SAssign _ (RVecStore _ _ _) -> declared
             C2.SAssign v _ -> S.insert v declared
             C2.SLoop spec body ->
-              let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars retKinds body
+              let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars (ceRetKinds env) body
               in case C2.lsRed spec of
                    Just r -> S.insert (C2.rsAccVar r) declaredWithHoists
                    Nothing -> declaredWithHoists
@@ -629,18 +658,20 @@ genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars 
               let branchVars = allAssignedVars (thn ++ els) `S.intersection` stmtLiveAfter
               in declared `S.union` branchVars
             _ -> declared
-      in doc $$ genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' liveAfter tupleDefs rest
+      in doc $$ genStmts2 env declared' liveAfter rest
 
-genStmt2 :: Map CVar VarKind -> Map CVar CType -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> Map CVar Int -> Set CVar -> Set CVar -> Map CVar [Atom] -> C2.Stmt -> Doc
-genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared liveAfter tupleDefs stmt = case stmt of
+genStmt2 :: CodegenEnv -> Set CVar -> Set CVar -> C2.Stmt -> Doc
+genStmt2 env declared liveAfter stmt = case stmt of
   C2.SAssign _ rhs@(RVecStore _ _ val) ->
-    let mw = case val of AVecVar vv -> Map.lookup vv vecVars; _ -> Nothing
-    in genRHS arrayElemTypes floatArrVars mw tupleDefs rhs <> text ";"
+    let mw = case val of
+               AVecVar vv -> Map.lookup vv (ceVecVars env)
+               _          -> Nothing
+    in genRHS (ceArrayElemTypes env) (ceFloatArrVars env) mw (ceTupleDefs env) rhs <> text ";"
   C2.SAssign v rhs
     | v `S.member` declared ->
       -- When a declared pair-of-arrays variable is overwritten, free the old
       -- array components first to prevent a heap leak.
-      let freeOldPair = case Map.lookup v pairVars of
+      let freeOldPair = case Map.lookup v (cePairVars env) of
             Just (CEArray, CEArray) ->
               text "hyd_array_free(" <> text (sanitize v) <> text ".fst);"
                 $$ text "hyd_array_free(" <> text (sanitize v) <> text ".snd);"
@@ -652,24 +683,24 @@ genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
       in freeOldPair $$ text (sanitize v) <+> text "=" <+> genAssignRHS rhs <> text ";"
     | otherwise ->
         let cv = sanitize v
-            decl = varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
+            decl = varDecl env v rhs
         in decl <+> text cv <+> text "=" <+> genAssignRHS rhs <> text ";"
     where
       genAssignRHS assignedRhs = case assignedRhs of
-        RArrayAlloc shp -> genArrayAllocExpr arrayElemTypes v shp
-        RProj 0 (AVar src) | Map.member src pairVars -> genAtom (AVar src) <> text ".fst"
-        RProj 1 (AVar src) | Map.member src pairVars -> genAtom (AVar src) <> text ".snd"
-        _ -> genRHS arrayElemTypes floatArrVars (Map.lookup v vecVars) tupleDefs assignedRhs
+        RArrayAlloc shp -> genArrayAllocExpr (ceArrayElemTypes env) v shp
+        RProj 0 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".fst"
+        RProj 1 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".snd"
+        _ -> genRHS (ceArrayElemTypes env) (ceFloatArrVars env) (Map.lookup v (ceVecVars env)) (ceTupleDefs env) assignedRhs
 
   C2.SArrayWrite arr idx val
-    | AVar arrV <- arr, Just eltTy <- Map.lookup arrV arrayElemTypes ->
+    | AVar arrV <- arr, Just eltTy <- Map.lookup arrV (ceArrayElemTypes env) ->
         genArrayAccess eltTy arr idx <+> text "=" <+> genAtom val <> text ";"
-    | AVar arrV <- arr, arrV `S.member` floatArrVars ->
+    | AVar arrV <- arr, arrV `S.member` ceFloatArrVars env ->
         text "hyd_array_set_float(" <> genAtom arr <> text "," <+> genAtom idx <> text "," <+> genAtom val <> text ");"
     | otherwise ->
         genAtom arr <> text "->data[" <> genAtom idx <> text "]" <+> text "=" <+> genAtom val <> text ";"
 
-  C2.SLoop spec body -> genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared tupleDefs spec body
+  C2.SLoop spec body -> genLoop2 env declared spec body
 
   C2.SIf cond thn els ->
     let branchRHS = assignedRHSMap (thn ++ els)
@@ -679,38 +710,37 @@ genStmt2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
           vcat
             [ case Map.lookup v branchRHS of
                 Just rhs ->
-                  varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
-                    <+> text (sanitize v) <> text ";"
+                  varDecl env v rhs <+> text (sanitize v) <> text ";"
                 Nothing -> empty
             | v <- branchVars
             ]
         declared' = declared `S.union` S.fromList branchVars
     in preDecls
        $$ text "if (" <> genAtom cond <> text ") {"
-       $$ nest 4 (genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' liveAfter tupleDefs thn)
+       $$ nest 4 (genStmts2 env declared' liveAfter thn)
        $$ case els of
             [] -> text "}"
             _ -> text "} else {"
-                  $$ nest 4 (genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' liveAfter tupleDefs els)
+                  $$ nest 4 (genStmts2 env declared' liveAfter els)
                   $$ text "}"
 
   C2.SReturn a -> text "return" <+> genAtom a <> text ";"
 
   C2.SBreak -> text "break;"
 
-genLoop2 :: Map CVar VarKind -> Map CVar CType -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Set CVar -> Map CVar Int -> Set CVar -> Map CVar [Atom] -> C2.LoopSpec -> [C2.Stmt] -> Doc
-genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared tupleDefs spec body =
+genLoop2 :: CodegenEnv -> Set CVar -> C2.LoopSpec -> [C2.Stmt] -> Doc
+genLoop2 env declared spec body =
   let iters = C2.lsIters spec
       bounds = C2.lsBounds spec
       red = C2.lsRed spec
       role = C2.lsRole spec
-      (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls retKinds body
+      (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls (ceRetKinds env) body
       hoistedMemoVars =
         S.fromList [v | C2.SAssign v (RCall _ []) <- hoistedMemoCalls]
       declaredWithHoisted = declared `S.union` hoistedMemoVars
       hoistedMemoDoc =
-        genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared (usedVarsStmts2 loopBody) tupleDefs hoistedMemoCalls
-      bodyDoc d = genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars d S.empty tupleDefs loopBody
+        genStmts2 env declared (usedVarsStmts2 loopBody) hoistedMemoCalls
+      bodyDoc d = genStmts2 env d S.empty loopBody
       parallelPolicyClause = case C2.lsExec spec of
         C2.Parallel p ->
           let strategyComment = case C2.psStrategy p of
@@ -754,8 +784,7 @@ genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
                       text "if (" <> genAtom cond <> text ") {"
                         $$ nest 4 atomicUpdate
                         $$ text "}"
-            in genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' prefixLiveAfter tupleDefs prefix
-                 $$ guardedUpdate
+            in genStmts2 env declared' prefixLiveAfter prefix $$ guardedUpdate
           Nothing ->
             bodyDoc declared'
       privatizedScatterLoopDoc declared' iter bound =
@@ -800,7 +829,7 @@ genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
                       $$ text "#pragma omp for"
                       $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr bound <> text ";" <+> text ci <> text "++) {"
                       $$ nest 4
-                            ( genStmts2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars floatArrVars vecVars declared' prefixLiveAfter tupleDefs prefix
+                            ( genStmts2 env declared' prefixLiveAfter prefix
                                $$ guardedPrivUpdate
                              )
                       $$ text "}"
@@ -827,7 +856,7 @@ genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
           ci = sanitize i
           declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
           alreadyDeclared = C2.rsAccVar r `S.member` declared
-          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
           accInit = if alreadyDeclared
                       then empty
                       else text "/* acc */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
@@ -844,7 +873,7 @@ genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
           redClause = case C2.rsRedop r of
             RAdd -> text "reduction(+:" <> text cacc <> text ")"
             RMul -> text "reduction(*:" <> text cacc <> text ")"
-          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
           accInit = if alreadyDeclared
                       then empty
                       else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
@@ -861,7 +890,7 @@ genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
           redClause = case C2.rsRedop r of
             RAdd -> text "reduction(+:" <> text cacc <> text ")"
             RMul -> text "reduction(*:" <> text cacc <> text ")"
-          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
           accInit = if alreadyDeclared
                       then empty
                       else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
@@ -876,7 +905,7 @@ genLoop2 retKinds arrayElemTypes arrVars tupVars pairVars recordVars floatVars f
           redClause = case C2.rsRedop r of
             RAdd -> text " reduction(+:" <> text cacc <> text ")"
             RMul -> text " reduction(*:" <> text cacc <> text ")"
-          accCType = if C2.rsAccVar r `S.member` floatVars then "double" else "int64_t"
+          accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
           accInit = if C2.rsAccVar r `S.member` declared
                       then empty
                       else text "/* simd reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
@@ -1069,10 +1098,9 @@ localArrayVarsProc2 typeEnv (C2.Proc { C2.procBody = body }) =
       RArrayAlloc {} -> True
       RCall {} -> True
       _ -> False
-    -- Arrays fed directly as CEArray fields into RPairMake at the function's
-    -- top level are "owned" by the pair.  They will be freed by the intra-loop
-    -- pair-update frees (fix 1) in the first iteration, so must not also be
-    -- freed by the post-return cleanup to avoid a double-free.
+    -- Arrays passed as CEArray components to RPairMake are owned by the
+    -- resulting pair and freed during pair-update in the enclosing loop.
+    -- Excluding them here prevents a double-free at the post-return cleanup.
     consumedByArrayPair = S.fromList
       [ v
       | C2.SAssign _ (RPairMake ct1 ct2 a1 a2) <- body
@@ -1537,46 +1565,46 @@ vecFuncSuffix :: Int -> String
 vecFuncSuffix 4 = "_f64x4"
 vecFuncSuffix _ = "_f64"
 
-varDecl :: Map CVar VarKind -> Set CVar -> Set CVar -> Map CVar (CElemType, CElemType) -> Map CVar [(BS.ByteString, CType)] -> Set CVar -> Map CVar Int -> CVar -> RHS -> Doc
-varDecl retKinds arrVars tupVars pairVars recordVars floatVars vecVars v rhs
-  | v `S.member` arrVars = text "hyd_array_t*"
-  | v `S.member` tupVars = text "hyd_tuple_t"
-  | Just (ct1, ct2) <- Map.lookup v pairVars = text (pairStructName ct1 ct2)
-  | Just fields <- Map.lookup v recordVars = text (recordStructName fields)
-  | Just w <- Map.lookup v vecVars = text (vecTypeName w)
-  | v `S.member` floatVars = text "double"
+varDecl :: CodegenEnv -> CVar -> RHS -> Doc
+varDecl env v rhs
+  | v `S.member` ceArrVars env    = text "hyd_array_t*"
+  | v `S.member` ceTupVars env    = text "hyd_tuple_t"
+  | Just (ct1, ct2) <- Map.lookup v (cePairVars env)   = text (pairStructName ct1 ct2)
+  | Just fields     <- Map.lookup v (ceRecordVars env)  = text (recordStructName fields)
+  | Just w          <- Map.lookup v (ceVecVars env)     = text (vecTypeName w)
+  | v `S.member` ceFloatVars env  = text "double"
   | otherwise = case rhs of
       RAtom (AVar src)
-        | src `S.member` arrVars -> text "hyd_array_t*"
-        | src `S.member` tupVars -> text "hyd_tuple_t"
-        | Just (ct1, ct2) <- Map.lookup src pairVars -> text (pairStructName ct1 ct2)
-        | Just fields <- Map.lookup src recordVars -> text (recordStructName fields)
-        | Just w <- Map.lookup src vecVars -> text (vecTypeName w)
-        | src `S.member` floatVars -> text "double"
-      RAtom (AVecVar src) -> text (vecTypeName (Map.findWithDefault defaultVectorWidth src vecVars))
+        | src `S.member` ceArrVars env -> text "hyd_array_t*"
+        | src `S.member` ceTupVars env -> text "hyd_tuple_t"
+        | Just (ct1, ct2) <- Map.lookup src (cePairVars env) -> text (pairStructName ct1 ct2)
+        | Just fields <- Map.lookup src (ceRecordVars env) -> text (recordStructName fields)
+        | Just w <- Map.lookup src (ceVecVars env) -> text (vecTypeName w)
+        | src `S.member` ceFloatVars env -> text "double"
+      RAtom (AVecVar src) -> text (vecTypeName (Map.findWithDefault defaultVectorWidth src (ceVecVars env)))
       RArrayAlloc {} -> text "hyd_array_t*"
       RArrayShape {} -> text "hyd_tuple_t"
-      RShapeInit {} -> text "hyd_tuple_t"
-      RTuple {} -> text "hyd_tuple_t"
-      RFlatToNd {} -> text "hyd_tuple_t"
-      RVecLoad {} -> text (vecTypeName defaultVectorWidth)
-      RVecBinOp {} -> text (vecTypeName defaultVectorWidth)
-      RVecUnOp {} -> text (vecTypeName defaultVectorWidth)
-      RVecSplat {} -> text (vecTypeName defaultVectorWidth)
-      RVecReduce {} -> text "double"
+      RShapeInit {}  -> text "hyd_tuple_t"
+      RTuple {}      -> text "hyd_tuple_t"
+      RFlatToNd {}   -> text "hyd_tuple_t"
+      RVecLoad {}    -> text (vecTypeName defaultVectorWidth)
+      RVecBinOp {}   -> text (vecTypeName defaultVectorWidth)
+      RVecUnOp {}    -> text (vecTypeName defaultVectorWidth)
+      RVecSplat {}   -> text (vecTypeName defaultVectorWidth)
+      RVecReduce {}  -> text "double"
       RCall fn _ | fn == "hyd_slice_shape" -> text "hyd_tuple_t"
-      RCall fn _ -> case Map.lookup fn retKinds of
-        Just KArray -> text "hyd_array_t*"
+      RCall fn _ -> case Map.lookup fn (ceRetKinds env) of
+        Just KArray      -> text "hyd_array_t*"
         Just KFloatArray -> text "hyd_array_t*"
-        Just KTuple -> text "hyd_tuple_t"
-        Just KFloat -> text "double"
-        Just (KPair ct1 ct2) -> text (pairStructName ct1 ct2)
-        Just (KRecord fields) -> text (recordStructName fields)
-        _ -> text "int64_t"
+        Just KTuple      -> text "hyd_tuple_t"
+        Just KFloat      -> text "double"
+        Just (KPair ct1 ct2)   -> text (pairStructName ct1 ct2)
+        Just (KRecord fields)  -> text (recordStructName fields)
+        _                      -> text "int64_t"
       RPairMake ct1 ct2 _ _ -> text (pairStructName ct1 ct2)
       RPairFst ct _         -> text (celemTypeCType ct)
       RPairSnd ct _         -> text (celemTypeCType ct)
-      _ -> text "int64_t"
+      _                     -> text "int64_t"
 
 -- | Collect all RTuple definitions from a statement list (pre-pass).
 -- Used for inlining RNdToFlat with known-arity tuples.
