@@ -1,0 +1,16 @@
+{
+  "name": "hydrangea-compiler",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "haskell.haskell"
+      ]
+    }
+  },
+  "postCreateCommand": "cabal update",
+  "remoteUser": "root"
+}
