@@ -91,6 +91,7 @@ applyConstMapToTerm m t =
     TSub l r     -> TSub (f l) (f r)
     TMul l r     -> TMul (f l) (f r)
     TNeg x       -> TNeg (f x)
+    TMax l r     -> TMax (f l) (f r)
   where f = applyConstMapToTerm m
 
 -- | Substitute known constant values into a predicate.
@@ -159,6 +160,7 @@ termToSBV env term =
     TNeg t -> negate (termToSBV env t)
     TDim arr ix -> lookupVar (dimVarName arr ix)
     TValBoundDim arr i -> lookupVar (valBoundDimName arr i)
+    TMax l r -> smax (termToSBV env l) (termToSBV env r)
   where
     lookupVar v =
       case M.lookup v env of

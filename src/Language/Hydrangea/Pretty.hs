@@ -71,6 +71,7 @@ instance Pretty Term where
       TNeg t -> text "-" <> pPrint t
       TDim v i -> text "dim" <> parens (text (unpack v) <> text "," <+> int i)
       TValBoundDim v i -> text "vbound" <> parens (text (unpack v) <> text "," <+> int i)
+      TMax l r -> text "max" <> parens (pPrint l <> text "," <+> pPrint r)
 
 instance Pretty Pred where
   pPrint pred' =
