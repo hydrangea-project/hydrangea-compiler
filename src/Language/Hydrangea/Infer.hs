@@ -113,7 +113,9 @@ type Ctx = Map Var UPolytype
 
 -- | Mutable state threaded through inference: a counter for generating
 -- fresh predicate variable names, a local value-bound context for index
--- variables annotated with @[i bound E]@, and accumulated warnings.
+-- variables annotated with @[i bound E]@, accumulated warnings, and a
+-- definition-body environment for propagating bounds through non-inline
+-- top-level function calls.
 data InferState = InferState
   { predVarCounter :: Int
   , valBoundCtx    :: Map Var Term
@@ -122,6 +124,11 @@ data InferState = InferState
     --   from generator body expressions.
   , inferWarnings  :: [String]
     -- ^ Non-fatal diagnostic messages (e.g. unverifiable bound annotations).
+  , defBodyEnv     :: Map Var (Var, Exp Range)
+    -- ^ Maps top-level single-parameter function names to their
+    --   @(paramName, bodyExp)@ pair.  Used by 'EMap' and 'EApp' to infer
+    --   output value bounds for non-inline functions without requiring PBound
+    --   annotations.  Only single-parameter definitions are registered.
   }
 
 -- | Initial inference state.
@@ -130,6 +137,7 @@ initInferState = InferState
   { predVarCounter = 0
   , valBoundCtx    = M.empty
   , inferWarnings  = []
+  , defBodyEnv     = M.empty
   }
 
 -- | Lift a unification-library action into the full inference monad.
@@ -457,6 +465,20 @@ withValBound v t m = do
 lookupValBound :: Var -> Infer (Maybe Term)
 lookupValBound v = gets (M.lookup v . valBoundCtx)
 
+-- | Register a top-level single-parameter function's body for later
+-- bound-transfer analysis.
+withDefBody :: Var -> Var -> Exp Range -> Infer a -> Infer a
+withDefBody f paramName body m = do
+  old <- gets defBodyEnv
+  modify (\s -> s { defBodyEnv = M.insert f (paramName, body) old })
+  x <- m
+  modify (\s -> s { defBodyEnv = old })
+  return x
+
+-- | Look up the registered @(paramName, bodyExp)@ for a top-level function.
+lookupDefBody :: Var -> Infer (Maybe (Var, Exp Range))
+lookupDefBody v = gets (M.lookup v . defBodyEnv)
+
 -- | Propagate PBound annotations from a list of patterns into valBoundCtx for
 -- the duration of an action.  Called around function body inference so that
 -- @[i bound N]@ patterns are visible to 'EIndex' and other bound-sensitive
@@ -581,6 +603,15 @@ bvalMulConst :: Integer -> BVal -> BVal
 bvalMulConst k (BoundOf b)   = BoundOf  (TMul (TConst k) b)
 bvalMulConst k (ExactVal c)  = ExactVal (TMul (TConst k) c)
 
+-- | Conservatively upper-bound the maximum of two 'BVal's.
+-- If @x < ba@ and @y < bb@ then @max(x,y) < max(ba, bb)@.
+-- Mixed exact/bound cases use @toBound@ to lift the exact value before taking the max.
+bvalMax :: BVal -> BVal -> BVal
+bvalMax (BoundOf b1)  (BoundOf b2)  = BoundOf  (TMax b1 b2)
+bvalMax (ExactVal c1) (ExactVal c2) = ExactVal  (TMax c1 c2)
+bvalMax (BoundOf b)   (ExactVal c)  = BoundOf   (TMax b (TAdd c (TConst 1)))
+bvalMax (ExactVal c)  (BoundOf b)   = BoundOf   (TMax (TAdd c (TConst 1)) b)
+
 -- | Conservatively compute a 'BVal' for an integer expression, given the
 -- current 'valBoundCtx'.  Returns 'Nothing' if the bound cannot be determined.
 inferBVal :: Exp Range -> Infer (Maybe BVal)
@@ -605,7 +636,28 @@ inferBVal expr = case expr of
         Just (ExactVal m) -> Just (BoundOf m)  -- x % m  <  m  (exact modulus)
         Just (BoundOf m)  -> Just (BoundOf m)  -- x % m  <  m  (upper bound on modulus)
         _                 -> Nothing
+    Divide _ -> do
+      -- Integer division by a positive constant k: if 0 ≤ e < b then
+      -- e / k ≤ (b-1) / k, so the exclusive upper bound is (b-1)/k + 1.
+      -- Only handle concrete divisors (EInt); symbolic divisors fall through.
+      mb1 <- inferBVal e1
+      return $ case (mb1, e2) of
+        (Just (ExactVal (TConst n)), EInt _ k) | k > 0 ->
+          Just (ExactVal (TConst (n `div` k)))
+        (Just (BoundOf (TConst b)), EInt _ k) | k > 0 ->
+          Just (BoundOf (TConst ((b - 1) `div` k + 1)))
+        _ -> Nothing
     _ -> return Nothing
+  EIfThenElse _ _ e1 e2 -> do
+    -- Bound of an if-then-else is the max of both branch bounds (conservative).
+    mb1 <- inferBVal e1
+    mb2 <- inferBVal e2
+    return $ bvalMax <$> mb1 <*> mb2
+  EApp _ (EApp _ (EVar _ "max") e1) e2 -> do
+    -- Saturated application of the built-in `max` function.
+    mb1 <- inferBVal e1
+    mb2 <- inferBVal e2
+    return $ bvalMax <$> mb1 <*> mb2
   _ -> return Nothing
   where
     combine f e1 e2 = do
@@ -750,8 +802,9 @@ emitRefineLink r expected actual = do
         (UTyArray s1 _, UTyArray s2 _) -> do
           _ <- wrange r $ s1 =:= s2
           rank <- shapeArityFromType r s1
-          forM_ [0 .. rank - 1] $ \i ->
+          forM_ [0 .. rank - 1] $ \i -> do
             emitPred (PEq (TDim vExp i) (TDim vAct i))
+            emitPred (PEq (TValBoundDim vExp i) (TValBoundDim vAct i))
         _ -> emitPred (PEq (TVar vExp) (TVar vAct))
     _ -> return ()
 
@@ -849,6 +902,18 @@ infer (EApp r e1 e2) = do
   case stripRefineTop ty1' of
     UTyFun argTy resTy -> do
       emitRefineLink r argTy ty2
+      -- Propagate scalar value bounds from the argument to the parameter's
+      -- refinement variable.  This grounds parameter-dependent obligations in
+      -- the callee when the argument has a statically inferrable bound (e.g.
+      -- from iota-produced values, arithmetic like i%N, or PBound indices).
+      mBound <- inferBVal e2
+      argTy' <- applyBindings argTy
+      forM_ mBound $ \bval ->
+        case fst (unwrapRefine argTy') of
+          Just pParam -> do
+            emitHyp (PLe (TConst 0) (TVar pParam))
+            emitHyp (PLt (TVar pParam) (toBound bval))
+          Nothing -> return ()
       return resTy
     _ -> return ty
 infer (EIfThen _ e1 e2) = do
@@ -945,8 +1010,18 @@ infer (EGenerate _ shapeExp fn) = do
             emitPred (PEq (TValBoundDim arrVar i) b)
           -- Case 3: EBoundLetIn chain in the body — try scalar bound propagation.
           -- Runs only when Case 2 (EVec) found no per-component bounds.
+          -- Case 4: Arithmetic fallback — when the chain analysis also yields nothing,
+          -- fall back to inferBodyBound which uses inferBVal to handle expressions
+          -- like @i + 1@, @i % M@, @i * k@, and constant bodies without requiring a
+          -- PBound annotation.  This closes the false-negative gap where, e.g.,
+          -- @generate [N] (let f [i] = i + 1 in f)@ was silently accepted as a
+          -- gather index into an N-element array.
           when (isNothing mCompBounds) $ do
-            mOutBound <- withValBound idxVar idxBound $ inferBodyBoundChain fn
+            mOutBound <- withValBound idxVar idxBound $ do
+              mChain <- inferBodyBoundChain fn
+              case mChain of
+                Just _  -> return mChain
+                Nothing -> inferBodyBound fn   -- arithmetic fallback (Case 4)
             forM_ mOutBound $ \outBound ->
               emitPred (PEq (TValBoundDim arrVar 0) outBound)
         [] -> return ()
@@ -1127,7 +1202,34 @@ infer (EMap _ fn arrExp) = do
                   Nothing   -> return Nothing
               forM_ (maybe [] (zip [0..]) mCompBounds) $ \(i, b) ->
                 emitPred (PEq (TValBoundDim arrVar i) b)
-        [] -> return ()
+        [] -> do
+          -- Non-inline named function: get the parameter pred var from the
+          -- function type after unification.  Using eTy directly doesn't work
+          -- because asArrayType returns a concrete element type (e.g. UTyInt)
+          -- with no refinement wrapper — the pred var lives in fty's argument
+          -- position, not in eTy.
+          fty' <- applyBindings fty
+          case stripRefineTop fty' of
+            UTyFun paramTy _ ->
+              case fst (unwrapRefine paramTy) of
+                Just elemPV -> do
+                  emitHyp (PLe (TConst 0) (TVar elemPV))
+                  emitHyp (PLt (TVar elemPV) (TValBoundDim srcVar 0))
+                Nothing -> return ()
+            _ -> return ()
+          -- Independently attempt to establish the output element bound by
+          -- running inferValBound on the callee's registered definition body
+          -- with the parameter name bounded by the source element bound.
+          -- This covers non-inline functions like `let f x = x+1`.
+          case fn of
+            EVar _ f -> do
+              mDefBody <- lookupDefBody f
+              forM_ mDefBody $ \(paramName, defBody) -> do
+                mOutBound <- withValBound paramName (TValBoundDim srcVar 0) $
+                             inferValBound defBody
+                forM_ mOutBound $ \outBound ->
+                  emitPred (PEq (TValBoundDim arrVar 0) outBound)
+            _ -> return ()
       return arrTyOut
 infer (EZipWith _ fn arrExp1 arrExp2) = do
   arrTy1 <- infer arrExp1
@@ -1285,12 +1387,23 @@ infer (EMakeIndex _ nExp arrExp) = do
   nTy   <- infer nExp
   arrTy <- infer arrExp
   _     <- wrange (firstParam nExp) $ nTy =:= UTyInt
-  (mArrVar, _, _) <- asArrayType (firstParam arrExp) arrTy
-  arrVar' <- maybe freshPredVar return mArrVar
+  (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  rank <- shapeArityFromType (firstParam arrExp) sTy'
+  srcVar <- maybe freshPredVar return mArrVar
+  -- Create a fresh refined output type so the user-declared TValBoundDim is
+  -- independent of any value bound already established on arrExp.  This
+  -- prevents a contradiction when arrExp is, e.g., a generate whose body
+  -- has an auto-inferred bound that differs from the declared N.
+  (arrVarOut, arrTyOut) <- freshRefined (UTyArray sTy' eTy)
+  -- Copy shape constraints from input.
+  forM_ [0 .. rank - 1] $ \i ->
+    emitPred (PEq (TDim arrVarOut i) (TDim srcVar i))
+  -- Assert the user-declared exclusive upper bound on element values.
   nTerm <- termFromExp nExp
-  emitPred (PEq (TValBoundDim arrVar' 0) nTerm)
+  emitPred (PEq (TValBoundDim arrVarOut 0) nTerm)
   emitWarning "note: make_index bound not statically verified"
-  return arrTy
+  return arrTyOut
 infer (ECOOSumDuplicates _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = do
   nrowsTy <- infer nrowsExp
   ncolsTy <- infer ncolsExp
@@ -1710,7 +1823,14 @@ inferDecs (Dec r var pats mty e : rest) = do
   -- holds the wrapper); for function declarations funTy already tracks params.
   let rhsTy = if null pats then inferredBodyTy else funTy
   boundTy <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
-  rest'   <- withBinding var boundTy $ inferDecs rest
+  -- Register the definition body for single-parameter functions so that EMap
+  -- and EApp can infer output value bounds for non-inline call sites.  We
+  -- extract the parameter name via 'patVar'; if it cannot be extracted (e.g.
+  -- PVec with multiple sub-patterns), we skip registration.
+  let registerDef = case pats of
+        [pat] | Just paramName <- patVar pat -> withDefBody var paramName e
+        _                                    -> id
+  rest' <- registerDef $ withBinding var boundTy $ inferDecs rest
   return $ (var, boundTy) : rest'
 
 -- | Extend the typing context with many bindings for the duration of an action.

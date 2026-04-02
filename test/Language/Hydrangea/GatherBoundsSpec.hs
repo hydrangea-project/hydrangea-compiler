@@ -174,26 +174,223 @@ spec = describe "gather bounds checking" $ do
         (isInfixOf "UnsatConstraints")
 
   -- ------------------------------------------------------------------ --
-  -- gather without established bounds (permissive / no false positives)
+  -- gather with unanalyzable index body: warning, not silent pass
+  -- ------------------------------------------------------------------ --
+  -- When a generator body is opaque to inferBVal (e.g. division), no
+  -- TValBound is established.  The bounds obligation is ungrounded, so the
+  -- solver emits a "could not verify" warning rather than silently accepting.
   -- ------------------------------------------------------------------ --
   describe "gather without established bounds" $ do
 
-    it "gather with an untracked index array is accepted (permissive)" $ do
-      -- generate with an arbitrary body has no TValBound established,
-      -- so the gather check is silently skipped — no false positive.
+    it "gather with unanalyzable body emits 'could not verify' warning" $ do
+      -- Without an explicit PBound, the index variable's bound is symbolic
+      -- (TDim arrVar 0), so inferBVal(i/2) returns Nothing.  TValBound is
+      -- unestablished → obligation is ungrounded → warning, not silent pass.
+      let src = BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = i / 2 in f)"
+            , "let main = gather idx src"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success with warning: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` any (isInfixOf "could not verify")
+
+    it "gather with second unanalyzable body emits 'could not verify' warning" $ do
+      -- Another division case; src body uses i*2 but that is irrelevant —
+      -- idx's division body is what makes the check ungrounded.
+      let src = BS.unlines
+            [ "let src = generate [10] (let g [i] = i * 2 in g)"
+            , "let idx = generate [3]  (let f [i] = i / 2 in f)"
+            , "let main = gather idx src"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success with warning: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` any (isInfixOf "could not verify")
+
+  -- ------------------------------------------------------------------ --
+  -- Division bounds with PBound annotation
+  -- ------------------------------------------------------------------ --
+  -- inferBVal now handles integer division when the dividend's bound is a
+  -- concrete TConst.  This occurs when the index variable has an explicit
+  -- [i bound N] annotation (PBound), which sets valBoundCtx[i] = TConst N.
+  -- For  [i bound N] = i / k:  exclusive upper bound = (N-1)/k + 1.
+  -- Without PBound the bound remains symbolic (TDim) and division still
+  -- produces an ungrounded obligation (warning, not error).
+  -- ------------------------------------------------------------------ --
+  describe "division bounds with PBound annotation" $ do
+
+    it "PBound i/2: bound = ceil(10/2) = 5; safe when source has 5 elements" $ do
+      -- [i bound 10]: i < 10 → i/2 < (10-1)/2+1 = 5.  5 ≤ 5 ✓
       expectDecsOk $ BS.unlines
-        [ "let src = generate [5] (let f [i] = i in f)"
-        , "let idx = generate [5] (let f [i] = 4 - i in f)"
+        [ "let src = generate [5] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i bound 10] = i / 2 in f)"
         , "let main = gather idx src"
         ]
 
-    it "gather with unknown index array is accepted (permissive)" $ do
-      -- No static knowledge about idx values — passes without error.
+    it "PBound i/2: bound = 5; rejected when source has only 4 elements" $ do
+      -- [i bound 10] → i/2 bound = 5.  5 > 4 → UnsatConstraints.
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [4] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i bound 10] = i / 2 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "PBound i/3: bound = ceil(9/3) = 3; safe when source has 3 elements" $ do
+      -- [i bound 9] → i/3 bound = (9-1)/3+1 = 3.  3 ≤ 3 ✓
       expectDecsOk $ BS.unlines
-        [ "let src = generate [10] (let f [i] = i * 2 in f)"
-        , "let idx = generate [3]  (let f [i] = i * 3 in f)"
+        [ "let src = generate [3] (let g [i] = i in g)"
+        , "let idx = generate [9] (let f [i bound 9] = i / 3 in f)"
         , "let main = gather idx src"
         ]
+
+    it "PBound (i/2)+1: bound = 6; safe when source has 6 elements" $ do
+      -- [i bound 10] → i/2 bound = 5 → (i/2)+1 bound = 6.  6 ≤ 6 ✓
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [6] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i bound 10] = i / 2 + 1 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "PBound (i/2)+1: bound = 6; rejected when source has only 5 elements" $ do
+      -- [i bound 10] → (i/2)+1 bound = 6.  6 > 5 → UnsatConstraints.
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i bound 10] = i / 2 + 1 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+  -- ------------------------------------------------------------------ --
+  -- When a generate body is a simple arithmetic expression over the index
+  -- variable (e.g. i + 1, i % M, i * k, a constant), the compiler now
+  -- infers the value bound automatically without requiring [i bound N].
+  -- This closes false-negative gaps where unsafe programs were silently
+  -- accepted in permissive mode.
+  -- ------------------------------------------------------------------ --
+  describe "generate body bound auto-inference without PBound" $ do
+
+    it "i+1 body: safe gather into N+1-element source passes" $ do
+      -- i < 5, so i+1 ≤ 5; src has 6 elements — safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [6] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i] = i + 1 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "i+1 body: unsafe gather into N-element source is rejected" $ do
+      -- i < 5, so i+1 ≤ 5; src has only 5 elements — TValBound 6 > 5: UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = i + 1 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "i%4 body: safe gather into 4-element source passes" $ do
+      -- i % 4 is in [0, 4); src has 4 elements — safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [4] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i] = i % 4 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "i%4 body: unsafe gather into 3-element source is rejected" $ do
+      -- i % 4 may be up to 3; src has only 3 elements — TValBound 4 > 3: UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [3] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i] = i % 4 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "i*2 body: safe gather into 2N-element source passes" $ do
+      -- i < 5, so i*2 < 10; src has 10 elements — safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [10] (let g [i] = i in g)"
+        , "let idx = generate [5]  (let f [i] = i * 2 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "i*2 body: unsafe gather into N-element source is rejected" $ do
+      -- i < 5, so i*2 < 10; src has only 5 elements — TValBound 10 > 5: UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = i * 2 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "constant 0 body: safe gather into any non-empty source passes" $ do
+      -- All elements are 0; src has 5 elements — safe (TValBound = 1 ≤ 5)
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [5] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i] = 0 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "constant 3 body: safe gather into 4-element source passes" $ do
+      -- All elements are 3; src has 4 elements — safe (TValBound = 4 ≤ 4)
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [4] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i] = 3 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "constant 3 body: unsafe gather into 3-element source is rejected" $ do
+      -- All elements are 3; src has only 3 elements — TValBound 4 > 3: UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [3] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i] = 3 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "scatter with i*2 indices auto-inferred: safe into 2N-element dst passes" $ do
+      -- i < 5, i*2 < 10; dst has 10 elements — safe
+      expectDecsOk $ BS.unlines
+        [ "let n   = 5"
+        , "let dst  = fill [10] 0"
+        , "let vals = fill [n] 1"
+        , "let main = scatter (+) dst"
+        , "  (generate [n] (let f [i] = i * 2 in f))"
+        , "  vals"
+        ]
+
+    it "scatter with i*2 indices: rejected when dst is too small" $ do
+      -- i < 5, i*2 < 10; dst has only 5 elements — TValBound 10 > 5: UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let n   = 5"
+            , "let dst  = fill [5] 0"
+            , "let vals = fill [n] 1"
+            , "let main = scatter (+) dst"
+            , "  (generate [n] (let f [i] = i * 2 in f))"
+            , "  vals"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
 
   -- ------------------------------------------------------------------ --
   -- PBound value bound propagation through generator bodies
@@ -227,13 +424,26 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
-    it "generate without PBound is permissive (no TValBound)" $ do
-      -- No annotation — no TValBound established, gather is unchecked.
-      expectDecsOk $ BS.unlines
-        [ "let src = generate [3] (let g [i] = i in g)"
-        , "let idx = generate [5] (let f [i] = i + 1 in f)"
-        , "let main = gather idx src"
-        ]
+    it "generate with non-inferable body emits a 'could not verify' warning" $ do
+      -- Division without PBound: i has symbolic bound (TDim arrVar 0), so
+      -- inferBVal(i/2) returns Nothing.  No TValBound established → ungrounded
+      -- obligation → warning.  This ensures unsafe code is never silently
+      -- accepted; the user gets a notice.
+      -- (Note: with [i bound N] annotation, division IS now auto-inferred and
+      -- checked precisely — only unannotated expressions fall through here.)
+      let src = BS.unlines
+            [ "let src = generate [3] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = i / 2 in f)"
+            , "let main = gather idx src"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success with warning: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` any (isInfixOf "could not verify")
 
     it "PBound soundness check: shape must not exceed declared bound" $ do
       -- generate [10] with [i bound 5] — shape 10 > bound 5: unsound
@@ -554,16 +764,76 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
-    it "map with non-inline fn is permissive (no false positive)" $ do
+    it "map with non-inline fn: out-of-bounds caught (f x = x+1, iota 5 vs src [3])" $ do
+      -- Phase 4: output bound of map propagated from definition body.
+      -- f x = x + 1  over iota 5 gives elements [1..5]; src has only 3 elements → UnsatConstraints.
+      expectDecsError
+        ( BS.unlines
+            [ "let src    = generate [3] (let g [i] = i in g)"
+            , "let f x    = x + 1"
+            , "let idx    = map f (iota 5)"
+            , "let main   = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "map with non-inline fn: in-bounds passes (f x = x+1, iota 5 vs src [6])" $ do
+      -- Phase 4: elements [1..5] from f(iota 5), src has 6 elements → safe.
       expectDecsOk $ BS.unlines
-        [ "let src    = generate [3] (let g [i] = i in g)"
+        [ "let src    = generate [6] (let g [i] = i in g)"
         , "let f x    = x + 1"
         , "let idx    = map f (iota 5)"
         , "let main   = gather idx src"
         ]
 
+    -- Phase 1: TValBoundDim propagated through emitRefineLink for array parameters.
+    -- The bound check here verifies that passing an array through generate's function
+    -- argument propagates the element bound; the EGenerate + gather chain already
+    -- tested this.  The new Phase 1 change enables it via EApp as well.
+    it "Phase 1 – iota element bound propagates: identity map via EApp (safe)" $ do
+      -- Passing iota 5 through map identity preserves the TValBoundDim = 5 bound.
+      -- src has exactly 5 elements → gather is safe.
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [5] (let g [i] = i in g)"
+        , "let idx    = map (let f x = x in f) (iota 5)"
+        , "let main   = gather idx src"
+        ]
+
+    it "Phase 1 – iota element bound propagates: identity map via EApp (rejected)" $ do
+      -- Passing iota 5 through map identity preserves TValBoundDim = 5.
+      -- src has only 4 elements → unsafe.
+      expectDecsError
+        ( BS.unlines
+            [ "let src    = generate [4] (let g [i] = i in g)"
+            , "let idx    = map (let f x = x in f) (iota 5)"
+            , "let main   = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Phase 3: non-inline function element bound hypothesis grounds parameter obligations.
+    it "Phase 3 – map with non-inline fn: parameter obligation grounded (rejected)" $ do
+      -- f i = index [i] src requires i < 3; map f (iota 5) feeds i in [0..4] → unsafe.
+      expectDecsError
+        ( BS.unlines
+            [ "let src    = generate [3] (let g [i] = i in g)"
+            , "let f i    = index [i] src"
+            , "let main   = map f (iota 5)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "Phase 3 – map with non-inline fn: parameter obligation grounded (safe)" $ do
+      -- f i = index [i] src requires i < 5; map f (iota 5) feeds i in [0..4] → safe.
+      -- Note: f's own definition emits an ungrounded warning (no caller-side bound at def
+      -- time), but map f (iota 5) itself introduces no new UnsatConstraints.
+      expectDecsOk $ BS.unlines
+        [ "let src    = generate [5] (let g [i] = i in g)"
+        , "let f i    = index [i] src"
+        , "let main   = map f (iota 5)"
+        ]
+
   -- ------------------------------------------------------------------ --
-  -- fill bounds
   -- ------------------------------------------------------------------ --
   describe "fill bounds propagation" $ do
 
@@ -812,11 +1082,11 @@ spec = describe "gather bounds checking" $ do
         (isInfixOf "UnsatConstraints")
 
     it "ungrounded index (no make_index) produces a warning, not an error" $ do
-      -- generate with arbitrary body has no TValBoundDim established;
-      -- the obligation is ungrounded → ObligationUnknown → warning only
+      -- generate with a division body (no PBound) → TValBound unestablished;
+      -- the obligation is ungrounded → ObligationUnknown → warning only, not an error
       let src = BS.unlines
             [ "let dst  = fill [5] 0"
-            , "let idx  = generate [5] (let f [i] = 4 - i in f)"
+            , "let idx  = generate [5] (let f [i] = i / 2 in f)"
             , "let vals = fill [5] 1"
             , "let keep = fill [5] true"
             , "let main = scatter_guarded (+) dst idx vals keep"
@@ -995,3 +1265,141 @@ spec = describe "gather bounds checking" $ do
             ]
         )
         (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- max expression bounds
+  -- ------------------------------------------------------------------ --
+  -- The bounds engine now handles `max e1 e2` (saturated application of the
+  -- `max` stdlib function): the element bound is max(bound(e1), bound(e2)).
+  -- ------------------------------------------------------------------ --
+  describe "max expression bounds" $ do
+
+    it "max i k: safe gather when source >= max(N, k+1)" $ do
+      -- i < 5, k = 3; max(i, 3) < 5; src has 5 elements → safe
+      expectDecsOk $ BS.unlines
+        [ "let max a b = if a > b then a else b"
+        , "let src = generate [5] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i] = max i 3 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "max i k: rejected when source < max(N, k+1)" $ do
+      -- i < 5, k = 4; max(i, 4) can be 4; src has only 4 elements → rejected
+      expectDecsError
+        ( BS.unlines
+            [ "let max a b = if a > b then a else b"
+            , "let src = generate [4] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = max i 4 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "max i i: safe when source size matches generate size" $ do
+      -- i < 3; max(i, i) = i < 3; src has 3 elements → safe
+      expectDecsOk $ BS.unlines
+        [ "let max a b = if a > b then a else b"
+        , "let src = generate [3] (let g [i] = i in g)"
+        , "let idx = generate [3] (let f [i] = max i i in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "max of i and constant too large: rejected" $ do
+      -- max(i, 5) where i < 3 → bound is max(3, 6) = 6; src has 5 elements → rejected
+      expectDecsError
+        ( BS.unlines
+            [ "let max a b = if a > b then a else b"
+            , "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [3] (let f [i] = max i 5 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- if-then-else conditional bounds
+  -- ------------------------------------------------------------------ --
+  -- For `if cond then e1 else e2`, the element bound is
+  -- max(bound(e1), bound(e2)) — conservative but always sound.
+  -- ------------------------------------------------------------------ --
+  describe "if-then-else conditional bounds" $ do
+
+    it "if-then-else: safe when both branches in range" $ do
+      -- i < 5: then-branch = i+1 (< 6), else-branch = i (< 5); max bound = 6; src has 6 → safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [6] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i] = if i > 0 then i + 1 else i in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "if-then-else: rejected when combined bound exceeds source" $ do
+      -- then-branch = i+1 (bound 6), else-branch = i (bound 5); max = 6; src has 5 → rejected
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = if i > 0 then i + 1 else i in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "if-then-else with constant branches: safe" $ do
+      -- then = 0, else = 1; bound = max(1, 2) = 2; src has 2 elements → safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [2] (let g [i] = i in g)"
+        , "let idx = generate [5] (let f [i] = if i > 0 then 0 else 1 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "if-then-else with constant branches: rejected when source too small" $ do
+      -- then = 0, else = 2; bound = max(1, 3) = 3; src has 2 elements → rejected
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [2] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = if i > 0 then 0 else 2 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- Transitive constant propagation in the solver
+  -- ------------------------------------------------------------------ --
+  -- The solver now iterates buildConstMap + applyConstMapToPred to a
+  -- fixpoint, so chains like  dim(p42) = dim(p7)  and  dim(p7) = 5
+  -- are resolved to  dim(p42) = 5  even though a single pass would not
+  -- propagate the second fact into the first.
+  -- ------------------------------------------------------------------ --
+  describe "transitive constant propagation" $ do
+
+    it "two-hop shape chain: gather safe when sizes match via transitivity" $ do
+      -- iota 5 → sort_indices → gather against generate [5]:
+      -- TValBound(sort) = TDim(iota) = 5, TDim(src) = 5; chain resolves to 5 ≤ 5
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [5] (let g [i] = i in g)"
+        , "let base = iota 5"
+        , "let idx  = sort_indices base"
+        , "let main = gather idx src"
+        ]
+
+    it "two-hop shape chain: gather rejected when source too small" $ do
+      -- iota 6 → sort_indices, gather against generate [5]: bound 6 > 5 → UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src  = generate [5] (let g [i] = i in g)"
+            , "let base = iota 6"
+            , "let idx  = sort_indices base"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "three-hop chain: map over sort_indices over iota is verified" $ do
+      -- iota 5 → sort_indices (bound = 5) → identity map (bound = 5) → gather [5]
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [5] (let g [i] = i in g)"
+        , "let base = iota 5"
+        , "let perm = sort_indices base"
+        , "let idx  = map (let f x = x in f) perm"
+        , "let main = gather idx src"
+        ]

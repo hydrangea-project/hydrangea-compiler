@@ -43,6 +43,10 @@ data Term
     -- ^ @TValBoundDim arr i@ is the exclusive upper bound on the i-th integer
     --   component of every element of the integer[-tuple] array bound to @arr@.
     --   For scalar-element arrays only component 0 is used.
+  | TMax Term Term
+    -- ^ @TMax a b@ is the larger of two terms.  Used as the bound of
+    --   @if-then-else@ and @max@ expressions: if @x < a@ and @y < b@ then
+    --   @max(x,y) < max(a,b)@.
   deriving (Eq, Ord, Show, Generic)
 
 -- | Predicates over refinement terms.
@@ -109,6 +113,7 @@ termVars term =
     TNeg t -> termVars t
     TDim arr ix -> S.singleton (dimVarName arr ix)
     TValBoundDim arr i -> S.singleton (valBoundDimName arr i)
+    TMax l r -> termVars l <> termVars r
 
 -- | Collect binder variables referenced by a term.
 termBindVars :: Term -> Set Var
@@ -122,6 +127,7 @@ termBindVars term =
     TNeg t -> termBindVars t
     TDim arr _ -> S.singleton arr
     TValBoundDim arr _ -> S.singleton arr
+    TMax l r -> termBindVars l <> termBindVars r
 
 -- | Collect solver variables referenced by a predicate.
 predVars :: Pred -> Set Var
@@ -157,6 +163,7 @@ substTermVars f term =
     TNeg t -> TNeg (substTermVars f t)
     TDim arr ix -> TDim (f arr) ix
     TValBoundDim arr i -> TValBoundDim (f arr) i
+    TMax l r -> TMax (substTermVars f l) (substTermVars f r)
 
 -- | Substitute variables inside a predicate.
 substPredVars :: (Var -> Var) -> Pred -> Pred
@@ -181,6 +188,7 @@ evalTermConst term =
     TNeg t -> negate <$> evalTermConst t
     TDim _ _ -> Nothing
     TValBoundDim _ _ -> Nothing
+    TMax l r -> max <$> evalTermConst l <*> evalTermConst r
 
 -- | Evaluate a predicate to a constant if both sides are constant.
 evalPredConst :: Pred -> Maybe Bool

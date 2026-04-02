@@ -91,6 +91,7 @@ applyConstMapToTerm m t =
     TSub l r     -> TSub (f l) (f r)
     TMul l r     -> TMul (f l) (f r)
     TNeg x       -> TNeg (f x)
+    TMax l r     -> TMax (f l) (f r)
   where f = applyConstMapToTerm m
 
 -- | Substitute known constant values into a predicate.
@@ -159,6 +160,7 @@ termToSBV env term =
     TNeg t -> negate (termToSBV env t)
     TDim arr ix -> lookupVar (dimVarName arr ix)
     TValBoundDim arr i -> lookupVar (valBoundDimName arr i)
+    TMax l r -> smax (termToSBV env l) (termToSBV env r)
   where
     lookupVar v =
       case M.lookup v env of
@@ -231,13 +233,24 @@ checkTaggedPredicates tagged = do
   case findFalseConst constHyps of
     Just p -> return (Left ([p], Nothing))
     Nothing -> do
-      -- 1b. One-pass constant propagation: substitute dim/var constants from
-      -- hypotheses into other hypotheses, then re-run findFalseConst.  This
-      -- catches concrete-false symbolic hypotheses like
-      --   PEq (TMul (TDim src 0) (TDim src 1)) (TConst 5)
-      -- when there are also hyps TDim src 0 = 2 and TDim src 1 = 3.
-      let cmap = buildConstMap (constHyps ++ symHyps)
-          foldedHyps = map (applyConstMapToPred cmap) hyps
+      -- 1b. Fixpoint constant propagation for contradiction detection.
+      -- Substitute dim/var constants from hypotheses into other hypotheses,
+      -- rebuilding the constant map each iteration until it stabilises.
+      -- This handles transitive chains like
+      --   TDim p42 0 = TDim p7 0  and  TDim p7 0 = TConst 5
+      -- which after one pass yield TDim p42 0 = TConst 5, and after a second
+      -- pass expose the contradiction if e.g. TDim p42 0 = TConst 10 also
+      -- appears.  The loop terminates because each step can only promote
+      -- symbolic variables to constants (monotone, finite variable set).
+      -- Note: the fully-folded hyps are used ONLY for findFalseConst; the
+      -- original symHyps/constHyps are still passed to checkObligation so
+      -- that Z3 can see all symbolic constraints in their unmodified form.
+      let foldToFixpoint hyps0 =
+            let cmap  = buildConstMap hyps0
+                hyps1 = map (applyConstMapToPred cmap) hyps0
+            in if cmap == buildConstMap hyps1 then hyps1
+               else foldToFixpoint hyps1
+          foldedHyps    = foldToFixpoint hyps
           (foldedConsts, _) = partitionConsts foldedHyps
       case findFalseConst foldedConsts of
         Just p -> return (Left ([p], Nothing))
