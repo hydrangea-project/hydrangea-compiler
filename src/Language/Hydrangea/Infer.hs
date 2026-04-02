@@ -636,6 +636,17 @@ inferBVal expr = case expr of
         Just (ExactVal m) -> Just (BoundOf m)  -- x % m  <  m  (exact modulus)
         Just (BoundOf m)  -> Just (BoundOf m)  -- x % m  <  m  (upper bound on modulus)
         _                 -> Nothing
+    Divide _ -> do
+      -- Integer division by a positive constant k: if 0 ≤ e < b then
+      -- e / k ≤ (b-1) / k, so the exclusive upper bound is (b-1)/k + 1.
+      -- Only handle concrete divisors (EInt); symbolic divisors fall through.
+      mb1 <- inferBVal e1
+      return $ case (mb1, e2) of
+        (Just (ExactVal (TConst n)), EInt _ k) | k > 0 ->
+          Just (ExactVal (TConst (n `div` k)))
+        (Just (BoundOf (TConst b)), EInt _ k) | k > 0 ->
+          Just (BoundOf (TConst ((b - 1) `div` k + 1)))
+        _ -> Nothing
     _ -> return Nothing
   EIfThenElse _ _ e1 e2 -> do
     -- Bound of an if-then-else is the max of both branch bounds (conservative).

@@ -183,8 +183,9 @@ spec = describe "gather bounds checking" $ do
   describe "gather without established bounds" $ do
 
     it "gather with unanalyzable body emits 'could not verify' warning" $ do
-      -- Division is not tracked by inferBVal → TValBound unestablished →
-      -- ungrounded obligation → warning, not silent pass.
+      -- Without an explicit PBound, the index variable's bound is symbolic
+      -- (TDim arrVar 0), so inferBVal(i/2) returns Nothing.  TValBound is
+      -- unestablished → obligation is ungrounded → warning, not silent pass.
       let src = BS.unlines
             [ "let src = generate [5] (let g [i] = i in g)"
             , "let idx = generate [5] (let f [i] = i / 2 in f)"
@@ -217,7 +218,70 @@ spec = describe "gather bounds checking" $ do
               warnings `shouldSatisfy` any (isInfixOf "could not verify")
 
   -- ------------------------------------------------------------------ --
-  -- Auto-inference of generator body bounds without PBound annotation
+  -- Division bounds with PBound annotation
+  -- ------------------------------------------------------------------ --
+  -- inferBVal now handles integer division when the dividend's bound is a
+  -- concrete TConst.  This occurs when the index variable has an explicit
+  -- [i bound N] annotation (PBound), which sets valBoundCtx[i] = TConst N.
+  -- For  [i bound N] = i / k:  exclusive upper bound = (N-1)/k + 1.
+  -- Without PBound the bound remains symbolic (TDim) and division still
+  -- produces an ungrounded obligation (warning, not error).
+  -- ------------------------------------------------------------------ --
+  describe "division bounds with PBound annotation" $ do
+
+    it "PBound i/2: bound = ceil(10/2) = 5; safe when source has 5 elements" $ do
+      -- [i bound 10]: i < 10 → i/2 < (10-1)/2+1 = 5.  5 ≤ 5 ✓
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [5] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i bound 10] = i / 2 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "PBound i/2: bound = 5; rejected when source has only 4 elements" $ do
+      -- [i bound 10] → i/2 bound = 5.  5 > 4 → UnsatConstraints.
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [4] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i bound 10] = i / 2 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "i%4 body: safe gather into 4-element source passes" $ do
+      -- i % 4 is in [0, 4); src has 4 elements — safe
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [4] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i] = i % 4 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "PBound i/3: bound = ceil(9/3) = 3; safe when source has 3 elements" $ do
+      -- [i bound 9] → i/3 bound = (9-1)/3+1 = 3.  3 ≤ 3 ✓
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [3] (let g [i] = i in g)"
+        , "let idx = generate [9] (let f [i bound 9] = i / 3 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "PBound (i/2)+1: bound = 6; safe when source has 6 elements" $ do
+      -- [i bound 10] → i/2 bound = 5 → (i/2)+1 bound = 6.  6 ≤ 6 ✓
+      expectDecsOk $ BS.unlines
+        [ "let src = generate [6] (let g [i] = i in g)"
+        , "let idx = generate [10] (let f [i bound 10] = i / 2 + 1 in f)"
+        , "let main = gather idx src"
+        ]
+
+    it "PBound (i/2)+1: bound = 6; rejected when source has only 5 elements" $ do
+      -- [i bound 10] → (i/2)+1 bound = 6.  6 > 5 → UnsatConstraints.
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [5] (let g [i] = i in g)"
+            , "let idx = generate [10] (let f [i bound 10] = i / 2 + 1 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
   -- ------------------------------------------------------------------ --
   -- When a generate body is a simple arithmetic expression over the index
   -- variable (e.g. i + 1, i % M, i * k, a constant), the compiler now
@@ -369,11 +433,12 @@ spec = describe "gather bounds checking" $ do
         (isInfixOf "UnsatConstraints")
 
     it "generate with non-inferable body emits a 'could not verify' warning" $ do
-      -- Division is not tracked by inferBVal, so no TValBound is established.
-      -- The bounds obligation is ungrounded → ObligationUnknown → warning emitted.
-      -- This ensures unsafe code is never silently accepted; the user gets a notice.
-      -- (Note: arithmetic bodies like i+1, i%M, i*k ARE now auto-inferred and
-      -- checked precisely — only truly opaque expressions fall through here.)
+      -- Division without PBound: i has symbolic bound (TDim arrVar 0), so
+      -- inferBVal(i/2) returns Nothing.  No TValBound established → ungrounded
+      -- obligation → warning.  This ensures unsafe code is never silently
+      -- accepted; the user gets a notice.
+      -- (Note: with [i bound N] annotation, division IS now auto-inferred and
+      -- checked precisely — only unannotated expressions fall through here.)
       let src = BS.unlines
             [ "let src = generate [3] (let g [i] = i in g)"
             , "let idx = generate [5] (let f [i] = i / 2 in f)"
@@ -1025,9 +1090,8 @@ spec = describe "gather bounds checking" $ do
         (isInfixOf "UnsatConstraints")
 
     it "ungrounded index (no make_index) produces a warning, not an error" $ do
-      -- generate with a non-inferable body (division is not tracked by inferBVal)
-      -- has no TValBoundDim established; the obligation is ungrounded →
-      -- ObligationUnknown → warning only, not an error
+      -- generate with a division body (no PBound) → TValBound unestablished;
+      -- the obligation is ungrounded → ObligationUnknown → warning only, not an error
       let src = BS.unlines
             [ "let dst  = fill [5] 0"
             , "let idx  = generate [5] (let f [i] = i / 2 in f)"
@@ -1305,3 +1369,45 @@ spec = describe "gather bounds checking" $ do
             ]
         )
         (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- Transitive constant propagation in the solver
+  -- ------------------------------------------------------------------ --
+  -- The solver now iterates buildConstMap + applyConstMapToPred to a
+  -- fixpoint, so chains like  dim(p42) = dim(p7)  and  dim(p7) = 5
+  -- are resolved to  dim(p42) = 5  even though a single pass would not
+  -- propagate the second fact into the first.
+  -- ------------------------------------------------------------------ --
+  describe "transitive constant propagation" $ do
+
+    it "two-hop shape chain: gather safe when sizes match via transitivity" $ do
+      -- iota 5 → sort_indices → gather against generate [5]:
+      -- TValBound(sort) = TDim(iota) = 5, TDim(src) = 5; chain resolves to 5 ≤ 5
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [5] (let g [i] = i in g)"
+        , "let base = iota 5"
+        , "let idx  = sort_indices base"
+        , "let main = gather idx src"
+        ]
+
+    it "two-hop shape chain: gather rejected when source too small" $ do
+      -- iota 6 → sort_indices, gather against generate [5]: bound 6 > 5 → UNSAT
+      expectDecsError
+        ( BS.unlines
+            [ "let src  = generate [5] (let g [i] = i in g)"
+            , "let base = iota 6"
+            , "let idx  = sort_indices base"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "three-hop chain: map over sort_indices over iota is verified" $ do
+      -- iota 5 → sort_indices (bound = 5) → identity map (bound = 5) → gather [5]
+      expectDecsOk $ BS.unlines
+        [ "let src  = generate [5] (let g [i] = i in g)"
+        , "let base = iota 5"
+        , "let perm = sort_indices base"
+        , "let idx  = map (let f x = x in f) perm"
+        , "let main = gather idx src"
+        ]
