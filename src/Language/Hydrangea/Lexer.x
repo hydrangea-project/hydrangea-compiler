@@ -107,6 +107,9 @@ tokens :-
 <0> false   { tok BFalse }
 <0> All     { tok All }
 <0> Any     { tok Any }
+<0> where   { tok Where }
+<0> dim     { tok Dim }
+<0> elem    { tok Elem }
 
 -- Arithmetic operators
 <0> "+"     { tok Plus }
@@ -279,6 +282,10 @@ data Token
   -- Logical operators
   | And
   | Or
+  -- Where-clause keywords
+  | Where
+  | Dim
+  | Elem
   -- Parenthesis
   | LPar
   | RPar

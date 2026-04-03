@@ -67,7 +67,7 @@ checkInlineSrc src = do
       case eres of
         Left err -> expectationFailure $ "Interpreter error: " ++ show err
         Right env -> do
-          let zeroVars = [v | Dec _ v pats _ _ <- decs, null pats]
+          let zeroVars = [v | Dec _ v pats _ _ _ <- decs, null pats]
               lookupVal v = Map.lookup v env
               formatElem (VInt n)    = show n
               formatElem (VFloat f)  = stripTrailingZerosG (printf "%.17g" f)

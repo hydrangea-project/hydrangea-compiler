@@ -132,7 +132,7 @@ normExp expr = case expr of
 
   -- ELetIn: handle shape binding
   ELetIn a dec body -> do
-    dec'@(Dec _ name _ _ decBody) <- normDec dec
+    dec'@(Dec _ name _ _ _ decBody) <- normDec dec
     -- If this is an array binding, extract and bind its shape
     case extractShape decBody of
       Just shapeExpr -> do
@@ -225,11 +225,11 @@ normShapeDim dim = case dim of
 
 -- | Normalize a declaration.
 normDec :: Dec a -> ShapeM a (Dec a)
-normDec (Dec a name pats poly body) = do
+normDec (Dec a name pats mw poly body) = do
   -- For declarations with patterns, we can't easily track shapes
   -- Just normalize the body
   body' <- normExp body
-  pure (Dec a name pats poly body')
+  pure (Dec a name pats mw poly body')
 
 -- | Compute shape expression for a slice operation.
 sliceShape :: a -> Exp a -> [SliceDim a] -> Exp a

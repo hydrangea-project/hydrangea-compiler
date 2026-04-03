@@ -93,7 +93,7 @@ lowerDecs2 decs = evalState go initState
     go = do
       mapM_ preRegister decs
       Program <$> mapM lowerDec decs
-    preRegister (Dec _ name pats _ body)
+    preRegister (Dec _ name pats _ _ body)
       | not (null pats) = registerFn name pats body
       | otherwise       = pure ()
 
@@ -105,12 +105,12 @@ lowerDecs2WithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
     go = do
       mapM_ preRegister decs
       Program <$> mapM lowerDec decs
-    preRegister (Dec _ name pats _ body)
+    preRegister (Dec _ name pats _ _ body)
       | not (null pats) = registerFn name pats body
       | otherwise       = pure ()
 
 lowerDec :: Dec Range -> LowerM Proc
-lowerDec (Dec _ name pats _ body) = do
+lowerDec (Dec _ name pats _ _ body) = do
   let params = concatMap patVarNames pats
   when (null pats) $
     modify' $ \s -> s { lsValueProcs = S.insert name (lsValueProcs s) }
@@ -135,6 +135,7 @@ patVarNames :: Pat a -> [CVar]
 patVarNames (PVar _ v) = [v]
 patVarNames (PBound _ v _) = [v]
 patVarNames (PVec _ ps) = concatMap patVarNames ps
+patVarNames (PPair _ p1 p2) = patVarNames p1 ++ patVarNames p2
 
 shapeRankExp :: Exp a -> Maybe Int
 shapeRankExp expr = case expr of
@@ -333,7 +334,7 @@ lowerExp expr = case expr of
     when (rTy /= CTUnknown) $ registerCType r rTy
     pure (sc ++ [SIf ac (st ++ [SAssign r (RAtom at')]) (se ++ [SAssign r (RAtom ae)])], AVar r)
 
-  ELetIn _ (Dec _ name pats _ body) rest
+  ELetIn _ (Dec _ name pats _ _ body) rest
     | not (null pats) -> do
         registerFn name pats body
         lowerExp rest
@@ -1548,7 +1549,7 @@ lowerExp expr = case expr of
 -- | Extract the accessor variable name and body from a stencil function expression.
 -- Handles both inline lambdas and named functions registered in the environment.
 extractStencilFn :: Exp Range -> LowerM (Maybe (Var, Exp Range))
-extractStencilFn (ELetIn _ (Dec _ _name [PVar _ accVar] _ body) _) =
+extractStencilFn (ELetIn _ (Dec _ _name [PVar _ accVar] _ _ body) _) =
   pure $ Just (accVar, body)
 extractStencilFn (EVar _ name) = do
   mFn <- lookupFn name
@@ -1567,7 +1568,7 @@ detectStencilRank accVar body = fromMaybe 1 (go body)
     go (EBinOp _ l _ r)               = go l <|> go r
     go (ENeg _ e)                      = go e
     go (EUnOp _ _ e)                   = go e
-    go (ELetIn _ (Dec _ _ _ _ b) e)    = go b <|> go e
+    go (ELetIn _ (Dec _ _ _ _ _ b) e)    = go b <|> go e
     go (EIfThenElse _ c t el)          = go c <|> go t <|> go el
     go (EIfThen _ c t)                 = go c <|> go t
     go (EPair _ e1 e2)                 = go e1 <|> go e2
@@ -1599,10 +1600,10 @@ substituteAccCalls accVar rank = go
         pure (EBinOp r e1' op e2', ps1 ++ ps2)
       ENeg r e -> do (e', ps) <- go e; pure (ENeg r e', ps)
       EUnOp r op e -> do (e', ps) <- go e; pure (EUnOp r op e', ps)
-      ELetIn r (Dec da dn dp dt db) e -> do
+      ELetIn r (Dec da dn dp dw dt db) e -> do
         (db', ps1) <- go db
         (e',  ps2) <- go e
-        pure (ELetIn r (Dec da dn dp dt db') e', ps1 ++ ps2)
+        pure (ELetIn r (Dec da dn dp dw dt db') e', ps1 ++ ps2)
       EIfThenElse r c t el -> do
         (c', ps1) <- go c; (t', ps2) <- go t; (el', ps3) <- go el
         pure (EIfThenElse r c' t' el', ps1 ++ ps2 ++ ps3)
@@ -2127,6 +2128,16 @@ bindPatAtom :: Pat Range -> Atom -> LowerM [Stmt]
 bindPatAtom (PVar _ v) src = bindCopyVar v src
 bindPatAtom (PBound _ v _) src = bindCopyVar v src
 bindPatAtom (PVec _ ps) src = bindPVecPats ps src
+bindPatAtom (PPair _ p1 p2) src = do
+  fstVar <- freshCVar "fst"
+  sndVar <- freshCVar "snd"
+  mPairTys <- pairElemTypes src
+  let (fstRhs, sndRhs) = case mPairTys of
+        Just (ct1, ct2) -> (RPairFst ct1 src, RPairSnd ct2 src)
+        Nothing         -> (RProj 0 src,       RProj 1 src)
+  fstStmts <- bindPatAtom p1 (AVar fstVar)
+  sndStmts <- bindPatAtom p2 (AVar sndVar)
+  pure $ [SAssign fstVar fstRhs, SAssign sndVar sndRhs] ++ fstStmts ++ sndStmts
 
 bindAppliedPat :: Pat Range -> Exp Range -> Atom -> LowerM [Stmt]
 bindAppliedPat pat arg src =
@@ -2343,8 +2354,15 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
             registerCType resultVar atomTy
             propagatePairInfo resultVar atom'
             pure $ binds ++ stmts' ++ [SAssign resultVar (RAtom atom')]
+          PPair _ _ _ -> do
+            binds <- bindPatAtom pat (AVar paramVar)
+            (stmts', atom') <- lowerExp body
+            atomTy <- ctypeOfAtom atom'
+            registerCType resultVar atomTy
+            propagatePairInfo resultVar atom'
+            pure $ binds ++ stmts' ++ [SAssign resultVar (RAtom atom')]
       _ -> pure [SAssign resultVar (RCall name [AVar paramVar])]
-  ELetIn _ (Dec _ name pats _ body) rest -> do
+  ELetIn _ (Dec _ name pats _ _ body) rest -> do
     registerFn name pats body
     inlineArrayFn rest paramVar resultVar
   _ -> do
@@ -2398,7 +2416,7 @@ inlineArrayFn1D fnExp paramVar resultVar = case fnExp of
             propagatePairInfo resultVar atom
             pure $ bindStmts ++ stmts ++ [SAssign resultVar (RAtom atom)]
       _ -> pure [SAssign resultVar (RCall name [AVar paramVar])]
-  ELetIn _ (Dec _ name pats _ body) rest -> do
+  ELetIn _ (Dec _ name pats _ _ body) rest -> do
     registerFn name pats body
     inlineArrayFn1D rest paramVar resultVar
   _ -> do
@@ -2456,7 +2474,7 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
         propagatePairInfo resultVar atom
         pure $ binds ++ stmts ++ [SAssign resultVar (RAtom atom)]
       _ -> pure [SAssign resultVar (RCall name [AVar paramVar])]
-  ELetIn _ (Dec _ name pats _ body) rest -> do
+  ELetIn _ (Dec _ name pats _ _ body) rest -> do
     registerFn name pats body
     inlineScalarFn rest paramVar resultVar
   _ -> do
@@ -2491,7 +2509,7 @@ inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of
         pure [ SAssign t (RCall name [AVar param1])
              , SAssign resultVar (RCall "__apply" [AVar t, AVar param2])
              ]
-  ELetIn _ (Dec _ name pats _ body) rest -> do
+  ELetIn _ (Dec _ name pats _ _ body) rest -> do
     registerFn name pats body
     inlineBinaryFn rest param1 param2 resultVar
   _ -> do

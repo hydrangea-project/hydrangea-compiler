@@ -65,15 +65,24 @@ data Pred
 -- are conditions that must be *entailed* by the hypotheses: for each obligation
 -- @S@ with hypotheses @H@, the solver checks that @H ∧ ¬S@ is UNSAT (i.e., @S@
 -- is valid given @H@).  This is validity checking, not satisfiability checking.
+--
+-- @WhereHyp@ marks predicates emitted by a @where@-clause annotation.  They act
+-- exactly like @Hyp@ within the annotated function's own body, but are *not*
+-- re-emitted at call sites (see @instantiate@).  This prevents the where-clause
+-- hypotheses from trivially discharging the corresponding obligations when the
+-- function is applied indirectly (e.g. through a bare wrapper with no where
+-- clause of its own), which would produce a false-positive "Verified" result.
 data TaggedPred
-  = Hyp Pred   -- ^ A known fact (shape equality, declared bound).
-  | Obl Pred   -- ^ A safety obligation (must be entailed by hypotheses).
+  = Hyp      Pred  -- ^ A known structural fact (shape equality, declared bound).
+  | WhereHyp Pred  -- ^ A where-clause hypothesis (local to the declaring function).
+  | Obl      Pred  -- ^ A safety obligation (must be entailed by hypotheses).
   deriving (Eq, Ord, Show, Generic)
 
 -- | Extract the underlying predicate from a tagged predicate.
 untagPred :: TaggedPred -> Pred
-untagPred (Hyp p) = p
-untagPred (Obl p) = p
+untagPred (Hyp      p) = p
+untagPred (WhereHyp p) = p
+untagPred (Obl      p) = p
 
 -- | Negate a predicate (used to form the check @H ∧ ¬S@ for validity).
 negatePred :: Pred -> Pred
@@ -86,8 +95,9 @@ negatePred (PGt  l r) = PLe  l r
 
 -- | Substitute variables inside a tagged predicate.
 substTaggedPredVars :: (Var -> Var) -> TaggedPred -> TaggedPred
-substTaggedPredVars f (Hyp p) = Hyp (substPredVars f p)
-substTaggedPredVars f (Obl p) = Obl (substPredVars f p)
+substTaggedPredVars f (Hyp      p) = Hyp      (substPredVars f p)
+substTaggedPredVars f (WhereHyp p) = WhereHyp (substPredVars f p)
+substTaggedPredVars f (Obl      p) = Obl      (substPredVars f p)
 
 -- | Convert a dimension projection into a synthetic variable name used in the solver.
 dimVarName :: Var -> Int -> Var
@@ -204,3 +214,36 @@ evalPredConst pred' =
 -- | Pack a regular string into the bytestring representation used for variables.
 fromString :: String -> ByteString
 fromString = BS.pack
+
+-- ---------------------------------------------------------------------------
+-- Refinement predicates for where-clause annotations
+-- ---------------------------------------------------------------------------
+
+-- | Comparison operators used in where-clause predicates.
+data RelOp = RLt | RLe | RGt | RGe | REq | RNeq
+  deriving (Eq, Ord, Show, Generic)
+
+-- | Terms appearing in where-clause predicates.  These reference parameter
+-- names (scalar or array components) and map to the existing 'Term' algebra
+-- after resolution against the in-scope refinement variables.
+data RefineTerm
+  = RTVar   Var           -- ^ A parameter name (scalar component)
+  | RTConst Integer       -- ^ A literal integer constant
+  | RTDim   Var Int       -- ^ @dim arr i@: the i-th dimension of array param @arr@
+  | RTElem  Var           -- ^ @elem arr@: the exclusive element upper bound of @arr@ (TValBoundDim arr 0)
+  | RTAdd   RefineTerm RefineTerm
+  | RTSub   RefineTerm RefineTerm
+  | RTMul   Integer RefineTerm  -- ^ @n * t@: constant × term (linear arithmetic only)
+  deriving (Eq, Ord, Show, Generic)
+
+-- | Predicates used in where-clause annotations.  Deliberately restricted to
+-- forms that map directly to the existing 'Pred' / 'Term' algebra.
+data RefinePred
+  = RPBound Var RefineTerm
+    -- ^ @bound x E@: shorthand for @0 <= x && x < E@ (exclusive upper bound).
+    --   Matches the semantics of existing @[i bound E]@ PBound patterns.
+  | RPRel RelOp RefineTerm RefineTerm
+    -- ^ A binary comparison between two refine-terms.
+  | RPAnd RefinePred RefinePred
+    -- ^ Conjunction: both sub-predicates must hold.
+  deriving (Eq, Ord, Show, Generic)

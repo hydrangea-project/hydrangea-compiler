@@ -48,7 +48,7 @@ spec = describe "Interpreter matmul correctness" $ do
             Left err -> expectationFailure $ "Interpreter error: " ++ show err
             Right env -> do
               -- find result binding
-              let mvar = case [ v | Dec _ v _ _ _ <- decs, v == "result" ] of
+              let mvar = case [ v | Dec _ v _ _ _ _ <- decs, v == "result" ] of
                           (v:_) -> v
                           [] -> error "result var not found in parsed decls"
               case Map.lookup mvar env of

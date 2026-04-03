@@ -19,6 +19,8 @@ import Data.List (intercalate)
 patVars :: Pat a -> S.Set Var
 patVars (PVar _ v) = S.singleton v
 patVars (PVec _ ps) = S.unions (map patVars ps)
+patVars (PBound _ v _) = S.singleton v
+patVars (PPair _ p1 p2) = patVars p1 <> patVars p2
 
 -- | Collect free references to names in @topNames@ within @expr@, respecting
 -- local shadowing.  Variables in @bound@ are treated as locally bound and
@@ -30,7 +32,7 @@ collectTopLevelRefs topNames expr bound =
       | v `S.member` topNames && not (v `S.member` bound) -> S.singleton v
     EVar{} -> S.empty
 
-    ELetIn _ (Dec _ name pats _ decBody) body ->
+    ELetIn _ (Dec _ name pats _ _ decBody) body ->
       let patBound = S.unions (map patVars pats)
        in go decBody patBound `S.union` go body (S.insert name (patBound `S.union` bound))
 
@@ -122,7 +124,7 @@ pruneDecsToMain ds =
           bfs (x:xs) seen =
             let seen' = S.insert x seen
                 refs = case Map.lookup x decByName of
-                         Just (Dec _ _ pats _ body) -> collectRefs body (S.unions (map patVars pats))
+                         Just (Dec _ _ pats _ _ body) -> collectRefs body (S.unions (map patVars pats))
                          _ -> S.empty
                 new = S.toList (refs S.\\ seen')
              in bfs (xs ++ new) seen'
@@ -145,7 +147,7 @@ checkKernelFused ds kernelName =
       fused = fuseDecs (normalizeShapesDecs (uniquifyDecs ds))
   in case filter (\d -> decName d == kernelName) fused of
        [] -> Left $ "Kernel '" ++ BS.unpack kernelName ++ "' not found in top-level declarations"
-       (Dec _ _ pats _ body : _) ->
+       (Dec _ _ pats _ _ body : _) ->
          let otherOriginals = S.delete kernelName originalNames
              refs = collectTopLevelRefs otherOriginals body (S.unions (map patVars pats))
              unFused = refs  -- refs is already filtered to otherOriginals by collectTopLevelRefs

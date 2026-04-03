@@ -201,8 +201,10 @@ checkObligation hyps obl = do
           return (Counterexample vals)
 
 -- | Collect the set of SMT variables that appear in a predicate's hypotheses.
+-- Both @Hyp@ and @WhereHyp@ contribute: within the function that declared the
+-- where clause, these are genuine hypotheses that ground the body's obligations.
 hypVars :: [TaggedPred] -> Set Var
-hypVars tagged = S.unions [predVars p | Hyp p <- tagged]
+hypVars tagged = S.unions [predVars p | tp <- tagged, case tp of { Obl _ -> False; _ -> True }, let p = untagPred tp]
 
 -- | Check all tagged predicates.
 --
@@ -225,7 +227,7 @@ checkTaggedPredicates tagged = do
   -- O(k) copies of every predicate for a k-step chain.  Deduplication here is
   -- O(n log n) and avoids redundant Z3 calls for duplicate Obl predicates.
   let tagged' = S.toList (S.fromList tagged)
-      hyps = [p | Hyp p <- tagged']
+      hyps = [p | tp <- tagged', case tp of { Obl _ -> False; _ -> True }, let p = untagPred tp]
       obls = [p | Obl p <- tagged']
       hVars = S.unions (map predVars hyps)
   -- 1. Eagerly evaluate constant hypotheses.

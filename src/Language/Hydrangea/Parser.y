@@ -15,6 +15,7 @@ import Data.Monoid (First (..))
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NE
 import qualified Language.Hydrangea.Lexer as L
+import Language.Hydrangea.Predicate (RefinePred(..), RefineTerm(..), RelOp(..))
 import Language.Hydrangea.Syntax
 }
 
@@ -103,6 +104,9 @@ import Language.Hydrangea.Syntax
   false      { L.RangedToken L.BFalse _ }
   all        { L.RangedToken L.All _ }
   any        { L.RangedToken L.Any _ }
+  where      { L.RangedToken L.Where _ }
+  dim        { L.RangedToken L.Dim _ }
+  elem       { L.RangedToken L.Elem _ }
   -- Arithmetic operators
   '+'        { L.RangedToken L.Plus _ }
   '-'        { L.RangedToken L.Minus _ }
@@ -183,7 +187,38 @@ typeAnnotation :: { Polytype }
   : ':' polytype { $2 }
 
 dec :: { Dec L.Range }
-  : let name many(pat) optional(typeAnnotation) '=' exp { Dec (L.rtRange $1 <-> info $6) (unName $2) $3 $4 $6 }
+  : let name many(pat) optional(whereClause) optional(typeAnnotation) '=' exp
+      { Dec (L.rtRange $1 <-> info $7) (unName $2) $3 $4 $5 $7 }
+
+-- | A where clause on a declaration: @where refinePred@.
+-- Provides a precondition on the (single pair/record) argument.
+whereClause :: { RefinePred }
+  : where refinePred { $2 }
+
+-- | Predicates in a where clause (conjunction of comparisons and bound assertions).
+refinePred :: { RefinePred }
+  : bound name refineTerm
+      { RPBound (unName $2) $3 }
+  | refineTerm '<'  refineTerm { RPRel RLt $1 $3 }
+  | refineTerm '<=' refineTerm { RPRel RLe $1 $3 }
+  | refineTerm '>'  refineTerm { RPRel RGt $1 $3 }
+  | refineTerm '>=' refineTerm { RPRel RGe $1 $3 }
+  | refineTerm '='  refineTerm { RPRel REq $1 $3 }
+  | refineTerm '<>' refineTerm { RPRel RNeq $1 $3 }
+  | refinePred '&'  refinePred { RPAnd $1 $3 }
+  | '(' refinePred ')'         { $2 }
+
+-- | Arithmetic terms in a where clause (linear, referencing pattern-bound names).
+refineTerm :: { RefineTerm }
+  : name                 { RTVar (unName $1) }
+  | integer              { RTConst (unTok $1 (\_ (L.Integer n) -> n)) }
+  | dim name integer     { RTDim (unName $2) (fromIntegral (unTok $3 (\_ (L.Integer n) -> n))) }
+  | elem name            { RTElem (unName $2) }
+  | refineTerm '+' refineTerm { RTAdd $1 $3 }
+  | refineTerm '-' refineTerm { RTSub $1 $3 }
+  | integer '*' refineTerm
+      { RTMul (unTok $1 (\_ (L.Integer n) -> n)) $3 }
+  | '(' refineTerm ')'   { $2 }
 
 decs :: { [Dec L.Range] }
   : many(dec) { $1 }
@@ -222,7 +257,7 @@ exp :: { Exp L.Range }
   | exp '>=.' exp            { EBinOp (info $1 <-> info $3) $1 (GeF (L.rtRange $2)) $3 }
   -- Lambda: fn pat1 pat2 ... => body  desugars to  let __lambda_L_C pat1 pat2 ... = body in __lambda_L_C
   | fn pat many(pat) '=>' exp
-      { ELetIn (L.rtRange $1 <-> info $5) (Dec (L.rtRange $1 <-> info $5) (mkLambdaName $1) ($2 : $3) Nothing $5) (EVar (L.rtRange $1 <-> info $5) (mkLambdaName $1)) }
+      { ELetIn (L.rtRange $1 <-> info $5) (Dec (L.rtRange $1 <-> info $5) (mkLambdaName $1) ($2 : $3) Nothing Nothing $5) (EVar (L.rtRange $1 <-> info $5) (mkLambdaName $1)) }
   -- Binding
   | dec in exp               { ELetIn (info $1 <-> info $3) $1 $3 }
   -- Bound-annotated binding: let x bound E = rhs in body
@@ -394,6 +429,7 @@ pat :: { Pat L.Range }
   : name                       { PVar (info $1) (unName $1) }
   | '[' patVec ']'             { PVec (L.rtRange $1 <-> L.rtRange $3) $2 }
   | name bound atom            { PBound (info $1 <-> info $3) (unName $1) $3 }
+  | '(' pat ',' pat ')'        { PPair (L.rtRange $1 <-> L.rtRange $5) $2 $4 }
 
 
 optional(p)

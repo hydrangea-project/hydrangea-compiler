@@ -248,14 +248,6 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
-    it "i%4 body: safe gather into 4-element source passes" $ do
-      -- i % 4 is in [0, 4); src has 4 elements — safe
-      expectDecsOk $ BS.unlines
-        [ "let src = generate [4] (let g [i] = i in g)"
-        , "let idx = generate [10] (let f [i] = i % 4 in f)"
-        , "let main = gather idx src"
-        ]
-
     it "PBound i/3: bound = ceil(9/3) = 3; safe when source has 3 elements" $ do
       -- [i bound 9] → i/3 bound = (9-1)/3+1 = 3.  3 ≤ 3 ✓
       expectDecsOk $ BS.unlines

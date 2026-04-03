@@ -108,6 +108,7 @@ test-suite hydrangea-test
        , Language.Hydrangea.RecordSpec
        , Language.Hydrangea.StencilSpec
        , Language.Hydrangea.GatherBoundsSpec
+       , Language.Hydrangea.WherePrecondSpec
     type:             exitcode-stdio-1.0
     default-language: GHC2021
     build-depends:

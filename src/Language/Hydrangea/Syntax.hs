@@ -31,7 +31,7 @@ import Data.Functor.Fixedpoint
 import Data.List (sortOn)
 import Data.Ord.Deriving
 import GHC.Generics (Generic1)
-import Language.Hydrangea.Predicate (TaggedPred)
+import Language.Hydrangea.Predicate (RefinePred, TaggedPred)
 import Text.Show.Deriving
 
 -- | Variables in our syntax are just bytestrings
@@ -197,7 +197,7 @@ unName (Name _ bs) = bs
 
 -- | Top-level or local value/function declaration.
 data Dec a
-  = Dec a Var [Pat a] (Maybe Polytype) (Exp a)
+  = Dec a Var [Pat a] (Maybe RefinePred) (Maybe Polytype) (Exp a)
   deriving (Functor, Foldable)
 
 deriving instance (Show a) => Show (Dec a)
@@ -208,11 +208,11 @@ deriving instance (Ord a) => Ord (Dec a)
 
 -- | Extract the binding name from a declaration.
 decName :: Dec a -> Var
-decName (Dec _ name _ _ _) = name
+decName (Dec _ name _ _ _ _) = name
 
 -- | Extract an optional user-supplied polytype annotation from a declaration.
 decPolyTy :: Dec a -> Maybe Polytype
-decPolyTy (Dec _ _ _ polyty _) = polyty
+decPolyTy (Dec _ _ _ _ polyty _) = polyty
 
 -- | Expression AST parameterised by an annotation @a@ (typically a source 'Range').
 data Exp a
@@ -498,24 +498,32 @@ data Pat a
     -- Declares that the index variable @i@ is in @[0, E)@.  Used inside
     -- @generate@ to enable value-bound propagation to the output array.
     PBound a Var (Exp a)
+  | PPair a (Pat a) (Pat a)
+    -- ^ Pair destructuring pattern: @(p1, p2)@.  Allows single-argument
+    --   functions to bind both components of a pair argument.
   deriving (Functor, Foldable)
 
 instance (Show a) => Show (Pat a) where
   show (PVar a v) = "PVar (" ++ show a ++ ") " ++ show v
   show (PVec a ps) = "PVec (" ++ show a ++ ") " ++ show ps
   show (PBound a v _) = "PBound (" ++ show a ++ ") " ++ show v ++ " <expr>"
+  show (PPair a p1 p2) = "PPair (" ++ show a ++ ") " ++ show p1 ++ " " ++ show p2
 
 instance (Eq a) => Eq (Pat a) where
   PVar a1 v1       == PVar a2 v2       = a1 == a2 && v1 == v2
   PVec a1 ps1      == PVec a2 ps2      = a1 == a2 && ps1 == ps2
   PBound a1 v1 _   == PBound a2 v2 _   = a1 == a2 && v1 == v2
+  PPair a1 p1a p1b == PPair a2 p2a p2b = a1 == a2 && p1a == p2a && p1b == p2b
   _                == _                = False
 
 instance (Ord a) => Ord (Pat a) where
   compare (PVar a1 v1)     (PVar a2 v2)     = compare a1 a2 <> compare v1 v2
   compare (PVec a1 ps1)    (PVec a2 ps2)    = compare a1 a2 <> compare ps1 ps2
   compare (PBound a1 v1 _) (PBound a2 v2 _) = compare a1 a2 <> compare v1 v2
+  compare (PPair a1 p1a p1b) (PPair a2 p2a p2b) = compare a1 a2 <> compare p1a p2a <> compare p1b p2b
   compare (PVar _ _)       _                = LT
   compare _                (PVar _ _)       = GT
   compare (PVec _ _)       _                = LT
   compare _                (PVec _ _)       = GT
+  compare (PBound _ _ _)   _                = LT
+  compare _                (PBound _ _ _)   = GT

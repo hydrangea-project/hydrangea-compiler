@@ -47,7 +47,7 @@ spec = do
       case selectProgramDecs [] decs of
         Left err -> expectationFailure err
         Right kept -> do
-          let names = [name | Dec _ name _ _ _ <- kept]
+          let names = [name | Dec _ name _ _ _ _ <- kept]
           names `shouldBe` ["helper", "main"]
 
     it "keeps every top-level declaration with the opt-out flag" $ do
@@ -59,7 +59,7 @@ spec = do
       case selectProgramDecs [allTopLevelProcsFlag] decs of
         Left err -> expectationFailure err
         Right kept -> do
-          let names = [name | Dec _ name _ _ _ <- kept]
+          let names = [name | Dec _ name _ _ _ _ <- kept]
           names `shouldBe` ["helper", "dead", "main"]
 
     it "changes the generated C surface when dead top-level kernels are kept" $ do

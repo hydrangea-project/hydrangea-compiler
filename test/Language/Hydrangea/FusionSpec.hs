@@ -57,7 +57,7 @@ anyExp p expr
         EBinOp _ l _ r -> anyExp p l || anyExp p r
         EUnOp _ _ e -> anyExp p e
         EOp {} -> False
-        ELetIn _ (Dec _ _ _ _ b) e -> anyExp p b || anyExp p e
+        ELetIn _ (Dec _ _ _ _ _ b) e -> anyExp p b || anyExp p e
         EProj _ _ e -> anyExp p e
         EGenerate _ s f -> anyExp p s || anyExp p f
         EMap _ f arr -> anyExp p f || anyExp p arr

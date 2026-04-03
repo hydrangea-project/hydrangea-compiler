@@ -21,12 +21,42 @@ instance Pretty (Dec a) where
 
 -- | Render a declaration body without the leading @let@ keyword.
 prettyDecNoLet :: Dec a -> Doc
-prettyDecNoLet (Dec _ nam pats mty body) =
+prettyDecNoLet (Dec _ nam pats mwhere mty body) =
   (text . unpack) nam
     <+> sep (map pPrint pats)
+    <+> prettyWhere mwhere
     <+> prettyTy mty
     <+> text "="
     <+> pPrint body
+
+-- | Render an optional where clause.
+prettyWhere :: Maybe RefinePred -> Doc
+prettyWhere Nothing     = empty
+prettyWhere (Just rpred) = text "where" <+> pPrintRefinePred rpred
+
+-- | Pretty-print a refinement term (used in where clauses).
+pPrintRefineTerm :: RefineTerm -> Doc
+pPrintRefineTerm (RTVar v)      = text (unpack v)
+pPrintRefineTerm (RTConst n)    = int (fromIntegral n)
+pPrintRefineTerm (RTDim v i)    = text "dim" <+> text (unpack v) <+> int i
+pPrintRefineTerm (RTElem v)     = text "elem" <+> text (unpack v)
+pPrintRefineTerm (RTAdd l r)    = parens (pPrintRefineTerm l <+> text "+" <+> pPrintRefineTerm r)
+pPrintRefineTerm (RTSub l r)    = parens (pPrintRefineTerm l <+> text "-" <+> pPrintRefineTerm r)
+pPrintRefineTerm (RTMul n t)    = parens (int (fromIntegral n) <+> text "*" <+> pPrintRefineTerm t)
+
+-- | Pretty-print a refinement predicate (used in where clauses).
+pPrintRefinePred :: RefinePred -> Doc
+pPrintRefinePred (RPBound v e)    = text "bound" <+> text (unpack v) <+> parens (pPrintRefineTerm e)
+pPrintRefinePred (RPRel op l r)   = pPrintRefineTerm l <+> pPrintRelOp op <+> pPrintRefineTerm r
+pPrintRefinePred (RPAnd p q)      = pPrintRefinePred p <+> text "&" <+> pPrintRefinePred q
+
+pPrintRelOp :: RelOp -> Doc
+pPrintRelOp RLt  = text "<"
+pPrintRelOp RLe  = text "<="
+pPrintRelOp RGt  = text ">"
+pPrintRelOp RGe  = text ">="
+pPrintRelOp REq  = text "="
+pPrintRelOp RNeq = text "<>"
 
 -- | Render an optional type annotation prefix.
 prettyTy :: Maybe Polytype -> Doc
@@ -210,6 +240,7 @@ instance Pretty (Pat a) where
   pPrint (PVec _ pats) =
     brackets (sep (punctuate (text ",") (map pPrint pats)))
   pPrint (PBound _ nam e) = text (unpack nam) <+> text "bound" <+> pPrint e
+  pPrint (PPair _ p1 p2) = parens (pPrint p1 <> text "," <+> pPrint p2)
 
 instance Pretty (ShapeDim a) where
   pPrint dim =

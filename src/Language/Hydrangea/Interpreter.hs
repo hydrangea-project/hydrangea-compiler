@@ -149,7 +149,7 @@ evalExp expr env = case expr of
           Just fieldVal -> pure fieldVal
           Nothing -> throwError $ TypeError ("Record field not found: " ++ unpack field)
       _ -> throwError $ TypeError "Record projection only works on records"
-  ELetIn _ (Dec _ var pats _ body) e ->
+  ELetIn _ (Dec _ var pats _ _ body) e ->
     evalExp e (Map.insert var (VClosure env pats body) env)
   EBoundLetIn _ x _ rhs body -> do
     val <- evalExp rhs env
@@ -790,6 +790,8 @@ matchPattern (PVec _ pats) (VTuple vals) env =
   if length pats /= length vals
     then Left $ MismatchedPatterns "Pattern length mismatch in tuple"
     else foldM (\e (p, v) -> matchPattern p v e) env (zip pats vals)
+matchPattern (PPair _ p1 p2) (VPair v1 v2) env =
+  matchPattern p1 v1 env >>= matchPattern p2 v2
 matchPattern _ _ _ = Left $ MismatchedPatterns "Pattern match failure"
 
 -- | Evaluate a binary operator
@@ -933,7 +935,7 @@ loadStencilElem bnd shape vals ndIdx offsets = do
 evalDecs :: [Dec ()] -> EvalM Env
 evalDecs = foldM step Map.empty
   where
-    step env (Dec _ var pats _ body) = do
+    step env (Dec _ var pats _ _ body) = do
       val <- if null pats then evalExp body env else pure (VClosure env pats body)
       pure $ Map.insert var val env
 

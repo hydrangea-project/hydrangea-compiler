@@ -30,7 +30,7 @@ spec = describe "pruneDecsToMain" $ do
       Right decs -> case pruneDecsToMain decs of
         Left err -> expectationFailure err
         Right pr -> do
-          let names = [v | Dec _ v _ _ _ <- pr]
+          let names = [v | Dec _ v _ _ _ _ <- pr]
           names `shouldSatisfy` ("unused" `notElem`)
           names `shouldSatisfy` ("a" `elem`)
           names `shouldSatisfy` ("f" `elem`)
@@ -47,7 +47,7 @@ spec = describe "pruneDecsToMain" $ do
       Right decs -> case pruneDecsToMain decs of
         Left err -> expectationFailure err
         Right pr -> do
-          let names = [v | Dec _ v _ _ _ <- pr]
+          let names = [v | Dec _ v _ _ _ _ <- pr]
           names `shouldSatisfy` ("a" `elem`)
           names `shouldSatisfy` ("b" `elem`)
           names `shouldSatisfy` ("main" `elem`)
@@ -63,7 +63,7 @@ spec = describe "pruneDecsToMain" $ do
       Right decs -> case pruneDecsToMain decs of
         Left err -> expectationFailure err
         Right pr -> do
-          let names = [v | Dec _ v _ _ _ <- pr]
+          let names = [v | Dec _ v _ _ _ _ <- pr]
           names `shouldSatisfy` ("f" `elem`)
           names `shouldSatisfy` ("main" `elem`)
           names `shouldSatisfy` (not . ("unusedFoo" `elem`))
@@ -79,7 +79,7 @@ spec = describe "pruneDecsToMain" $ do
       Right decs -> case pruneDecsToMain decs of
         Left err -> expectationFailure err
         Right pr -> do
-          let names = [v | Dec _ v _ _ _ <- pr]
+          let names = [v | Dec _ v _ _ _ _ <- pr]
           names `shouldSatisfy` ("p" `elem`)
           names `shouldSatisfy` ("main" `elem`)
           names `shouldSatisfy` (not . ("orphan" `elem`))
@@ -96,7 +96,7 @@ spec = describe "pruneDecsToMain" $ do
       Right decs -> case pruneDecsToMain decs of
         Left err -> expectationFailure err
         Right pr -> do
-          let names = [v | Dec _ v _ _ _ <- pr]
+          let names = [v | Dec _ v _ _ _ _ <- pr]
           names `shouldSatisfy` ("a" `elem`)
           names `shouldSatisfy` ("b" `elem`)
           names `shouldSatisfy` ("main" `elem`)

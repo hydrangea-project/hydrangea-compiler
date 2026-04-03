@@ -141,7 +141,7 @@ collectVarsBndFusion BMirror    = S.empty
 collectVarsBndFusion (BConst e) = collectVarsExp e
 
 collectVarsDec :: Dec a -> Set Var
-collectVarsDec (Dec _ name pats _ body) =
+collectVarsDec (Dec _ name pats _ _ body) =
   S.insert name (S.unions (map collectVarsPat pats) `S.union` collectVarsExp body)
 
 collectVarsPat :: Pat a -> Set Var
@@ -170,9 +170,10 @@ patVars pat =
     PVar _ v -> S.singleton v
     PBound _ v _ -> S.singleton v
     PVec _ ps -> S.unions (map patVars ps)
+    PPair _ p1 p2 -> patVars p1 <> patVars p2
 
 decBoundVars :: Dec a -> Set Var
-decBoundVars (Dec _ name pats _ _) = S.insert name (S.unions (map patVars pats))
+decBoundVars (Dec _ name pats _ _ _) = S.insert name (S.unions (map patVars pats))
 
 freeVarsExp :: Exp a -> Set Var
 freeVarsExp expr =
@@ -248,7 +249,7 @@ freeVarsBnd BMirror    = S.empty
 freeVarsBnd (BConst e) = freeVarsExp e
 
 freeVarsDec :: Dec a -> Set Var
-freeVarsDec (Dec _ _ pats _ body) = freeVarsExp body S.\\ S.unions (map patVars pats)
+freeVarsDec (Dec _ _ pats _ _ body) = freeVarsExp body S.\\ S.unions (map patVars pats)
 
 freeVarsShapeDim :: ShapeDim a -> Set Var
 freeVarsShapeDim dim =
@@ -334,7 +335,7 @@ boundVarsBnd BMirror    = S.empty
 boundVarsBnd (BConst e) = boundVarsExp e
 
 boundVarsDecBody :: Dec a -> Set Var
-boundVarsDecBody (Dec _ _ pats _ body) = boundVarsExp body `S.union` S.unions (map patVars pats)
+boundVarsDecBody (Dec _ _ pats _ _ body) = boundVarsExp body `S.union` S.unions (map patVars pats)
 
 boundVarsShapeDim :: ShapeDim a -> Set Var
 boundVarsShapeDim dim =
@@ -368,8 +369,8 @@ countVarExp v expr =
     EOp _ _ -> 0
     ELetIn _ dec body ->
       let name = decName dec
-          patBound = S.unions (map patVars (case dec of Dec _ _ ps _ _ -> ps))
-          inDec = if v == name || v `S.member` patBound then 0 else countVarExp v (case dec of Dec _ _ _ _ b -> b)
+          patBound = S.unions (map patVars (case dec of Dec _ _ ps _ _ _ -> ps))
+          inDec = if v == name || v `S.member` patBound then 0 else countVarExp v (case dec of Dec _ _ _ _ _ b -> b)
           inBody = if v == name then 0 else countVarExp v body
        in inDec + inBody
     EProj _ _ e -> countVarExp v e
@@ -455,11 +456,11 @@ substExp v replacement expr =
     EUnOp a op e -> EUnOp a op (substExp v replacement e)
     EOp {} -> expr
     ELetIn a dec body ->
-      let Dec da name pats poly decBody = dec
+      let Dec da name pats mw poly decBody = dec
           patBound = S.unions (map patVars pats)
           decBody' = if v == name || v `S.member` patBound then decBody else substExp v replacement decBody
           body' = if v == name then body else substExp v replacement body
-       in ELetIn a (Dec da name pats poly decBody') body'
+       in ELetIn a (Dec da name pats mw poly decBody') body'
     EProj a i e -> EProj a i (substExp v replacement e)
     EPair a e1 e2 -> EPair a (substExp v replacement e1) (substExp v replacement e2)
     ERecord a fields ->
@@ -563,7 +564,7 @@ substPat (PVec pa ps) arg body =
 -- parameters in a local let-binding), so that inlining it at application
 -- sites enables further beta reduction.
 isFunctionExp :: Exp a -> Bool
-isFunctionExp (ELetIn _ (Dec _ _ pats _ _) (EVar _ _)) = not (null pats)
+isFunctionExp (ELetIn _ (Dec _ _ pats _ _ _) (EVar _ _)) = not (null pats)
 isFunctionExp (ELetIn _ _ body) = isFunctionExp body
 isFunctionExp _ = False
 
@@ -629,10 +630,10 @@ mkLet2 _ = do
   pure (fn, x, y)
 
 mkDec1 :: a -> Var -> Var -> Exp a -> Dec a
-mkDec1 a fn x body = Dec a fn [PVar a x] Nothing body
+mkDec1 a fn x body = Dec a fn [PVar a x] Nothing Nothing body
 
 mkDec2 :: a -> Var -> Var -> Var -> Exp a -> Dec a
-mkDec2 a fn x y body = Dec a fn [PVar a x, PVar a y] Nothing body
+mkDec2 a fn x y body = Dec a fn [PVar a x, PVar a y] Nothing Nothing body
 
 -- | Small internal lambda-like kernel language with de Bruijn variables.
 --
@@ -1031,14 +1032,14 @@ normSliceDim dim =
     SliceRange a s l -> SliceRange a <$> normExp s <*> normExp l
 
 normDec :: Dec a -> State NormFusionState (Dec a, Map Var Var)
-normDec (Dec a name pats poly body) = do
+normDec (Dec a name pats mw poly body) = do
   env0 <- gets normFusionEnv
   name' <- normBindVar name
   pats' <- mapM normPat pats
   env1 <- gets normFusionEnv
   body' <- normExp body
   modify' (\s -> s {normFusionEnv = env0})
-  pure (Dec a name' pats' poly body', env1)
+  pure (Dec a name' pats' mw poly body', env1)
 
 normExp :: Exp a -> State NormFusionState (Exp a)
 normExp expr =
@@ -1170,16 +1171,16 @@ inlineFnValueDecs :: (Eq a) => [Dec a] -> [Dec a]
 inlineFnValueDecs = go []
   where
     go env [] = []
-    go env (Dec a name [] poly body : rest) =
+    go env (Dec a name [] mw poly body : rest) =
       let body' = applyEnv env body
-          totalUsage = sum (map (\(Dec _ _ _ _ b) -> countVarExp name (applyEnv env b)) rest)
+          totalUsage = sum (map (\(Dec _ _ _ _ _ b) -> countVarExp name (applyEnv env b)) rest)
           eligible = isFunctionExp body' && totalUsage == 1
       in if eligible
            then go ((name, body') : env) rest
-           else Dec a name [] poly body' : go env rest
-    go env (Dec a name pats poly body : rest) =
+           else Dec a name [] mw poly body' : go env rest
+    go env (Dec a name pats mw poly body : rest) =
       let body' = applyEnv env body
-      in Dec a name pats poly body' : go env rest
+      in Dec a name pats mw poly body' : go env rest
 
     applyEnv env e = foldl (\acc (v, r) -> substExp v r acc) e env
 
@@ -1218,13 +1219,13 @@ fuseOnce expr =
       -- Beta reduction: (let fn p pats... = fbody in fn) arg
       -- → substitute arg for p in fbody, keeping remaining pats.
       case f' of
-        ELetIn _ (Dec db fname (p:pats) poly fbody) (EVar _ fname')
+        ELetIn _ (Dec db fname (p:pats) mw poly fbody) (EVar _ fname')
           | fname == fname' ->
               case substPat p x' fbody of
                 Just fbody' ->
                   let reduced = if null pats
                         then fbody'
-                        else ELetIn db (Dec db fname pats poly fbody') (EVar db fname')
+                        else ELetIn db (Dec db fname pats mw poly fbody') (EVar db fname')
                   in fuseOnce reduced
                 Nothing -> pure (EApp a f' x')
         _ -> pure (EApp a f' x')
@@ -1235,7 +1236,7 @@ fuseOnce expr =
     EUnOp a op e -> EUnOp a op <$> fuseOnce e
     EOp {} -> pure expr
     ELetIn a d e -> do
-      d'@(Dec da name pats _ body) <- fuseDecM d
+      d'@(Dec da name pats _ _ body) <- fuseDecM d
       e' <- fuseOnce e
       -- Beta reduction: (let f p1...pn = body in f a1...am) where 1 ≤ m.
       -- Consume as many leading arguments as we have patterns, substituting each.
@@ -1251,7 +1252,7 @@ fuseOnce expr =
                    Just body' ->
                      let inner = if null remainingPats
                                    then body'
-                                   else ELetIn da (Dec da name remainingPats Nothing body') (EVar da name)
+                                   else ELetIn da (Dec da name remainingPats Nothing Nothing body') (EVar da name)
                      in Just (foldl (EApp a) inner remainingArgs)
                    Nothing -> Nothing
             _ -> Nothing
@@ -1382,9 +1383,9 @@ fuseOnce expr =
       EBoundLetIn a x <$> fuseOnce boundExp <*> fuseOnce rhs <*> fuseOnce body
 
 fuseDecM :: (Eq a) => Dec a -> FusionM (Dec a)
-fuseDecM (Dec a name pats poly body) = do
+fuseDecM (Dec a name pats mw poly body) = do
   body' <- fuseFix body
-  pure (Dec a name pats poly body')
+  pure (Dec a name pats mw poly body')
 
 fuseBnd :: (Eq a) => BoundaryCondition a -> FusionM (BoundaryCondition a)
 fuseBnd BClamp     = pure BClamp

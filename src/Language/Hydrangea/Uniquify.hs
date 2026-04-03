@@ -55,12 +55,12 @@ uniquifyDecs decs =
    in evalState (runUniqM (mapM uniqTopDec decs)) st
 
 uniqTopDec :: Dec a -> UniqM (Dec a)
-uniqTopDec (Dec a name pats poly body) = do
+uniqTopDec (Dec a name pats mw poly body) = do
   env <- gets uniqEnv
   (pats', patEnv) <- uniqPats pats
   withEnv (M.union patEnv env) $ do
     body' <- uniqExp body
-    pure (Dec a name pats' poly body')
+    pure (Dec a name pats' mw poly body')
 
 uniqExp :: Exp a -> UniqM (Exp a)
 uniqExp expr =
@@ -142,13 +142,13 @@ uniqBnd BMirror       = pure BMirror
 uniqBnd (BConst e)    = BConst <$> uniqExp e
 
 uniqLocalDec :: Dec a -> UniqM (Dec a, Map Var Var)
-uniqLocalDec (Dec a name pats poly body) = do
+uniqLocalDec (Dec a name pats mw poly body) = do
   env <- gets uniqEnv
   name' <- freshenBinder name
   (pats', patEnv) <- uniqPats pats
   let decEnv = M.insert name name' patEnv
   body' <- withEnv (M.union decEnv env) (uniqExp body)
-  pure (Dec a name' pats' poly body', M.union decEnv env)
+  pure (Dec a name' pats' mw poly body', M.union decEnv env)
 
 uniqPats :: [Pat a] -> UniqM ([Pat a], Map Var Var)
 uniqPats pats = do
@@ -169,6 +169,10 @@ uniqPat pat =
     PVec a ps -> do
       (ps', envs) <- unzip <$> mapM uniqPat ps
       pure (PVec a ps', M.unions envs)
+    PPair a p1 p2 -> do
+      (p1', env1) <- uniqPat p1
+      (p2', env2) <- uniqPat p2
+      pure (PPair a p1' p2', M.union env1 env2)
 
 uniqShapeDim :: ShapeDim a -> UniqM (ShapeDim a)
 uniqShapeDim dim =
@@ -285,7 +289,7 @@ collectVarsBnd BMirror    = S.empty
 collectVarsBnd (BConst e) = collectVarsExp e
 
 collectVarsDec :: Dec a -> Set Var
-collectVarsDec (Dec _ name pats _ body) =
+collectVarsDec (Dec _ name pats _ _ body) =
   S.insert name (S.unions (map collectVarsPat pats) `S.union` collectVarsExp body)
 
 collectVarsPat :: Pat a -> Set Var
@@ -294,6 +298,7 @@ collectVarsPat pat =
     PVar _ v -> S.singleton v
     PBound _ v _ -> S.singleton v
     PVec _ ps -> S.unions (map collectVarsPat ps)
+    PPair _ p1 p2 -> collectVarsPat p1 `S.union` collectVarsPat p2
 
 collectVarsShapeDim :: ShapeDim a -> Set Var
 collectVarsShapeDim dim =

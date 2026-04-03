@@ -854,7 +854,7 @@ spec = do
         `shouldBe` Right
           ( ELetIn
               ()
-              (Dec () "x" [] (Just (Forall [] [] TyInt)) (EInt () 10))
+              (Dec () "x" [] Nothing (Just (Forall [] [] TyInt)) (EInt () 10))
               (EInt () 1)
           )
       (readExp "let x : forall a . a = f y in x" >>= stripRange)
@@ -865,6 +865,7 @@ spec = do
                   ()
                   "x"
                   []
+                  Nothing
                   (Just (Forall ["a"] [] (TyVar "a")))
                   (EApp () (EVar () "f") (EVar () "y"))
               )
@@ -878,6 +879,7 @@ spec = do
                   ()
                   ("f")
                   [PVar () ("x")]
+                  Nothing
                   (Just (Forall [] [] (TyFun TyInt TyInt)))
                   (EBinOp () (EVar () ("x")) (Plus ()) (EInt () 1))
               )
@@ -891,6 +893,7 @@ spec = do
                   ()
                   ("f")
                   [PVar () ("a"), PVar () ("b")]
+                  Nothing
                   (Just (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt))))
                   (EBinOp () (EVar () ("a")) (Plus ()) (EVar () ("b")))
               )
@@ -904,6 +907,7 @@ spec = do
                   ()
                   "f"
                   [PVec () [PVar () "x", PVar () "y"]]
+                  Nothing
                   ( Just
                       ( Forall
                           []

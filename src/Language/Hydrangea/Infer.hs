@@ -51,6 +51,7 @@ import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Predicate
   ( Pred (..), TaggedPred (..), Term (..)
   , predBindVars, substTaggedPredVars, untagPred
+  , RefinePred (..), RefineTerm (..), RelOp (..)
   )
 import Language.Hydrangea.Solver
 import Language.Hydrangea.Syntax
@@ -129,6 +130,9 @@ data InferState = InferState
     --   @(paramName, bodyExp)@ pair.  Used by 'EMap' and 'EApp' to infer
     --   output value bounds for non-inline functions without requiring PBound
     --   annotations.  Only single-parameter definitions are registered.
+  , wherePrecondEnv :: Map Var ([Pat Range], RefinePred)
+    -- ^ Maps function names to their where-clause preconditions.
+    --   Used at call sites to emit proof obligations.
   }
 
 -- | Initial inference state.
@@ -138,6 +142,7 @@ initInferState = InferState
   , valBoundCtx    = M.empty
   , inferWarnings  = []
   , defBodyEnv     = M.empty
+  , wherePrecondEnv = M.empty
   }
 
 -- | Lift a unification-library action into the full inference monad.
@@ -285,6 +290,11 @@ applyBindings ut = lift (lift (lift (U.applyBindings ut)))
 s =:= t = lift (lift (lift (stripRefineDeep s U.=:= stripRefineDeep t)))
 
 -- | Instantiate a polymorphic scheme with fresh unification variables and emit its predicates.
+-- @WhereHyp@ predicates (from where-clause annotations on the callee) are intentionally
+-- NOT re-emitted: they are only hypotheses within the declaring function's own body,
+-- not facts that hold at every call site.  Re-emitting them would allow abstract
+-- where-clause hyps to trivially discharge obligations in indirect callers, producing
+-- false-positive "Verified" results for programs that are actually unsafe.
 instantiate :: UPolytype -> Infer UType
 instantiate (Forall xs preds uty) = do
   xs' <- mapM (const fresh) xs
@@ -299,7 +309,8 @@ instantiate (Forall xs preds uty) = do
         let env = M.fromList subs
             rename v = fromMaybe v (M.lookup v env)
         return (map (substTaggedPredVars rename) preds, substRefineVars rename uty)
-  tell preds'
+  -- Filter out WhereHyp: where-clause hypotheses are local to the declaring function.
+  tell [p | p <- preds', case p of { WhereHyp _ -> False; _ -> True }]
   return $ substU (M.fromList (zip (map Left xs) xs')) uty'
 
 -- | Substitute named or unification variables inside a unification type.
@@ -420,6 +431,24 @@ normalizeShapeToTupleOf r expectedElt ty = do
 normalizeShapeToTupleOfInts :: Range -> UType -> Infer UType
 normalizeShapeToTupleOfInts r = normalizeShapeToTupleOf r UTyInt
 
+-- | Pre-promote a bare shape 'UVar' to a fresh 1-D cons-list of 'Int' so
+-- that the subsequent 'normalizeShapeToTupleOf' hits the 'UTyCons' branch
+-- instead of the catch-all (which would otherwise wrongly bind the shape UVar
+-- to bare 'UTyInt').  This is needed when inferring array operations on
+-- arguments bound by a pair pattern, where the shape starts as an unknown
+-- 'UVar'.  We use raw 'U.=:=' (through 'ExceptT', 3 lifts) to preserve the
+-- 'UTyRefine' wrapper inside the cons-list.
+promoteShapeUVar :: Range -> UType -> Infer UType
+promoteShapeUVar r ty = do
+  ty' <- applyBindings ty
+  case stripRefineTop ty' of
+    UVar _ -> do
+      dimVar <- freshPredVar
+      let consList = UTyCons (UTyRefine dimVar UTyInt) UTyUnit
+      _ <- lift (lift (lift (ty' U.=:= consList)))
+      return consList
+    _ -> return ty'
+
 -- | Build an expected tuple-of-Int shape from a vector literal. This
 -- constructs a cons-list of @UTyInt@ of the same arity and checks that each
 -- element's inferred type is @Int@ (unifying where necessary).
@@ -434,6 +463,11 @@ expectedShapeFromExp e = normalizeShapeToTupleOfInts (firstParam e) =<< infer e
 -- | Emit a known fact (hypothesis) into the writer.
 emitHyp :: Pred -> Infer ()
 emitHyp p = tell [Hyp p]
+
+-- | Emit a where-clause hypothesis.  Unlike 'emitHyp', these are NOT re-emitted
+-- at call sites by 'instantiate'; they are scoped to the declaring function body.
+emitWhereHyp :: Pred -> Infer ()
+emitWhereHyp p = tell [WhereHyp p]
 
 -- | Emit a safety obligation into the writer.
 emitObl :: Pred -> Infer ()
@@ -479,6 +513,21 @@ withDefBody f paramName body m = do
 lookupDefBody :: Var -> Infer (Maybe (Var, Exp Range))
 lookupDefBody v = gets (M.lookup v . defBodyEnv)
 
+-- | Register a where-clause precondition for a function for the duration of
+-- an action.  Used by 'inferDecs' to make the precondition visible to callers
+-- that are inferred later in the same declaration sequence.
+withWherePrecond :: Var -> [Pat Range] -> RefinePred -> Infer a -> Infer a
+withWherePrecond f ps rpred m = do
+  old <- gets wherePrecondEnv
+  modify (\s -> s { wherePrecondEnv = M.insert f (ps, rpred) old })
+  x <- m
+  modify (\s -> s { wherePrecondEnv = old })
+  return x
+
+-- | Look up the where-clause precondition for a named function.
+lookupWherePrecond :: Var -> Infer (Maybe ([Pat Range], RefinePred))
+lookupWherePrecond v = gets (M.lookup v . wherePrecondEnv)
+
 -- | Propagate PBound annotations from a list of patterns into valBoundCtx for
 -- the duration of an action.  Called around function body inference so that
 -- @[i bound N]@ patterns are visible to 'EIndex' and other bound-sensitive
@@ -490,6 +539,8 @@ withBoundsFromPats (PBound _ v bExp : ps) m = do
   withValBound v bt $ withBoundsFromPats ps m
 withBoundsFromPats (PVec _ vs : ps) m =
   withBoundsFromPatsFlat vs $ withBoundsFromPats ps m
+withBoundsFromPats (PPair _ p1 p2 : ps) m =
+  withBoundsFromPats [p1] $ withBoundsFromPats [p2] $ withBoundsFromPats ps m
 withBoundsFromPats (_ : ps) m = withBoundsFromPats ps m
 
 -- | Like 'withBoundsFromPats' but for the flat sub-pattern list inside a PVec.
@@ -675,8 +726,8 @@ inferValBound e = fmap toBound <$> inferBVal e
 -- and @let f (i bound E) = body in f@ (bare PBound at the top level).
 -- Returns @(indexVar, boundExp)@ if found, 'Nothing' otherwise.
 extractPBoundInfo :: Exp Range -> Maybe (Var, Exp Range)
-extractPBoundInfo (ELetIn _ (Dec _ _ [PVec _ [PBound _ v e]] _ _) _) = Just (v, e)
-extractPBoundInfo (ELetIn _ (Dec _ _ [PBound _ v e]            _ _) _) = Just (v, e)
+extractPBoundInfo (ELetIn _ (Dec _ _ [PVec _ [PBound _ v e]] _ _ _) _) = Just (v, e)
+extractPBoundInfo (ELetIn _ (Dec _ _ [PBound _ v e]            _ _ _) _) = Just (v, e)
 extractPBoundInfo _ = Nothing
 
 -- | Extract the variable from a single parameter pattern.
@@ -691,14 +742,14 @@ patVar _                   = Nothing
 -- expression of the form @let f p1 p2 ... = body in f@.
 -- Returns @[]@ if the expression is not in this recognizable form.
 extractFnParamVars :: Exp Range -> [Var]
-extractFnParamVars (ELetIn _ (Dec _ _ pats _ _) _) = mapMaybe patVar pats
+extractFnParamVars (ELetIn _ (Dec _ _ pats _ _ _) _) = mapMaybe patVar pats
 extractFnParamVars _                                = []
 
 -- | Compute the value bound of an inline generator body, with the index
 -- variable already registered in the caller's 'valBoundCtx'.
 -- Used by Case 1 (PBound) and by EMap/EZipWith bound propagation.
 inferBodyBound :: Exp Range -> Infer (Maybe Term)
-inferBodyBound (ELetIn _ (Dec _ _ _ _ body) _) = inferValBound body
+inferBodyBound (ELetIn _ (Dec _ _ _ _ _ body) _) = inferValBound body
 inferBodyBound _ = return Nothing
 
 -- | Infer the terminal bound from a function whose body is a chain of
@@ -710,7 +761,7 @@ inferBodyBound _ = return Nothing
 -- so it never emits spurious bounds for bodies that were not explicitly
 -- annotated.
 inferBodyBoundChain :: Exp Range -> Infer (Maybe Term)
-inferBodyBoundChain (ELetIn _ (Dec _ _ _ _ chainBody) _) = chainExprBound chainBody
+inferBodyBoundChain (ELetIn _ (Dec _ _ _ _ _ chainBody) _) = chainExprBound chainBody
 inferBodyBoundChain _ = return Nothing
 
 chainExprBound :: Exp Range -> Infer (Maybe Term)
@@ -727,7 +778,7 @@ chainExprBound _ = return Nothing
 
 -- | Extract the body expression from an inline function @let f p = body in f@.
 extractFnBody :: Exp Range -> Maybe (Exp Range)
-extractFnBody (ELetIn _ (Dec _ _ _ _ body) _) = Just body
+extractFnBody (ELetIn _ (Dec _ _ _ _ _ body) _) = Just body
 extractFnBody _                                = Nothing
 
 -- | Infer per-component value bounds from a vector-literal body @[e0, e1, ...]@.
@@ -806,7 +857,14 @@ emitRefineLink r expected actual = do
             emitPred (PEq (TDim vExp i) (TDim vAct i))
             emitPred (PEq (TValBoundDim vExp i) (TValBoundDim vAct i))
         _ -> emitPred (PEq (TVar vExp) (TVar vAct))
-    _ -> return ()
+    -- For pair types there is no outer refinement variable to link, but we
+    -- can recurse into each component to propagate bounds transitively.
+    _ ->
+      case (stripRefineTop innerExp, stripRefineTop innerAct) of
+        (UTyPair te1 te2, UTyPair ta1 ta2) -> do
+          emitRefineLink r te1 ta1
+          emitRefineLink r te2 ta2
+        _ -> return ()
 
 
 -- | Decompose a type into its two pair (or cons-tuple) components.
@@ -914,6 +972,15 @@ infer (EApp r e1 e2) = do
             emitHyp (PLe (TConst 0) (TVar pParam))
             emitHyp (PLt (TVar pParam) (toBound bval))
           Nothing -> return ()
+      -- Emit where-clause proof obligations for the callee (if it has a
+      -- where clause).  We try to decompose the argument expression against
+      -- the callee's parameter patterns to produce grounded obligations.
+      case e1 of
+        EVar _ fname -> do
+          mWhere <- lookupWherePrecond fname
+          forM_ mWhere $ \(calleePatterns, rpred) ->
+            emitWhereObls calleePatterns rpred ty2
+        _ -> return ()
       return resTy
     _ -> return ty
 infer (EIfThen _ e1 e2) = do
@@ -1501,7 +1568,8 @@ infer (EScatter _ comb defaults idxArr vals) = do
   (_mSrcVar', sSrc', eSrc) <- asArrayType (firstParam vals) valsTy
   _ <- wrange (firstParam idxArr) $ sSrc =:= sSrc'
   idxTy' <- normalizeShapeToTupleOf (firstParam idxArr) UTyInt idxTy
-  sDstNorm <- normalizeShapeToTupleOf (firstParam defaults) UTyInt sDst
+  sDst_p <- promoteShapeUVar (firstParam defaults) sDst
+  sDstNorm <- normalizeShapeToTupleOf (firstParam defaults) UTyInt sDst_p
   _ <- wrange (firstParam idxArr) $ idxTy' =:= sDstNorm
   _ <- wrange (firstParam vals) $ eSrc =:= eDst
   combTy <- infer comb
@@ -1536,7 +1604,8 @@ infer (EScatterGuarded _ comb defaults idxArr vals guardArr) = do
   _ <- wrange (firstParam idxArr) $ sSrc =:= sSrc'
   _ <- wrange (firstParam idxArr) $ sSrc =:= sSrc''
   idxTy' <- normalizeShapeToTupleOf (firstParam idxArr) UTyInt idxTy
-  sDstNorm <- normalizeShapeToTupleOf (firstParam defaults) UTyInt sDst
+  sDst_p <- promoteShapeUVar (firstParam defaults) sDst
+  sDstNorm <- normalizeShapeToTupleOf (firstParam defaults) UTyInt sDst_p
   _ <- wrange (firstParam idxArr) $ idxTy' =:= sDstNorm
   _ <- wrange (firstParam vals) $ eSrc =:= eDst
   _ <- wrange (firstParam guardArr) $ guardElemTy =:= UTyBool
@@ -1568,10 +1637,14 @@ infer (EGather _ idxArr arrExp) = do
   arrTy    <- infer arrExp
   (mIdxVar, sIdx, idxTy) <- asArrayType (firstParam idxArr) idxArrTy
   (mSrcVar, sSrc, eTy) <- asArrayType (firstParam arrExp) arrTy
+  -- Promote any shape UVars (from pair-pattern bindings) to fresh 1-D
+  -- cons-lists before normalization so they don't get wrongly bound to UTyInt.
+  sIdx_p <- promoteShapeUVar (firstParam idxArr) sIdx
   idxTy' <- normalizeShapeToTupleOf (firstParam idxArr) UTyInt idxTy
-  sSrc' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sSrc
+  sSrc_p <- promoteShapeUVar (firstParam arrExp) sSrc
+  sSrc' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sSrc_p
   _ <- wrange (firstParam idxArr) $ idxTy' =:= sSrc'
-  sIdx' <- applyBindings sIdx
+  sIdx' <- applyBindings sIdx_p
   (arrVar, arrTyOut) <- freshRefined (UTyArray sIdx' eTy)
   case mIdxVar of
     Nothing -> return ()
@@ -1666,7 +1739,7 @@ infer (EStencil _ bnd fnExp arrExp) = do
         emitPred (PEq (TDim arrVar i) (TDim srcVar i))
       return arrTyOut
 infer (ELetIn r dec e) = do
-  let Dec rr v pats mty body = dec
+  let Dec rr v pats _mwhere mty body = dec
   bodyTy    <- fresh
   skolemAnn <- mapM (skolemize . toUPolytype) mty
   (patBinds, funTy) <- buildPatFunType rr bodyTy pats skolemAnn
@@ -1764,6 +1837,23 @@ buildPatFunType r bodyTy = go
         Nothing  -> return $ UTyFun argTy bodyTy
         Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
       return ([(arg, argTy)], funTy)
+    go [PPair _ p1 p2] mAnn = do
+      ty1 <- freshValue
+      ty2 <- freshValue
+      let argTy = UTyPair ty1 ty2
+      -- Extract bindings from each component pattern.
+      let binds1 = case p1 of
+                     PVar _ v     -> [(v, ty1)]
+                     PBound _ v _ -> [(v, ty1)]
+                     _            -> []
+      let binds2 = case p2 of
+                     PVar _ v     -> [(v, ty2)]
+                     PBound _ v _ -> [(v, ty2)]
+                     _            -> []
+      funTy <- case mAnn of
+        Nothing  -> return $ UTyFun argTy bodyTy
+        Just ann -> wrange r (ann =:= UTyFun argTy bodyTy)
+      return (binds1 ++ binds2, funTy)
     go [PVec _ vs] mAnn = do
       tyArgs <- mapM (const freshValue) vs
       let argTy = foldr UTyCons UTyUnit tyArgs
@@ -1784,6 +1874,34 @@ buildPatFunType r bodyTy = go
           funTy <- wrange r (ann =:= UTyFun argTy innerTy)
           (binds, _) <- go ps (Just innerTy)
           return ((arg, argTy) : binds, funTy)
+    go (PBound _ arg _ : ps) mAnn = do
+      argTy <- freshValue
+      case mAnn of
+        Nothing -> do
+          (binds, restTy) <- go ps Nothing
+          return ((arg, argTy) : binds, UTyFun argTy restTy)
+        Just ann -> do
+          innerTy <- fresh
+          funTy <- wrange r (ann =:= UTyFun argTy innerTy)
+          (binds, _) <- go ps (Just innerTy)
+          return ((arg, argTy) : binds, funTy)
+    go (PPair _ p1 p2 : ps) mAnn = do
+      ty1 <- freshValue
+      ty2 <- freshValue
+      let argTy = UTyPair ty1 ty2
+      let bindsLocal = [(v, ty1) | PVar _ v <- [p1]]
+                    ++ [(v, ty1) | PBound _ v _ <- [p1]]
+                    ++ [(v, ty2) | PVar _ v <- [p2]]
+                    ++ [(v, ty2) | PBound _ v _ <- [p2]]
+      case mAnn of
+        Nothing -> do
+          (bindsRest, restTy) <- go ps Nothing
+          return (bindsLocal ++ bindsRest, UTyFun argTy restTy)
+        Just ann -> do
+          innerTy <- fresh
+          funTy <- wrange r (ann =:= UTyFun argTy innerTy)
+          (bindsRest, _) <- go ps (Just innerTy)
+          return (bindsLocal ++ bindsRest, funTy)
     go (PVec _ vs : ps) mAnn = do
       tyArgs <- mapM (const freshValue) vs
       let argTy      = foldr UTyCons UTyUnit tyArgs
@@ -1803,15 +1921,206 @@ bindPats :: [(Var, UType)] -> Infer a -> Infer a
 bindPats []            m = m
 bindPats ((v, t) : vs) m = withBinding v (Forall [] [] t) $ bindPats vs m
 
+-- | Build a map from pattern-bound names to their refinement variables, using
+-- the @(Var, UType)@ bindings produced by 'buildPatFunType'.  The 'Var' key
+-- is the source name; the 'Var' value is the pred-variable from the
+-- @UTyRefine rfVar _@ wrapper of that binding's type.
+buildRefineEnv :: [(Var, UType)] -> Map Var Var
+buildRefineEnv binds = M.fromList [(v, rfVar) | (v, ty) <- binds, Just rfVar <- [fst (unwrapRefine ty)]]
+
+-- | Resolve a 'RefineTerm' to a 'Term' given the refinement-variable map.
+-- Returns 'Nothing' if any name is not in the environment.
+resolveRefineTerm :: Map Var Var -> RefineTerm -> Maybe Term
+resolveRefineTerm env (RTVar v)    = TVar <$> M.lookup v env
+resolveRefineTerm _   (RTConst n)  = Just (TConst n)
+resolveRefineTerm env (RTDim v i)  = (\rfVar -> TDim rfVar i) <$> M.lookup v env
+resolveRefineTerm env (RTElem v)   = (\rfVar -> TValBoundDim rfVar 0) <$> M.lookup v env
+resolveRefineTerm env (RTAdd l r)  = TAdd <$> resolveRefineTerm env l <*> resolveRefineTerm env r
+resolveRefineTerm env (RTSub l r)  = TSub <$> resolveRefineTerm env l <*> resolveRefineTerm env r
+resolveRefineTerm env (RTMul n t)  = TMul (TConst n) <$> resolveRefineTerm env t
+
+-- | Resolve a 'RefinePred' to a list of 'Pred's given the refinement-variable map.
+-- Returns 'Nothing' if any term is unresolvable.
+resolveRefinePred :: Map Var Var -> RefinePred -> Maybe [Pred]
+resolveRefinePred env (RPBound v e) = do
+  rfVar <- M.lookup v env
+  t     <- resolveRefineTerm env e
+  return [PLe (TConst 0) (TVar rfVar), PLt (TVar rfVar) t]
+resolveRefinePred env (RPRel op l r) = do
+  lt <- resolveRefineTerm env l
+  rt <- resolveRefineTerm env r
+  return [relOpToPred op lt rt]
+resolveRefinePred env (RPAnd p q) = (++) <$> resolveRefinePred env p <*> resolveRefinePred env q
+
+relOpToPred :: RelOp -> Term -> Term -> Pred
+relOpToPred RLt  = PLt
+relOpToPred RLe  = PLe
+relOpToPred RGt  = PGt
+relOpToPred RGe  = PGe
+relOpToPred REq  = PEq
+relOpToPred RNeq = PNeq
+
+-- | Emit where-clause hypotheses inside the body scope of a declaration.
+-- Uses 'buildRefineEnv' from 'patBinds' to resolve each 'RefinePred' to
+-- concrete 'Pred's and emits them as 'Hyp's.  Unresolvable terms are silently
+-- skipped (they would produce ungrounded obligations anyway).
+emitWhereHyps :: Maybe RefinePred -> [(Var, UType)] -> Infer ()
+emitWhereHyps Nothing      _        = return ()
+emitWhereHyps (Just rpred) patBinds = do
+  let env = buildRefineEnv patBinds
+  case resolveRefinePred env rpred of
+    Just preds -> mapM_ emitWhereHyp preds
+    Nothing    -> return ()  -- unresolvable; body checking will be conservative
+
+-- | Try to decompose a call-site argument expression against a parameter
+-- pattern, returning a refinement-variable environment for obligation emission.
+-- Returns 'Nothing' if the argument structure does not match the pattern
+-- (which causes the obligation to be ungrounded → warning).
+buildCallEnv :: [Pat Range] -> Exp Range -> [(Var, UType)] -> Infer (Maybe (Map Var Term))
+buildCallEnv pats argExp patBinds = do
+  let rfEnv = buildRefineEnv patBinds
+  case (pats, argExp) of
+    ([PPair _ p1 p2], EPair _ e1 e2) -> do
+      m1 <- resolveArgTerm rfEnv p1 e1
+      m2 <- resolveArgTerm rfEnv p2 e2
+      return $ M.union <$> m1 <*> m2
+    ([pat], e) -> do
+      m <- resolveArgTerm rfEnv pat e
+      return m
+    _ -> return Nothing
+
+-- | Try to resolve a single pattern component against an expression to a
+-- 'Term' mapping.  For scalars, maps the component's rfVar to the expression's
+-- value term; for this to be useful the expression must be a variable or literal.
+resolveArgTerm :: Map Var Var -> Pat Range -> Exp Range -> Infer (Maybe (Map Var Term))
+resolveArgTerm rfEnv (PVar _ v) (EInt _ n) =
+  return $ Just $ M.singleton v (TConst (fromIntegral n))
+resolveArgTerm rfEnv (PVar _ v) (EVar _ w) = do
+  mBound <- inferBVal (EVar undefined w)
+  ctx <- ask
+  case M.lookup w ctx of
+    Just wTy -> do
+      wTy' <- instantiate wTy
+      case fst (unwrapRefine wTy') of
+        Just wRfVar -> return $ Just $ M.singleton v (TVar wRfVar)
+        Nothing     -> return Nothing
+    Nothing -> return Nothing
+resolveArgTerm rfEnv (PBound _ v _) e = resolveArgTerm rfEnv (PVar undefined v) e
+resolveArgTerm _ _ _ = return Nothing
+
+-- | Emit where-clause obligations at a call site.
+-- Given the callee's patterns, where-clause predicate, and the INFERRED TYPE
+-- of the actual argument (already fully resolved by type inference), this
+-- extracts refinement variables from the argument type to build a term map,
+-- then emits the instantiated obligations.
+-- Using the inferred type avoids the fragility of expression-level parsing
+-- (complex expressions like `generate [10] f` would return Nothing from
+-- expression-level decomposition).
+emitWhereObls :: [Pat Range] -> RefinePred -> UType -> Infer ()
+emitWhereObls pats rpred argTy = do
+  argTy' <- applyBindings argTy
+  mEnv <- buildCallArgEnvFromType pats argTy'
+  case mEnv of
+    Nothing  -> return ()   -- unresolvable → conservative (no false positive)
+    Just env ->
+      case resolveRefinePredFromTermMap env rpred of
+        Just preds -> mapM_ emitObl preds
+        Nothing    -> return ()
+
+-- | Build a term map from the callee's pattern structure against the INFERRED
+-- TYPE of the actual argument. This is the type-level counterpart to the old
+-- expression-based 'buildCallArgEnv': instead of parsing the argument
+-- expression, we look at the refinement variable in each component's type.
+buildCallArgEnvFromType :: [Pat Range] -> UType -> Infer (Maybe (Map Var Term))
+buildCallArgEnvFromType [PPair _ p1 p2] ty = do
+  ty' <- applyBindings ty
+  case stripRefineTop ty' of
+    UTyPair ty1 ty2 -> do
+      m1 <- patTypeTerm p1 ty1
+      m2 <- patTypeTerm p2 ty2
+      return $ M.union <$> m1 <*> m2
+    _ -> return Nothing
+buildCallArgEnvFromType [pat] ty = patTypeTerm pat ty
+buildCallArgEnvFromType _ _ = return Nothing
+
+-- | Extract a term-map entry for a single pattern component from its inferred type.
+-- For a PVar/PBound matched against a type with an outer refinement variable,
+-- returns @Just {v → TVar rfVar}@, enabling where-clause term resolution.
+patTypeTerm :: Pat Range -> UType -> Infer (Maybe (Map Var Term))
+patTypeTerm (PVar _ v) ty = do
+  ty' <- applyBindings ty
+  case fst (unwrapRefine ty') of
+    Just rfVar -> return $ Just $ M.singleton v (TVar rfVar)
+    Nothing    -> return Nothing
+patTypeTerm (PBound _ v _) ty = patTypeTerm (PVar undefined v) ty
+patTypeTerm _ _ = return Nothing
+
+-- | (Kept for reference; no longer used by 'emitWhereObls'.)
+buildCallArgEnv :: [Pat Range] -> Exp Range -> Infer (Maybe (Map Var Term))
+buildCallArgEnv [PPair _ p1 p2] (EPair _ e1 e2) = do
+  m1 <- patExpToTerm p1 e1
+  m2 <- patExpToTerm p2 e2
+  return $ M.union <$> m1 <*> m2
+buildCallArgEnv [pat] e = patExpToTerm pat e
+buildCallArgEnv _ _ = return Nothing
+
+patExpToTerm :: Pat Range -> Exp Range -> Infer (Maybe (Map Var Term))
+patExpToTerm (PVar _ v) (EInt _ n) =
+  return $ Just $ M.singleton v (TConst (fromIntegral n))
+patExpToTerm (PVar _ v) (EVar _ w) = do
+  ctx <- ask
+  case M.lookup w ctx of
+    Just wPoly -> do
+      wTy <- instantiate wPoly
+      case fst (unwrapRefine wTy) of
+        Just wRfVar -> return $ Just $ M.singleton v (TVar wRfVar)
+        Nothing     -> return Nothing
+    Nothing -> return Nothing
+patExpToTerm (PBound _ v _) e = patExpToTerm (PVar undefined v) e
+patExpToTerm _ _ = return Nothing
+
+-- | Resolve a 'RefinePred' to 'Pred's using a 'Map Var Term' (from 'buildCallArgEnv').
+resolveRefinePredFromTermMap :: Map Var Term -> RefinePred -> Maybe [Pred]
+resolveRefinePredFromTermMap env (RPBound v e) = do
+  vt <- M.lookup v env
+  et <- resolveRTFromTermMap env e
+  return [PLe (TConst 0) vt, PLt vt et]
+resolveRefinePredFromTermMap env (RPRel op l r) = do
+  lt <- resolveRTFromTermMap env l
+  rt <- resolveRTFromTermMap env r
+  return [relOpToPred op lt rt]
+resolveRefinePredFromTermMap env (RPAnd p q) =
+  (++) <$> resolveRefinePredFromTermMap env p <*> resolveRefinePredFromTermMap env q
+
+resolveRTFromTermMap :: Map Var Term -> RefineTerm -> Maybe Term
+resolveRTFromTermMap env (RTVar v)   = M.lookup v env
+resolveRTFromTermMap _   (RTConst n) = Just (TConst n)
+resolveRTFromTermMap env (RTDim v i) = do
+  t <- M.lookup v env
+  case t of
+    TVar rfVar -> Just (TDim rfVar i)
+    _          -> Nothing  -- argument is a literal; can't project dimension
+resolveRTFromTermMap env (RTElem v) = do
+  t <- M.lookup v env
+  case t of
+    TVar rfVar -> Just (TValBoundDim rfVar 0)
+    _          -> Nothing
+resolveRTFromTermMap env (RTAdd l r) = TAdd <$> resolveRTFromTermMap env l <*> resolveRTFromTermMap env r
+resolveRTFromTermMap env (RTSub l r) = TSub <$> resolveRTFromTermMap env l <*> resolveRTFromTermMap env r
+resolveRTFromTermMap env (RTMul n t) = TMul (TConst n) <$> resolveRTFromTermMap env t
+
 -- | Infer and generalize a sequence of declarations from left to right.
 inferDecs :: [Dec Range] -> Infer [(Var, UPolytype)]
 inferDecs [] = return []
-inferDecs (Dec r var pats mty e : rest) = do
+inferDecs (Dec r var pats mwhere mty e : rest) = do
   bodyTy    <- fresh
   skolemAnn <- mapM (skolemize . toUPolytype) mty
   (patBinds, funTy) <- buildPatFunType r bodyTy pats skolemAnn
   (inferredBodyTy, rhsPreds) <- censor (const []) $ listen $
-    withBoundsFromPats pats $ bindPats patBinds $ infer e
+    withBoundsFromPats pats $ bindPats patBinds $ do
+      -- Emit where-clause hypotheses inside the body so they ground obligations.
+      emitWhereHyps mwhere patBinds
+      infer e
   _ <- inferredBodyTy =:= bodyTy
   case skolemAnn of
     Just ann -> void $ wrange r (funTy =:= ann)
@@ -1830,7 +2139,12 @@ inferDecs (Dec r var pats mty e : rest) = do
   let registerDef = case pats of
         [pat] | Just paramName <- patVar pat -> withDefBody var paramName e
         _                                    -> id
-  rest' <- registerDef $ withBinding var boundTy $ inferDecs rest
+  -- Register where-clause precondition so callers later in this declaration
+  -- sequence can emit proof obligations.
+  let registerWhere = case mwhere of
+        Just rpred -> withWherePrecond var pats rpred
+        Nothing    -> id
+  rest' <- registerDef $ registerWhere $ withBinding var boundTy $ inferDecs rest
   return $ (var, boundTy) : rest'
 
 -- | Extend the typing context with many bindings for the duration of an action.
@@ -1847,6 +2161,8 @@ withPats ((PVar _ v) : ps) e = do
 withPats ((PBound _ v _) : ps) e = do
   tyArg <- freshValue
   withBinding v (Forall [] [] tyArg) $ withPats ps e
+withPats ((PPair _ p1 p2) : ps) e =
+  withPats [p1] $ withPats [p2] $ withPats ps e
 withPats ((PVec r vs) : ps) e = do
   tyArgs <- mapM (const freshValue) vs
   vars <- forM vs $ \p ->
