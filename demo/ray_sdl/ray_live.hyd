@@ -1,0 +1,267 @@
+(* ray_live.hyd — object-space ray tracer demo for SDL.
+   Inspired by the Repa/Gloss raster/Ray example: animated spheres, checker plane,
+   direct + ambient light, bounded iterative reflections. *)
+
+let big_t = 1.0e30
+let eps_t = 1.0e-3
+
+let minf a b = if a <. b then a else b
+let maxf a b = if a >. b then a else b
+let clamp01 x = if x <. 0.0 then 0.0 else if x >. 1.0 then 1.0 else x
+
+let dot3 ax ay az bx by bz = ax *. bx +. ay *. by +. az *. bz
+
+let norm3 x y z =
+  let l = sqrt (x *. x +. y *. y +. z *. z) in
+  let s = if l <. 1.0e-9 then 1.0 else l in
+  (x /. s, (y /. s, z /. s))
+
+let reflect3 dx dy dz nx ny nz =
+  let k = 2.0 *. dot3 nx ny nz dx dy dz in
+  (dx -. k *. nx, (dy -. k *. ny, dz -. k *. nz))
+
+let imod x m = x - ((x / m) * m)
+
+(* Distance to sphere along ray, or big_t when no hit. *)
+let sphere_t ox oy oz dx dy dz cx cy cz radius =
+  let lx = cx -. ox in
+  let ly = cy -. oy in
+  let lz = cz -. oz in
+  let tca = dot3 lx ly lz dx dy dz in
+  if tca <=. 0.0 then big_t
+  else
+    let l2 = dot3 lx ly lz lx ly lz in
+    let d2 = l2 -. tca *. tca in
+    let r2 = radius *. radius in
+    if d2 >=. r2 then big_t
+    else
+      let thc = sqrt (r2 -. d2) in
+      let t0 = tca -. thc in
+      let t1 = tca +. thc in
+      if t0 >. eps_t then t0 else if t1 >. eps_t then t1 else big_t
+
+(* Plane: n . p + d = 0 *)
+let plane_t ox oy oz dx dy dz nx ny nz d =
+  let denom = dot3 nx ny nz dx dy dz in
+  if abs_f denom <. 1.0e-9 then big_t
+  else
+    let t = (0.0 -. (dot3 nx ny nz ox oy oz +. d)) /. denom in
+    if t >. eps_t then t else big_t
+
+(* One bounce step.
+   state = ((active, (origX,(origY,origZ))),
+            ((dirX,(dirY,dirZ)),
+             ((thrR,(thrG,thrB)),
+              (outR,(outG,outB))))) *)
+let bounce_step time lightX lightY lightZ st dummy =
+  let active = fst (fst st) in
+  if active = 0 then st
+  else
+    let orig = snd (fst st) in
+    let ox = fst orig in
+    let oy = fst (snd orig) in
+    let oz = snd (snd orig) in
+
+    let dir = fst (snd st) in
+    let dx = fst dir in
+    let dy = fst (snd dir) in
+    let dz = snd (snd dir) in
+
+    let thr = fst (snd (snd st)) in
+    let thrR = fst thr in
+    let thrG = fst (snd thr) in
+    let thrB = snd (snd thr) in
+
+    let out = snd (snd (snd st)) in
+    let outR = fst out in
+    let outG = fst (snd out) in
+    let outB = snd (snd out) in
+
+    (* Animated scene close to the original Repa example. *)
+    let s1x = 40.0 *. sin time in
+    let s1y = 80.0 in
+    let s1z = 0.0 in
+
+    let s2x = 200.0 *. sin time in
+    let s2y = (0.0 -. 40.0) *. sin (time +. 1.5707963267948966) in
+    let s2z = 200.0 *. cos time in
+
+    let s3x = (0.0 -. 200.0) *. sin time in
+    let s3y = (0.0 -. 40.0) *. sin (time -. 1.5707963267948966) in
+    let s3z = (0.0 -. 200.0) *. cos time in
+
+    let t1 = sphere_t ox oy oz dx dy dz s1x s1y s1z 20.0 in
+    let t2 = sphere_t ox oy oz dx dy dz s2x s2y s2z 100.0 in
+    let t3 = sphere_t ox oy oz dx dy dz s3x s3y s3z 100.0 in
+    let t4 = plane_t  ox oy oz dx dy dz 0.0 1.0 0.0 150.0 in
+
+    let near12 = minf t1 t2 in
+    let near34 = minf t3 t4 in
+    let near_t = minf near12 near34 in
+
+    if near_t >=. (big_t -. 1.0) then
+      ((0, (ox, (oy, oz))),
+       ((dx, (dy, dz)),
+        ((thrR, (thrG, thrB)),
+         (outR, (outG, outB)))))
+    else
+      let id1 = if t1 <=. t2 then 1 else 2 in
+      let t12 = minf t1 t2 in
+      let id2 = if t3 <=. t4 then 3 else 4 in
+      let t34 = minf t3 t4 in
+      let obj_id = if t12 <=. t34 then id1 else id2 in
+
+      let px = ox +. near_t *. dx in
+      let py = oy +. near_t *. dy in
+      let pz = oz +. near_t *. dz in
+
+      let n_s1 = norm3 (px -. s1x) (py -. s1y) (pz -. s1z) in
+      let n1x = fst n_s1 in
+      let n1y = fst (snd n_s1) in
+      let n1z = snd (snd n_s1) in
+      let n_s2 = norm3 (px -. s2x) (py -. s2y) (pz -. s2z) in
+      let n2x = fst n_s2 in
+      let n2y = fst (snd n_s2) in
+      let n2z = snd (snd n_s2) in
+      let n_s3 = norm3 (px -. s3x) (py -. s3y) (pz -. s3z) in
+      let n3x = fst n_s3 in
+      let n3y = fst (snd n_s3) in
+      let n3z = snd (snd n_s3) in
+
+      let nx = if obj_id = 1 then n1x else if obj_id = 2 then n2x else if obj_id = 3 then n3x else 0.0 in
+      let ny = if obj_id = 1 then n1y else if obj_id = 2 then n2y else if obj_id = 3 then n3y else 1.0 in
+      let nz = if obj_id = 1 then n1z else if obj_id = 2 then n2z else if obj_id = 3 then n3z else 0.0 in
+
+      let ix = int_of_float (floor_f (px /. 100.0)) in
+      let iz = int_of_float (floor_f (pz /. 100.0)) in
+      let parity = imod (ix + iz) 2 in
+      let pcol = if parity = 0 then 1.0 else 0.4 in
+
+      let baseR = if obj_id = 1 then 1.0 else if obj_id = 2 then 0.4 else if obj_id = 3 then 0.4 else pcol in
+      let baseG = if obj_id = 1 then 0.3 else if obj_id = 2 then 0.4 else if obj_id = 3 then 0.4 else pcol in
+      let baseB = if obj_id = 1 then 1.0 else if obj_id = 2 then 1.0 else if obj_id = 3 then 1.0 else pcol in
+      let shine = if obj_id = 1 then 0.4 else if obj_id = 2 then 0.8 else if obj_id = 3 then 0.5 else 0.2 in
+
+      let ldxr = lightX -. px in
+      let ldyr = lightY -. py in
+      let ldzr = lightZ -. pz in
+      let ldist = sqrt (ldxr *. ldxr +. ldyr *. ldyr +. ldzr *. ldzr) in
+      let lnorm = norm3 ldxr ldyr ldzr in
+      let ldx = fst lnorm in
+      let ldy = fst (snd lnorm) in
+      let ldz = snd (snd lnorm) in
+
+      let sh_ox = px +. nx *. 1.0e-2 in
+      let sh_oy = py +. ny *. 1.0e-2 in
+      let sh_oz = pz +. nz *. 1.0e-2 in
+      let st1 = sphere_t sh_ox sh_oy sh_oz ldx ldy ldz s1x s1y s1z 20.0 in
+      let st2 = sphere_t sh_ox sh_oy sh_oz ldx ldy ldz s2x s2y s2z 100.0 in
+      let st3 = sphere_t sh_ox sh_oy sh_oz ldx ldy ldz s3x s3y s3z 100.0 in
+      let st4 = plane_t  sh_ox sh_oy sh_oz ldx ldy ldz 0.0 1.0 0.0 150.0 in
+      let stnear = minf (minf st1 st2) (minf st3 st4) in
+      let shadow = if stnear <. ldist then 1.0 else 0.0 in
+
+      let lambert = maxf 0.0 (dot3 nx ny nz ldx ldy ldz) in
+      let direct = if shadow >. 0.5 then 0.0 else lambert *. 0.85 in
+      let lightR = 0.3 +. direct in
+      let lightG = 0.3 +. direct in
+      let lightB = 0.3 +. direct in
+
+      let localR = baseR *. lightR in
+      let localG = baseG *. lightG in
+      let localB = baseB *. lightB in
+
+      let addScale = 1.0 -. shine in
+      let outR2 = outR +. thrR *. localR *. addScale in
+      let outG2 = outG +. thrG *. localG *. addScale in
+      let outB2 = outB +. thrB *. localB *. addScale in
+
+      let thrR2 = thrR *. baseR *. shine in
+      let thrG2 = thrG *. baseG *. shine in
+      let thrB2 = thrB *. baseB *. shine in
+
+      let rdir = reflect3 dx dy dz nx ny nz in
+      let ndx = fst rdir in
+      let ndy = fst (snd rdir) in
+      let ndz = snd (snd rdir) in
+
+      let nox = px +. nx *. 1.0e-2 in
+      let noy = py +. ny *. 1.0e-2 in
+      let noz = pz +. nz *. 1.0e-2 in
+      let active2 = if thrR2 +. thrG2 +. thrB2 <. 1.0e-4 then 0 else 1 in
+
+      ((active2, (nox, (noy, noz))),
+       ((ndx, (ndy, ndz)),
+        ((thrR2, (thrG2, thrB2)),
+         (outR2, (outG2, outB2)))))
+
+let ray_render dummy_state frame =
+  let outW = 1280 in
+  let outH = 960 in
+  let aspect = float_of outW /. float_of outH in
+  let fov = 1.15 in
+  let maxBounces = 4 in
+
+  let time = float_of frame *. 0.04 in
+
+  (* Camera orbits around the scene centre. *)
+  let eyeX = 50.0 +. 500.0 *. sin (time *. 0.35) in
+  let eyeY = 0.0 -. 100.0 in
+  let eyeZ = 0.0 -. 700.0 +. 200.0 *. cos (time *. 0.25) in
+  let targetX = 0.0 in
+  let targetY = 80.0 in
+  let targetZ = 100.0 in
+
+  let fwd = norm3 (targetX -. eyeX) (targetY -. eyeY) (targetZ -. eyeZ) in
+  let fwdX = fst fwd in
+  let fwdY = fst (snd fwd) in
+  let fwdZ = snd (snd fwd) in
+
+  let right_raw = norm3 (0.0 -. fwdZ) 0.0 fwdX in
+  let rightX = fst right_raw in
+  let rightY = fst (snd right_raw) in
+  let rightZ = snd (snd right_raw) in
+
+  let upx_r = (0.0 -. rightZ) *. fwdY in
+  let upy_r = rightZ *. fwdX -. rightX *. fwdZ in
+  let upz_r = rightX *. fwdY in
+  let up = norm3 upx_r upy_r upz_r in
+  let upX = fst up in
+  let upY = fst (snd up) in
+  let upZ = snd (snd up) in
+
+  let lightX = 300.0 in
+  let lightY = 0.0 -. 300.0 in
+  let lightZ = 0.0 -. 100.0 in
+
+  let ray_fn [py, px] =
+    let sx = ((float_of px +. 0.5) /. float_of outW -. 0.5) *. aspect *. fov in
+    let sy = ((float_of py +. 0.5) /. float_of outH -. 0.5) *. fov in
+
+    let rax = fwdX +. sx *. rightX -. sy *. upX in
+    let ray = fwdY +. sx *. rightY -. sy *. upY in
+    let raz = fwdZ +. sx *. rightZ -. sy *. upZ in
+    let rnorm = norm3 rax ray raz in
+    let dirX = fst rnorm in
+    let dirY = fst (snd rnorm) in
+    let dirZ = snd (snd rnorm) in
+
+    let initState =
+      ((1, (eyeX, (eyeY, eyeZ))),
+       ((dirX, (dirY, dirZ)),
+        ((1.0, (1.0, 1.0)),
+         (0.0, (0.0, 0.0))))) in
+    let finalState = foldl_while
+      (let still_active s = fst (fst s) > 0 in still_active)
+      (let step s d = bounce_step time lightX lightY lightZ s d in step)
+      initState
+      (fill [maxBounces] 0) in
+    let out = snd (snd (snd finalState)) in
+    let outR = fst out in
+    let outG = fst (snd out) in
+    let outB = snd (snd out) in
+    clamp01 ((outR +. outG +. outB) /. 3.0) in
+
+  let pixels = generate [outH, outW] ray_fn in
+  let new_dummy = fill [1] 0.0 in
+  (pixels, new_dummy)

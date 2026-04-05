@@ -208,6 +208,14 @@ demo/voxel_ppm/build.sh
 
 # Render the same demo at a larger output size
 demo/voxel_ppm/build.sh /tmp/voxel_demo.ppm 128
+
+# Build and run the SDL ray tracing demo (animated spheres + checker plane)
+demo/ray_sdl/build.sh
+demo/ray_sdl/out/ray_sdl
+
+# Build and run the Metal-backed SDL ray tracing demo (macOS)
+demo/ray_sdl/metal_build.sh
+demo/ray_sdl/out/ray_sdl_metal
 ```
 
 ## Running Tests
