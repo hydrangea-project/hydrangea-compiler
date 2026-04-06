@@ -766,6 +766,11 @@ genLoop2 env declared spec body =
       defaultSimdLen = case C2.lsExec spec of
         C2.Vector v -> C2.vsWidth v
         _ -> 1
+      minSimdTripCount = 4
+      constantTripCount ie = case C2.simplifyIndexExpr ie of
+        C2.IConst n -> Just n
+        _ -> Nothing
+      shouldEmitSimd ie = maybe True (>= minSimdTripCount) (constantTripCount ie)
       atomicScatterBodyDoc elemTy declared' =
           case detectAtomicScatterAddLoop loopBody of
           Just (prefix, mGuard, arr, idx, val) ->
@@ -912,23 +917,34 @@ genLoop2 env declared spec body =
           vecComment = case C2.vsTail v of
             C2.TailNone -> text "/* vectorized reduction loop, width =" <+> int (C2.vsWidth v) <> text " */"
             _ -> text "/* vectorized reduction loop, width =" <+> int (C2.vsWidth v) <+> text "(compiler handles tail) */"
-      in accInit
-          $$ vecComment
-          $$ simdPragma redClause
-          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
-          $$ nest 4 (bodyDoc declared')
-          $$ text "}"
+      in if shouldEmitSimd b
+           then accInit
+             $$ vecComment
+             $$ simdPragma redClause
+             $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+             $$ nest 4 (bodyDoc declared')
+             $$ text "}"
+           else accInit
+             $$ text "/* short vector reduction loop; simd pragma omitted */"
+             $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+             $$ nest 4 (bodyDoc declared')
+             $$ text "}"
 
     (C2.Vector v, _, [i], [b]) ->
       let ci = sanitize i
           vecComment = case C2.vsTail v of
             C2.TailNone -> text "/* vectorized loop, width =" <+> int (C2.vsWidth v) <> text " */"
             _ -> text "/* vectorized loop, width =" <+> int (C2.vsWidth v) <+> text "(compiler handles tail) */"
-      in vecComment
-          $$ simdPragma empty
-          $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
-          $$ nest 4 (bodyDoc declaredWithHoisted)
-          $$ text "}"
+      in if shouldEmitSimd b
+           then vecComment
+             $$ simdPragma empty
+             $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+             $$ nest 4 (bodyDoc declaredWithHoisted)
+             $$ text "}"
+           else text "/* short vector loop; simd pragma omitted */"
+             $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> genIndexExpr b <> text ";" <+> text ci <> text "++) {"
+             $$ nest 4 (bodyDoc declaredWithHoisted)
+             $$ text "}"
 
     (C2.Parallel p, _, [i], [b]) | C2.psStrategy p == C2.ParallelScatterPrivatizedIntAdd ->
       privatizedScatterLoopDoc declaredWithHoisted i b

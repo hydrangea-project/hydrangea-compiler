@@ -128,6 +128,28 @@ substRHS2 env rhs =
     RPairSnd ct a           -> RPairSnd ct (sub a)
     _                       -> rhs
 
+-- | Substitute variables appearing in an 'IndexExpr' using the copy-prop
+-- environment.  Integer atom bindings are folded to constants so loop bounds
+-- can become static trip counts.
+substIndexExpr2 :: Map ByteString Atom -> IndexExpr -> IndexExpr
+substIndexExpr2 env ie =
+  let go = substIndexExpr2 env
+  in simplifyIndexExpr $ case ie of
+       IVar v -> case M.lookup v env of
+         Just (AInt n) -> IConst n
+         Just (AVar v') -> IVar v'
+         _ -> IVar v
+       IConst n -> IConst n
+       IAdd a b -> IAdd (go a) (go b)
+       ISub a b -> ISub (go a) (go b)
+       IMul a b -> IMul (go a) (go b)
+       IDiv a b -> IDiv (go a) (go b)
+       ITuple es -> ITuple (map go es)
+       IProj i e -> IProj i (go e)
+       IFlatToNd a b -> IFlatToNd (go a) (go b)
+       INdToFlat a b -> INdToFlat (go a) (go b)
+       ICall f args -> ICall f (map go args)
+
 ------------------------------------------------------------------------
 -- Copy propagation
 ------------------------------------------------------------------------
@@ -156,10 +178,15 @@ copyProp2 = go M.empty
         SArrayWrite (substAtom2 env a1) (substAtom2 env a2) (substAtom2 env a3)
           : go env rest
       SLoop spec body ->
-        let defs  = S.toList (definedVarsStmts2 body)
+        let spec' =
+              spec
+                { lsBounds = map (substIndexExpr2 env) (lsBounds spec)
+                , lsRed = fmap (\r -> r { rsInit = substIndexExpr2 env (rsInit r) }) (lsRed spec)
+                }
+            defs  = S.toList (definedVarsStmts2 body)
             env'  = foldr M.delete env (lsIters spec ++ defs)
             body' = go env' body
-        in  SLoop spec body' : go env' rest
+        in  SLoop spec' body' : go env' rest
       SIf cond thn els ->
         let cond'             = substAtom2 env cond
             thn'              = go env thn
@@ -289,19 +316,53 @@ loopInvariantCodeMotion2 = concatMap goStmt
     goStmt :: Stmt -> [Stmt]
     goStmt (SLoop spec body) =
       let body'    = loopInvariantCodeMotion2 body
-          loopDefs = S.fromList (lsIters spec) <> definedVarsStmts2 body'
-          (hoisted, kept) = partition (isHoistable loopDefs) body'
+          iterDefs = S.fromList (lsIters spec)
+          bodyDefs = definedVarsStmts2 body'
+          loopDeps = iterDefs <> bodyDefs
+          body'' = concatMap (hoistCommonBranchPrefix loopDeps) body'
+          defCounts = countAssignedVars body''
+          (hoisted, kept) = partition (isHoistable iterDefs loopDeps defCounts) body''
       in  hoisted ++ [SLoop spec kept]
     goStmt (SIf cond thn els) =
       [SIf cond (loopInvariantCodeMotion2 thn) (loopInvariantCodeMotion2 els)]
     goStmt stmt = [stmt]
 
-    isHoistable :: Set ByteString -> Stmt -> Bool
-    isHoistable loopDefs (SAssign x rhs) =
-      not (x `S.member` loopDefs)
+    isHoistable :: Set ByteString -> Set ByteString -> Map ByteString Int -> Stmt -> Bool
+    isHoistable iterDefs loopDeps defCounts (SAssign x rhs) =
+      not (x `S.member` iterDefs)
+      && M.findWithDefault 0 x defCounts == 1
       && rhsIsPure2 rhs
-      && S.null (usedVarsRHS2 rhs `S.intersection` loopDefs)
-    isHoistable _ _ = False
+      && S.null (usedVarsRHS2 rhs `S.intersection` loopDeps)
+    isHoistable _ _ _ _ = False
+
+    hoistCommonBranchPrefix :: Set ByteString -> Stmt -> [Stmt]
+    hoistCommonBranchPrefix loopDeps stmt = case stmt of
+      SIf cond thn els ->
+        let (prefix, thn', els') = commonHoistablePrefix thn els
+        in prefix ++ [SIf cond thn' els']
+      _ -> [stmt]
+      where
+        commonHoistablePrefix :: [Stmt] -> [Stmt] -> ([Stmt], [Stmt], [Stmt])
+        commonHoistablePrefix (a:as) (b:bs)
+          | a == b && isBranchHoistable loopDeps a =
+              let (rest, as', bs') = commonHoistablePrefix as bs
+              in (a : rest, as', bs')
+        commonHoistablePrefix as bs = ([], as, bs)
+
+    isBranchHoistable :: Set ByteString -> Stmt -> Bool
+    isBranchHoistable loopDeps (SAssign _ rhs) =
+      rhsIsPure2 rhs
+      && S.null (usedVarsRHS2 rhs `S.intersection` loopDeps)
+    isBranchHoistable _ _ = False
+
+    countAssignedVars :: [Stmt] -> Map ByteString Int
+    countAssignedVars = foldr go M.empty
+      where
+        go stmt acc = case stmt of
+          SAssign x _ -> M.insertWith (+) x 1 acc
+          SLoop _ body -> foldr go acc body
+          SIf _ thn els -> foldr go (foldr go acc thn) els
+          _ -> acc
 
 ------------------------------------------------------------------------
 -- Common subexpression elimination (CSE)

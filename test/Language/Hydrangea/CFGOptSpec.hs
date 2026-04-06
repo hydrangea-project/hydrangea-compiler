@@ -41,6 +41,17 @@ spec = do
       -- x should still be propagated where legal, but not into loop if it's a loop var
       length result `shouldSatisfy` (>= 0)
 
+    it "propagates integer constants into loop bounds" $ do
+      let loop = SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopFold)
+                   [SAssign "acc" (RAtom (AVar "i"))]
+          stmts = [ SAssign "n" (RAtom (AInt 4))
+                  , loop
+                  ]
+          result = copyProp2 stmts
+      case result of
+        [_assignN, SLoop spec _] -> lsBounds spec `shouldBe` [IConst 4]
+        _ -> expectationFailure "Expected loop after copy propagation"
+
   describe "CFGOpt - Dead Assignment Elimination" $ do
     it "removes unused pure assignments" $ do
       let stmts = [ SAssign "x" (RAtom (AInt 5))
@@ -124,6 +135,29 @@ spec = do
           result = loopInvariantCodeMotion2 stmts
       -- y depends on i, so should stay in loop
       length result `shouldBe` 1
+
+    it "hoists shared branch-invariant prefixes from loop conditionals" $ do
+      let shared = SAssign "c" (RUnOp CSin (AFloat 1.0))
+          loopBody =
+            [ SIf (AVar "cond")
+                [ shared
+                , SAssign "x" (RBinOp CAdd (AVar "i") (AInt 1))
+                ]
+                [ shared
+                , SAssign "x" (RBinOp CAdd (AVar "i") (AInt 2))
+                ]
+            , SArrayWrite (AVar "arr") (AVar "i") (AVar "x")
+            ]
+          stmts = [SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain) loopBody]
+          result = loopInvariantCodeMotion2 stmts
+      case result of
+        (SAssign "c" _ : SLoop _ body' : _) ->
+          case body' of
+            (SIf _ thn els : _) -> do
+              thn `shouldSatisfy` all (/= shared)
+              els `shouldSatisfy` all (/= shared)
+            _ -> expectationFailure "Expected conditional in loop body"
+        _ -> expectationFailure "Expected shared assignment hoisted before loop"
 
   describe "CFGOpt - Combined Optimization" $ do
     it "copy prop + DAE removes copy chains" $ do

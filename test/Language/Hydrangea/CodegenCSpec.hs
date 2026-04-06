@@ -38,6 +38,16 @@ spec = describe "CodegenC" $ do
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(4)"
 
+  it "omits omp simd for very short vector loops" $ do
+    let prog = Program
+          [ mkProc "p" []
+              [ SLoop (LoopSpec ["i"] [IConst 3] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain) []
+              , SReturn (C.AInt 0)
+              ]
+          ]
+        c = codegenProgram2 prog
+    c `shouldSatisfy` (not . isInfixOf "#pragma omp simd simdlen(4)")
+
   it "emits parallel reduction clause from ReductionSpec" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AInt 1))]
         spec' = LoopSpec ["i"] [IConst 16] (Parallel (ParallelSpec ParallelGeneric Nothing))

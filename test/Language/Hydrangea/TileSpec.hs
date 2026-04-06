@@ -73,6 +73,31 @@ spec = describe "Tile" $ do
 
     tileStmts2 [outer] `shouldBe` [outer]
 
+  it "does not tile fold loops even with large bounds" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i"] [IConst 256] Serial Nothing LoopFold)
+            [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
+
+    tileStmts2 [loop] `shouldBe` [loop]
+
+  it "keeps tiling non-fold map-reduction nests (matmul-like shape)" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["k"] [IConst 96] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction)
+            [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
+        outer =
+          SLoop
+            (LoopSpec ["j"] [IConst 128] Serial Nothing LoopMapReduction)
+            [ SAssign "acc" (RAtom (AInt 0))
+            , inner
+            , SArrayWrite (AVar "out") (AVar "j") (AVar "acc")
+            ]
+
+    let tiled = tileStmts2 [outer]
+        loopSpecs = collectLoopSpecs tiled
+    length loopSpecs `shouldSatisfy` (> 2)
+
 collectLoopSpecs :: [Stmt] -> [LoopSpec]
 collectLoopSpecs = concatMap go
   where

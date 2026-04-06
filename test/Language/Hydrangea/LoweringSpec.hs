@@ -155,6 +155,8 @@ spec = do
       any (\s -> case s of { SAssign _ (RArrayAlloc _) -> True; _ -> False }) stmts `shouldBe` True
       any (\s -> case s of { SLoop _ _ -> True; _ -> False }) stmts `shouldBe` True
       loopRoles stmts `shouldBe` [LoopMap]
+      let mapBounds = [b | LoopSpec _ [b] _ _ LoopMap <- collectLoopSpecs stmts]
+      mapBounds `shouldContain` [IConst 3]
 
     it "lowers generate array" $ do
       prog <- lowerFromSource "let arr = generate [3] (let f [i] = i + 1 in f)"
@@ -185,6 +187,13 @@ spec = do
       let Proc { procBody = stmts } = head procs
       -- Should contain nested loops for reduce
       countSLoops stmts `shouldSatisfy` (>= 1)
+
+    it "lowers foldl over literal fill to a fixed loop bound" $ do
+      prog <- lowerFromSource "let main = foldl (fn acc _ => acc + 1) 0 (fill [4] 0)"
+      let Program procs = prog
+      let Proc { procBody = stmts } = head procs
+      let foldBounds = [b | LoopSpec _ [b] _ _ LoopFold <- collectLoopSpecs stmts]
+      foldBounds `shouldContain` [IConst 4]
 
     it "lowers gather as a map-style output loop" $ do
       prog <- lowerFromSource $ BS.pack $ unlines
@@ -417,4 +426,12 @@ loopRoles = concatMap go
     go stmt = case stmt of
       SLoop loopSpec body -> lsRole loopSpec : loopRoles body
       SIf _ thn els -> loopRoles thn ++ loopRoles els
+      _ -> []
+
+collectLoopSpecs :: [Stmt] -> [LoopSpec]
+collectLoopSpecs = concatMap go
+  where
+    go stmt = case stmt of
+      SLoop loopSpec body -> loopSpec : collectLoopSpecs body
+      SIf _ thn els -> collectLoopSpecs thn ++ collectLoopSpecs els
       _ -> []
