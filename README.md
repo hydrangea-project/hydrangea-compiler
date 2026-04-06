@@ -85,16 +85,28 @@ GHC 9.10.1 together with Cabal, GCC, OpenMP support via GCC, and `z3`.
 Hydrangea currently has two code generation targets:
 
 - **C backend** — the primary and more mature path, generating C that can be compiled and run with SIMD and OpenMP support.
-- **Apple Metal backend (experimental / WIP)** — generates a `.metal` compute kernel plus an Objective-C harness and drives the Metal toolchain via `xcrun`. This path is currently aimed at macOS / Apple Silicon workflows and has a narrower supported feature set than the C backend.
+- **Apple Metal backend** — generates `.metal` compute kernel(s) plus an Objective-C harness and drives the Metal toolchain via `xcrun`. Targets macOS / Apple Silicon.
 
-The current Metal backend implementation is intentionally limited. In `CodegenMSL.hs`, the documented initial scope includes:
+### C backend
 
-- 1-D parallel or map-style kernels
-- Scalar and 1-D array inputs and outputs
-- `Int64` and `Double`-based programs, with Metal codegen demoting `Double` to `float`
-- Inner serial loops and conditionals inside the selected kernel body
+The C backend produces C99 code with:
+- SIMD vectorization via SIMDE intrinsics (configurable width with `--simd-width=<n>`)
+- OpenMP parallelization for multi-core CPU execution
+- Exportable kernels with stable C ABI via `--export-kernel=<name>`
+- Benchmark scaffolding via `--benchmark=<name>`
 
-It is still a work in progress and should be treated as experimental.
+### Apple Metal backend
+
+The Metal backend generates MSL (Metal Shading Language) compute kernels and drives the full Metal toolchain (`xcrun metal`, `xcrun metallib`) to produce GPU executables. Key capabilities:
+
+- **Multi-kernel dispatch** — when a program contains multiple GPU-eligible procs (e.g., a map kernel that feeds a second map kernel), the backend automatically generates and dispatches each as a separate Metal kernel, handling data flow through GPU buffers
+- **Atomic scatter add** — supports both `int` (via `atomic_fetch_add_explicit`) and `float` (via a CAS loop) scatter patterns for parallel reduction
+- **1-D parallel / vector map kernels** — the dominant kernel form; outer `LoopMap` loops are mapped directly to a Metal compute grid
+- **Scalar and 1-D array inputs/outputs** — `Int64` and `Float` element types (with `Double` demoted to `Float` on the GPU)
+- **Inner serial loops and conditionals** — supported inside the kernel body
+- **Export mode** — `--export-metal-kernel=<name>` produces a reusable Metal library with `hyd_metal_init(path)`, `hyd_metal_*(*)`, and `hyd_metal_cleanup()` for embedding in larger applications
+
+The Metal backend skips CPU-side OpenMP parallelization (GPU parallelism is handled by the Metal dispatch). It does not support dynamic allocation inside kernels, `RFlatToNd`/`RNdToFlat` inside kernel bodies, or 2-D+ index spaces in the current implementation.
 
 ## Command-Line Usage
 
@@ -129,7 +141,7 @@ If no file is provided, reads from stdin.
 | `--all-top-level-procs` | Preserve every top-level declaration instead of pruning to `main` |
 | `--no-parallel` | Disable OpenMP-oriented parallelization and compile generated C without `-fopenmp` |
 | `--no-solver-check` | Skip refinement-solver discharge after type inference |
-| `--simd-width=<2|4>` | Select the SIMD vector width used by the C backend (default: `4`) |
+| `--simd-width=<n>` | Select the SIMD vector width used by the C backend (default: `4`) |
 | `--prune-dead-procs` | Prune unused generated procedures during code generation |
 | `--kernel=<name>` | Assert that the named top-level kernel fully fused away references to other original top-level bindings; fails if fusion leaves dependencies behind |
 | `--metal-kernel=<name>` | When using `--metal`, choose which lowered procedure should be emitted as the Metal kernel; otherwise the backend selects a candidate automatically |
