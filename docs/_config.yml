@@ -1,0 +1,14 @@
+title: Hydrangea
+description: Experimental compiler for a functional, higher-order, rank-polymorphic array programming language
+
+plugins:
+  - jekyll-remote-theme
+  
+remote_theme: just-the-docs/just-the-docs
+
+url: https://hydrangea-project.github.io
+baseurl: "/hydrangea-copmiler"
+
+aux_links:
+  "GitHub Repo":
+    - "//github.com/hydrangea-project/hydrangea-compiler"
