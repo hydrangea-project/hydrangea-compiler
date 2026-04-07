@@ -1,0 +1,93 @@
+(* pic_density.hyd — Particle-in-cell density simulation.
+   Exports pic_step: (state_array, attractor_encoded) -> (new_state, density_grid).
+
+   State: flat array [num_particles * 4], layout per particle: x, y, vx, vy.
+   Attractor position: encoded as ax * 10000 + ay (grid coordinates).
+
+   Each frame:
+   1. Euler integration: update velocities toward attractor, update positions
+   2. Scatter particle mass into density grid (guarded for out-of-bounds)
+
+   The per-particle bin-index array, mass array, and guard array are all maps
+   over the same particle-index source, triggering Case 6a scatter_reindex
+   fusion: none of the three intermediate arrays is materialised.  The scatter
+   loop reads each particle's position once, computes the grid cell and
+   boundary check on-the-fly, and accumulates directly into the density grid.
+
+   Use --no-solver-check to suppress SMT. *)
+
+let num_particles = 400
+let state_size    = 1600     (* 400 * 4 *)
+let grid_h        = 128
+let grid_w        = 128
+let num_cells     = 16384    (* 128 * 128 *)
+let dt            = 0.003
+let grav_strength = 80000.0
+let damping       = 0.998
+
+let pic_step state attractor_encoded =
+  let ax = float_of (attractor_encoded / 10000) in
+  let ay = float_of (attractor_encoded - (attractor_encoded / 10000) * 10000) in
+
+  (* --- Update particles: Euler integration with central attractor ---
+     Each output element k encodes one component of one particle:
+       k / 4 = particle index,  k mod 4 = component (0=x, 1=y, 2=vx, 3=vy).
+     Gravity uses a softened inverse-square law toward (ax, ay). *)
+  let new_state = generate [state_size]
+    (let f [k] =
+       let p  = k / 4 in
+       let c  = k - p * 4 in
+       let px = index [p * 4]     state in
+       let py = index [p * 4 + 1] state in
+       let vx = index [p * 4 + 2] state in
+       let vy = index [p * 4 + 3] state in
+       let dx_a  = ax -. px in
+       let dy_a  = ay -. py in
+       let dist2 = dx_a *. dx_a +. dy_a *. dy_a +. 50.0 in
+       let inv_d = 1.0 /. sqrt dist2 in
+       let force = grav_strength *. inv_d *. inv_d in
+       let acc_x = force *. dx_a *. inv_d in
+       let acc_y = force *. dy_a *. inv_d in
+       let nvx   = damping *. (vx +. acc_x *. dt) in
+       let nvy   = damping *. (vy +. acc_y *. dt) in
+       let npx   = px +. nvx *. dt in
+       let npy   = py +. nvy *. dt in
+       if c = 0 then npx
+       else if c = 1 then npy
+       else if c = 2 then nvx
+       else nvy
+     in f) in
+
+  (* --- Density grid via guarded scatter ---
+     Create a particle-index source array.  For each particle p, compute:
+       - cellFn:  grid cell index from particle position (row * grid_w + col)
+       - massFn:  weight = 1.0  (unit mass per particle)
+       - keepFn:  true iff particle lies within [0, grid_w) x [0, grid_h)
+     All three are maps over the same source, so Case 6a scatter_reindex
+     fires: no intermediate arrays materialised. *)
+  let particles = generate [num_particles] (let id [i] = i in id) in
+
+  let cellFn p =
+    let px = index [p * 4]     new_state in
+    let py = index [p * 4 + 1] new_state in
+    int_of_float (floor_f py) * grid_w + int_of_float (floor_f px)
+  in
+
+  let massFn p = 1.0 in
+
+  let keepFn p =
+    let px = index [p * 4]     new_state in
+    let py = index [p * 4 + 1] new_state in
+    let ci = int_of_float (floor_f px) in
+    let cj = int_of_float (floor_f py) in
+    if ci < 0 then false
+    else if ci >= grid_w then false
+    else if cj < 0 then false
+    else if cj >= grid_h then false
+    else true
+  in
+
+  let density = scatter_guarded (+.) (fill [num_cells] 0.0)
+    (map cellFn particles) (map massFn particles) (map keepFn particles) in
+
+  (new_state, density)
