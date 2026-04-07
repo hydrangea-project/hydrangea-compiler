@@ -7,7 +7,7 @@ plugins:
 remote_theme: just-the-docs/just-the-docs
 
 url: https://hydrangea-project.github.io
-baseurl: "/hydrangea-copmiler"
+baseurl: "/hydrangea-compiler"
 
 aux_links:
   "GitHub Repo":
