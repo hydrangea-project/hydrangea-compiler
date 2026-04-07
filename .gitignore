@@ -28,6 +28,6 @@ hydrangea_out.c
 .idea
 *.log
 tmp/
-*.md
 *.ppm
 *out.c
+/demo/*/out
