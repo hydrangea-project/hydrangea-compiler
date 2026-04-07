@@ -31,3 +31,4 @@ tmp/
 *.ppm
 *out.c
 /demo/*/out
+bench/matmul/gen_mats
