@@ -45,6 +45,24 @@ spec = describe "parser" $ do
       Left err -> expectationFailure ("lexer/parser failed: " ++ err)
       Right ast -> fmap (const ()) ast `shouldBe` EScan () (EVar () "f") (EInt () 0) (EVar () "arr")
 
+  it "parses scan_inclusive as a special form" $ do
+    let res = runAlex "scan_inclusive f 0 arr" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast -> fmap (const ()) ast `shouldBe` EScanInclusive () (EVar () "f") (EInt () 0) (EVar () "arr")
+
+  it "parses scanr as a special form" $ do
+    let res = runAlex "scanr f 0 arr" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast -> fmap (const ()) ast `shouldBe` EScanR () (EVar () "f") (EInt () 0) (EVar () "arr")
+
+  it "parses scanr_inclusive as a special form" $ do
+    let res = runAlex "scanr_inclusive f 0 arr" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast -> fmap (const ()) ast `shouldBe` EScanRInclusive () (EVar () "f") (EInt () 0) (EVar () "arr")
+
   it "parses segmented_reduce as a special form" $ do
     let res = runAlex "segmented_reduce f 0 offsets vals" parseMiniML
     case res of

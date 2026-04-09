@@ -189,6 +189,15 @@ spec = do
       expectType
         "let g [i] = i + 1 in let f acc x = acc + x in scan f 0 (generate [4] g)"
         (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
+      expectType
+        "let g [i] = i + 1 in let f acc x = acc + x in scan_inclusive f 0 (generate [4] g)"
+        (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
+      expectType
+        "let g [i] = i + 1 in let f acc x = acc + x in scanr f 0 (generate [4] g)"
+        (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
+      expectType
+        "let g [i] = i + 1 in let f acc x = acc + x in scanr_inclusive f 0 (generate [4] g)"
+        (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
     it "typechecks segmented_reduce over 1D offsets and values" $ do
       expectType
         "let offsets = generate [4] (let f [i] = if i = 0 then 0 else if i = 1 then 2 else if i = 2 then 5 else 5 in f) in let vals = generate [5] (let f [i] = i + 1 in f) in segmented_reduce (let add acc x = acc + x in add) 0 offsets vals"
@@ -377,6 +386,15 @@ spec = do
       expectTypeError
         "let f acc x = acc + x in scan f 0 (generate [2,2] (let g _ = 1 in g))"
         (const True)
+      expectTypeError
+        "let f acc x = acc + x in scan_inclusive f 0 (generate [2,2] (let g _ = 1 in g))"
+        (const True)
+      expectTypeError
+        "let f acc x = acc + x in scanr f 0 (generate [2,2] (let g _ = 1 in g))"
+        (const True)
+      expectTypeError
+        "let f acc x = acc + x in scanr_inclusive f 0 (generate [2,2] (let g _ = 1 in g))"
+        (const True)
     it "rejects segmented_reduce on non-int offsets" $ do
       expectTypeError
         "let offsets = generate [3] (let f [i] = i +. 1.0 in f) in let vals = generate [4] (let f [i] = i in f) in segmented_reduce (let add acc x = acc + x in add) 0 offsets vals"
@@ -399,6 +417,33 @@ spec = do
         ]
       c `shouldSatisfy` isInfixOf "scan_arr"
       c `shouldSatisfy` isInfixOf "scan_k"
+
+    it "emits explicit scan loop structure for scan_inclusive" $ do
+      c <- emitCFromSource $ BS.pack $ unlines
+        [ "let main ="
+        , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
+        , "  scan_inclusive (let add acc x = acc + x in add) 0 arr"
+        ]
+      c `shouldSatisfy` isInfixOf "scan_incl_arr"
+      c `shouldSatisfy` isInfixOf "scan_incl_k"
+
+    it "emits explicit scan loop structure for scanr" $ do
+      c <- emitCFromSource $ BS.pack $ unlines
+        [ "let main ="
+        , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
+        , "  scanr (let add acc x = acc + x in add) 0 arr"
+        ]
+      c `shouldSatisfy` isInfixOf "scanr_arr"
+      c `shouldSatisfy` isInfixOf "scanr_ix"
+
+    it "emits explicit scan loop structure for scanr_inclusive" $ do
+      c <- emitCFromSource $ BS.pack $ unlines
+        [ "let main ="
+        , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
+        , "  scanr_inclusive (let add acc x = acc + x in add) 0 arr"
+        ]
+      c `shouldSatisfy` isInfixOf "scanr_incl_arr"
+      c `shouldSatisfy` isInfixOf "scanr_incl_ix"
 
     it "emits explicit segment-bounded loop structure for segmented_reduce" $ do
       c <- emitCFromSource $ BS.pack $ unlines

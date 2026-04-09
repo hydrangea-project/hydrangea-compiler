@@ -144,6 +144,9 @@ instance Pretty (Exp a) where
   pPrint (EFoldl _ f z arr) = text "foldl" <+> pPrint f <+> pPrint z <+> pPrint arr
   pPrint (EFoldlWhile _ p f z arr) = text "foldl_while" <+> pPrint p <+> pPrint f <+> pPrint z <+> pPrint arr
   pPrint (EScan _ f z arr) = text "scan" <+> pPrint f <+> pPrint z <+> pPrint arr
+  pPrint (EScanInclusive _ f z arr) = text "scan_inclusive" <+> pPrint f <+> pPrint z <+> pPrint arr
+  pPrint (EScanR _ f z arr) = text "scanr" <+> pPrint f <+> pPrint z <+> pPrint arr
+  pPrint (EScanRInclusive _ f z arr) = text "scanr_inclusive" <+> pPrint f <+> pPrint z <+> pPrint arr
   pPrint (ESegmentedReduce _ f z offsets vals) =
     text "segmented_reduce" <+> pPrint f <+> pPrint z <+> pPrint offsets <+> pPrint vals
   pPrint (ESortIndices _ arr) = text "sort_indices" <+> pPrint arr

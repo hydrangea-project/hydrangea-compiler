@@ -172,6 +172,9 @@ normExp expr = case expr of
   EFoldl a f z arr -> EFoldl a <$> normExp f <*> normExp z <*> normExp arr
   EFoldlWhile a p f z arr -> EFoldlWhile a <$> normExp p <*> normExp f <*> normExp z <*> normExp arr
   EScan a f z arr -> EScan a <$> normExp f <*> normExp z <*> normExp arr
+  EScanInclusive a f z arr -> EScanInclusive a <$> normExp f <*> normExp z <*> normExp arr
+  EScanR a f z arr -> EScanR a <$> normExp f <*> normExp z <*> normExp arr
+  EScanRInclusive a f z arr -> EScanRInclusive a <$> normExp f <*> normExp z <*> normExp arr
   ESegmentedReduce a f z offsets vals ->
     ESegmentedReduce a <$> normExp f <*> normExp z <*> normExp offsets <*> normExp vals
   ESortIndices a arr -> ESortIndices a <$> normExp arr

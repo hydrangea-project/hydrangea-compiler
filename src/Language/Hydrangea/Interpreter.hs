@@ -24,6 +24,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.ByteString.Lazy.Char8 (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.ByteString.Lazy.Char8 (unpack)
+import Data.Foldable (foldrM)
 import Data.List (intercalate, isInfixOf, sortOn)
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -313,6 +314,63 @@ evalExp expr env = case expr of
             pure $ VArray shape (reverse revOut)
           _ -> throwError $ InvalidArrayOperation "scan: array must be 1-dimensional"
       _ -> throwError $ TypeError "scan: third argument must be an array"
+  EScanInclusive _ fnExpr initExpr arrExpr -> do
+    vFn <- evalExp fnExpr env
+    vInit <- evalExp initExpr env
+    varr <- evalExp arrExpr env
+    case varr of
+      VArray shape vals ->
+        case shape of
+          [_] -> do
+            (_accFinal, revOut) <- foldM
+              (\(acc, outs) v -> do
+                  fnAcc <- evalApp vFn acc env
+                  acc' <- evalApp fnAcc v env
+                  pure (acc', acc' : outs)
+              )
+              (vInit, [])
+              vals
+            pure $ VArray shape (reverse revOut)
+          _ -> throwError $ InvalidArrayOperation "scan_inclusive: array must be 1-dimensional"
+      _ -> throwError $ TypeError "scan_inclusive: third argument must be an array"
+  EScanR _ fnExpr initExpr arrExpr -> do
+    vFn <- evalExp fnExpr env
+    vInit <- evalExp initExpr env
+    varr <- evalExp arrExpr env
+    case varr of
+      VArray shape vals ->
+        case shape of
+          [_] -> do
+            (_accFinal, outVals) <- foldrM
+              (\v (acc, outs) -> do
+                  fnAcc <- evalApp vFn acc env
+                  acc' <- evalApp fnAcc v env
+                  pure (acc', acc : outs)
+              )
+              (vInit, [])
+              vals
+            pure $ VArray shape outVals
+          _ -> throwError $ InvalidArrayOperation "scanr: array must be 1-dimensional"
+      _ -> throwError $ TypeError "scanr: third argument must be an array"
+  EScanRInclusive _ fnExpr initExpr arrExpr -> do
+    vFn <- evalExp fnExpr env
+    vInit <- evalExp initExpr env
+    varr <- evalExp arrExpr env
+    case varr of
+      VArray shape vals ->
+        case shape of
+          [_] -> do
+            (_accFinal, outVals) <- foldrM
+              (\v (acc, outs) -> do
+                  fnAcc <- evalApp vFn acc env
+                  acc' <- evalApp fnAcc v env
+                  pure (acc', acc' : outs)
+              )
+              (vInit, [])
+              vals
+            pure $ VArray shape outVals
+          _ -> throwError $ InvalidArrayOperation "scanr_inclusive: array must be 1-dimensional"
+      _ -> throwError $ TypeError "scanr_inclusive: third argument must be an array"
   ESegmentedReduce _ fnExpr initExpr offsetsExpr valsExpr -> do
     vFn <- evalExp fnExpr env
     vInit <- evalExp initExpr env

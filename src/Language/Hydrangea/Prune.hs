@@ -55,6 +55,9 @@ collectTopLevelRefs topNames expr bound =
     EFoldl _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
     EFoldlWhile _ p f z a -> go p bound `S.union` go f bound `S.union` go z bound `S.union` go a bound
     EScan _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
+    EScanInclusive _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
+    EScanR _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
+    EScanRInclusive _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
     ESegmentedReduce _ f z offsets vals ->
       go f bound `S.union` go z bound `S.union` go offsets bound `S.union` go vals bound
     ESortIndices _ a -> go a bound

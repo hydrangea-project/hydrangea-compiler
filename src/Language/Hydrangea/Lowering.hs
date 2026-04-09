@@ -810,6 +810,103 @@ lowerExp expr = case expr of
                   ++ bodyStmts
                 )
              ]
+          , AVar outArr
+          )
+  EScanInclusive _ fnExp initExp arrExp -> do
+    (si, ai) <- lowerExp initExp
+    (sa, aa) <- lowerExp arrExp
+    shp <- freshCVar "scan_incl_shp"
+    n <- freshCVar "scan_incl_n"
+    outArr <- freshCVar "scan_incl_arr"
+    acc <- freshCVar "scan_incl_acc"
+    k <- freshCVar "scan_incl_k"
+    elem' <- freshCVar "scan_incl_elem"
+    accTy <- ctypeOfAtom ai
+    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
+    when (accTy /= CTUnknown) $ do
+      registerCType acc accTy
+      registerCType outArr (CTArray accTy)
+    propagatePairInfo acc ai
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    pure ( si ++ sa
+         ++ [ SAssign shp (RArrayShape aa)
+            , SAssign n (RShapeLast (AVar shp))
+            , SAssign outArr (RArrayAlloc (AVar shp))
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                ( [ SAssign elem' (RArrayLoad aa (AVar k)) ]
+                  ++ bodyStmts
+                  ++ [SArrayWrite (AVar outArr) (AVar k) (AVar acc)]
+                )
+             ]
+         , AVar outArr
+         )
+  EScanR _ fnExp initExp arrExp -> do
+    (si, ai) <- lowerExp initExp
+    (sa, aa) <- lowerExp arrExp
+    shp <- freshCVar "scanr_shp"
+    n <- freshCVar "scanr_n"
+    n1 <- freshCVar "scanr_n1"
+    outArr <- freshCVar "scanr_arr"
+    acc <- freshCVar "scanr_acc"
+    k <- freshCVar "scanr_k"
+    ix <- freshCVar "scanr_ix"
+    elem' <- freshCVar "scanr_elem"
+    accTy <- ctypeOfAtom ai
+    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
+    when (accTy /= CTUnknown) $ do
+      registerCType acc accTy
+      registerCType outArr (CTArray accTy)
+    propagatePairInfo acc ai
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    pure ( si ++ sa
+         ++ [ SAssign shp (RArrayShape aa)
+            , SAssign n (RShapeLast (AVar shp))
+            , SAssign n1 (RBinOp CSub (AVar n) (AInt 1))
+            , SAssign outArr (RArrayAlloc (AVar shp))
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                ( [ SAssign ix (RBinOp CSub (AVar n1) (AVar k))
+                  , SAssign elem' (RArrayLoad aa (AVar ix))
+                  , SArrayWrite (AVar outArr) (AVar ix) (AVar acc)
+                  ]
+                  ++ bodyStmts
+                )
+             ]
+         , AVar outArr
+         )
+  EScanRInclusive _ fnExp initExp arrExp -> do
+    (si, ai) <- lowerExp initExp
+    (sa, aa) <- lowerExp arrExp
+    shp <- freshCVar "scanr_incl_shp"
+    n <- freshCVar "scanr_incl_n"
+    n1 <- freshCVar "scanr_incl_n1"
+    outArr <- freshCVar "scanr_incl_arr"
+    acc <- freshCVar "scanr_incl_acc"
+    k <- freshCVar "scanr_incl_k"
+    ix <- freshCVar "scanr_incl_ix"
+    elem' <- freshCVar "scanr_incl_elem"
+    accTy <- ctypeOfAtom ai
+    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
+    when (accTy /= CTUnknown) $ do
+      registerCType acc accTy
+      registerCType outArr (CTArray accTy)
+    propagatePairInfo acc ai
+    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    pure ( si ++ sa
+         ++ [ SAssign shp (RArrayShape aa)
+            , SAssign n (RShapeLast (AVar shp))
+            , SAssign n1 (RBinOp CSub (AVar n) (AInt 1))
+            , SAssign outArr (RArrayAlloc (AVar shp))
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                ( [ SAssign ix (RBinOp CSub (AVar n1) (AVar k))
+                  , SAssign elem' (RArrayLoad aa (AVar ix))
+                  ]
+                  ++ bodyStmts
+                  ++ [SArrayWrite (AVar outArr) (AVar ix) (AVar acc)]
+                )
+             ]
          , AVar outArr
          )
   ESegmentedReduce _ fnExp initExp offsetsExp valsExp -> do

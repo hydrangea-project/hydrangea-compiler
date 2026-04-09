@@ -1408,6 +1408,12 @@ infer (EScan _ fn initExp arrExp) = do
             emitPred (PEq (TValBoundDim arrVar 0) outBound)
         _ -> return ()
       return arrTyOut
+infer (EScanInclusive a fn initExp arrExp) =
+  infer (EScan a fn initExp arrExp)
+infer (EScanR a fn initExp arrExp) =
+  infer (EScan a fn initExp arrExp)
+infer (EScanRInclusive a fn initExp arrExp) =
+  infer (EScan a fn initExp arrExp)
 infer (ESegmentedReduce _ fn initExp offsetsExp valsExp) = do
   offsetsTy <- infer offsetsExp
   valsTy <- infer valsExp

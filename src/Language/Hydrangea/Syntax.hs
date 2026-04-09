@@ -275,6 +275,18 @@ data Exp a
     -- @scan : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]@
     -- The output at position @i@ is the state /before/ consuming element @i@.
     EScan a (Exp a) (Exp a) (Exp a)
+  | -- | Inclusive prefix scan over a 1-D array.
+    -- @scan_inclusive : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]@
+    -- The output at position @i@ is the state /after/ consuming element @i@.
+    EScanInclusive a (Exp a) (Exp a) (Exp a)
+  | -- | Exclusive right-to-left prefix scan over a 1-D array.
+    -- @scanr : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]@
+    -- The output at position @i@ is the right-scan state /before/ consuming @arr[i]@.
+    EScanR a (Exp a) (Exp a) (Exp a)
+  | -- | Inclusive right-to-left prefix scan over a 1-D array.
+    -- @scanr_inclusive : (s -> a -> s) -> s -> Array[n, a] -> Array[n, s]@
+    -- The output at position @i@ is the right-scan state /after/ consuming @arr[i]@.
+    EScanRInclusive a (Exp a) (Exp a) (Exp a)
   | -- | Segmented reduction: reduces each @vals[offsets[i] : offsets[i+1]]@ from left to right.
     -- @segmented_reduce : (s -> a -> s) -> s -> offsets -> vals -> Array[nsegs, s]@
     ESegmentedReduce a (Exp a) (Exp a) (Exp a) (Exp a)
@@ -412,6 +424,9 @@ firstParam e = case e of
   EFoldl a _ _ _ -> a
   EFoldlWhile a _ _ _ _ -> a
   EScan a _ _ _ -> a
+  EScanInclusive a _ _ _ -> a
+  EScanR a _ _ _ -> a
+  EScanRInclusive a _ _ _ -> a
   ESegmentedReduce a _ _ _ _ -> a
   ESortIndices a _ -> a
   EIota a _ -> a

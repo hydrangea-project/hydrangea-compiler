@@ -100,6 +100,9 @@ collectVarsExp expr =
     EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EScanInclusive _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EScanR _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EScanRInclusive _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals
     ESortIndices _ arr -> collectVarsExp arr
@@ -207,6 +210,9 @@ freeVarsExp expr =
     EFoldl _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EFoldlWhile _ p f z arr -> freeVarsExp p `S.union` freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EScan _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
+    EScanInclusive _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
+    EScanR _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
+    EScanRInclusive _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp offsets `S.union` freeVarsExp vals
     ESortIndices _ arr -> freeVarsExp arr
@@ -294,6 +300,9 @@ boundVarsExp expr =
     EFoldl _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EFoldlWhile _ p f z arr -> boundVarsExp p `S.union` boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EScan _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
+    EScanInclusive _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
+    EScanR _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
+    EScanRInclusive _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp offsets `S.union` boundVarsExp vals
     ESortIndices _ arr -> boundVarsExp arr
@@ -385,6 +394,9 @@ countVarExp v expr =
     EFoldl _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
     EFoldlWhile _ p f z arr -> countVarExp v p + countVarExp v f + countVarExp v z + countVarExp v arr
     EScan _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
+    EScanInclusive _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
+    EScanR _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
+    EScanRInclusive _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
     ESegmentedReduce _ f z offsets vals ->
       countVarExp v f + countVarExp v z + countVarExp v offsets + countVarExp v vals
     ESortIndices _ arr -> countVarExp v arr
@@ -474,6 +486,9 @@ substExp v replacement expr =
     EFoldl a f z arr -> EFoldl a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EFoldlWhile a p f z arr -> EFoldlWhile a (substExp v replacement p) (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EScan a f z arr -> EScan a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
+    EScanInclusive a f z arr -> EScanInclusive a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
+    EScanR a f z arr -> EScanR a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
+    EScanRInclusive a f z arr -> EScanRInclusive a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a (substExp v replacement f) (substExp v replacement z)
         (substExp v replacement offsets) (substExp v replacement vals)
@@ -586,6 +601,9 @@ isArrayExp expr =
     EFoldl {} -> False
     EFoldlWhile {} -> False
     EScan {} -> True
+    EScanInclusive {} -> True
+    EScanR {} -> True
+    EScanRInclusive {} -> True
     ESegmentedReduce {} -> False
     ESortIndices {} -> True
     EIota {} -> True
@@ -1077,6 +1095,9 @@ normExp expr =
     EFoldl a f z arr -> EFoldl a <$> normExp f <*> normExp z <*> normExp arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> normExp p <*> normExp f <*> normExp z <*> normExp arr
     EScan a f z arr -> EScan a <$> normExp f <*> normExp z <*> normExp arr
+    EScanInclusive a f z arr -> EScanInclusive a <$> normExp f <*> normExp z <*> normExp arr
+    EScanR a f z arr -> EScanR a <$> normExp f <*> normExp z <*> normExp arr
+    EScanRInclusive a f z arr -> EScanRInclusive a <$> normExp f <*> normExp z <*> normExp arr
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> normExp f <*> normExp z <*> normExp offsets <*> normExp vals
     ESortIndices a arr -> ESortIndices a <$> normExp arr
@@ -1296,6 +1317,9 @@ fuseOnce expr =
     EFoldl a f z arr -> EFoldl a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> fuseOnce p <*> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EScan a f z arr -> EScan a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
+    EScanInclusive a f z arr -> EScanInclusive a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
+    EScanR a f z arr -> EScanR a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
+    EScanRInclusive a f z arr -> EScanRInclusive a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce offsets <*> fuseOnce vals
     ESortIndices a arr -> ESortIndices a <$> fuseOnce arr

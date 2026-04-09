@@ -386,6 +386,24 @@ spec = do
         , "let r = scan (let add acc x = acc + x in add) 0 arr"
         ]
 
+    it "scan_inclusive compiles and matches the interpreter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let arr = generate [4] (let f [i] = i + 1 in f)"
+        , "let r = scan_inclusive (let add acc x = acc + x in add) 0 arr"
+        ]
+
+    it "scanr compiles and matches the interpreter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let arr = generate [4] (let f [i] = i + 1 in f)"
+        , "let r = scanr (let add acc x = acc + x in add) 0 arr"
+        ]
+
+    it "scanr_inclusive compiles and matches the interpreter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let arr = generate [4] (let f [i] = i + 1 in f)"
+        , "let r = scanr_inclusive (let add acc x = acc + x in add) 0 arr"
+        ]
+
     it "segmented_reduce compiles and matches the interpreter" $ withCC $
       checkInlineSrc $ BS.pack $ unlines
         [ "let offsets = generate [4] (let f [i] ="

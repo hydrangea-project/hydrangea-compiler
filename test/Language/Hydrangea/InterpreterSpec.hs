@@ -211,6 +211,27 @@ spec = do
         Right val -> val `shouldBe` (VArray [4] [VInt 0, VInt 1, VInt 3, VInt 6])
         Left err -> expectationFailure err
 
+    it "evaluates inclusive scan on arrays" $ do
+      let code = "let add x y = x + y in scan_inclusive add 0 (generate [4] (let f [i] = i + 1 in f))"
+      result <- evalString code
+      case result of
+        Right val -> val `shouldBe` (VArray [4] [VInt 1, VInt 3, VInt 6, VInt 10])
+        Left err -> expectationFailure err
+
+    it "evaluates exclusive scanr on arrays" $ do
+      let code = "let add x y = x + y in scanr add 0 (generate [4] (let f [i] = i + 1 in f))"
+      result <- evalString code
+      case result of
+        Right val -> val `shouldBe` (VArray [4] [VInt 9, VInt 7, VInt 4, VInt 0])
+        Left err -> expectationFailure err
+
+    it "evaluates inclusive scanr on arrays" $ do
+      let code = "let add x y = x + y in scanr_inclusive add 0 (generate [4] (let f [i] = i + 1 in f))"
+      result <- evalString code
+      case result of
+        Right val -> val `shouldBe` (VArray [4] [VInt 10, VInt 9, VInt 7, VInt 4])
+        Left err -> expectationFailure err
+
     it "evaluates segmented_reduce over grouped integer values" $ do
       let code = unlines
             [ "let offsets = generate [4] (let f [i] = if i = 0 then 0 else if i = 1 then 2 else if i = 2 then 5 else 5 in f) in"
@@ -437,6 +458,15 @@ spec = do
   describe "Interpreter - scan" $ do
     it "scan over empty array returns empty array" $
       expectEval "let add x y = x + y in scan add 42 (fill [0] 0)"
+        (VArray [0] [])
+    it "scan_inclusive over empty array returns empty array" $
+      expectEval "let add x y = x + y in scan_inclusive add 42 (fill [0] 0)"
+        (VArray [0] [])
+    it "scanr over empty array returns empty array" $
+      expectEval "let add x y = x + y in scanr add 42 (fill [0] 0)"
+        (VArray [0] [])
+    it "scanr_inclusive over empty array returns empty array" $
+      expectEval "let add x y = x + y in scanr_inclusive add 42 (fill [0] 0)"
         (VArray [0] [])
 
   describe "Interpreter - float_of" $ do

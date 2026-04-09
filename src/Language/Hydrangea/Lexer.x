@@ -58,6 +58,9 @@ tokens :-
 <0> foldl_while { tok FoldlWhile }
 <0> foldl    { tok Foldl }
 <0> scan     { tok Scan }
+<0> scan_inclusive { tok ScanInclusive }
+<0> scanr    { tok ScanR }
+<0> scanr_inclusive { tok ScanRInclusive }
 <0> segmented_reduce { tok SegmentedReduce }
 <0> sort_indices { tok SortIndices }
 <0> iota        { tok Iota }
@@ -304,6 +307,9 @@ data Token
   | Foldl
   | FoldlWhile
   | Scan
+  | ScanInclusive
+  | ScanR
+  | ScanRInclusive
   | SegmentedReduce
   | SortIndices
   | Iota

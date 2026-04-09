@@ -97,6 +97,9 @@ uniqExp expr =
     EFoldl a f z arr -> EFoldl a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> uniqExp p <*> uniqExp f <*> uniqExp z <*> uniqExp arr
     EScan a f z arr -> EScan a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
+    EScanInclusive a f z arr -> EScanInclusive a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
+    EScanR a f z arr -> EScanR a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
+    EScanRInclusive a f z arr -> EScanRInclusive a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     ESegmentedReduce a f z offsets vals ->
       ESegmentedReduce a <$> uniqExp f <*> uniqExp z <*> uniqExp offsets <*> uniqExp vals
     ESortIndices a arr -> ESortIndices a <$> uniqExp arr
@@ -249,6 +252,9 @@ collectVarsExp expr =
     EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EScanInclusive _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EScanR _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
+    EScanRInclusive _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     ESegmentedReduce _ f z offsets vals ->
       collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals
     ESortIndices _ arr -> collectVarsExp arr
