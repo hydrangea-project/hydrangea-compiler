@@ -193,6 +193,10 @@ demo/voxel_ppm/build.sh /tmp/voxel_demo.ppm 128
 demo/ray_sdl/build.sh
 demo/ray_sdl/out/ray_sdl
 
+# Build and run the scan-family SDL demo
+demo/scan_sdl/build.sh
+demo/scan_sdl/out/scan_sdl
+
 # Build and run the Metal-backed SDL ray tracing demo on macOS
 demo/ray_sdl/metal_build.sh
 demo/ray_sdl/out/ray_sdl_metal

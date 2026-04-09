@@ -1,0 +1,94 @@
+(* scan_live.hyd - Bidirectional scan-light visualizer for SDL.
+   Exports scan_frame: (frame, mouse_encoded) -> [num_cells] packed RGB ints.
+
+   Uses all four prefix scan variants over a row-reset linearization:
+     scan, scan_inclusive, scanr, scanr_inclusive *)
+
+let clamp_i x lo hi = if x < lo then lo else if x > hi then hi else x
+let clamp01 x = if x <. 0.0 then 0.0 else if x >. 1.0 then 1.0 else x
+
+let grid_h = 256
+let grid_w = 256
+let num_cells = 65536
+
+let source_strength i j cx cy amp spread =
+  let dx = float_of (j - cx) in
+  let dy = float_of (i - cy) in
+  amp /. (1.0 +. (dx *. dx +. dy *. dy) /. spread)
+
+let cell_atten i j t =
+  let si = float_of i in
+  let sj = float_of j in
+  let fog = 0.5 +. 0.5 *. sin (0.09 *. si +. 0.13 *. sj +. 0.7 *. t) in
+  let stripe = 0.5 +. 0.5 *. sin (0.22 *. sj -. 1.2 *. t) in
+  clamp01 (0.80 +. 0.17 *. fog +. 0.03 *. stripe)
+
+let step_light acc node =
+  let p = fst node in
+  let reset = fst p in
+  let atten = snd p in
+  let emit = snd node in
+  if reset = 1 then emit else atten *. acc +. emit
+
+let pack_rgb r g b =
+  let r8 = clamp_i (int_of_float (floor_f (255.0 *. clamp01 r))) 0 255 in
+  let g8 = clamp_i (int_of_float (floor_f (255.0 *. clamp01 g))) 0 255 in
+  let b8 = clamp_i (int_of_float (floor_f (255.0 *. clamp01 b))) 0 255 in
+  r8 * 65536 + g8 * 256 + b8
+
+let scan_frame frame mouse_encoded =
+  let mx0 = mouse_encoded / 10000 in
+  let my0 = mouse_encoded - (mouse_encoded / 10000) * 10000 in
+  let mx = clamp_i mx0 0 (grid_w - 1) in
+  let my = clamp_i my0 0 (grid_h - 1) in
+
+  let t = float_of frame *. 0.03 in
+  let sx = (frame * 2) - ((frame * 2 / grid_w) * grid_w) in
+  let sy = clamp_i (grid_h / 2 + int_of_float (floor_f (42.0 *. sin t))) 0 (grid_h - 1) in
+
+  let emit_base = generate [num_cells]
+    (let f [k] =
+       let i = k / grid_w in
+       let j = k - i * grid_w in
+       source_strength i j sx sy 0.030 250.0 +. source_strength i j mx my 0.045 150.0
+     in f) in
+
+  let row_lr = generate [num_cells]
+    (let f [k] =
+       let i = k / grid_w in
+       let j = k - i * grid_w in
+       let reset = if j = 0 then 1 else 0 in
+       let atten = cell_atten i j t in
+       let emit = index [k] emit_base in
+       ((reset, atten), emit)
+     in f) in
+
+  let row_rl = generate [num_cells]
+    (let f [k] =
+       let i = k / grid_w in
+       let j = k - i * grid_w in
+       let reset = if j = grid_w - 1 then 1 else 0 in
+       let atten = cell_atten i j t in
+       let emit = index [k] emit_base in
+       ((reset, atten), emit)
+     in f) in
+
+  let h_excl = scan step_light 0.0 row_lr in
+  let h_incl = scan_inclusive step_light 0.0 row_lr in
+  let h_rexcl = scanr step_light 0.0 row_rl in
+  let h_rincl = scanr_inclusive step_light 0.0 row_rl in
+
+  let h_sum_l = zipwith (+.) h_excl h_incl in
+  let h_sum_r = zipwith (+.) h_rexcl h_rincl in
+  let energy = zipwith (let f a b = 0.5 *. (a +. b) in f) h_sum_l h_sum_r in
+  let dir_incl = zipwith (-.) h_incl h_rincl in
+  let dir_excl = zipwith (-.) h_excl h_rexcl in
+  let signed = zipwith (let f a b = a +. 0.35 *. b in f) dir_incl dir_excl in
+
+  let red = zipwith (let f e s = 0.10 +. 3.20 *. e +. 0.70 *. s in f) energy signed in
+  let green = map (let f e = 0.06 +. 3.50 *. e in f) energy in
+  let blue = zipwith (let f e s = 0.12 +. 3.20 *. e -. 0.70 *. s in f) energy signed in
+  let rg = zipwith (let f r g = (r, g) in f) red green in
+
+  zipwith (let f p b = pack_rgb (fst p) (snd p) b in f) rg blue
+
