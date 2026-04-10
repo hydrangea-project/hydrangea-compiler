@@ -27,6 +27,50 @@ cabal run hydrangea-compiler -- examples/mat_mul.hyd
 
 If you are on macOS and want parallel C code, use `nix develop` or point `--cc` / `CC` at a GCC with OpenMP support. The system clang usually is not enough for that path.
 
+## Example compiler output
+
+Given a dot product procedure like this (assuming arrays `a` and `b`):
+
+```
+reduce (+) 0 (zipwith (*) a b) 
+```
+
+The compiler will produce C code like this:
+
+```c
+hyd_array_t* t6 = a();
+hyd_tuple_t t7 = t6->shape;
+hyd_tuple_t out_shp8 = hyd_shape_init(t7);
+int64_t red_dim9 = hyd_shape_last(t7);
+double acc11 = 0.0;
+int64_t k12__vec_trips = (red_dim9 / 4LL);
+hyd_float64x4_t acc11__vec = hyd_vec_set1_f64x4(0LL);
+hyd_array_t* t17 = b();
+
+#pragma omp parallel for
+for (int64_t k12__vec_i = 0; k12__vec_i < k12__vec_trips; k12__vec_i++) {
+    int64_t k12__vec_base = (k12__vec_i * 4LL);
+    hyd_float64x4_t val14__vec = hyd_vec_loadu_f64x4(((double*)(void*)t6->data) + k12__vec_base);
+    hyd_float64x4_t val16__vec = hyd_vec_loadu_f64x4(((double*)(void*)t17->data) + k12__vec_base);
+    hyd_float64x4_t t18__vec = hyd_vec_mul_f64x4(val14__vec, val16__vec);
+    acc11__vec = hyd_vec_add_f64x4(acc11__vec, t18__vec);
+}
+
+acc11 = hyd_vec_reduce_add_f64x4(acc11__vec);
+int64_t k12__tail_start = (k12__vec_trips * 4LL);
+int64_t k12__tail_len = (red_dim9 - k12__tail_start);
+for (int64_t k12__tail_i = 0; k12__tail_i < k12__tail_len; k12__tail_i++) {
+    int64_t k12 = (k12__tail_start + k12__tail_i);
+    double val14 = (((double*)(void*)t6->data)[k12]);
+    double val16 = (((double*)(void*)t17->data)[k12]);
+    double t18 = (val14 * val16);
+    acc11 = (acc11 + t18);
+}
+```
+
+The `hyd_vec_add_f64x4` and similar operations are SIMD intrinsics, implemented with the portable [SIMDE library](https://github.com/simd-everywhere/simde).
+
+
 ## Backends
 
 - **C backend**: the primary backend. It generates C99, uses SIMDE for vector code, and can add OpenMP parallelization when the toolchain supports it.

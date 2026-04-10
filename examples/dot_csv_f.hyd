@@ -1,0 +1,9 @@
+let add x y = x +. y
+let mul x y = x *. y
+
+let a = read_array_float [3] "examples/dotA_f.csv"
+let b = read_array_float [3] "examples/dotB_f.csv"
+
+let result = reduce add 0.0 (zipwith mul a b)
+
+let main = index () result
