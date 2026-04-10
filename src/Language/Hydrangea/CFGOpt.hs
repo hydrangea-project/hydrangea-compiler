@@ -163,41 +163,154 @@ substIndexExpr2 env ie =
 -- evicted to avoid propagating loop-carried updates into or across loop
 -- scopes.  Analogously, any variable assigned inside either branch of an
 -- 'SIf' is evicted from the environment for the statements that follow.
+--
+-- Additionally, three CSE rules eliminate redundant shape/index operations:
+--
+-- * /Call CSE/: zero-argument value-proc calls (@f()@) are idempotent due to
+--   the @__cache_*@ mechanism; a second call to the same proc is replaced with
+--   a copy of the first result.
+--
+-- * /Shape CSE/: repeated @arr->shape@ reads for the same array pointer are
+--   collapsed to a single read.
+--
+-- * /Roundtrip elimination/: @nd_to_flat(flat_to_nd(k, s), s) == k@ — when
+--   both the @RFlatToNd@ and @RNdToFlat@ use the same shape atom, the
+--   round-trip is replaced by the original flat index @k@.
 copyProp2 :: [Stmt] -> [Stmt]
-copyProp2 = go M.empty
+copyProp2 = go M.empty M.empty M.empty M.empty M.empty
   where
-    go :: Map ByteString Atom -> [Stmt] -> [Stmt]
-    go _   []             = []
-    go env (stmt : rest) = case stmt of
+    -- env        : copy/constant propagation (variable → atom)
+    -- tupEnv     : tuple-content tracking (variable → [atoms])
+    -- callEnv    : call CSE (proc name → first-result variable)
+    -- shapeEnv   : shape CSE (array variable → shape variable)
+    -- flatToNdEnv: roundtrip tracking (nd-index variable → (flat atom, shape atom))
+    go :: Map ByteString Atom
+       -> Map ByteString [Atom]
+       -> Map ByteString ByteString
+       -> Map ByteString ByteString
+       -> Map ByteString (Atom, Atom)
+       -> [Stmt] -> [Stmt]
+    go _   _        _       _        _           []             = []
+    go env tupEnv callEnv shapeEnv flatToNdEnv (stmt : rest) = case stmt of
       SAssign x (RAtom a) ->
         let a' = substAtom2 env a
-        in  SAssign x (RAtom a') : go (M.insert x a' env) rest
+        in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+
+      -- Track RTuple assignments for downstream shape-folding.
+      SAssign x (RTuple atoms) ->
+        let atoms' = map (substAtom2 env) atoms
+        in  SAssign x (RTuple atoms') : go env (M.insert x atoms' tupEnv) callEnv shapeEnv flatToNdEnv rest
+
+      -- Fold RShapeInit on a statically-known tuple: drop the last element.
+      SAssign x (RShapeInit (AVar v))
+        | Just atoms <- M.lookup v tupEnv
+        , not (null atoms) ->
+            let atoms' = init atoms
+            in  SAssign x (RTuple atoms') : go env (M.insert x atoms' tupEnv) callEnv shapeEnv flatToNdEnv rest
+
+      -- Fold RShapeLast on a statically-known tuple: extract the last element.
+      SAssign x (RShapeLast (AVar v))
+        | Just atoms <- M.lookup v tupEnv
+        , not (null atoms) ->
+            let a' = last atoms
+            in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+
+      -- Fold RShapeSize on a statically-known tuple: compute the product.
+      SAssign x (RShapeSize (AVar v))
+        | Just atoms <- M.lookup v tupEnv
+        , Just ns    <- mapM atomToInt atoms ->
+            let a' = AInt (product ns)
+            in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+
+      -- Call CSE: zero-argument value procs are idempotent (cached).
+      -- Replace a second call to the same proc with a copy of the first result.
+      SAssign x (RCall proc []) ->
+        case M.lookup proc callEnv of
+          Just prevVar ->
+            let a' = AVar prevVar
+            in  SAssign x (RAtom a')
+                  : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+          Nothing ->
+            SAssign x (RCall proc [])
+              : go env tupEnv (M.insert proc x callEnv) shapeEnv flatToNdEnv rest
+
+      -- Shape CSE: deduplicate arr->shape reads for the same array pointer.
+      SAssign x (RArrayShape a) ->
+        let a' = substAtom2 env a
+        in  case a' of
+              AVar v -> case M.lookup v shapeEnv of
+                Just prevShp ->
+                  let atom' = AVar prevShp
+                  in  SAssign x (RAtom atom')
+                        : go (M.insert x atom' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+                Nothing ->
+                  SAssign x (RArrayShape a')
+                    : go env tupEnv callEnv (M.insert v x shapeEnv) flatToNdEnv rest
+              _ -> SAssign x (RArrayShape a')
+                     : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+
+      -- Track flat→nd conversions for roundtrip elimination below.
+      SAssign x (RFlatToNd ka sa) ->
+        let ka' = substAtom2 env ka
+            sa' = substAtom2 env sa
+        in  SAssign x (RFlatToNd ka' sa')
+              : go env tupEnv callEnv shapeEnv (M.insert x (ka', sa') flatToNdEnv) rest
+
+      -- Roundtrip elimination: nd_to_flat(flat_to_nd(k, s), s) == k.
+      SAssign x (RNdToFlat a sa) ->
+        let a'  = substAtom2 env a
+            sa' = substAtom2 env sa
+        in  case a' of
+              AVar ndVar | Just (kAtom, s1) <- M.lookup ndVar flatToNdEnv
+                         , s1 == sa' ->
+                -- The nd-index was produced by flat_to_nd with the same shape:
+                -- skip the round-trip and use the original flat index directly.
+                SAssign x (RAtom kAtom)
+                  : go (M.insert x kAtom env) tupEnv callEnv shapeEnv flatToNdEnv rest
+              _ ->
+                SAssign x (RNdToFlat a' sa')
+                  : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+
       SAssign x rhs ->
-        SAssign x (substRHS2 env rhs) : go env rest
+        SAssign x (substRHS2 env rhs) : go env tupEnv callEnv shapeEnv flatToNdEnv rest
       SArrayWrite a1 a2 a3 ->
         SArrayWrite (substAtom2 env a1) (substAtom2 env a2) (substAtom2 env a3)
-          : go env rest
+          : go env tupEnv callEnv shapeEnv flatToNdEnv rest
       SLoop spec body ->
         let spec' =
               spec
                 { lsBounds = map (substIndexExpr2 env) (lsBounds spec)
                 , lsRed = fmap (\r -> r { rsInit = substIndexExpr2 env (rsInit r) }) (lsRed spec)
                 }
-            defs  = S.toList (definedVarsStmts2 body)
-            env'  = foldr M.delete env (lsIters spec ++ defs)
-            body' = go env' body
-        in  SLoop spec' body' : go env' rest
+            defs     = S.toList (definedVarsStmts2 body)
+            evicted  = lsIters spec ++ defs
+            env'     = foldr M.delete env evicted
+            tupEnv'  = foldr M.delete tupEnv evicted
+            -- callEnv and shapeEnv are globally valid (immutable cached results
+            -- and immutable array shapes), so they are not evicted at loops.
+            -- flatToNdEnv tracks loop-local index vars; entries referencing
+            -- evicted iter/def vars are stale but harmless: they only fire when
+            -- the nd-index variable appears again, which cannot happen outside
+            -- the loop since it was defined inside.
+            body'    = go env' tupEnv' callEnv shapeEnv flatToNdEnv body
+        in  SLoop spec' body' : go env' tupEnv' callEnv shapeEnv flatToNdEnv rest
       SIf cond thn els ->
         let cond'             = substAtom2 env cond
-            thn'              = go env thn
-            els'              = go env els
+            thn'              = go env tupEnv callEnv shapeEnv flatToNdEnv thn
+            els'              = go env tupEnv callEnv shapeEnv flatToNdEnv els
             definedInBranches = definedVarsStmts2 (thn ++ els)
-            env'              = foldr M.delete env (S.toList definedInBranches)
-        in  SIf cond' thn' els' : go env' rest
+            evicted           = S.toList definedInBranches
+            env'              = foldr M.delete env evicted
+            tupEnv'           = foldr M.delete tupEnv evicted
+        in  SIf cond' thn' els' : go env' tupEnv' callEnv shapeEnv flatToNdEnv rest
       SReturn a ->
-        SReturn (substAtom2 env a) : go env rest
+        SReturn (substAtom2 env a) : go env tupEnv callEnv shapeEnv flatToNdEnv rest
       SBreak ->
-        SBreak : go env rest
+        SBreak : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+
+    atomToInt :: Atom -> Maybe Integer
+    atomToInt (AInt n) = Just n
+    atomToInt _        = Nothing
 
 ------------------------------------------------------------------------
 -- Dead assignment elimination

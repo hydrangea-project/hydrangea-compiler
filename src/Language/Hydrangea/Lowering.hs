@@ -16,6 +16,7 @@
 module Language.Hydrangea.Lowering
   ( lowerDecs2
   , lowerDecs2WithTypeEnv
+  , lowerDecs2WithTypeEnvAndRanks
   ) where
 
 import Control.Applicative ((<|>))
@@ -45,6 +46,8 @@ data LowerState = LowerState
     -- ^ Access and layout facts for the vectorizer; reset per proc.
   , lsTopTypeEnv :: Map Var CType
     -- ^ Top-level declaration types from inference (@Var → CType@).
+  , lsArrayRankEnv :: Map Var Int
+    -- ^ Array rank (number of dimensions) for each top-level declaration.
   }
 
 type LowerM = State LowerState
@@ -78,10 +81,15 @@ initState = LowerState
   , lsArrayFacts = M.empty
   , lsVectorAccessFacts = M.empty
   , lsTopTypeEnv = M.empty
+  , lsArrayRankEnv = M.empty
   }
 
 initStateWithTypeEnv :: Map Var CType -> LowerState
 initStateWithTypeEnv topEnv = initState { lsTopTypeEnv = topEnv }
+
+initStateWithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> LowerState
+initStateWithTypeEnvAndRanks topEnv rankEnv =
+  initState { lsTopTypeEnv = topEnv, lsArrayRankEnv = rankEnv }
 
 -- | Lower a list of top-level declarations into a 'Program'.
 --
@@ -109,6 +117,20 @@ lowerDecs2WithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
       | not (null pats) = registerFn name pats body
       | otherwise       = pure ()
 
+-- | Like 'lowerDecs2WithTypeEnv' but also supplies an array-rank map that
+-- enables rank-aware optimisations during lowering (e.g. emitting a scalar
+-- accumulator instead of a 0-D output array for 1-D reductions).
+lowerDecs2WithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> [Dec Range] -> Program
+lowerDecs2WithTypeEnvAndRanks topEnv rankEnv decs =
+  evalState go (initStateWithTypeEnvAndRanks topEnv rankEnv)
+  where
+    go = do
+      mapM_ preRegister decs
+      Program <$> mapM lowerDec decs
+    preRegister (Dec _ name pats _ _ body)
+      | not (null pats) = registerFn name pats body
+      | otherwise       = pure ()
+
 lowerDec :: Dec Range -> LowerM Proc
 lowerDec (Dec _ name pats _ _ body) = do
   let params = concatMap patVarNames pats
@@ -116,12 +138,16 @@ lowerDec (Dec _ name pats _ _ body) = do
     modify' $ \s -> s { lsValueProcs = S.insert name (lsValueProcs s) }
   savedFacts <- gets lsArrayFacts
   savedVectorFacts <- gets lsVectorAccessFacts
-  modify' $ \s -> s { lsArrayFacts = M.empty, lsVectorAccessFacts = M.empty }
+  modify' $ \s -> s { lsArrayFacts = M.empty
+                    , lsVectorAccessFacts = M.empty
+                    }
   (stmts, result) <- lowerExp body
   typeEnv <- gets lsTypeEnv
   arrayFacts <- gets lsArrayFacts
   vectorAccessFacts <- gets lsVectorAccessFacts
-  modify' $ \s -> s { lsArrayFacts = savedFacts, lsVectorAccessFacts = savedVectorFacts }
+  modify' $ \s -> s { lsArrayFacts = savedFacts
+                    , lsVectorAccessFacts = savedVectorFacts
+                    }
   pure Proc
     { procName    = name
     , procParams  = params
@@ -146,6 +172,15 @@ shapeLength1DExp :: Exp a -> Maybe (Exp a)
 shapeLength1DExp expr = case expr of
   EVec _ [lenExp] -> Just lenExp
   _ -> Nothing
+
+-- | Determine the rank of a shape expression.  For 'EVec' the rank is the
+-- number of elements; for @'EShapeOf' (EVar v)@ the rank is looked up from
+-- the array-rank environment populated by type inference.
+shapeRankM :: Exp a -> LowerM (Maybe Int)
+shapeRankM expr = case expr of
+  EVec _ es         -> pure (Just (length es))
+  EShapeOf _ (EVar _ v) -> gets (M.lookup v . lsArrayRankEnv)
+  _                 -> pure Nothing
 
 -- | Lower an expression, returning the emitted statements and the atom
 -- that holds the result.
@@ -573,44 +608,77 @@ lowerExp expr = case expr of
   EReduceGenerate _ fnExp initExp shapeExp genExp -> do
     (si, ai) <- lowerExp initExp
     (ss, as') <- lowerExp shapeExp
-    outShp <- freshCVar "out_shp"
-    redDim <- freshCVar "red_dim"
-    outN <- freshCVar "out_n"
-    outArr <- freshCVar "out_arr"
-    j <- freshIterVar "j"
-    acc <- freshCVar "acc"
-    k <- freshCVar "k"
-    base <- freshCVar "base"
-    flatIn <- freshCVar "flat_in"
-    idx <- freshCVar "idx"
-    elem' <- freshCVar "elem"
-    _val <- freshCVar "val"
-    registerCType idx CTTuple
-    genStmts <- inlineArrayFn genExp idx elem'
-    (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-    let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
-    pure ( si ++ ss
-         ++ [ SAssign outShp (RShapeInit as')
-            , SAssign redDim (RShapeLast as')
-            , SAssign outN (RShapeSize (AVar outShp))
-             , SAssign outArr (RArrayAlloc (AVar outShp))
-             , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction)
-                  ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
-                     -- Initialize the accumulator for this output element.
-                     , SAssign acc (RAtom ai)
-                     , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
-                         ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
-                          , SAssign idx (RFlatToNd (AVar flatIn) as')
-                          ]
-                          ++ genStmts
-                          ++ bodyStmts
-                       )
-                   , SArrayWrite (AVar outArr) (AVar j) (AVar acc)
-                   ]
-                )
-            ]
-         , AVar outArr
-         )
+    mRank <- shapeRankM shapeExp
+    case mRank of
+      Just 1 -> do
+        -- 1-D input: skip the outer LoopMapReduction (which iterates exactly
+        -- once) and accumulate directly in a scalar.  Store the result into a
+        -- freshly allocated 0-D array so the proc return type is unchanged.
+        -- Use inlineArrayFn1D with the raw loop counter k (CTInt64) so that
+        -- array element accesses inside the body use k directly as a flat
+        -- index, avoiding the flat_to_nd / nd_to_flat round-trip entirely.
+        outShp <- freshCVar "out_shp"
+        redDim <- freshCVar "red_dim"
+        outArr <- freshCVar "out_arr"
+        acc    <- freshCVar "acc"
+        k      <- freshIterVar "k"
+        elem'  <- freshCVar "elem"
+        genStmts <- inlineArrayFn1D genExp k elem'
+        (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+        let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+        pure ( si ++ ss
+             ++ [ SAssign outShp (RShapeInit as')
+                , SAssign redDim (RShapeLast as')
+                , SAssign outArr (RArrayAlloc (AVar outShp))
+                , SAssign acc (RAtom ai)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                    ( genStmts
+                      ++ bodyStmts
+                    )
+                , SArrayWrite (AVar outArr) (AInt 0) (AVar acc)
+                ]
+             , AVar outArr
+             )
+      _ -> do
+        -- General case: output is a multi-element array.
+        outShp <- freshCVar "out_shp"
+        redDim <- freshCVar "red_dim"
+        outN <- freshCVar "out_n"
+        outArr <- freshCVar "out_arr"
+        j <- freshIterVar "j"
+        acc <- freshCVar "acc"
+        k <- freshCVar "k"
+        base <- freshCVar "base"
+        flatIn <- freshCVar "flat_in"
+        idx <- freshCVar "idx"
+        elem' <- freshCVar "elem"
+        _val <- freshCVar "val"
+        registerCType idx CTTuple
+        genStmts <- inlineArrayFn genExp idx elem'
+        (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+        let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+        pure ( si ++ ss
+             ++ [ SAssign outShp (RShapeInit as')
+                , SAssign redDim (RShapeLast as')
+                , SAssign outN (RShapeSize (AVar outShp))
+                , SAssign outArr (RArrayAlloc (AVar outShp))
+                , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction)
+                    ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
+                      -- Initialize the accumulator for this output element.
+                      , SAssign acc (RAtom ai)
+                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                          ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
+                            , SAssign idx (RFlatToNd (AVar flatIn) as')
+                            ]
+                            ++ genStmts
+                            ++ bodyStmts
+                          )
+                      , SArrayWrite (AVar outArr) (AVar j) (AVar acc)
+                      ]
+                    )
+                ]
+             , AVar outArr
+             )
 
   -- Optimized: foldl over fill avoids allocating a temporary array.
   -- The fill element is loop-invariant; assign it once before the loop.
@@ -1219,17 +1287,26 @@ lowerExp expr = case expr of
       _ -> do
         (si, ai) <- lowerExp idxExp
         (sa, aa) <- lowerExp arrExp
-        shp <- freshCVar "shp"
-        off <- freshCVar "off"
-        propagateDenseLinearIndex off ai
-        whenM (atomHasDenseLinearOrigin ai) (noteDenseReadAtom aa)
-        pure ( si ++ sa
-             ++ [ SAssign shp (RArrayShape aa)
-                , SAssign off (RNdToFlat ai (AVar shp))
-                , SAssign val (RArrayLoad aa (AVar off))
-                ]
-             , AVar val
-             )
+        aiTy <- ctypeOfAtom ai
+        -- Fast path: if the index is already a flat int64 (e.g. because we
+        -- are inside the rank-1 reduction loop and the parameter was bound as
+        -- the loop iteration variable), skip the nd_to_flat round-trip.
+        if aiTy == CTInt64
+          then do
+            whenM (atomHasDenseLinearOrigin ai) (noteDenseReadAtom aa)
+            pure (si ++ sa ++ [SAssign val (RArrayLoad aa ai)], AVar val)
+          else do
+            shp <- freshCVar "shp"
+            off <- freshCVar "off"
+            propagateDenseLinearIndex off ai
+            whenM (atomHasDenseLinearOrigin ai) (noteDenseReadAtom aa)
+            pure ( si ++ sa
+                 ++ [ SAssign shp (RArrayShape aa)
+                    , SAssign off (RNdToFlat ai (AVar shp))
+                    , SAssign val (RArrayLoad aa (AVar off))
+                    ]
+                 , AVar val
+                 )
 
   ECheckIndex _ idxExp defExp arrExp -> do
     (si, ai) <- lowerExp idxExp

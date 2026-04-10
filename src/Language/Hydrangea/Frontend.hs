@@ -22,7 +22,7 @@ import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, normalizeShapesDec
 import Language.Hydrangea.Uniquify
 import Language.Hydrangea.CFG qualified as C2
 import Language.Hydrangea.CFGCore (CType(..))
-import Language.Hydrangea.Lowering (lowerDecs2, lowerDecs2WithTypeEnv)
+import Language.Hydrangea.Lowering (lowerDecs2, lowerDecs2WithTypeEnv, lowerDecs2WithTypeEnvAndRanks)
 import Language.Hydrangea.CFGPipeline (parallelPipeline2, parallelPipelineWithWidth, vectorizePipeline2, vectorizePipelineWithWidth, metalPipeline2)
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
@@ -107,10 +107,35 @@ typeOfPolytype :: Polytype -> Maybe CType
 typeOfPolytype (Forall [] _ ty) = typeOfType ty
 typeOfPolytype (Forall _ _ _) = Nothing
 
--- | Run type inference on a list of declarations and return a map from
--- declaration name to its concrete 'CType'. Polymorphic declarations
--- (those that cannot be represented as a single C type) are omitted.
-inferTopLevelTypes :: [Dec Range] -> IO (Map.Map Var CType)
+-- | Count the rank (number of dimensions) of an array type.
+rankOfType :: Type -> Maybe Int
+rankOfType ty = case unFix ty of
+  TyArrayF shape _ -> Just (countCons shape)
+  TyRefineF _ inner -> rankOfType inner
+  _ -> Nothing
+  where
+    countCons t = case unFix t of
+      TyConsF _ rest -> 1 + countCons rest
+      _ -> 0
+
+-- | Extract the rank from a polytype, or 'Nothing' if polymorphic / not an array.
+rankOfPolytype :: Polytype -> Maybe Int
+rankOfPolytype (Forall [] _ ty) = rankOfType ty
+rankOfPolytype (Forall _ _ _)   = Nothing
+
+-- | Compute top-level type and rank maps from type inference.
+inferTopLevelTypesAndRanksWithOptions
+  :: InferOptions -> [Dec Range] -> IO (Map.Map Var CType, Map.Map Var Int)
+inferTopLevelTypesAndRanksWithOptions opts decs = do
+  res <- runInferDecsWithOptions opts decs
+  case res of
+    Left _ -> pure (Map.empty, Map.empty)
+    Right (pairs, _) -> pure
+      ( M.fromList [(v, ct) | (v, poly) <- pairs, Just ct <- [typeOfPolytype poly]]
+      , M.fromList [(v, r)  | (v, poly) <- pairs, Just r  <- [rankOfPolytype poly]]
+      )
+
+
 inferTopLevelTypes = inferTopLevelTypesWithOptions defaultInferOptions
 
 inferTopLevelTypesWithOptions :: InferOptions -> [Dec Range] -> IO (Map.Map Var CType)
@@ -154,9 +179,9 @@ lowerToCFG2WithConcreteTypes typeEnv = lowerDecs2WithTypeEnv typeEnv . preproces
 
 inferAndLowerToCFG2 :: InferOptions -> [Dec Range] -> IO C2.Program
 inferAndLowerToCFG2 opts decs = do
-  typeEnv <- inferTopLevelTypesWithOptions opts decs
+  (typeEnv, rankEnv) <- inferTopLevelTypesAndRanksWithOptions opts decs
   let pre = preprocessDecs decs
-  let prog = lowerDecs2WithTypeEnv typeEnv pre
+  let prog = lowerDecs2WithTypeEnvAndRanks typeEnv rankEnv pre
   pure prog
 
 -- | Lower declarations to CFG using inferred top-level concrete types.
