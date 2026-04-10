@@ -5,3 +5,4 @@ let w [i] = i + 2
 let arr1 = generate [3] v
 let arr2 = generate [3] w
 let result = reduce add 0 (zipwith mul arr1 arr2)
+let main = index () result
