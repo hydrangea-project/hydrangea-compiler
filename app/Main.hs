@@ -28,19 +28,16 @@ import Language.Hydrangea.CodegenC
 import Language.Hydrangea.CodegenMSL (MSLArtifacts(..), MSLOptions(..), defaultMSLOptions, codegenMSL)
 import Language.Hydrangea.ErrorFormat (formatEvalError, formatTypeError)
 import Language.Hydrangea.Frontend
-  ( compileToCOptIOWithOptions
-  , compileToCOptParallelIOWithOptions
-  , compileToCOptIOWithCodegenOptions
-  , compileToCOptParallelIOWithCodegenOptions
+  ( compileToCOptIOWithPipelineOptionsAndCodegenOptions
   , evalDecsFrontend
   , lowerToCFG2
   , lowerToCFG2OptWithTypesWithOptions
   , lowerToCFG2WithTypesWithOptions
-  , optimizeCFG2
-  , optimizeParallelCFG2
-  , optimizeMetalCFG2
+  , optimizeCFG2WithPipelineOptions
+  , optimizeMetalCFG2WithTiling
   , readDecs
   )
+import Language.Hydrangea.CFGPipeline (PipelineOptions(..), defaultPipelineOptions)
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions, runInferDecsWithOptions)
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Language.Hydrangea.Fusion (fuseDecs)
@@ -70,8 +67,10 @@ usage = unwords
   , "[--output-h=<file>]"
   , "[--export-kernel=<name>]"
   , "[" ++ allTopLevelProcsFlag ++ "]"
-  , "[--no-parallel]"
-  , "[--no-solver-check]"
+   , "[--no-parallel]"
+   , "[--tiling]"
+   , "[--explicit-vectorization]"
+   , "[--no-solver-check]"
   , "[--simd-width=<2|4>]"
   , "[--kernel=<name>]"
   , "[" ++ mainFlag ++ "]"
@@ -114,6 +113,8 @@ main = do
       keepC = "--keep-c" `elem` flags
       compileOnly = "--compile-only" `elem` flags
       parallel = not ("--no-parallel" `elem` flags)
+      enableTiling = "--tiling" `elem` flags
+      enableExplicitVectorization = "--explicit-vectorization" `elem` flags
       solveRefinements = not ("--no-solver-check" `elem` flags)
       pruneDead = "--prune-dead-procs" `elem` flags
       outputCFile = flagValue "--output-c=" flags
@@ -136,6 +137,13 @@ main = do
       keepMetal = "--keep-metal" `elem` flags
       noMultiKernel = "--no-multi-kernel" `elem` flags
       inferOptions = defaultInferOptions {inferSolveRefinements = solveRefinements}
+      pipelineOptions =
+        defaultPipelineOptions
+          { poEnableTiling = enableTiling
+          , poEnableExplicitVectorization = enableExplicitVectorization
+          , poEnableParallelization = parallel
+          , poVectorWidth = simdWidth
+          }
   (input, mpath) <- readInput paths
 
   let ccFlag = flagValue "--cc=" flags
@@ -169,9 +177,12 @@ main = do
   when (isJust exportMetalKernelFlag && not (isJust outputCFile)) $
     dieWithMessage "--export-metal-kernel requires --output-c=<file> for the .m harness."
 
+  when (enableExplicitVectorization && useMetal) $
+    dieWithMessage "--explicit-vectorization is only supported for the C backend."
+
   let generateExportArtifacts decs = do
         prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
-        let optimized = if parallel then optimizeParallelCFG2 prog else optimizeCFG2 prog
+        let optimized = optimizeCFG2WithPipelineOptions pipelineOptions prog
         pure (codegenProgram2WithOptionsPrune exportCodegenOptions pruneDead optimized)
 
       writeExportHeaderIfRequested artifacts =
@@ -204,9 +215,12 @@ main = do
                 Right () -> pure ()
           compileSelectedC =
             let codegenOpts = defaultCodegenOptions { codegenSimdWidth = simdWidth }
-            in if parallel
-              then compileToCOptParallelIOWithCodegenOptions inferOptions codegenOpts pruneDead decs
-              else compileToCOptIOWithCodegenOptions inferOptions codegenOpts pruneDead decs
+            in compileToCOptIOWithPipelineOptionsAndCodegenOptions
+                 inferOptions
+                 pipelineOptions
+                 codegenOpts
+                 pruneDead
+                 decs
           renderResult (v, p, mval) =
             case mval of
               Nothing -> putStrLn $ unpack v ++ " : evaluation error"
@@ -293,7 +307,7 @@ main = do
           else if useMetal then do
             _ <- runCheckedInference
             prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
-            let optimized = optimizeMetalCFG2 prog
+            let optimized = optimizeMetalCFG2WithTiling enableTiling prog
                 metalOpts = defaultMSLOptions
                   { mslKernelToEmit = fmap BS.pack metalKernelFlag
                   , mslMultiKernel = not noMultiKernel

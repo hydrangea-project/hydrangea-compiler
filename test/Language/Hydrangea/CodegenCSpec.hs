@@ -8,10 +8,12 @@ import Language.Hydrangea.CFGCore (Atom(..))
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CodegenC
-  ( CodegenArtifacts(..)
+  ( BenchmarkConfig(..)
+  , CodegenArtifacts(..)
   , CodegenOptions(..)
   , codegenProgram2
   , codegenProgram2WithOptions
+  , codegenProgram2WithOptionsPrune
   , defaultCodegenOptions
   )
 import Test.Hspec
@@ -338,6 +340,124 @@ spec = describe "CodegenC" $ do
     c `shouldSatisfy` isInfixOf "hyd_vec_add_f64x4"
     c `shouldSatisfy` isInfixOf "hyd_vec_storeu_f64x4"
 
+  it "disables memoization for pure zero-arg array procs in benchmark closure" $ do
+    let inputProc =
+          (mkProc "input_data" []
+             [ SAssign "arr" (C.RArrayAlloc (C.AInt 8))
+             , SReturn (C.AVar "arr")
+             ])
+            { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
+        kernelProc =
+          (mkProc "kernel" []
+             [ SAssign "tmp" (C.RCall "input_data" [])
+             , SReturn (C.AVar "tmp")
+             ])
+            { procTypeEnv = Map.fromList [("tmp", C.CTArray C.CTInt64)] }
+        prog = Program [inputProc, kernelProc]
+        artifacts =
+          codegenProgram2WithOptions
+            defaultCodegenOptions
+              { codegenEmitMain = False
+              , codegenBenchmark = Just (BenchmarkConfig "kernel" 1 1)
+              }
+            prog
+    case artifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } ->
+        c `shouldNotSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+
+  it "keeps memoization for benchmark-closure zero-arg array procs that perform IO" $ do
+    let inputProc =
+          (mkProc "input_data" []
+             [ SAssign "arr" (C.RCall "hyd_read_array_csv" [C.AString "input.csv"])
+             , SReturn (C.AVar "arr")
+             ])
+            { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
+        kernelProc =
+          (mkProc "kernel" []
+             [ SAssign "tmp" (C.RCall "input_data" [])
+             , SReturn (C.AVar "tmp")
+             ])
+            { procTypeEnv = Map.fromList [("tmp", C.CTArray C.CTInt64)] }
+        prog = Program [inputProc, kernelProc]
+        artifacts =
+          codegenProgram2WithOptions
+            defaultCodegenOptions
+              { codegenEmitMain = False
+              , codegenBenchmark = Just (BenchmarkConfig "kernel" 1 1)
+              }
+            prog
+    case artifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } ->
+        c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+
+  it "strips benchmark IO writes from benchmark kernel body only" $ do
+    let kernelProc =
+          (mkProc "kernel" []
+             [ SAssign "arr" (C.RArrayAlloc (C.AInt 8))
+             , SAssign "_" (C.RCall "hyd_write_array_csv" [C.AString "out.csv", C.AVar "arr"])
+             , SReturn (C.AVar "arr")
+             ])
+            { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
+        prog = Program [kernelProc]
+        nonBenchArtifacts =
+          codegenProgram2WithOptions
+            defaultCodegenOptions
+              { codegenEmitMain = False
+              }
+            prog
+        benchArtifacts =
+          codegenProgram2WithOptions
+            defaultCodegenOptions
+              { codegenEmitMain = False
+              , codegenBenchmark = Just (BenchmarkConfig "kernel" 1 1)
+              }
+            prog
+    case nonBenchArtifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } ->
+        c `shouldSatisfy` isInfixOf "hyd_write_array_csv("
+    case benchArtifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } ->
+        c `shouldNotSatisfy` isInfixOf "hyd_write_array_csv("
+
+  it "resets benchmark kernel cache before warmup and timed iterations" $ do
+    let kernelProc =
+          (mkProc "kernel" []
+             [ SAssign "arr" (C.RArrayAlloc (C.AInt 8))
+             , SReturn (C.AVar "arr")
+             ])
+            { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
+        prog = Program [kernelProc]
+        artifacts =
+          codegenProgram2WithOptions
+            defaultCodegenOptions
+              { codegenBenchmark = Just (BenchmarkConfig "kernel" 2 3)
+              }
+            prog
+    case artifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } ->
+        c `shouldSatisfy` isInfixOf "__bench_cache_kernel = NULL;"
+
+  it "benchmark mode main only runs the selected benchmark kernel" $ do
+    let helperProc = mkProc "helper" [] [SReturn (C.AInt 7)]
+        kernelProc = mkProc "kernel" [] [SReturn (C.AFloat 1.0)]
+        prog = Program [helperProc, kernelProc]
+        artifacts =
+          codegenProgram2WithOptions
+            defaultCodegenOptions
+              { codegenBenchmark = Just (BenchmarkConfig "kernel" 1 2)
+              }
+            prog
+    case artifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } -> do
+        c `shouldNotSatisfy` isInfixOf "helper_result"
+        c `shouldSatisfy` isInfixOf "benchmark[kernel]"
+
   it "emits export wrapper and suppresses main in export mode" $ do
     let prog = Program [mkProc "main" [] [SReturn (C.AInt 42)]]
         artifacts =
@@ -370,3 +490,15 @@ spec = describe "CodegenC" $ do
         c `shouldSatisfy` isInfixOf "int64_t hyd_export_kernel(int64_t n)"
         c `shouldSatisfy` isInfixOf "return kernel(n);"
         mHeader `shouldSatisfy` maybe False (isInfixOf "int64_t hyd_export_kernel(int64_t n);")
+
+  it "prunes uncalled zero-arg procs when pruning is enabled" $ do
+    let prog =
+          Program
+            [ mkProc "main" [] [SReturn (C.AInt 42)]
+            , mkProc "dead" [] [SReturn (C.AInt 7)]
+            ]
+    case codegenProgram2WithOptionsPrune defaultCodegenOptions True prog of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } -> do
+        c `shouldSatisfy` isInfixOf "int64_t hyd_main(void)"
+        c `shouldNotSatisfy` isInfixOf "dead(void)"

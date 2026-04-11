@@ -23,7 +23,16 @@ import Language.Hydrangea.Uniquify
 import Language.Hydrangea.CFG qualified as C2
 import Language.Hydrangea.CFGCore (CType(..))
 import Language.Hydrangea.Lowering (lowerDecs2, lowerDecs2WithTypeEnv, lowerDecs2WithTypeEnvAndRanks)
-import Language.Hydrangea.CFGPipeline (parallelPipeline2, parallelPipelineWithWidth, vectorizePipeline2, vectorizePipelineWithWidth, metalPipeline2)
+import Language.Hydrangea.CFGPipeline
+  ( PipelineOptions(..)
+  , metalPipeline2
+  , metalPipelineWithTiling
+  , parallelPipeline2
+  , parallelPipelineWithWidth
+  , pipelineWithOptions
+  , vectorizePipeline2
+  , vectorizePipelineWithWidth
+  )
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
   , CodegenOptions(..)
@@ -274,6 +283,10 @@ compileToCFG2OptParallelPrune prune prog = codegenProgram2Prune prune (parallelP
 optimizeCFG2 :: C2.Program -> C2.Program
 optimizeCFG2 = vectorizePipeline2
 
+-- | Run the configurable CFG optimization pipeline.
+optimizeCFG2WithPipelineOptions :: PipelineOptions -> C2.Program -> C2.Program
+optimizeCFG2WithPipelineOptions = pipelineWithOptions
+
 -- | Run the CFG parallelization pipeline on a CFG program.
 optimizeParallelCFG2 :: C2.Program -> C2.Program
 optimizeParallelCFG2 = parallelPipeline2
@@ -281,6 +294,10 @@ optimizeParallelCFG2 = parallelPipeline2
 -- | Run the Metal-targeted pipeline: optimize + parallelize without SIMD vectorization.
 optimizeMetalCFG2 :: C2.Program -> C2.Program
 optimizeMetalCFG2 = metalPipeline2
+
+-- | Run the Metal-targeted pipeline with configurable tiling.
+optimizeMetalCFG2WithTiling :: Bool -> C2.Program -> C2.Program
+optimizeMetalCFG2WithTiling = metalPipelineWithTiling
 
 -- | Compile optimized CFG to C using the given 'CodegenOptions'.
 compileToCFG2OptPruneWithOpts :: CodegenOptions -> Bool -> C2.Program -> String
@@ -296,6 +313,14 @@ compileToCFG2OptParallelPruneWithOpts opts prune prog =
     Right artifacts -> codegenSource artifacts
     Left err -> error err
 
+-- | Compile CFG to C using explicit pipeline options and codegen options.
+compileToCFG2PruneWithPipelineAndOpts :: PipelineOptions -> CodegenOptions -> Bool -> C2.Program -> String
+compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune prog =
+  let opts = pipelineOpts { poVectorWidth = codegenSimdWidth codegenOpts }
+  in case codegenProgram2WithOptionsPrune codegenOpts prune (pipelineWithOptions opts prog) of
+       Right artifacts -> codegenSource artifacts
+       Left err -> error err
+
 -- | IO compile variant that accepts full 'CodegenOptions'.
 compileToCOptIOWithCodegenOptions :: InferOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptIOWithCodegenOptions inferOpts codegenOpts prune decs =
@@ -305,6 +330,12 @@ compileToCOptIOWithCodegenOptions inferOpts codegenOpts prune decs =
 compileToCOptParallelIOWithCodegenOptions :: InferOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptParallelIOWithCodegenOptions inferOpts codegenOpts prune decs =
   compileToCFG2OptParallelPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG2 inferOpts decs
+
+-- | IO compile variant with explicit pipeline options and codegen options.
+compileToCOptIOWithPipelineOptionsAndCodegenOptions
+  :: InferOptions -> PipelineOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
+compileToCOptIOWithPipelineOptionsAndCodegenOptions inferOpts pipelineOpts codegenOpts prune decs =
+  compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune <$> inferAndLowerToCFG2 inferOpts decs
 
 -- | Erase source-range annotations from an expression.
 stripRange :: Exp Range -> Either String (Exp ())

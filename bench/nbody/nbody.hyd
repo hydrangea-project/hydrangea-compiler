@@ -66,6 +66,14 @@ let new_xs = generate [n] (fn [i] => index [i] xs +. index [i] new_vxs *. dt)
 let new_ys = generate [n] (fn [i] => index [i] ys +. index [i] new_vys *. dt)
 let new_zs = generate [n] (fn [i] => index [i] zs +. index [i] new_vzs *. dt)
 
+(* Benchmark kernel: pure compute-only checksum over the evolved state.
+   This keeps timed runs focused on kernel work with no CSV writes. *)
+let benchmark_kernel =
+  let sum_x = reduce_generate (+.) 0.0 [n] (fn [i] => index [i] new_xs) in
+  let sum_y = reduce_generate (+.) 0.0 [n] (fn [i] => index [i] new_ys) in
+  let sum_z = reduce_generate (+.) 0.0 [n] (fn [i] => index [i] new_zs) in
+  index () sum_x +. index () sum_y +. index () sum_z
+
 let main =
   let _ = write_array_float new_xs "bench/nbody/out_xs.csv" in
   let _ = write_array_float new_ys "bench/nbody/out_ys.csv" in

@@ -39,6 +39,7 @@ module Language.Hydrangea.Vectorize
   ( vectorizeProc2
   , vectorizeProgram2
   , vectorizeProgram2WithWidth
+  , vectorizeProgram2WithWidthAndExplicit
   , vectorizeStmts2
   , defaultVectorWidth
   ) where
@@ -473,8 +474,10 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
                 _ -> tailPrep ++ [SLoop tailLoopSpec tailBody]
           pure (vecTripsStmt : vecLoop : tailStmts)
 
-planVectorLoop :: TypeEnv -> AccessFacts -> LoopSpec -> [Stmt] -> VectorPlan
-planVectorLoop typeEnv accessFacts spec body
+planVectorLoop :: Bool -> TypeEnv -> AccessFacts -> LoopSpec -> [Stmt] -> VectorPlan
+planVectorLoop allowExplicit typeEnv accessFacts spec body
+  | not allowExplicit =
+      VectorHintOnly
   | not typedArrays =
       VectorHintOnly
   | otherwise =
@@ -484,8 +487,8 @@ planVectorLoop typeEnv accessFacts spec body
   where
     typedArrays = bodyUsesOnlyDoubleArrays typeEnv body
 
-vectorizeProcWithCalls :: Int -> Map CVar CType -> Proc -> Proc
-vectorizeProcWithCalls w callTypes proc =
+vectorizeProcWithCalls :: Int -> Bool -> Map CVar CType -> Proc -> Proc
+vectorizeProcWithCalls w allowExplicit callTypes proc =
   proc { procBody = rewriteStmts2With defaultContext enterLoop rewriteStmt (procBody proc) }
   where
     defaultContext = VectorContext False
@@ -498,7 +501,7 @@ vectorizeProcWithCalls w callTypes proc =
       SLoop spec body ->
         case vectorCandidate w ctx spec body of
           Just vectorSpec ->
-            case planVectorLoop typeEnv accessFacts vectorSpec body of
+            case planVectorLoop allowExplicit typeEnv accessFacts vectorSpec body of
               VectorExplicit lowered -> lowered
               VectorHintOnly -> [SLoop vectorSpec body]
           Nothing ->
@@ -511,13 +514,18 @@ vectorizeProcWithCalls w callTypes proc =
 -- This is useful for unit tests and for callers that do not have whole-program
 -- call information available.
 vectorizeProc2 :: Proc -> Proc
-vectorizeProc2 = vectorizeProcWithCalls defaultVectorWidth M.empty
+vectorizeProc2 = vectorizeProcWithCalls defaultVectorWidth True M.empty
+
+-- | Vectorize a whole program using the given SIMD lane width, optionally
+-- enabling explicit vector lowering.
+vectorizeProgram2WithWidthAndExplicit :: Int -> Bool -> Program -> Program
+vectorizeProgram2WithWidthAndExplicit w allowExplicit (Program procs) =
+  let callTypes = inferProgramReturnTypes2 (Program procs)
+  in Program (map (vectorizeProcWithCalls w allowExplicit callTypes) procs)
 
 -- | Vectorize a whole program using the given SIMD lane width.
 vectorizeProgram2WithWidth :: Int -> Program -> Program
-vectorizeProgram2WithWidth w (Program procs) =
-  let callTypes = inferProgramReturnTypes2 (Program procs)
-  in Program (map (vectorizeProcWithCalls w callTypes) procs)
+vectorizeProgram2WithWidth w = vectorizeProgram2WithWidthAndExplicit w True
 
 -- | Vectorize a whole program.
 --

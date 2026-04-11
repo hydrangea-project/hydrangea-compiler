@@ -591,6 +591,99 @@ cseStmts2 = go M.empty
         SBreak : go env rest
 
 ------------------------------------------------------------------------
+-- Scalar 0-D array roundtrip elimination
+------------------------------------------------------------------------
+
+-- | Eliminate lowered scalar 0-D array materialization roundtrips of the form:
+--
+-- @
+-- out_shp = ()
+-- out_arr = alloc(out_shp)
+-- ... compute writeVal ...
+-- out_arr[0] = writeVal
+-- shp = shape(out_arr)
+-- off = 0               -- or nd_to_flat((), shp)
+-- val = out_arr[off]
+-- @
+--
+-- and rewrite to:
+--
+-- @
+-- ... compute writeVal ...
+-- val = writeVal
+-- @
+--
+-- This pass is conservative: it only rewrites when @out_arr@ is not otherwise
+-- referenced between alloc and load except by the matched write/shape/load
+-- chain.
+scalarizeZeroDimArrayRoundtrips :: [Stmt] -> [Stmt]
+scalarizeZeroDimArrayRoundtrips = rewriteBlock
+  where
+    rewriteBlock :: [Stmt] -> [Stmt]
+    rewriteBlock = go M.empty
+      where
+        go _ [] = []
+        go tupEnv (stmt : rest) =
+          case stmt of
+            SAssign v (RTuple atoms) ->
+              SAssign v (RTuple atoms) : go (M.insert v atoms tupEnv) rest
+            SLoop spec body ->
+              let body' = rewriteBlock body
+               in SLoop spec body' : go tupEnv rest
+            SIf cond thn els ->
+              let thn' = rewriteBlock thn
+                  els' = rewriteBlock els
+               in SIf cond thn' els' : go tupEnv rest
+            SAssign arr (RArrayAlloc (AVar shpVar))
+              | Just [] <- M.lookup shpVar tupEnv
+              , Just (prefix, tail') <- rewriteZeroDimUse arr rest ->
+                  prefix ++ go tupEnv tail'
+            _ ->
+              stmt : go tupEnv rest
+
+    rewriteZeroDimUse :: ByteString -> [Stmt] -> Maybe ([Stmt], [Stmt])
+    rewriteZeroDimUse arr stmts =
+      findPattern [] stmts
+      where
+        findPattern _ [] = Nothing
+        findPattern accPrefix (s1 : s2 : s3 : s4 : suffix)
+          | SArrayWrite (AVar arrW) writeIdx writeVal <- s1
+          , arrW == arr
+          , isZeroIndex writeIdx
+          , SAssign shpVar (RArrayShape (AVar arrShape)) <- s2
+          , arrShape == arr
+          , SAssign offVar offRhs <- s3
+          , isZeroOffset offRhs shpVar
+          , SAssign valVar (RArrayLoad (AVar arrLoad) loadIdx) <- s4
+          , arrLoad == arr
+          , isMatchingLoadIdx loadIdx offVar
+          , arr `S.notMember` usedVarsStmts2 accPrefix
+          , not (arr `S.member` definedVarsStmts2 accPrefix)
+          = Just (accPrefix ++ [SAssign valVar (RAtom writeVal)], suffix)
+        findPattern accPrefix (x : xs) =
+          if arr `S.member` usedVarsStmts2 [x] || arr `S.member` definedVarsStmts2 [x]
+            then Nothing
+            else findPattern (accPrefix ++ [x]) xs
+
+    isZeroIndex :: Atom -> Bool
+    isZeroIndex a = case a of
+      AInt 0 -> True
+      AUnit -> True
+      _ -> False
+
+    isZeroOffset :: RHS -> ByteString -> Bool
+    isZeroOffset rhs shpVar = case rhs of
+      RAtom (AInt 0) -> True
+      RNdToFlat idx (AVar shp') -> shp' == shpVar && isZeroIndex idx
+      _ -> False
+
+    isMatchingLoadIdx :: Atom -> ByteString -> Bool
+    isMatchingLoadIdx idx offVar = case idx of
+      AVar v -> v == offVar
+      AInt 0 -> True
+      _ -> False
+
+------------------------------------------------------------------------
 -- Function inlining
 ------------------------------------------------------------------------
 
@@ -687,6 +780,7 @@ optimizeOnce :: [Stmt] -> [Stmt]
 optimizeOnce =
     loopInvariantCodeMotion2
   . deadAssignElim2
+  . scalarizeZeroDimArrayRoundtrips
   . copyProp2
   . cseStmts2
   . copyProp2

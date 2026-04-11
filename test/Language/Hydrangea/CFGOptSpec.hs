@@ -160,6 +160,42 @@ spec = do
         _ -> expectationFailure "Expected shared assignment hoisted before loop"
 
   describe "CFGOpt - Combined Optimization" $ do
+    it "scalarizes temporary 0-D array write/load roundtrips" $ do
+      let stmts =
+            [ SAssign "out_shp" (RTuple [])
+            , SAssign "out_arr" (RArrayAlloc (AVar "out_shp"))
+            , SAssign "acc" (RAtom (AInt 0))
+            , SLoop (LoopSpec ["k"] [IConst 4] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction)
+                [ SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))
+                ]
+            , SArrayWrite (AVar "out_arr") (AInt 0) (AVar "acc")
+            , SAssign "shp" (RArrayShape (AVar "out_arr"))
+            , SAssign "off" (RAtom (AInt 0))
+            , SAssign "val" (RArrayLoad (AVar "out_arr") (AVar "off"))
+            , SReturn (AVar "val")
+            ]
+          result = optimizeStmts2 stmts
+          hasOutArrAlloc = any isOutArrAlloc result
+          hasOutArrWrite = any isOutArrWrite result
+          hasOutArrShape = any isOutArrShape result
+          hasOutArrLoad = any isOutArrLoad result
+          isOutArrAlloc s = case s of
+            SAssign "out_arr" (RArrayAlloc _) -> True
+            _ -> False
+          isOutArrWrite s = case s of
+            SArrayWrite (AVar "out_arr") _ _ -> True
+            _ -> False
+          isOutArrShape s = case s of
+            SAssign _ (RArrayShape (AVar "out_arr")) -> True
+            _ -> False
+          isOutArrLoad s = case s of
+            SAssign _ (RArrayLoad (AVar "out_arr") _) -> True
+            _ -> False
+      hasOutArrAlloc `shouldBe` False
+      hasOutArrWrite `shouldBe` False
+      hasOutArrShape `shouldBe` False
+      hasOutArrLoad `shouldBe` False
+
     it "copy prop + DAE removes copy chains" $ do
       let stmts = [ SAssign "x" (RAtom (AInt 5))
                   , SAssign "y" (RAtom (AVar "x"))

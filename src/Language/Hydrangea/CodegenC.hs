@@ -53,7 +53,7 @@ import Data.Char (isAlphaNum, toUpper)
 import Data.List (nub, nubBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG qualified as C2
@@ -138,6 +138,7 @@ ctypeToVarKind CTUnknown = Nothing
 data CodegenEnv = CodegenEnv
   { ceOpts :: CodegenOptions,
     ceRetKinds :: Map CVar VarKind,
+    ceRetTypes :: Map CVar CType,
     ceArrayElemTypes :: Map CVar CType,
     ceArrVars :: Set CVar,
     ceTupVars :: Set CVar,
@@ -192,16 +193,17 @@ codegenProgram2WithOptions opts = codegenProgram2WithOptionsPrune opts False
 
 codegenProgram2WithOptionsPrune :: CodegenOptions -> Bool -> C2.Program -> Either String CodegenArtifacts
 codegenProgram2WithOptionsPrune opts prune prog = do
-  let prepared = pruneProgram prune prog
+  let prepared = pruneProgram opts prune prog
   genProgram2 opts prepared
 
-pruneProgram :: Bool -> C2.Program -> C2.Program
-pruneProgram False prog = prog
-pruneProgram True prog@(C2.Program procs) =
+pruneProgram :: CodegenOptions -> Bool -> C2.Program -> C2.Program
+pruneProgram _ False prog = prog
+pruneProgram opts True prog@(C2.Program procs) =
   if usesApply then prog else C2.Program keptProcs
   where
     -- detect any use of the dynamic apply operator; if present, skip pruning
     usesApply = any procUsesApply procs
+    procNames = S.fromList [C2.procName p | p <- procs]
 
     procUsesApply (C2.Proc {C2.procBody = body}) = any stmtUsesApply body
     stmtUsesApply st = case st of
@@ -226,8 +228,20 @@ pruneProgram True prog@(C2.Program procs) =
     rhsCalledNames (RCall fn _) = if fn == "__apply" then S.empty else S.singleton fn
     rhsCalledNames _ = S.empty
 
-    -- roots: zero-arg procs (entry points)
-    rootNames = S.fromList [C2.procName p | p <- procs, null (C2.procParams p)]
+    -- roots: explicit entrypoints first (main/export/benchmark); fallback to
+    -- all zero-arg procs when no explicit root exists in the program.
+    explicitRootCandidates =
+      S.fromList $
+        mapMaybe
+          id
+          ( [if codegenEmitMain opts then Just "main" else Nothing]
+              ++ [codegenExportKernel opts]
+              ++ [bcKernelName <$> codegenBenchmark opts]
+          )
+    explicitRoots = explicitRootCandidates `S.intersection` procNames
+    rootNames
+      | S.null explicitRoots = S.fromList [C2.procName p | p <- procs, null (C2.procParams p)]
+      | otherwise = explicitRoots
 
     -- traverse call graph to find reachable procs
     reachable = closure callEdges rootNames
@@ -243,13 +257,72 @@ pruneProgram True prog@(C2.Program procs) =
                   visited' = S.insert x visited
                   succs = Map.findWithDefault S.empty x edges
                   new = succs `S.difference` visited'
-               in go (rest `S.union` new) visited'
+                in go (rest `S.union` new) visited'
+
+procCallEdges :: [C2.Proc] -> Map CVar (Set CVar)
+procCallEdges procs = Map.fromList [(C2.procName p, calledByProc p) | p <- procs]
+  where
+    procNames = S.fromList (map C2.procName procs)
+    calledByProc (C2.Proc {C2.procBody = body}) = foldMap (stmtCalledNames procNames) body
+
+stmtCalledNames :: Set CVar -> C2.Stmt -> Set CVar
+stmtCalledNames procNames st = case st of
+  C2.SAssign _ rhs -> rhsCalledNames procNames rhs
+  C2.SLoop _ body' -> foldMap (stmtCalledNames procNames) body'
+  C2.SIf _ thn els -> foldMap (stmtCalledNames procNames) thn `S.union` foldMap (stmtCalledNames procNames) els
+  _ -> S.empty
+
+rhsCalledNames :: Set CVar -> RHS -> Set CVar
+rhsCalledNames procNames rhs = case rhs of
+  RCall fn _ | fn `S.member` procNames && fn /= "__apply" -> S.singleton fn
+  _ -> S.empty
+
+procUsesIO :: [C2.Stmt] -> Bool
+procUsesIO = any stmtUsesIO
+  where
+    stmtUsesIO st = case st of
+      C2.SAssign _ rhs -> rhsUsesIO rhs
+      C2.SLoop _ body' -> procUsesIO body'
+      C2.SIf _ thn els -> procUsesIO thn || procUsesIO els
+      _ -> False
+    rhsUsesIO (RCall fn _) =
+      fn == "hyd_read_array_csv"
+        || fn == "hyd_read_float_array_csv"
+        || fn == "hyd_write_array_csv"
+        || fn == "hyd_write_array_csv_float"
+    rhsUsesIO _ = False
+
+stripBenchmarkIOStmts :: [C2.Stmt] -> [C2.Stmt]
+stripBenchmarkIOStmts = mapMaybe stripStmt
+  where
+    stripStmt st = case st of
+      C2.SAssign _ rhs | rhsIsBenchmarkIO rhs -> Nothing
+      C2.SLoop spec body -> Just (C2.SLoop spec (stripBenchmarkIOStmts body))
+      C2.SIf cond thn els -> Just (C2.SIf cond (stripBenchmarkIOStmts thn) (stripBenchmarkIOStmts els))
+      _ -> Just st
+
+    rhsIsBenchmarkIO (RCall fn _) =
+      fn == "hyd_write_array_csv" || fn == "hyd_write_array_csv_float"
+    rhsIsBenchmarkIO _ = False
+
+reachableClosure :: Map CVar (Set CVar) -> Set CVar -> Set CVar
+reachableClosure edges roots = go roots S.empty
+  where
+    go frontier visited
+      | S.null frontier = visited
+      | otherwise =
+          let (x, rest) = S.deleteFindMin frontier
+              visited' = S.insert x visited
+              succs = Map.findWithDefault S.empty x edges
+              new = succs `S.difference` visited'
+           in go (rest `S.union` new) visited'
 
 genProgram2 :: CodegenOptions -> C2.Program -> Either String CodegenArtifacts
 genProgram2 opts prog@(C2.Program procs) = do
   let retKinds = procReturnKinds2 prog
       retTypes = inferProgramReturnTypes2 prog
       callParamTypes = buildCallParamTypes retTypes procs
+      callEdges = procCallEdges procs
       missingArrayElemVars = collectMissingArrayElemVars retTypes callParamTypes procs
       needsOmp = any (\(C2.Proc {C2.procBody = body}) -> hasParallelStmt2 body) procs
       needsMath = any (\(C2.Proc {C2.procBody = body}) -> hasMathOp body) procs
@@ -259,6 +332,7 @@ genProgram2 opts prog@(C2.Program procs) = do
       timeInclude = case mBench of
         Nothing -> empty
         Just _ -> text "#include <time.h>"
+      benchReachable = fmap (\bc -> reachableClosure callEdges (S.singleton (bcKernelName bc))) mBench
       recoveredEnvs = map (recoverProcTypeEnv2 retTypes callParamTypes) procs
       pairStructs = genPairStructDefs opts prog recoveredEnvs
       recordStructs = genRecordStructDefs prog
@@ -313,7 +387,7 @@ genProgram2 opts prog@(C2.Program procs) = do
           $$ structuredArrayPrints
           $$ text ""
           $$ benchCacheGlobal
-          $$ vcat (punctuate (text "") (map (genProc2 opts retKinds retTypes callParamTypes) procs))
+          $$ vcat (punctuate (text "") (map (genProc2 opts benchReachable retKinds retTypes callParamTypes) procs))
           $$ maybe empty (\spec -> text "" $$ genExportWrapper spec) exportSpec
           $$ if codegenEmitMain opts
             then text "" $$ genMain2 mBench retKinds retTypes procs
@@ -428,14 +502,14 @@ genMain2 mBench retKinds retTypes procs =
       Nothing -> vcat (map callAndPrint zeroArgProcs)
       Just bc ->
         let benchName = bcKernelName bc
-            (before, benchAndAfter) = break (\p -> C2.procName p == benchName) zeroArgProcs
+            benchAndAfter = dropWhile (\p -> C2.procName p /= benchName) zeroArgProcs
          in case benchAndAfter of
-              -- Fallback if kernel not found among zero-arg procs (should have been caught earlier).
-              [] -> vcat (map callAndPrint zeroArgProcs)
-              (benchProc : after) ->
-                vcat (map callAndPrint before)
-                  $$ benchScaffold bc benchProc
-                  $$ vcat (map callAndPrint after)
+               -- Fallback if kernel not found among zero-arg procs (should have been caught earlier).
+               [] -> vcat (map callAndPrint zeroArgProcs)
+               (benchProc : _) ->
+                -- In benchmark mode, time only the selected benchmark kernel in
+                -- main; do not run unrelated zero-arg top-level procedures.
+                benchScaffold bc benchProc
 
     -- Generate warmup + measure loops + stats report + final call-and-print.
     benchScaffold bc proc =
@@ -444,6 +518,7 @@ genMain2 mBench retKinds retTypes procs =
           bsName = BS.unpack name
           warmupStr = show (bcWarmupIters bc)
           itersStr = show (bcMeasureIters bc)
+          retKind = Map.findWithDefault KScalar name retKinds
           isArrayRet = case Map.lookup name retTypes of
             Just (CTArray _) -> True
             _ -> case Map.findWithDefault KScalar name retKinds of
@@ -451,18 +526,32 @@ genMain2 mBench retKinds retTypes procs =
               KFloatArray -> True
               _ -> False
           benchCacheVar = "__bench_cache_" ++ cName
+          resetBenchCache =
+            if isArrayRet
+              then text (benchCacheVar ++ " = NULL;")
+              else empty
+          benchSinkDecl = case retKind of
+            KFloat -> text "volatile double __bench_sink_f = 0.0;"
+            KScalar -> text "volatile int64_t __bench_sink_i = 0;"
+            _ -> empty
+          benchInvoke = case retKind of
+            KFloat -> text ("__bench_sink_f += " ++ cName ++ "();")
+            KScalar -> text ("__bench_sink_i += " ++ cName ++ "();")
+            _ -> text ("(void) " ++ cName ++ "();")
        in -- Warmup loop
-          text ("for (int __bench_w = 0; __bench_w < " ++ warmupStr ++ "; __bench_w++) {")
-            $$ nest 4 (text ("(void) " ++ cName ++ "();"))
+          benchSinkDecl
+            $$ text ("for (int __bench_w = 0; __bench_w < " ++ warmupStr ++ "; __bench_w++) {")
+            $$ nest 4 (resetBenchCache $$ text ("(void) " ++ cName ++ "();"))
             $$ text "}"
             -- Measurement loop
             $$ text ("double __bench_times[" ++ itersStr ++ "];")
             $$ text ("for (int __bench_i = 0; __bench_i < " ++ itersStr ++ "; __bench_i++) {")
             $$ nest
               4
-              ( text "struct timespec __ts0, __ts1;"
+              ( resetBenchCache
+                  $$ text "struct timespec __ts0, __ts1;"
                   $$ text "clock_gettime(CLOCK_MONOTONIC, &__ts0);"
-                  $$ text ("(void) " ++ cName ++ "();")
+                  $$ benchInvoke
                   $$ text "clock_gettime(CLOCK_MONOTONIC, &__ts1);"
                   $$ text ("__bench_times[__bench_i] = (double)(__ts1.tv_sec - __ts0.tv_sec) * 1.0e9")
                   $$ text "    + (double)(__ts1.tv_nsec - __ts0.tv_nsec);"
@@ -549,8 +638,8 @@ genMain2 mBench retKinds retTypes procs =
               KFloat -> invoke "double" (text "hyd_print_double" <> parens (text result) <> text ";")
               KScalar -> invoke "int64_t" (text "hyd_print_int" <> parens (text result) <> text ";")
 
-genProc2 :: CodegenOptions -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> C2.Proc -> Doc
-genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc {C2.procName = name, C2.procParams = params, C2.procBody = body}) =
+genProc2 :: CodegenOptions -> Maybe (Set CVar) -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> C2.Proc -> Doc
+genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2.procName = name, C2.procParams = params, C2.procBody = body}) =
   let mBench = codegenBenchmark opts
       typeEnv = recoverProcTypeEnv2 retTypes callParamTypes proc
       -- Authoritative classification from the recovered type environment.
@@ -597,10 +686,13 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc {C2.procName = name
       isBenchKernel = case mBench of
         Just bc -> bcKernelName bc == name
         Nothing -> False
-      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel
+      benchClosureHit = maybe False (name `S.member`) mBenchReachable
+      benchmarkUsesMemo = benchClosureHit && not (procUsesIO body)
+      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel && not benchmarkUsesMemo
       cacheVar = text "__cache_" <> text cName
       benchCacheVar = text "__bench_cache_" <> text cName
-      (bodyWithoutReturn, finalReturn) = splitFinalReturn body
+      benchmarkBody = if isBenchKernel then stripBenchmarkIOStmts body else body
+      (bodyWithoutReturn, finalReturn) = splitFinalReturn benchmarkBody
       localArrayVars = localArrayVarsProc2 typeEnv proc
       vecVars = classifyVecVars (codegenSimdWidth opts) body
       tupleDefs = collectTupleDefs body
@@ -608,6 +700,7 @@ genProc2 opts retKinds retTypes callParamTypes proc@(C2.Proc {C2.procName = name
         CodegenEnv
           { ceOpts = opts,
             ceRetKinds = retKinds,
+            ceRetTypes = retTypes,
             ceArrayElemTypes = arrayElemTypes,
             ceArrVars = arrVars,
             ceTupVars = tupVars,
@@ -718,7 +811,7 @@ genStmts2 env declared liveAfter stmts =
             C2.SAssign _ (RVecStore _ _ _) -> declared
             C2.SAssign v _ -> S.insert v declared
             C2.SLoop spec body ->
-              let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars (ceRetKinds env) body
+              let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars (ceRetKinds env) (ceRetTypes env) body
                in case C2.lsRed spec of
                     Just r -> S.insert (C2.rsAccVar r) declaredWithHoists
                     Nothing -> declaredWithHoists
@@ -806,9 +899,9 @@ genLoop2 env declared spec body =
       bounds = C2.lsBounds spec
       red = C2.lsRed spec
       role = C2.lsRole spec
-      (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls (ceRetKinds env) body
+      (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls (ceRetKinds env) (ceRetTypes env) body
       hoistedMemoVars =
-        S.fromList [v | C2.SAssign v (RCall _ []) <- hoistedMemoCalls]
+        S.fromList [v | C2.SAssign v (RCall _ args) <- hoistedMemoCalls, isZeroArgCallArgs args]
       declaredWithHoisted = declared `S.union` hoistedMemoVars
       hoistedMemoDoc =
         genStmts2 env declared (usedVarsStmts2 loopBody) hoistedMemoCalls
@@ -1161,25 +1254,44 @@ genLoop2 env declared spec body =
               )
         (_, _, _, _) -> genNestedLoops iters bounds (bodyDoc declaredWithHoisted)
 
-hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> [C2.Stmt] -> ([C2.Stmt], [C2.Stmt])
-hoistMemoizedZeroArgArrayCalls retKinds = foldr step ([], [])
+hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> Map CVar CType -> [C2.Stmt] -> ([C2.Stmt], [C2.Stmt])
+hoistMemoizedZeroArgArrayCalls retKinds retTypes = go
   where
-    step stmt (hoisted, kept)
-      | isMemoizedZeroArgArrayCall retKinds stmt = (stmt : hoisted, kept)
-      | otherwise = (hoisted, stmt : kept)
+    go [] = ([], [])
+    go (stmt : rest) =
+      let (hoistedStmt, keptStmt) = step stmt
+          (hoistedRest, keptRest) = go rest
+       in (hoistedStmt ++ hoistedRest, keptStmt ++ keptRest)
 
-memoizedZeroArgArrayCallVars :: Map CVar VarKind -> [C2.Stmt] -> Set CVar
-memoizedZeroArgArrayCallVars retKinds body =
-  S.fromList [v | C2.SAssign v (RCall _ []) <- fst (hoistMemoizedZeroArgArrayCalls retKinds body)]
+    step stmt
+      | isMemoizedZeroArgArrayCall retKinds retTypes stmt = ([stmt], [])
+    step (C2.SLoop spec body) =
+      let (hoistedBody, keptBody) = go body
+       in (hoistedBody, [C2.SLoop spec keptBody])
+    step (C2.SIf cond thn els) =
+      let (hoistedThn, keptThn) = go thn
+          (hoistedEls, keptEls) = go els
+       in ([], [C2.SIf cond (hoistedThn ++ keptThn) (hoistedEls ++ keptEls)])
+    step other = ([], [other])
 
-isMemoizedZeroArgArrayCall :: Map CVar VarKind -> C2.Stmt -> Bool
-isMemoizedZeroArgArrayCall retKinds stmt = case stmt of
-  C2.SAssign _ (RCall f []) ->
+memoizedZeroArgArrayCallVars :: Map CVar VarKind -> Map CVar CType -> [C2.Stmt] -> Set CVar
+memoizedZeroArgArrayCallVars retKinds retTypes body =
+  S.fromList [v | C2.SAssign v (RCall _ args) <- fst (hoistMemoizedZeroArgArrayCalls retKinds retTypes body), isZeroArgCallArgs args]
+
+isMemoizedZeroArgArrayCall :: Map CVar VarKind -> Map CVar CType -> C2.Stmt -> Bool
+isMemoizedZeroArgArrayCall retKinds retTypes stmt = case stmt of
+  C2.SAssign _ (RCall f args)
+    | isZeroArgCallArgs args ->
     case Map.findWithDefault KScalar f retKinds of
       KArray -> True
       KFloatArray -> True
-      _ -> False
+      _ -> case Map.lookup f retTypes of
+        Just (CTArray _) -> True
+        _ -> False
   _ -> False
+
+isZeroArgCallArgs :: [Atom] -> Bool
+isZeroArgCallArgs args = null args || all (== AUnit) args
 
 genNestedLoops :: [CVar] -> [C2.IndexExpr] -> Doc -> Doc
 genNestedLoops iters bounds body =
