@@ -94,7 +94,7 @@ app/        CLI entry point and backend orchestration
 src/        Compiler frontend, CFG pipeline, and code generation
 runtime/    C runtime support used by generated programs
 examples/   Small Hydrangea programs
-demo/       Larger demos, including voxel and SDL examples
+demo/       Larger demos, including voxel, PPM, and SDL examples
 test/       HSpec test suite
 docs/       Additional documentation
 ```
