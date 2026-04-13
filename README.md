@@ -2,6 +2,10 @@
 
 Hydrangea is an experimental compiler for a functional array language with higher-order combinators and rank polymorphism. The main target is optimized C with fusion, SIMD vectorization, and OpenMP parallelization. There is also an Apple Metal backend for macOS, but the C path is the one to reach for first.
 
+<a href="docs/images/ray_still_life.png">
+  <img src="docs/images/ray_thumb.jpeg" alt="Ray Example" width="400"/>
+</a>
+
 ## What it is good at
 
 - Writing array programs in a compact, functional style
