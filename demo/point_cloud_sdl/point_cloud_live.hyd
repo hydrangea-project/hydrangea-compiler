@@ -1,0 +1,170 @@
+(* point_cloud_live.hyd — projected Stanford bunny point-cloud compositing demo.
+   Exports point_cloud_frame: (yaw_milli, pitch_milli, mode) -> packed RGB image.
+
+   The scene is the Stanford bunny loaded from a generated CSV file. Each frame:
+   1. Rotate each point by yaw/pitch.
+   2. Project to screen coordinates.
+   3. Guard on viewport inclusion.
+   4. Resolve per-pixel contributions with one of:
+      - min: nearest packed depth/color wins
+      - +  : additive point density
+      - max: farthest packed depth/color wins
+
+   The min/max modes encode (depth_key, rgb24) into one Int so the scatter can
+   pick a winner and keep the corresponding colour in one pass. *)
+
+let num_points = 8171
+
+let out_w = 768
+let out_h = 768
+let num_pixels = 589824
+
+let half_w = 384.0
+let half_h = 384.0
+let cam_dist = 3.25
+let focal = 420.0
+
+let depth_scale = 100000.0
+let color_shift = 16777216
+let min_default_depth = 1000000
+let background = 527382
+
+let clamp01 x = if x <. 0.0 then 0.0 else if x >. 1.0 then 1.0 else x
+let min_i a b = if a < b then a else b
+let max_i a b = if a > b then a else b
+let pack_rgb r g b = r * 65536 + g * 256 + b
+
+let bunny_points = read_array_float [num_points, 3] "bunny_points.csv"
+
+let base_point p =
+  let bx = index [p, 0] bunny_points in
+  let by = index [p, 1] bunny_points in
+  let bz = index [p, 2] bunny_points in
+  ((bx, by), bz)
+
+let rotate_point yaw pitch p =
+  let bp = base_point p in
+  let bx = fst (fst bp) in
+  let by = snd (fst bp) in
+  let bz = snd bp in
+  let cy = cos yaw in
+  let sy = sin yaw in
+  let cp = cos pitch in
+  let sp = sin pitch in
+  let x1 = cy *. bx +. sy *. bz in
+  let y1 = by in
+  let z1 = (0.0 -. sy) *. bx +. cy *. bz in
+  let rx = x1 in
+  let ry = cp *. y1 -. sp *. z1 in
+  let rz = sp *. y1 +. cp *. z1 in
+  ((rx, ry), rz)
+
+let point_screen yaw pitch p =
+  let rp = rotate_point yaw pitch p in
+  let rx = fst (fst rp) in
+  let ry = snd (fst rp) in
+  let rz = snd rp in
+  let cam_z = rz +. cam_dist in
+  let px = int_of_float (floor_f (half_w +. focal *. rx /. cam_z)) in
+  let py = int_of_float (floor_f (half_h -. focal *. ry /. cam_z)) in
+  let depth_key = int_of_float (floor_f (cam_z *. depth_scale)) in
+  ((px, py), depth_key)
+
+let point_keep yaw pitch p =
+  let sp = point_screen yaw pitch p in
+  let px = fst (fst sp) in
+  let py = snd (fst sp) in
+  if px < 0 then false
+  else if px >= out_w then false
+  else if py < 0 then false
+  else if py >= out_h then false
+  else true
+
+let point_route yaw pitch p =
+  let sp = point_screen yaw pitch p in
+  let px = fst (fst sp) in
+  let py = snd (fst sp) in
+  py * out_w + px
+
+let point_color p =
+  let bp = base_point p in
+  let bx = fst (fst bp) in
+  let by = snd (fst bp) in
+  let bz = snd bp in
+  let nx = clamp01 (0.5 +. 0.5 *. bx) in
+  let ny = clamp01 (0.5 +. 0.5 *. by) in
+  let nz = clamp01 (0.5 +. 0.5 *. bz) in
+  let shade = clamp01 (0.25 +. 0.75 *. ny) in
+  let r = int_of_float (floor_f (255.0 *. clamp01 (shade *. (0.30 +. 0.70 *. nx)))) in
+  let g = int_of_float (floor_f (255.0 *. clamp01 (shade *. (0.26 +. 0.74 *. ny)))) in
+  let b = int_of_float (floor_f (255.0 *. clamp01 (shade *. (0.34 +. 0.66 *. nz)))) in
+  pack_rgb r g b
+
+let point_color_max yaw pitch p =
+  let bp = base_point p in
+  let bx = fst (fst bp) in
+  let by = snd (fst bp) in
+  let bz = snd bp in
+  let sp = point_screen yaw pitch p in
+  let depth_key = snd sp in
+  let depth = float_of depth_key /. depth_scale in
+  let fog = clamp01 ((depth -. 2.1) /. 2.2) in
+  let nx = clamp01 (0.5 +. 0.5 *. bx) in
+  let ny = clamp01 (0.5 +. 0.5 *. by) in
+  let nz = clamp01 (0.5 +. 0.5 *. bz) in
+  let shade = clamp01 (0.25 +. 0.75 *. ny) in
+  let base_r = clamp01 (shade *. (0.30 +. 0.70 *. nx)) in
+  let base_g = clamp01 (shade *. (0.26 +. 0.74 *. ny)) in
+  let base_b = clamp01 (shade *. (0.34 +. 0.66 *. nz)) in
+  let xr = clamp01 ((1.0 -. fog) *. base_r +. fog *. 0.18) in
+  let xg = clamp01 ((1.0 -. fog) *. base_g +. fog *. (0.72 +. 0.16 *. ny)) in
+  let xb = clamp01 ((1.0 -. fog) *. base_b +. fog *. 1.0) in
+  let r = int_of_float (floor_f (255.0 *. xr)) in
+  let g = int_of_float (floor_f (255.0 *. xg)) in
+  let b = int_of_float (floor_f (255.0 *. xb)) in
+  pack_rgb r g b
+
+let point_packed yaw pitch p =
+  let sp = point_screen yaw pitch p in
+  let depth_key = snd sp in
+  depth_key * color_shift + point_color p
+
+let point_packed_max yaw pitch p =
+  let sp = point_screen yaw pitch p in
+  let depth_key = snd sp in
+  depth_key * color_shift + point_color_max yaw pitch p
+
+let count_color c =
+  let t = clamp01 (sqrt (float_of c) /. 4.0) in
+  let v = int_of_float (floor_f (255.0 *. t)) in
+  pack_rgb v v v
+
+let unpack_color packed = packed - (packed / color_shift) * color_shift
+
+let point_cloud_frame yaw_milli pitch_milli mode =
+  let yaw = float_of yaw_milli /. 1000.0 in
+  let pitch = float_of pitch_milli /. 1000.0 in
+  let points = generate [num_points] (let pid [i] = i in pid) in
+  let route_of p = point_route yaw pitch p in
+  let keep_of p = point_keep yaw pitch p in
+  if mode = 0 then
+    let packed = scatter_guarded min_i
+      (fill [num_pixels] (min_default_depth * color_shift + background))
+      (map route_of points)
+      (map (let value_of p = point_packed yaw pitch p in value_of) points)
+      (map keep_of points) in
+    map (let unpack v = unpack_color v in unpack) packed
+  else if mode = 1 then
+    let counts = scatter_guarded (+)
+      (fill [num_pixels] 0)
+      (map route_of points)
+      (map (let one _ = 1 in one) points)
+      (map keep_of points) in
+    map (let to_rgb c = count_color c in to_rgb) counts
+  else
+    let packed = scatter_guarded max_i
+      (fill [num_pixels] background)
+      (map route_of points)
+      (map (let value_of p = point_packed_max yaw pitch p in value_of) points)
+      (map keep_of points) in
+    map (let unpack v = unpack_color v in unpack) packed
