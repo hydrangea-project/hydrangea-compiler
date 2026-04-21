@@ -309,10 +309,269 @@ spec = describe "Polyhedral" $ do
               , pdTargetStmt = [0, 2]
               , pdDirection = PolyDepBackward
               , pdIsLoopCarried = True
-              , pdDistance = Just [-1]
+               , pdDistance = Just [-1]
+               }
+            ]
+        blockingScopDependences2 scop `shouldBe` collectScopDependences2 scop
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "records carried-band metadata for mixed-sign dependences" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
+            , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "prevJ" (C.RBinOp C.CSub (C.AVar "j") (C.AInt 1))
+            , SAssign "dstIx" (C.RTuple [C.AVar "nextI", C.AVar "prevJ"])
+            , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+      [scop] ->
+        collectScopDependenceRelations2 scop `shouldBe`
+          [ PolyhedralDependenceRelation
+              { pdrKind = PolyDepRAW
+              , pdrArray = "arr"
+              , pdrSourceStmt = [0, 4]
+              , pdrTargetStmt = [0, 5]
+              , pdrDirection = PolyDepForward
+              , pdrIsLoopCarried = True
+              , pdrDistance = Just [1, -1]
+              , pdrCarryInfo =
+                  [ PolyhedralCarryInfo "i" (PolyCarryDistance 1)
+                  , PolyhedralCarryInfo "j" (PolyCarryDistance (-1))
+                  ]
+              , pdrBandCarry =
+                  [ PolyhedralBandCarry
+                      { pbcIters = ["i", "j"]
+                      , pbcRole = LoopPlain
+                      , pbcStatus = PolyBandForward
+                      , pbcCarryInfo =
+                          [ PolyhedralCarryInfo "i" (PolyCarryDistance 1)
+                          , PolyhedralCarryInfo "j" (PolyCarryDistance (-1))
+                          ]
+                      }
+                  ]
+              , pdrClassification = PolyDepClassRegular
+              , pdrIsBlocking = False
               }
           ]
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "classifies reduction-carried dependences separately from blocking ones" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            [ SAssign "prev" (C.RBinOp C.CSub (C.AVar "k") (C.AInt 1))
+            , SArrayWrite (C.AVar "arr") (C.AVar "k") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "prev"))
+            , SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AVar "x"))
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+      [scop] ->
+        collectScopDependenceRelations2 scop `shouldBe`
+          [ PolyhedralDependenceRelation
+              { pdrKind = PolyDepRAW
+              , pdrArray = "arr"
+              , pdrSourceStmt = [0, 1]
+              , pdrTargetStmt = [0, 2]
+              , pdrDirection = PolyDepBackward
+              , pdrIsLoopCarried = True
+              , pdrDistance = Just [-1]
+              , pdrCarryInfo =
+                  [PolyhedralCarryInfo "k" (PolyCarryDistance (-1))]
+              , pdrBandCarry =
+                  [ PolyhedralBandCarry
+                      { pbcIters = ["k"]
+                      , pbcRole = LoopReduction
+                      , pbcStatus = PolyBandBackward
+                      , pbcCarryInfo =
+                          [PolyhedralCarryInfo "k" (PolyCarryDistance (-1))]
+                      }
+                  ]
+              , pdrClassification = PolyDepClassReductionLike
+              , pdrIsBlocking = False
+              }
+          ]
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "tracks carried-vs-independent bands across nested reduction contexts" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            [ SAssign "srcIx" (C.RTuple [C.AVar "j", C.AVar "k"])
+            , SAssign "prev" (C.RBinOp C.CSub (C.AVar "k") (C.AInt 1))
+            , SAssign "dstIx" (C.RTuple [C.AVar "j", C.AVar "prev"])
+            , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
+            , SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AVar "x"))
+            ]
+        outer =
+          SLoop
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMapReduction)
+            [ SAssign "acc" (C.RAtom (C.AInt 0))
+            , inner
+            , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
+            ]
+    case extractProcScops2 (mkProc "p" ["m", "n", "arr", "out"] [outer]) of
+      [scop] ->
+        collectScopDependenceRelations2 scop `shouldBe`
+          [ PolyhedralDependenceRelation
+              { pdrKind = PolyDepRAW
+              , pdrArray = "arr"
+              , pdrSourceStmt = [0, 1, 3]
+              , pdrTargetStmt = [0, 1, 4]
+              , pdrDirection = PolyDepBackward
+              , pdrIsLoopCarried = True
+              , pdrDistance = Just [0, -1]
+              , pdrCarryInfo =
+                  [ PolyhedralCarryInfo "j" PolyCarryIndependent
+                  , PolyhedralCarryInfo "k" (PolyCarryDistance (-1))
+                  ]
+              , pdrBandCarry =
+                  [ PolyhedralBandCarry
+                      { pbcIters = ["j"]
+                      , pbcRole = LoopMapReduction
+                      , pbcStatus = PolyBandIndependent
+                      , pbcCarryInfo =
+                          [PolyhedralCarryInfo "j" PolyCarryIndependent]
+                      }
+                  , PolyhedralBandCarry
+                      { pbcIters = ["k"]
+                      , pbcRole = LoopReduction
+                      , pbcStatus = PolyBandBackward
+                      , pbcCarryInfo =
+                          [PolyhedralCarryInfo "k" (PolyCarryDistance (-1))]
+                      }
+                  ]
+              , pdrClassification = PolyDepClassReductionLike
+              , pdrIsBlocking = False
+              }
+          ]
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "keeps dependence relations on quasi-affine tile-count bounds" $ do
+    let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
+        loop =
+          SLoop
+            (LoopSpec ["i"] [tileCountBound] Serial Nothing LoopPlain)
+            [ SAssign "ix" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+      [scop] ->
+        collectScopDependenceRelations2 scop `shouldBe`
+          [ PolyhedralDependenceRelation
+              { pdrKind = PolyDepRAW
+              , pdrArray = "arr"
+              , pdrSourceStmt = [0, 1]
+              , pdrTargetStmt = [0, 2]
+              , pdrDirection = PolyDepForward
+              , pdrIsLoopCarried = True
+              , pdrDistance = Just [1]
+              , pdrCarryInfo =
+                  [PolyhedralCarryInfo "i" (PolyCarryDistance 1)]
+              , pdrBandCarry =
+                  [ PolyhedralBandCarry
+                      { pbcIters = ["i"]
+                      , pbcRole = LoopPlain
+                      , pbcStatus = PolyBandForward
+                      , pbcCarryInfo =
+                          [PolyhedralCarryInfo "i" (PolyCarryDistance 1)]
+                      }
+                  ]
+              , pdrClassification = PolyDepClassRegular
+              , pdrIsBlocking = False
+              }
+          ]
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "synthesizes a legal band interchange when an outer dimension is independent" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
+            , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "dstIx" (C.RTuple [C.AVar "nextI", C.AVar "j"])
+            , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+      [scop] -> do
+        case ssAffineSchedule (synthesizeScopSchedule2 scop) of
+          AffineSchedule { asRoot = AffineScheduleLoopBand band } ->
+            map sdIter (albDims band) `shouldBe` ["j", "i"]
+          other ->
+            expectationFailure ("unexpected affine schedule: " <> show other)
+        case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
+          Just [SLoop loopSpec _] ->
+            lsIters loopSpec `shouldBe` ["j", "i"]
+          other ->
+            expectationFailure ("unexpected reified schedule: " <> show other)
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "reorders a nested inner band even when an outer band already carries the dependence" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["j", "k"] [IVar "m", IVar "p"] Serial Nothing LoopPlain)
+            [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j", C.AVar "k"])
+            , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "nextJ" (C.RBinOp C.CAdd (C.AVar "j") (C.AInt 1))
+            , SAssign "dstIx" (C.RTuple [C.AVar "nextI", C.AVar "nextJ", C.AVar "k"])
+            , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
+            ]
+        outer =
+          SLoop
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [inner]
+    case extractProcScops2 (mkProc "p" ["n", "m", "p", "arr"] [outer]) of
+      [scop] -> do
+        case ssAffineSchedule (synthesizeScopSchedule2 scop) of
+          AffineSchedule
+            { asRoot =
+                AffineScheduleLoopBand outerBand
+            } ->
+              case albBody outerBand of
+                AffineScheduleSequence [AffineScheduleLoopBand innerBand] ->
+                  map sdIter (albDims innerBand) `shouldBe` ["k", "j"]
+                other ->
+                  expectationFailure ("unexpected nested affine schedule: " <> show other)
+          other ->
+            expectationFailure ("unexpected affine schedule: " <> show other)
+        case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
+          Just
+            [ SLoop _ [SLoop innerLoopSpec _] ] ->
+              lsIters innerLoopSpec `shouldBe` ["k", "j"]
+          other ->
+            expectationFailure ("unexpected reified schedule: " <> show other)
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "uses band interchange to turn a blocking dependence into a forward schedule" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
+            , SAssign "prevI" (C.RBinOp C.CSub (C.AVar "i") (C.AInt 1))
+            , SAssign "nextJ" (C.RBinOp C.CAdd (C.AVar "j") (C.AInt 1))
+            , SAssign "dstIx" (C.RTuple [C.AVar "prevI", C.AVar "nextJ"])
+            , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+      [scop] -> do
         blockingScopDependences2 scop `shouldBe` collectScopDependences2 scop
+        case ssAffineSchedule (synthesizeScopSchedule2 scop) of
+          AffineSchedule { asRoot = AffineScheduleLoopBand band } ->
+            map sdIter (albDims band) `shouldBe` ["j", "i"]
+          other ->
+            expectationFailure ("unexpected affine schedule: " <> show other)
+        case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
+          Just [SLoop loopSpec _] ->
+            lsIters loopSpec `shouldBe` ["j", "i"]
+          other ->
+            expectationFailure ("unexpected reified schedule: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
   it "reifies an identity schedule back into the original loop nest" $ do
@@ -415,8 +674,8 @@ hasLoopIterPrefix :: C.CVar -> [Stmt] -> Bool
 hasLoopIterPrefix prefix = any go
   where
     go stmt = case stmt of
-      SLoop spec body ->
-        any (BS.isPrefixOf prefix) (lsIters spec) || hasLoopIterPrefix prefix body
+      SLoop loopSpec body ->
+        any (BS.isPrefixOf prefix) (lsIters loopSpec) || hasLoopIterPrefix prefix body
       SIf _ thn els ->
         hasLoopIterPrefix prefix thn || hasLoopIterPrefix prefix els
       _ ->
@@ -426,8 +685,8 @@ hasMapUpdateLoop :: [Stmt] -> Bool
 hasMapUpdateLoop = any go
   where
     go stmt = case stmt of
-      SLoop spec body ->
-        (lsRole spec == LoopMap && loadCount body >= 2 && writeCount body >= 1)
+      SLoop loopSpec body ->
+        (lsRole loopSpec == LoopMap && loadCount body >= 2 && writeCount body >= 1)
           || hasMapUpdateLoop body
       SIf _ thn els ->
         hasMapUpdateLoop thn || hasMapUpdateLoop els

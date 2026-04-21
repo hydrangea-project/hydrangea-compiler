@@ -66,7 +66,15 @@ withCC action = do
 
 -- | Parse, interpret and C-compile a source program; assert the two outputs agree.
 checkInlineSrc :: BS.ByteString -> IO ()
-checkInlineSrc src = do
+checkInlineSrc =
+  checkInlineSrcWithOptions
+    defaultInferOptions
+    defaultPipelineOptions
+
+-- | Parse, interpret and C-compile a source program with explicit pipeline
+-- options; assert the interpreter and compiled outputs agree.
+checkInlineSrcWithOptions :: InferOptions -> PipelineOptions -> BS.ByteString -> IO ()
+checkInlineSrcWithOptions inferOpts pipelineOpts src = do
   case readDecs src of
     Left perr -> expectationFailure $ "Parse error: " ++ perr
     Right decs -> do
@@ -121,7 +129,13 @@ checkInlineSrc src = do
                 Nothing  -> True   -- keep "<eval error>" entries to surface bugs
               expected = concat [ maybe "<eval error>\n" formatVal (lookupVal v)
                                 | v <- zeroVars, isPrintable v ]
-          csrc <- compileToCOptIO False decs
+          csrc <-
+            compileToCOptIOWithPipelineOptionsAndCodegenOptions
+              inferOpts
+              pipelineOpts
+              defaultCodegenOptions
+              False
+              decs
           ec <- compileAndRunC csrc True False False
           case ec of
             ExitFailure _ -> expectationFailure "C compilation or execution failed"
@@ -186,6 +200,28 @@ spec = do
         , "let matElem [i, j] = index () (reduce_generate add 0 [K] (innerGen i j))"
         , "let result = generate [M, N] matElem"
         ]
+
+    it "compiles and runs polyhedral tiled reduce_generate matmul and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = True
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let M = 6"
+          , "let K = 9"
+          , "let N = 6"
+          , "let A = generate [M, K] (let fa [i, j] = i * 10 + j + 1 in fa)"
+          , "let B = generate [K, N] (let fb [i, j] = i * 7 + j + 1 in fb)"
+          , "let add x y = x + y"
+          , "let mul x y = x * y"
+          , "let innerGen i j [idx] = mul (index [i, idx] A) (index [idx, j] B)"
+          , "let matElem [i, j] = index () (reduce_generate add 0 [K] (innerGen i j))"
+          , "let result = generate [M, N] matElem"
+          ])
 
     it "polyhedral matmul benchmark emits blocked SIMD-friendly C" $ do
       src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"

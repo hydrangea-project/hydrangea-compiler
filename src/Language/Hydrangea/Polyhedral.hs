@@ -3,11 +3,12 @@
 -- |
 -- Module: Language.Hydrangea.Polyhedral
 --
--- CFG-adjacent polyhedral scaffolding. This first slice extracts affine
--- static-control regions (SCoPs) from serial CFG loop nests and preserves
--- their schedule structure separately from the executable CFG. Loop bounds
--- are allowed to be slightly more expressive than access functions so the
--- scaffolding can preserve common strip-mining forms such as ceil-div tile
+-- Polyhedral analysis and scheduling for the CFG loop representation.
+-- This module extracts affine static-control regions (SCoPs), records their
+-- domains, accesses, and schedules, derives dependence information, and
+-- reifies scheduled regions back into executable CFG loops. Loop bounds are
+-- accepted in a slightly broader class than access expressions so the
+-- scheduled form can preserve common tiled-loop bounds such as ceil-div tile
 -- counts.
 module Language.Hydrangea.Polyhedral
   ( StmtId
@@ -19,9 +20,19 @@ module Language.Hydrangea.Polyhedral
   , PolyhedralStmt(..)
   , PolyhedralDependenceKind(..)
   , PolyhedralDependenceDirection(..)
+  , PolyhedralCarryStatus(..)
+  , PolyhedralCarryInfo(..)
+  , PolyhedralBandCarryStatus(..)
+  , PolyhedralBandCarry(..)
+  , PolyhedralDependenceClass(..)
   , PolyhedralDependence(..)
+  , PolyhedralDependenceRelation(..)
   , LoopBand(..)
   , ScheduleTree(..)
+  , ScheduleDim(..)
+  , AffineLoopBand(..)
+  , AffineScheduleTree(..)
+  , AffineSchedule(..)
   , Scop(..)
   , ScheduledScop(..)
   , ScopRejectReason(..)
@@ -32,11 +43,13 @@ module Language.Hydrangea.Polyhedral
   , collectProgramScopDiagnostics2
   , blockingScopDependences2
   , collectScopDependences2
+  , collectScopDependenceRelations2
   , extractProcScops2
   , extractProgramScops2
   , polyhedralProgram2
   , polyhedralTileProgram2
   , reifyScheduledScop2
+  , synthesizeScopSchedule2
   , tileScop2
   ) where
 
@@ -44,7 +57,7 @@ import Control.Applicative ((<|>))
 import Control.Monad.State.Strict (State, evalState, state)
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
-import Data.List (find, nub, sort, sortOn)
+import Data.List (find, nub, permutations, sort, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, listToMaybe)
@@ -96,6 +109,36 @@ data PolyhedralDependenceKind = PolyDepRAW | PolyDepWAR | PolyDepWAW
 data PolyhedralDependenceDirection = PolyDepForward | PolyDepBackward | PolyDepUnknown
   deriving (Eq, Show)
 
+data PolyhedralCarryStatus
+  = PolyCarryIndependent
+  | PolyCarryDistance Integer
+  | PolyCarryUnknown
+  deriving (Eq, Show)
+
+data PolyhedralCarryInfo = PolyhedralCarryInfo
+  { pciIter :: CVar
+  , pciStatus :: PolyhedralCarryStatus
+  }
+  deriving (Eq, Show)
+
+data PolyhedralBandCarryStatus
+  = PolyBandIndependent
+  | PolyBandForward
+  | PolyBandBackward
+  | PolyBandUnknown
+  deriving (Eq, Show)
+
+data PolyhedralBandCarry = PolyhedralBandCarry
+  { pbcIters :: [CVar]
+  , pbcRole :: LoopRole
+  , pbcStatus :: PolyhedralBandCarryStatus
+  , pbcCarryInfo :: [PolyhedralCarryInfo]
+  }
+  deriving (Eq, Show)
+
+data PolyhedralDependenceClass = PolyDepClassRegular | PolyDepClassReductionLike
+  deriving (Eq, Show)
+
 data PolyhedralDependence = PolyhedralDependence
   { pdKind :: PolyhedralDependenceKind
   , pdArray :: CVar
@@ -104,6 +147,21 @@ data PolyhedralDependence = PolyhedralDependence
   , pdDirection :: PolyhedralDependenceDirection
   , pdIsLoopCarried :: Bool
   , pdDistance :: Maybe [Integer]
+  }
+  deriving (Eq, Show)
+
+data PolyhedralDependenceRelation = PolyhedralDependenceRelation
+  { pdrKind :: PolyhedralDependenceKind
+  , pdrArray :: CVar
+  , pdrSourceStmt :: StmtId
+  , pdrTargetStmt :: StmtId
+  , pdrDirection :: PolyhedralDependenceDirection
+  , pdrIsLoopCarried :: Bool
+  , pdrDistance :: Maybe [Integer]
+  , pdrCarryInfo :: [PolyhedralCarryInfo]
+  , pdrBandCarry :: [PolyhedralBandCarry]
+  , pdrClassification :: PolyhedralDependenceClass
+  , pdrIsBlocking :: Bool
   }
   deriving (Eq, Show)
 
@@ -155,10 +213,38 @@ data ScheduleTree
   | ScheduleStmtRef StmtId
   deriving (Eq, Show)
 
+data ScheduleDim = ScheduleDim
+  { sdIter :: CVar
+  , sdBound :: IndexExpr
+  }
+  deriving (Eq, Show)
+
+data AffineLoopBand = AffineLoopBand
+  { albDims :: [ScheduleDim]
+  , albExec :: ExecPolicy
+  , albReduction :: Maybe ReductionSpec
+  , albRole :: LoopRole
+  , albBody :: AffineScheduleTree
+  }
+  deriving (Eq, Show)
+
+data AffineScheduleTree
+  = AffineScheduleSequence [AffineScheduleTree]
+  | AffineScheduleLoopBand AffineLoopBand
+  | AffineScheduleStmtRef StmtId
+  deriving (Eq, Show)
+
+data AffineSchedule = AffineSchedule
+  { asRoot :: AffineScheduleTree
+  , asStmtOrder :: [StmtId]
+  }
+  deriving (Eq, Show)
+
 data Scop = Scop
   { scProcName :: CVar
   , scRootPath :: StmtId
   , scSchedule :: ScheduleTree
+  , scAffineSchedule :: AffineSchedule
   , scStatements :: [PolyhedralStmt]
   , scIterators :: [CVar]
   , scParameters :: [CVar]
@@ -168,6 +254,7 @@ data Scop = Scop
 
 data ScheduledScop = ScheduledScop
   { ssOriginal :: Scop
+  , ssAffineSchedule :: AffineSchedule
   , ssSchedule :: ScheduleTree
   , ssReplacement :: Maybe [Stmt]
   , ssArrayFactOverrides :: Map CVar ArrayFact
@@ -216,7 +303,7 @@ type AffineEnv = Map CVar AffineValue
 type TileM = State (Set CVar, Int)
 
 polyhedralProgram2 :: Program -> Program
-polyhedralProgram2 = scheduleProgram2 buildIdentitySchedule2
+polyhedralProgram2 = scheduleProgram2 synthesizeScopSchedule2
 
 polyhedralTileProgram2 :: Program -> Program
 polyhedralTileProgram2 = scheduleProgram2 tileScop2
@@ -236,31 +323,225 @@ scheduleProgram2 mkSchedule (Program procs) = Program (map rewriteProc procs)
 
 buildIdentitySchedule2 :: Scop -> ScheduledScop
 buildIdentitySchedule2 scop =
+  buildScheduledScop2 scop (scAffineSchedule scop) (scSchedule scop)
+
+synthesizeScopSchedule2 :: Scop -> ScheduledScop
+synthesizeScopSchedule2 scop =
+  let affineSchedule = synthesizeAffineSchedule2 scop
+  in  buildScheduledScop2 scop affineSchedule (scheduleTreeFromAffineSchedule2 affineSchedule)
+
+tileScop2 :: Scop -> ScheduledScop
+tileScop2 =
+  tileScheduledScop2 . synthesizeScopSchedule2
+
+tileScheduledScop2 :: ScheduledScop -> ScheduledScop
+tileScheduledScop2 scheduled =
+  fromMaybe generic (buildMatmulBlockedScop2 scheduled)
+  where
+    scop = ssOriginal scheduled
+    generic =
+      scheduled
+        { ssSchedule =
+            evalState (tileScheduleTree2 0 (ssSchedule scheduled)) (collectScopNames scop, 0)
+        }
+
+buildScheduledScop2 :: Scop -> AffineSchedule -> ScheduleTree -> ScheduledScop
+buildScheduledScop2 scop affineSchedule scheduleTree =
   ScheduledScop
     { ssOriginal = scop
-    , ssSchedule = scSchedule scop
+    , ssAffineSchedule = affineSchedule
+    , ssSchedule = scheduleTree
     , ssReplacement = Nothing
     , ssArrayFactOverrides = M.empty
     , ssVectorAccessFactOverrides = M.empty
     }
 
-tileScop2 :: Scop -> ScheduledScop
-tileScop2 scop =
-  fromMaybe generic (buildMatmulBlockedScop2 scop)
+affineScheduleFromScheduleTree2 :: ScheduleTree -> AffineSchedule
+affineScheduleFromScheduleTree2 scheduleTree =
+  AffineSchedule
+    { asRoot = go scheduleTree
+    , asStmtOrder = scheduleStmtOrder scheduleTree
+    }
   where
-    generic =
-      ScheduledScop
-        { ssOriginal = scop
-        , ssSchedule = evalState (tileScheduleTree2 0 (scSchedule scop)) (collectScopNames scop, 0)
-        , ssReplacement = Nothing
-        , ssArrayFactOverrides = M.empty
-        , ssVectorAccessFactOverrides = M.empty
+    go sched = case sched of
+      ScheduleSequence xs ->
+        AffineScheduleSequence (map go xs)
+      ScheduleLoopBand band ->
+        AffineScheduleLoopBand
+          AffineLoopBand
+            { albDims = zipWith ScheduleDim (lbIters band) (lbBounds band)
+            , albExec = lbExec band
+            , albReduction = lbReduction band
+            , albRole = lbRole band
+            , albBody = go (lbBody band)
+            }
+      ScheduleStripMine band _ ->
+        go (ScheduleLoopBand band)
+      ScheduleStmtRef stmtId ->
+        AffineScheduleStmtRef stmtId
+
+scheduleTreeFromAffineSchedule2 :: AffineSchedule -> ScheduleTree
+scheduleTreeFromAffineSchedule2 = go . asRoot
+  where
+    go sched = case sched of
+      AffineScheduleSequence xs ->
+        ScheduleSequence (map go xs)
+      AffineScheduleLoopBand band ->
+        ScheduleLoopBand
+          LoopBand
+            { lbIters = map sdIter (albDims band)
+            , lbBounds = map sdBound (albDims band)
+            , lbExec = albExec band
+            , lbReduction = albReduction band
+            , lbRole = albRole band
+            , lbBody = go (albBody band)
+            }
+      AffineScheduleStmtRef stmtId ->
+        ScheduleStmtRef stmtId
+
+synthesizeAffineSchedule2 :: Scop -> AffineSchedule
+synthesizeAffineSchedule2 scop =
+  let relations = collectScopDependenceRelations2 scop
+      root' = synthesizeAffineScheduleTree2 0 relations (asRoot (scAffineSchedule scop))
+  in  AffineSchedule
+        { asRoot = root'
+        , asStmtOrder = affineScheduleStmtOrder2 root'
         }
 
-extractProgramScops2 :: Program -> [Scop]
-extractProgramScops2 = foldMap extractProcScops2 . programProcs
+synthesizeAffineScheduleTree2
+  :: Int
+  -> [PolyhedralDependenceRelation]
+  -> AffineScheduleTree
+  -> AffineScheduleTree
+synthesizeAffineScheduleTree2 bandDepth relations sched = case sched of
+  AffineScheduleSequence xs ->
+    AffineScheduleSequence (map (synthesizeAffineScheduleTree2 bandDepth relations) xs)
+  AffineScheduleStmtRef stmtId ->
+    AffineScheduleStmtRef stmtId
+  AffineScheduleLoopBand band ->
+    let dims' = applyPermutation (chooseBandPermutation2 bandDepth (albDims band) relations) (albDims band)
+    in  AffineScheduleLoopBand
+          band
+            { albDims = dims'
+            , albBody = synthesizeAffineScheduleTree2 (bandDepth + 1) relations (albBody band)
+            }
+
+chooseBandPermutation2
+  :: Int
+  -> [ScheduleDim]
+  -> [PolyhedralDependenceRelation]
+  -> [Int]
+chooseBandPermutation2 _ dims _
+  | length dims <= 1 = [0 .. length dims - 1]
+chooseBandPermutation2 bandDepth dims relations =
+  fromMaybe identityPermutation (listToMaybe orderedPermutations)
   where
-    programProcs (Program procs) = procs
+    identityPermutation = [0 .. length dims - 1]
+    bandIters = map sdIter dims
+    allPermutations = permutations identityPermutation
+    legalPermutations =
+      filter
+        (\perm -> perm == identityPermutation || all (relationAllowsPermutation2 bandDepth bandIters perm) relations)
+        allPermutations
+    orderedPermutations = sortOn (permutationScore2 bandDepth dims relations) legalPermutations
+
+relationAllowsPermutation2 :: Int -> [CVar] -> [Int] -> PolyhedralDependenceRelation -> Bool
+relationAllowsPermutation2 bandDepth bandIters permutation relation =
+  case prefixBandStatus2 bandDepth relation of
+    PrefixNonZero -> True
+    PrefixUnknown -> False
+    PrefixZero ->
+      case currentBandCarryForDepth2 bandDepth relation of
+        Nothing -> True
+        Just bandCarry ->
+          case classifyBandCarry2 (permuteBandCarryInfo2 permutedBandIters bandCarry) of
+            PolyBandBackward -> False
+            PolyBandUnknown -> False
+            PolyBandForward -> True
+            PolyBandIndependent -> True
+  where
+    permutedBandIters = applyPermutation permutation bandIters
+
+data PrefixDistanceStatus = PrefixZero | PrefixNonZero | PrefixUnknown
+  deriving (Eq, Show)
+
+prefixBandStatus2 :: Int -> PolyhedralDependenceRelation -> PrefixDistanceStatus
+prefixBandStatus2 bandDepth relation =
+  foldl step PrefixZero (take bandDepth (pdrBandCarry relation))
+  where
+    step PrefixNonZero _ = PrefixNonZero
+    step PrefixUnknown _ = PrefixUnknown
+    step PrefixZero bandCarry = case pbcStatus bandCarry of
+      PolyBandIndependent -> PrefixZero
+      PolyBandForward -> PrefixNonZero
+      PolyBandBackward -> PrefixNonZero
+      PolyBandUnknown -> PrefixUnknown
+
+permutationScore2
+  :: Int
+  -> [ScheduleDim]
+  -> [PolyhedralDependenceRelation]
+  -> [Int]
+  -> [(Int, Int, Int, Int, Int)]
+permutationScore2 bandDepth dims relations permutation =
+  map scoreDim (zip [0 :: Int ..] permutedDims)
+  where
+    permutedDims = applyPermutation permutation dims
+    scoringRelations =
+      [ relation
+      | relation <- relations
+      , prefixBandStatus2 bandDepth relation /= PrefixUnknown
+      , hasCurrentBandCarry2 bandDepth relation
+      ]
+    scoreDim (position, dim) =
+      ( negativeCount dim
+      , carriedCount dim
+      , unknownCount dim
+      , negate (independentCount dim)
+      , position
+      )
+    negativeCount dim =
+      length
+        [ ()
+        | relation <- scoringRelations
+        , Just distance <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        , distance < 0
+        ]
+    carriedCount dim =
+      length
+        [ ()
+        | relation <- scoringRelations
+        , Just distance <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        , distance /= 0
+        ]
+    unknownCount dim =
+      length
+        [ ()
+        | relation <- scoringRelations
+        , Nothing <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        ]
+    independentCount dim =
+      length
+        [ ()
+        | relation <- scoringRelations
+        , Just 0 <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        ]
+
+applyPermutation :: [Int] -> [a] -> [a]
+applyPermutation permutation xs =
+  [ x
+  | ix <- permutation
+  , Just x <- [atMay xs ix]
+  ]
+
+affineScheduleStmtOrder2 :: AffineScheduleTree -> [StmtId]
+affineScheduleStmtOrder2 sched = case sched of
+  AffineScheduleSequence xs -> foldMap affineScheduleStmtOrder2 xs
+  AffineScheduleLoopBand band -> affineScheduleStmtOrder2 (albBody band)
+  AffineScheduleStmtRef stmtId -> [stmtId]
+
+extractProgramScops2 :: Program -> [Scop]
+extractProgramScops2 (Program procs) = foldMap extractProcScops2 procs
 
 extractProcScops2 :: Proc -> [Scop]
 extractProcScops2 = foldMap onlyScop . collectProcScopDiagnostics2
@@ -270,9 +551,8 @@ extractProcScops2 = foldMap onlyScop . collectProcScopDiagnostics2
       ScopRejected {} -> []
 
 collectProgramScopDiagnostics2 :: Program -> [ScopDiagnostic]
-collectProgramScopDiagnostics2 = foldMap collectProcScopDiagnostics2 . programProcs
-  where
-    programProcs (Program procs) = procs
+collectProgramScopDiagnostics2 (Program procs) =
+  foldMap collectProcScopDiagnostics2 procs
 
 collectProcScopDiagnostics2 :: Proc -> [ScopDiagnostic]
 collectProcScopDiagnostics2 proc = go [] (procBody proc)
@@ -291,16 +571,12 @@ collectProcScopDiagnostics2 proc = go [] (procBody proc)
         []
 
 collectScopDependences2 :: Scop -> [PolyhedralDependence]
-collectScopDependences2 scop =
-  [ PolyhedralDependence
-      { pdKind = depKind
-      , pdArray = paArray srcAccess
-      , pdSourceStmt = psPath srcStmt
-      , pdTargetStmt = psPath tgtStmt
-      , pdDirection = depDirection
-      , pdIsLoopCarried = maybe True (any (/= 0)) depDistance
-      , pdDistance = depDistance
-      }
+collectScopDependences2 =
+  map relationToLegacyDependence2 . collectScopDependenceRelations2
+
+collectScopDependenceRelations2 :: Scop -> [PolyhedralDependenceRelation]
+collectScopDependenceRelations2 scop =
+  [ mkRelation srcStmt tgtStmt srcAccess depKind accessAnalysis
   | (srcPos, srcStmt) <- orderedStmts
   , (tgtPos, tgtStmt) <- orderedStmts
   , srcPos < tgtPos
@@ -308,8 +584,8 @@ collectScopDependences2 scop =
   , tgtAccess <- psReads tgtStmt ++ psWrites tgtStmt
   , paArray srcAccess == paArray tgtAccess
   , Just depKind <- [dependenceKindFromAccesses srcAccess tgtAccess]
-  , let (depDirection, depDistance) =
-          analyzeAccessDistance (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
+  , let accessAnalysis =
+          analyzeAccessDistance2 (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
   ]
   where
     stmtMap = M.fromList [(psPath stmt, stmt) | stmt <- scStatements scop]
@@ -318,13 +594,139 @@ collectScopDependences2 scop =
        | (pos, stmtId) <- zip [0 :: Int ..] (scheduleStmtOrder (scSchedule scop))
        , Just stmt <- [M.lookup stmtId stmtMap]
        ]
+    stmtContexts = stmtLoopContexts2 (scSchedule scop)
+    mkRelation srcStmt tgtStmt srcAccess depKind accessAnalysis =
+      let srcCtx = M.findWithDefault [] (psPath srcStmt) stmtContexts
+          tgtCtx = M.findWithDefault [] (psPath tgtStmt) stmtContexts
+          bandCarry = dependenceBandCarry2 srcCtx tgtCtx accessAnalysis
+          depClass = dependenceClassFor2 bandCarry
+          isLoopCarried = accessIsLoopCarried2 accessAnalysis
+          isBlocking = dependenceIsBlocking2 bandCarry accessAnalysis depClass
+      in  PolyhedralDependenceRelation
+            { pdrKind = depKind
+            , pdrArray = paArray srcAccess
+            , pdrSourceStmt = psPath srcStmt
+            , pdrTargetStmt = psPath tgtStmt
+            , pdrDirection = adaDirection accessAnalysis
+            , pdrIsLoopCarried = isLoopCarried
+            , pdrDistance = accessDistanceVector2 accessAnalysis
+            , pdrCarryInfo = adaCarryInfo accessAnalysis
+            , pdrBandCarry = bandCarry
+            , pdrClassification = depClass
+            , pdrIsBlocking = isBlocking
+            }
+
+relationToLegacyDependence2 :: PolyhedralDependenceRelation -> PolyhedralDependence
+relationToLegacyDependence2 relation =
+  PolyhedralDependence
+    { pdKind = pdrKind relation
+    , pdArray = pdrArray relation
+    , pdSourceStmt = pdrSourceStmt relation
+    , pdTargetStmt = pdrTargetStmt relation
+    , pdDirection = pdrDirection relation
+    , pdIsLoopCarried = pdrIsLoopCarried relation
+    , pdDistance = pdrDistance relation
+    }
 
 blockingScopDependences2 :: Scop -> [PolyhedralDependence]
 blockingScopDependences2 =
-  filter isBlockingDependence . collectScopDependences2
+  map relationToLegacyDependence2 . filter pdrIsBlocking . collectScopDependenceRelations2
+
+data LoopContext = LoopContext
+  { lcIters :: [CVar]
+  , lcRole :: LoopRole
+  }
+
+stmtLoopContexts2 :: ScheduleTree -> Map StmtId [LoopContext]
+stmtLoopContexts2 = go []
   where
-    isBlockingDependence dep =
-      pdIsLoopCarried dep && pdDirection dep /= PolyDepForward
+    go stack sched = case sched of
+      ScheduleSequence xs ->
+        M.unions (map (go stack) xs)
+      ScheduleStmtRef stmtId ->
+        M.singleton stmtId (reverse stack)
+      ScheduleLoopBand band ->
+        enterBand stack band
+      ScheduleStripMine band _ ->
+        enterBand stack band
+
+    enterBand stack band =
+      go (LoopContext (lbIters band) (lbRole band) : stack) (lbBody band)
+
+dependenceBandCarry2 :: [LoopContext] -> [LoopContext] -> AccessDistanceAnalysis -> [PolyhedralBandCarry]
+dependenceBandCarry2 srcCtx tgtCtx accessAnalysis =
+  map mkBandCarry (commonLoopPrefix2 srcCtx tgtCtx)
+  where
+    carryMap = M.fromList [(pciIter info, info) | info <- adaCarryInfo accessAnalysis]
+    mkBandCarry loopCtx =
+      let carryInfo =
+            [ M.findWithDefault (PolyhedralCarryInfo iter PolyCarryUnknown) iter carryMap
+            | iter <- lcIters loopCtx
+            ]
+      in  PolyhedralBandCarry
+            { pbcIters = lcIters loopCtx
+            , pbcRole = lcRole loopCtx
+            , pbcStatus = classifyBandCarry2 carryInfo
+            , pbcCarryInfo = carryInfo
+            }
+
+classifyBandCarry2 :: [PolyhedralCarryInfo] -> PolyhedralBandCarryStatus
+classifyBandCarry2 carryInfo =
+  case traverse carryDistance2 carryInfo of
+    Just distances
+      | all (== 0) distances ->
+          PolyBandIndependent
+      | otherwise ->
+          case classifyDistance distances of
+            PolyDepForward -> PolyBandForward
+            PolyDepBackward -> PolyBandBackward
+            PolyDepUnknown -> PolyBandUnknown
+    Nothing
+      | all ((== PolyCarryIndependent) . pciStatus) carryInfo ->
+          PolyBandIndependent
+      | otherwise ->
+          PolyBandUnknown
+
+dependenceClassFor2 :: [PolyhedralBandCarry] -> PolyhedralDependenceClass
+dependenceClassFor2 bandCarry
+  | any isReductionBand bandCarry && not (any isBlockingRegularBand bandCarry) =
+      PolyDepClassReductionLike
+  | otherwise =
+      PolyDepClassRegular
+  where
+    isReductionBand band =
+      isReductionRole2 (pbcRole band) && pbcStatus band /= PolyBandIndependent
+    isBlockingRegularBand band =
+      not (isReductionRole2 (pbcRole band)) && bandStatusBlocks2 (pbcStatus band)
+
+dependenceIsBlocking2
+  :: [PolyhedralBandCarry]
+  -> AccessDistanceAnalysis
+  -> PolyhedralDependenceClass
+  -> Bool
+dependenceIsBlocking2 bandCarry accessAnalysis depClass
+  | any (\band -> not (isReductionRole2 (pbcRole band)) && bandStatusBlocks2 (pbcStatus band)) bandCarry =
+      True
+  | depClass == PolyDepClassReductionLike =
+      False
+  | otherwise =
+      accessIsLoopCarried2 accessAnalysis && adaDirection accessAnalysis /= PolyDepForward
+
+isReductionRole2 :: LoopRole -> Bool
+isReductionRole2 role =
+  role == LoopReduction || role == LoopReductionWrapper || role == LoopMapReduction
+
+bandStatusBlocks2 :: PolyhedralBandCarryStatus -> Bool
+bandStatusBlocks2 status = case status of
+  PolyBandBackward -> True
+  PolyBandUnknown -> True
+  _ -> False
+
+commonLoopPrefix2 :: [LoopContext] -> [LoopContext] -> [LoopContext]
+commonLoopPrefix2 (x : xs) (y : ys)
+  | lcIters x == lcIters y && lcRole x == lcRole y =
+      x : commonLoopPrefix2 xs ys
+commonLoopPrefix2 _ _ = []
 
 buildScop :: CVar -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
 buildScop procName rootPath spec body = do
@@ -335,14 +737,15 @@ buildScop procName rootPath spec body = do
       let iterators = collectIterators schedule
           arrays = collectArrays stmts
           params = collectParameters iterators arrays schedule stmts
-      in Right Scop
-          { scProcName = procName
-          , scRootPath = rootPath
-          , scSchedule = schedule
-          , scStatements = stmts
-          , scIterators = iterators
-          , scParameters = params
-          , scArrays = arrays
+       in Right Scop
+           { scProcName = procName
+           , scRootPath = rootPath
+           , scSchedule = schedule
+           , scAffineSchedule = affineScheduleFromScheduleTree2 schedule
+           , scStatements = stmts
+           , scIterators = iterators
+           , scParameters = params
+           , scArrays = arrays
           }
 
 stmtHasMemoryAccess :: PolyhedralStmt -> Bool
@@ -540,9 +943,14 @@ indexExprToAtom expr = case simplifyIndexExpr expr of
 freshLike :: CVar -> ByteString -> TileM CVar
 freshLike base suffix =
   state $ \(seen, nextId) ->
-    let candidates = [base <> suffix <> "_" <> BS.pack (show n) | n <- [nextId ..]]
-        fresh = fromMaybe (base <> suffix <> "_fresh") (listToMaybe (filter (`S.notMember` seen) candidates))
-    in (fresh, (S.insert fresh seen, nextId + 1))
+    let (fresh, nextId') = pickFresh seen nextId
+    in (fresh, (S.insert fresh seen, nextId'))
+  where
+    pickFresh seen n =
+      let candidate = base <> suffix <> "_" <> BS.pack (show n)
+      in if candidate `S.member` seen
+           then pickFresh seen (n + 1)
+           else (candidate, n + 1)
 
 collectScopNames :: Scop -> Set CVar
 collectScopNames scop =
@@ -591,7 +999,7 @@ extractLoop loopPath domain env spec body
           Just bad -> Left (RejectUnsupportedBound bad)
           Nothing -> Left (RejectUnsupportedStmt (SLoop spec body))
       let domain' = domain ++ loopDomainConstraints spec bounds
-      (stmts, bodySchedule, _envOut) <- extractStmtList loopPath domain' env body
+      (stmts, bodySchedule, _) <- extractStmtList loopPath domain' env body
       pure
         ( stmts
         , ScheduleLoopBand
@@ -660,11 +1068,8 @@ extractStmtList basePath domain env stmts = go env [] [] (zip [0 ..] stmts)
           Left (RejectUnsupportedStmt stmt)
 
 firstUnsupportedBound :: [IndexExpr] -> Maybe IndexExpr
-firstUnsupportedBound = foldr pick Nothing
-  where
-    pick bound acc = case supportedBoundExprFromIndexExpr2 bound of
-      Just _ -> acc
-      Nothing -> Just bound
+firstUnsupportedBound =
+  find (\bound -> supportedBoundExprFromIndexExpr2 bound == Nothing)
 
 loopDomainConstraints :: LoopSpec -> [IndexExpr] -> [AffineConstraint]
 loopDomainConstraints spec bounds =
@@ -694,10 +1099,10 @@ rhsIsAffineScopCore rhs = case rhs of
   RArrayLoad {} -> True
   _ -> False
 
--- | Prelude forms that show up around otherwise affine kernels after lowering.
--- These are allowed into a SCoP so loop extraction can see through hoistable
--- scalar setup and shape/index normalization without widening memory-access
--- legality beyond affine loads/stores.
+-- | Scalar setup forms that preserve affine memory behavior.
+-- These are accepted inside a SCoP so extraction can keep shape normalization
+-- and index conversion around an affine kernel without admitting general
+-- effectful or non-affine operations.
 rhsIsSupportedScopPrelude :: RHS -> Bool
 rhsIsSupportedScopPrelude rhs = case rhs of
   RCall _ [] -> True
@@ -906,30 +1311,100 @@ dependenceKindFromAccesses src tgt = case (paType src, paType tgt) of
   (PolyWrite, PolyWrite) -> Just PolyDepWAW
   _ -> Nothing
 
-analyzeAccessDistance
+data AccessDistanceAnalysis = AccessDistanceAnalysis
+  { adaDirection :: PolyhedralDependenceDirection
+  , adaCarryInfo :: [PolyhedralCarryInfo]
+  }
+
+analyzeAccessDistance2
   :: [CVar]
   -> [AffineExpr]
   -> [AffineExpr]
-  -> (PolyhedralDependenceDirection, Maybe [Integer])
-analyzeAccessDistance iterators srcIdx tgtIdx
-  | length srcIdx /= length tgtIdx = (PolyDepUnknown, Nothing)
+  -> AccessDistanceAnalysis
+analyzeAccessDistance2 iterators srcIdx tgtIdx
+  | length srcIdx /= length tgtIdx =
+      AccessDistanceAnalysis
+        { adaDirection = PolyDepUnknown
+        , adaCarryInfo = [PolyhedralCarryInfo iter PolyCarryUnknown | iter <- iterators]
+        }
   | otherwise =
-      case foldl step (Just (M.fromList [(iter, 0) | iter <- iterators])) (zip srcIdx tgtIdx) of
-        Nothing -> (PolyDepUnknown, Nothing)
-        Just distancesByIter ->
-          let distances = [M.findWithDefault 0 iter distancesByIter | iter <- iterators]
-          in (classifyDistance distances, Just distances)
+      let carryInfo = foldl step initialCarryInfo (zip srcIdx tgtIdx)
+          direction =
+            case traverse carryDistance2 carryInfo of
+              Just distances -> classifyDistance distances
+              Nothing -> PolyDepUnknown
+      in  AccessDistanceAnalysis
+            { adaDirection = direction
+            , adaCarryInfo = carryInfo
+            }
   where
-    step Nothing _ = Nothing
-    step (Just distances) (srcExpr, tgtExpr) =
+    initialCarryInfo = [PolyhedralCarryInfo iter PolyCarryIndependent | iter <- iterators]
+    step carryInfo (srcExpr, tgtExpr) =
       case analyzeAffineDimension iterators srcExpr tgtExpr of
-        DimExact -> Just distances
-        DimUnknown -> Nothing
+        DimExact ->
+          carryInfo
+        DimUnknown ->
+          map (\info -> info { pciStatus = PolyCarryUnknown }) carryInfo
         DimShift iter distance ->
-          let existing = M.findWithDefault 0 iter distances
-          in if existing == 0 || existing == distance
-                then Just (M.insert iter distance distances)
-                else Nothing
+          map (mergeCarryInfo2 iter distance) carryInfo
+
+mergeCarryInfo2 :: CVar -> Integer -> PolyhedralCarryInfo -> PolyhedralCarryInfo
+mergeCarryInfo2 iter distance info
+  | pciIter info /= iter = info
+  | otherwise =
+      info
+        { pciStatus = case pciStatus info of
+            PolyCarryIndependent -> PolyCarryDistance distance
+            PolyCarryDistance existing
+              | existing == distance ->
+                  PolyCarryDistance distance
+            _ ->
+              PolyCarryUnknown
+        }
+
+accessDistanceVector2 :: AccessDistanceAnalysis -> Maybe [Integer]
+accessDistanceVector2 = traverse carryDistance2 . adaCarryInfo
+
+accessIsLoopCarried2 :: AccessDistanceAnalysis -> Bool
+accessIsLoopCarried2 analysis =
+  case accessDistanceVector2 analysis of
+    Just distances -> any (/= 0) distances
+    Nothing ->
+      any
+        (\info -> case pciStatus info of
+          PolyCarryDistance distance -> distance /= 0
+          PolyCarryUnknown -> True
+          PolyCarryIndependent -> False
+        )
+        (adaCarryInfo analysis)
+
+carryDistance2 :: PolyhedralCarryInfo -> Maybe Integer
+carryDistance2 info = case pciStatus info of
+  PolyCarryIndependent -> Just 0
+  PolyCarryDistance distance -> Just distance
+  PolyCarryUnknown -> Nothing
+
+currentBandCarryForDepth2 :: Int -> PolyhedralDependenceRelation -> Maybe PolyhedralBandCarry
+currentBandCarryForDepth2 bandDepth relation =
+  atMay (pdrBandCarry relation) bandDepth
+
+hasCurrentBandCarry2 :: Int -> PolyhedralDependenceRelation -> Bool
+hasCurrentBandCarry2 bandDepth =
+  maybe False (const True) . currentBandCarryForDepth2 bandDepth
+
+permuteBandCarryInfo2 :: [CVar] -> PolyhedralBandCarry -> [PolyhedralCarryInfo]
+permuteBandCarryInfo2 bandIters bandCarry =
+  [ M.findWithDefault (PolyhedralCarryInfo iter PolyCarryUnknown) iter carryInfoByIter
+  | iter <- bandIters
+  ]
+  where
+    carryInfoByIter = M.fromList [(pciIter info, info) | info <- pbcCarryInfo bandCarry]
+
+currentBandDistanceForIter2 :: Int -> PolyhedralDependenceRelation -> CVar -> Maybe Integer
+currentBandDistanceForIter2 bandDepth relation iter = do
+  bandCarry <- currentBandCarryForDepth2 bandDepth relation
+  carryInfo <- find ((== iter) . pciIter) (pbcCarryInfo bandCarry)
+  carryDistance2 carryInfo
 
 data DimDistance
   = DimExact
@@ -1076,26 +1551,29 @@ applyScheduledScopToProc2 scheduled proc
                 (procVectorAccessFacts proc)
           }
 
-buildMatmulBlockedScop2 :: Scop -> Maybe ScheduledScop
-buildMatmulBlockedScop2 scop = do
+buildMatmulBlockedScop2 :: ScheduledScop -> Maybe ScheduledScop
+buildMatmulBlockedScop2 scheduled = do
   kernel <- matchMatmulKernel2 scop
   let (replacement, vectorFacts) =
         evalState (buildMatmulBlockedBody2 kernel) (collectScopNames scop, 0)
+      scopedArrayOverrides =
+        M.singleton
+          (mkOutputArray kernel)
+          ArrayFact
+            { afFreshAlloc = True
+            , afWriteOnce = False
+            , afReadOnly = False
+            }
   pure
-    ScheduledScop
-      { ssOriginal = scop
-      , ssSchedule = scSchedule scop
-      , ssReplacement = Just replacement
+    scheduled
+      { ssReplacement = Just replacement
       , ssArrayFactOverrides =
-          M.singleton
-            (mkOutputArray kernel)
-            ArrayFact
-              { afFreshAlloc = True
-              , afWriteOnce = False
-              , afReadOnly = False
-              }
-      , ssVectorAccessFactOverrides = vectorFacts
+          M.union scopedArrayOverrides (ssArrayFactOverrides scheduled)
+      , ssVectorAccessFactOverrides =
+          M.union vectorFacts (ssVectorAccessFactOverrides scheduled)
       }
+  where
+    scop = ssOriginal scheduled
 
 matchMatmulKernel2 :: Scop -> Maybe MatmulKernel
 matchMatmulKernel2 scop = do
