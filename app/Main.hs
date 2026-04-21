@@ -37,8 +37,13 @@ import Language.Hydrangea.Frontend
   , optimizeMetalCFG2WithTiling
   , readDecs
   )
-import Language.Hydrangea.CFGPipeline (PipelineOptions(..), defaultPipelineOptions)
+import Language.Hydrangea.CFGPipeline
+  ( PipelineOptions(..)
+  , defaultPipelineOptions
+  , preparePolyhedralProgramWithOptions
+  )
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions, runInferDecsWithOptions)
+import Language.Hydrangea.Polyhedral (collectProgramScopDiagnostics2)
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Language.Hydrangea.Fusion (fuseDecs)
 import Language.Hydrangea.Uniquify (uniquifyDecs)
@@ -62,6 +67,7 @@ usage = unwords
   , "[--print-fused]"
   , "[--print-cfg]"
   , "[--print-cfg-raw]"
+  , "[--print-polyhedral-scops]"
   , "[--emit-c]"
   , "[--output-c=<file>]"
   , "[--output-h=<file>]"
@@ -69,6 +75,7 @@ usage = unwords
   , "[" ++ allTopLevelProcsFlag ++ "]"
    , "[--no-parallel]"
    , "[--tiling]"
+   , "[--polyhedral]"
    , "[--explicit-vectorization]"
    , "[--no-solver-check]"
   , "[--simd-width=<2|4>]"
@@ -108,12 +115,14 @@ main = do
       printFused = "--print-fused" `elem` flags
       printCFG = "--print-cfg" `elem` flags
       printCFGRaw = "--print-cfg-raw" `elem` flags
+      printPolyhedralScops = "--print-polyhedral-scops" `elem` flags
       emitC = "--emit-c" `elem` flags
       interp = "--interp" `elem` flags
       keepC = "--keep-c" `elem` flags
       compileOnly = "--compile-only" `elem` flags
       parallel = not ("--no-parallel" `elem` flags)
       enableTiling = "--tiling" `elem` flags
+      enablePolyhedral = "--polyhedral" `elem` flags
       enableExplicitVectorization = "--explicit-vectorization" `elem` flags
       solveRefinements = not ("--no-solver-check" `elem` flags)
       pruneDead = "--prune-dead-procs" `elem` flags
@@ -140,6 +149,7 @@ main = do
       pipelineOptions =
         defaultPipelineOptions
           { poEnableTiling = enableTiling
+          , poEnablePolyhedral = enablePolyhedral
           , poEnableExplicitVectorization = enableExplicitVectorization
           , poEnableParallelization = parallel
           , poVectorWidth = simdWidth
@@ -240,6 +250,14 @@ main = do
         _ <- runCheckedInference
         let prog = lowerToCFG2 decs
         print prog
+      when printPolyhedralScops $ do
+        _ <- runCheckedInference
+        prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
+        let prepared = preparePolyhedralProgramWithOptions pipelineOptions prog
+            diagnostics = collectProgramScopDiagnostics2 prepared
+        if null diagnostics
+          then putStrLn "No polyhedral SCoPs found."
+          else mapM_ print diagnostics
       when emitC $ do
         _ <- runCheckedInference
         ensureSelectedKernelIsFused
@@ -289,6 +307,7 @@ main = do
             not printFused
               && not printCFG
               && not printCFGRaw
+              && not printPolyhedralScops
               && not emitC
               && (not (isJust outputCFile) || metalExportMode)
               && (not (isJust outputHFile) || metalExportMode)

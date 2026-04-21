@@ -10,6 +10,7 @@ module Language.Hydrangea.CFGPipeline
     PipelineOptions(..)
   , defaultPipelineOptions
     -- * Pipelines
+  , preparePolyhedralProgramWithOptions
   , optimizePipeline2
   , optimizePipelineWithTiling
   , vectorizePipeline2
@@ -26,11 +27,13 @@ module Language.Hydrangea.CFGPipeline
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGOpt
 import Language.Hydrangea.Parallelize
+import Language.Hydrangea.Polyhedral
 import Language.Hydrangea.Tile
 import Language.Hydrangea.Vectorize
 
 data PipelineOptions = PipelineOptions
   { poEnableTiling :: Bool
+  , poEnablePolyhedral :: Bool
   , poEnableExplicitVectorization :: Bool
   , poEnableParallelization :: Bool
   , poVectorWidth :: Int
@@ -39,6 +42,7 @@ data PipelineOptions = PipelineOptions
 defaultPipelineOptions :: PipelineOptions
 defaultPipelineOptions = PipelineOptions
   { poEnableTiling = True
+  , poEnablePolyhedral = False
   , poEnableExplicitVectorization = True
   , poEnableParallelization = False
   , poVectorWidth = defaultVectorWidth
@@ -59,14 +63,24 @@ optimizePipelineWithTiling enableTiling stmts =
       stmts'' = if enableTiling then tileStmts2 stmts' else stmts'
   in  optimizeStmts2 stmts''
 
+-- | Run the CFG cleanup steps that prepare loop nests for polyhedral
+-- extraction or scheduling.
+preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
+preparePolyhedralProgramWithOptions opts (Program procs) =
+  Program
+    [ proc { procBody = optimizePipelineWithTiling (poEnableTiling opts) (procBody proc) }
+    | proc <- procs
+    ]
+
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
-vectorizePipelineWithOptions opts (Program procs) =
-  let optimized = [proc { procBody = optimizePipelineWithTiling (poEnableTiling opts) (procBody proc) } | proc <- procs]
+vectorizePipelineWithOptions opts prog =
+  let prepared = preparePolyhedralProgramWithOptions opts prog
+      optimized = if poEnablePolyhedral opts then polyhedralProgram2 prepared else prepared
   in  vectorizeProgram2WithWidthAndExplicit
         (poVectorWidth opts)
         (poEnableExplicitVectorization opts)
-        (Program optimized)
+        optimized
 
 -- | Run optimization followed by vectorization using the given SIMD lane width.
 vectorizePipelineWithWidth :: Int -> Program -> Program
