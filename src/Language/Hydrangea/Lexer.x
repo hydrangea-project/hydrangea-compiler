@@ -34,6 +34,10 @@ tokens :-
 
 <0> $white+ ;
 
+-- First-class multiplication operators must win over the "(*" comment opener.
+<0>       "(*)"  { tok TimesValue }
+<0>       "(*.)" { tok TTimesFValue }
+
 -- Comments
 <0>       "(*" { nestComment `andBegin` comment }
 <0>       "*)" { \_ _ -> alexError "Error: unexpected closing comment" }
@@ -261,12 +265,14 @@ data Token
   | Plus
   | Minus
   | Times
+  | TimesValue
   | Divide
   | Percent
   -- Float arithmetic operators
   | TPlusF
   | TMinusF
   | TTimesF
+  | TTimesFValue
   | TDivideF
   -- Comparison operators
   | Eq

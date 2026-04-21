@@ -171,10 +171,12 @@ spec = do
     it "typechecks operator-as-values" $ do
       expectType "(+)" (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))
       expectType "(-)" (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))
+      expectType "(*)" (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))
       expectType "( * )" (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))
       expectType "(/)" (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))
       expectType "(=)" (Forall [] [] (TyFun TyInt (TyFun TyInt TyBool)))
       expectType "(&)" (Forall [] [] (TyFun TyBool (TyFun TyBool TyBool)))
+      expectType "(*.)" (Forall [] [] (TyFun TyFloat (TyFun TyFloat TyFloat)))
     it "typechecks immutable arrays generated from a function" $ do
       expectType "let f [i] = i + 1 in generate [3] f" (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
       expectType "let f [i] = i + 1 in index [1] (generate [3] f)" (Forall [] [] TyInt)

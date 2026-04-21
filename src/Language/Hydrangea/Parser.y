@@ -114,12 +114,14 @@ import Language.Hydrangea.Syntax
   '+'        { L.RangedToken L.Plus _ }
   '-'        { L.RangedToken L.Minus _ }
   '*'        { L.RangedToken L.Times _ }
+  times_value { L.RangedToken L.TimesValue _ }
   '/'        { L.RangedToken L.Divide _ }
   '%'        { L.RangedToken L.Percent _ }
   -- Float arithmetic operators
   '+.'       { L.RangedToken L.TPlusF _ }
   '-.'       { L.RangedToken L.TMinusF _ }
   '*.'       { L.RangedToken L.TTimesF _ }
+  timesf_value { L.RangedToken L.TTimesFValue _ }
   '/.'       { L.RangedToken L.TDivideF _ }
   -- Comparison operators
   '='        { L.RangedToken L.Eq _ }
@@ -403,6 +405,7 @@ atom_base :: { Exp L.Range }
   | '(' '+' ')'              { EOp (L.rtRange $1 <-> L.rtRange $3) (Plus (L.rtRange $2)) }
   | '(' '-' ')'              { EOp (L.rtRange $1 <-> L.rtRange $3) (Minus (L.rtRange $2)) }
   | '(' '*' ')'              { EOp (L.rtRange $1 <-> L.rtRange $3) (Times (L.rtRange $2)) }
+  | times_value              { EOp (L.rtRange $1) (Times (L.rtRange $1)) }
   | '(' '/' ')'              { EOp (L.rtRange $1 <-> L.rtRange $3) (Divide (L.rtRange $2)) }
   -- Comparison operators
   | '(' '=' ')'              { EOp (L.rtRange $1 <-> L.rtRange $3) (Eq (L.rtRange $2)) }
@@ -418,6 +421,7 @@ atom_base :: { Exp L.Range }
   | '(' '+.' ')'             { EOp (L.rtRange $1 <-> L.rtRange $3) (PlusF (L.rtRange $2)) }
   | '(' '-.' ')'             { EOp (L.rtRange $1 <-> L.rtRange $3) (MinusF (L.rtRange $2)) }
   | '(' '*.' ')'             { EOp (L.rtRange $1 <-> L.rtRange $3) (TimesF (L.rtRange $2)) }
+  | timesf_value             { EOp (L.rtRange $1) (TimesF (L.rtRange $1)) }
   | '(' '/.' ')'             { EOp (L.rtRange $1 <-> L.rtRange $3) (DivideF (L.rtRange $2)) }
   -- Float comparison operators (first-class)
   | '(' '=.' ')'             { EOp (L.rtRange $1 <-> L.rtRange $3) (EqF (L.rtRange $2)) }

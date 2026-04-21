@@ -126,6 +126,40 @@ spec = describe "parser" $ do
     let res = runAlex "forall a . a -> a" parsePolytype
     res `shouldBe` Right (Forall ["a"] [] (TyFun (TyVar "a") (TyVar "a")))
 
+  it "parses multiplication operators as first-class values without whitespace" $ do
+    let res = runAlex "(*)" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast -> fmap (const ()) ast `shouldBe` EOp () (Times ())
+
+  it "parses float multiplication operators as first-class values without whitespace" $ do
+    let res = runAlex "(*.)" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast -> fmap (const ()) ast `shouldBe` EOp () (TimesF ())
+
+  it "parses anonymous functions as expressions" $ do
+    let res = runAlex "fn x => x" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast ->
+        fmap (const ()) ast `shouldBe`
+          ELetIn () (Dec () "__lambda_1_1" [PVar () "x"] Nothing Nothing (EVar () "x")) (EVar () "__lambda_1_1")
+
+  it "parses parenthesized anonymous functions in higher-order special forms" $ do
+    let res = runAlex "map (fn x => x) arr" parseMiniML
+    case res of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right ast ->
+        fmap (const ()) ast `shouldBe`
+          EMap ()
+            (ELetIn () (Dec () "__lambda_1_6" [PVar () "x"] Nothing Nothing (EVar () "x")) (EVar () "__lambda_1_6"))
+            (EVar () "arr")
+
+  it "requires parentheses around anonymous functions in higher-order special forms" $ do
+    let res = runAlex "map fn x => x arr" parseMiniML
+    res `shouldSatisfy` either (const True) (const False)
+
   it "fails to parse generate when args are not parenthesized" $ do
     -- according to the grammar generate requires atom arguments; `1+2`
     -- without parentheses is not an atom and should therefore be a parse error
