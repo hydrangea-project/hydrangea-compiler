@@ -335,10 +335,16 @@ transformVectorStmt ctx env stmt =
       base       = vlcBase ctx
   in case stmt of
     SAssign v (C.RArrayLoad arr@(AVar _) idx)
-      | arrayAllowsExplicitLoad typeEnv accessFacts arr -> do
-          idx' <- contiguousVectorIndex accessFacts iter base idx
-          let vv = vecTarget env v
-          pure (M.insert v vv env, [SAssign vv (C.RVecLoad arr idx')])
+      | arrayAllowsExplicitLoad typeEnv accessFacts arr ->
+          case contiguousVectorIndex accessFacts iter base idx of
+            Just idx' ->
+              let vv = vecTarget env v
+              in pure (M.insert v vv env, [SAssign vv (C.RVecLoad arr idx')])
+            Nothing ->
+              let idx' = substScalarAtom iter base idx
+              in if atomRefsVector env idx' || atomRefsVector env arr
+                   then Nothing
+                   else pure (env, [SAssign v (C.RArrayLoad arr idx')])
 
     SAssign v (C.RBinOp op a b)
       | supportedVecBinOp op ->

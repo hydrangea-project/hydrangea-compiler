@@ -177,7 +177,7 @@ spec = describe "Polyhedral" $ do
       [] ->
         expectationFailure "expected an extracted matElem scop"
 
-  it "reifies the matmul benchmark result as blocked ii/jj/kk loops" $ do
+  it "reifies the matmul benchmark result as blocked ii/jj/kk loops with a vector-friendly update body" $ do
     diagnostics <- loadPreparedMatmulBenchmarkDiagnostics
     case [scop | ScopExtracted scop <- diagnostics, scProcName scop == "result"] of
       (scop : _) ->

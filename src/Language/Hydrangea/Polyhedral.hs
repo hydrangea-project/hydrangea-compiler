@@ -47,9 +47,11 @@ module Language.Hydrangea.Polyhedral
   , extractProcScops2
   , extractProgramScops2
   , polyhedralProgram2
+  , polyhedralIdentityTileProgram2
   , polyhedralTileProgram2
   , reifyScheduledScop2
   , synthesizeScopSchedule2
+  , tileIdentityScop2
   , tileScop2
   ) where
 
@@ -60,12 +62,12 @@ import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (find, nub, permutations, sort, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts2, usedVarsIndexExpr, usedVarsStmts2)
-import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..), Redop(..))
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
 
 type StmtId = [Int]
 
@@ -257,23 +259,30 @@ data ScheduledScop = ScheduledScop
   , ssAffineSchedule :: AffineSchedule
   , ssSchedule :: ScheduleTree
   , ssReplacement :: Maybe [Stmt]
+  , ssTypeOverrides :: Map CVar CType
   , ssArrayFactOverrides :: Map CVar ArrayFact
   , ssVectorAccessFactOverrides :: Map CVar VectorAccessFact
   }
   deriving (Eq, Show)
 
-data MatmulKernel = MatmulKernel
-  { mkOuterIterI :: CVar
-  , mkOuterIterJ :: CVar
-  , mkOuterIBound :: IndexExpr
-  , mkOuterJBound :: IndexExpr
-  , mkReductionIter :: CVar
-  , mkReductionBound :: IndexExpr
-  , mkReductionSetup :: Stmt
-  , mkInitAtom :: Atom
-  , mkOutputArray :: CVar
-  , mkMatASetup :: Stmt
-  , mkMatBSetup :: Stmt
+data BlockedMapReductionKernel = BlockedMapReductionKernel
+  { bmrOuterIterI :: CVar
+  , bmrOuterIterJ :: CVar
+  , bmrOuterIBound :: IndexExpr
+  , bmrOuterJBound :: IndexExpr
+  , bmrReductionIter :: CVar
+  , bmrReductionBound :: IndexExpr
+  , bmrAccVar :: CVar
+  , bmrInitAtom :: Atom
+  , bmrOutputArray :: CVar
+  , bmrOuterSetup :: [Stmt]
+  , bmrWrapperIter :: CVar
+  , bmrWrapperSetup :: [Stmt]
+  , bmrReductionSetup :: [Stmt]
+  , bmrOutputIndex :: Atom
+  , bmrUpdateOp :: BinOp
+  , bmrUpdateLhs :: Atom
+  , bmrUpdateRhs :: Atom
   }
   deriving (Eq, Show)
 
@@ -308,6 +317,9 @@ polyhedralProgram2 = scheduleProgram2 synthesizeScopSchedule2
 polyhedralTileProgram2 :: Program -> Program
 polyhedralTileProgram2 = scheduleProgram2 tileScop2
 
+polyhedralIdentityTileProgram2 :: Program -> Program
+polyhedralIdentityTileProgram2 = scheduleProgram2 tileIdentityScop2
+
 scheduleProgram2 :: (Scop -> ScheduledScop) -> Program -> Program
 scheduleProgram2 mkSchedule (Program procs) = Program (map rewriteProc procs)
   where
@@ -334,9 +346,13 @@ tileScop2 :: Scop -> ScheduledScop
 tileScop2 =
   tileScheduledScop2 . synthesizeScopSchedule2
 
+tileIdentityScop2 :: Scop -> ScheduledScop
+tileIdentityScop2 =
+  tileScheduledScop2 . buildIdentitySchedule2
+
 tileScheduledScop2 :: ScheduledScop -> ScheduledScop
 tileScheduledScop2 scheduled =
-  fromMaybe generic (buildMatmulBlockedScop2 scheduled)
+  fromMaybe generic (buildBlockedMapReductionScop2 generic)
   where
     scop = ssOriginal scheduled
     generic =
@@ -352,6 +368,7 @@ buildScheduledScop2 scop affineSchedule scheduleTree =
     , ssAffineSchedule = affineSchedule
     , ssSchedule = scheduleTree
     , ssReplacement = Nothing
+    , ssTypeOverrides = M.empty
     , ssArrayFactOverrides = M.empty
     , ssVectorAccessFactOverrides = M.empty
     }
@@ -846,10 +863,17 @@ shouldTileBand depth band =
   lbExec band == Serial
     && lbRole band /= LoopReductionWrapper
     && lbRole band /= LoopFold
-    && lbRole band /= LoopMap
+    && loopRoleSupportsTiling2 band
     && boundsAreIteratorIndependent band
     && all (supportsAtomBound . simplifyIndexExpr) (lbBounds band)
     && (depth > 0 || hasNestedBand (lbBody band) || length (lbIters band) > 1)
+
+loopRoleSupportsTiling2 :: LoopBand -> Bool
+loopRoleSupportsTiling2 band = case lbRole band of
+  LoopMap ->
+    hasNestedBand (lbBody band) || length (lbIters band) > 1
+  _ ->
+    True
 
 boundsAreIteratorIndependent :: LoopBand -> Bool
 boundsAreIteratorIndependent band =
@@ -1540,25 +1564,33 @@ applyScheduledScopToProc2 scheduled proc
   | otherwise = do
       replacement <- reifyScheduledScop2 scheduled
       body' <- replaceStmtRangeAtPath (scRootPath (ssOriginal scheduled)) replacement (procBody proc)
+      let vectorFacts =
+            deriveVectorAccessFacts2
+              body'
+              ( scheduledVectorAccessFacts2
+                  scheduled
+                  (M.union (ssVectorAccessFactOverrides scheduled) (procVectorAccessFacts proc))
+              )
       pure
         proc
           { procBody = body'
+          , procTypeEnv =
+              M.union (ssTypeOverrides scheduled) (procTypeEnv proc)
           , procArrayFacts =
               M.union (ssArrayFactOverrides scheduled) (procArrayFacts proc)
-          , procVectorAccessFacts =
-              M.union
-                (ssVectorAccessFactOverrides scheduled)
-                (procVectorAccessFacts proc)
+          , procVectorAccessFacts = vectorFacts
           }
 
-buildMatmulBlockedScop2 :: ScheduledScop -> Maybe ScheduledScop
-buildMatmulBlockedScop2 scheduled = do
-  kernel <- matchMatmulKernel2 scop
-  let (replacement, vectorFacts) =
-        evalState (buildMatmulBlockedBody2 kernel) (collectScopNames scop, 0)
+buildBlockedMapReductionScop2 :: ScheduledScop -> Maybe ScheduledScop
+buildBlockedMapReductionScop2 scheduled = do
+  kernel <- matchBlockedMapReductionKernel2 scop
+  let replacement =
+        evalState (buildBlockedMapReductionBody2 kernel) (collectScopNames scop, 0)
+      typeOverrides =
+        M.singleton (bmrOutputArray kernel) (CTArray (blockedMapReductionElemType2 kernel))
       scopedArrayOverrides =
         M.singleton
-          (mkOutputArray kernel)
+          (bmrOutputArray kernel)
           ArrayFact
             { afFreshAlloc = True
             , afWriteOnce = False
@@ -1567,209 +1599,155 @@ buildMatmulBlockedScop2 scheduled = do
   pure
     scheduled
       { ssReplacement = Just replacement
+      , ssTypeOverrides =
+          M.union typeOverrides (ssTypeOverrides scheduled)
       , ssArrayFactOverrides =
           M.union scopedArrayOverrides (ssArrayFactOverrides scheduled)
-      , ssVectorAccessFactOverrides =
-          M.union vectorFacts (ssVectorAccessFactOverrides scheduled)
       }
   where
     scop = ssOriginal scheduled
 
-matchMatmulKernel2 :: Scop -> Maybe MatmulKernel
-matchMatmulKernel2 scop = do
+matchBlockedMapReductionKernel2 :: Scop -> Maybe BlockedMapReductionKernel
+matchBlockedMapReductionKernel2 scop = do
   [SLoop outerSpec outerBody] <- reifyScheduledScop2 (buildIdentitySchedule2 scop)
   [outerI, outerJ] <- pure (lsIters outerSpec)
   [outerIBound, outerJBound] <- pure (lsBounds outerSpec)
   if lsRole outerSpec /= LoopMap
     then Nothing
     else do
-      wrapperBody <- do
-        SLoop wrapperSpec wrapperBody <-
-          find
-            (\stmt -> case stmt of
-              SLoop spec _ -> lsRole spec == LoopReductionWrapper
-              _ -> False)
-            outerBody
-        if lsBounds wrapperSpec == [IConst 1]
-          then Just wrapperBody
-          else Nothing
-      reductionLoop@(redSpec, redBody) <- extractReductionLoop2 wrapperBody
-      ReductionSpec accVar _ RAdd <- lsRed redSpec
-      [reductionIter] <- pure (lsIters redSpec)
-      [reductionBound] <- pure (lsBounds redSpec)
-      reductionSetup <- case reductionBound of
-        IVar redBoundVar ->
-          find
-            (\stmt -> case stmt of
-              SAssign v (RCall _ []) -> v == redBoundVar
-              _ -> False)
-            outerBody
-        _ ->
-          Nothing
-      SAssign accInitVar (RAtom initAtom) <-
-        find
-          (\stmt -> case stmt of
-            SAssign v (RAtom _) -> v == accVar
-            _ -> False)
-          outerBody
-      if accInitVar /= accVar
+      (outerBeforeWrite, finalWrite) <- unsnoc2 outerBody
+      SArrayWrite (AVar outArr) outIdx (AVar outAcc) <- Just finalWrite
+      (beforeWrapper, wrapperStmt, afterWrapper) <- splitFirstMatching2 isReductionWrapperStmt2 outerBeforeWrite
+      (outerSetupPrefix, accInitStmt) <- unsnoc2 beforeWrapper
+      SAssign accVar (RAtom initAtom) <- Just accInitStmt
+      if outAcc /= accVar
+           || usesVar2 accVar (outerSetupPrefix ++ afterWrapper)
         then Nothing
         else do
-          SArrayWrite (AVar outArr) _ (AVar outAcc) <- listToMaybe (reverse outerBody)
-          if outAcc /= accVar
+          SLoop wrapperSpec wrapperBody <- Just wrapperStmt
+          if lsBounds wrapperSpec /= [IConst 1]
             then Nothing
             else do
-              (matASetup, matBSetup) <- extractMatmulInputSetups2 redBody
-              if reductionLooksLikeMatmul2 accVar reductionLoop
-                then
-                  Just
-                    MatmulKernel
-                      { mkOuterIterI = outerI
-                      , mkOuterIterJ = outerJ
-                      , mkOuterIBound = outerIBound
-                      , mkOuterJBound = outerJBound
-                      , mkReductionIter = reductionIter
-                      , mkReductionBound = reductionBound
-                      , mkReductionSetup = reductionSetup
-                      , mkInitAtom = initAtom
-                      , mkOutputArray = outArr
-                      , mkMatASetup = matASetup
-                      , mkMatBSetup = matBSetup
-                      }
-                else Nothing
+              [wrapperIter] <- pure (lsIters wrapperSpec)
+              (wrapperSetup, reductionStmt) <- unsnoc2 wrapperBody
+              if usesVar2 accVar wrapperSetup
+                then Nothing
+                else do
+                  SLoop reductionSpec reductionBody <- Just reductionStmt
+                  if lsRole reductionSpec /= LoopReduction
+                    then Nothing
+                    else do
+                      ReductionSpec redAcc _ RAdd <- lsRed reductionSpec
+                      [reductionIter] <- pure (lsIters reductionSpec)
+                      [reductionBound] <- pure (lsBounds reductionSpec)
+                      if redAcc /= accVar
+                           || not
+                                (S.null
+                                   ( usedVarsIndexExpr reductionBound
+                                       `S.intersection` S.fromList [outerI, outerJ]
+                                   )
+                                )
+                        then Nothing
+                        else do
+                          (reductionSetup, accUpdateStmt) <- unsnoc2 reductionBody
+                          if usesVar2 accVar reductionSetup
+                            then Nothing
+                            else do
+                              SAssign accDst (RBinOp updateOp updateLhs updateRhs) <- Just accUpdateStmt
+                              if accDst /= accVar || not (atomRefsVar2 accVar updateLhs || atomRefsVar2 accVar updateRhs)
+                                then Nothing
+                                else
+                                  Just
+                                    BlockedMapReductionKernel
+                                      { bmrOuterIterI = outerI
+                                      , bmrOuterIterJ = outerJ
+                                      , bmrOuterIBound = outerIBound
+                                      , bmrOuterJBound = outerJBound
+                                      , bmrReductionIter = reductionIter
+                                      , bmrReductionBound = reductionBound
+                                      , bmrAccVar = accVar
+                                      , bmrInitAtom = initAtom
+                                      , bmrOutputArray = outArr
+                                      , bmrOuterSetup = outerSetupPrefix ++ afterWrapper
+                                      , bmrWrapperIter = wrapperIter
+                                      , bmrWrapperSetup = wrapperSetup
+                                      , bmrReductionSetup = reductionSetup
+                                      , bmrOutputIndex = outIdx
+                                      , bmrUpdateOp = updateOp
+                                      , bmrUpdateLhs = updateLhs
+                                      , bmrUpdateRhs = updateRhs
+                                      }
 
-extractReductionLoop2 :: [Stmt] -> Maybe (LoopSpec, [Stmt])
-extractReductionLoop2 body = do
-  SLoop spec redBody <-
-    find
-      (\stmt -> case stmt of
-        SLoop loopSpec _ -> lsRole loopSpec == LoopReduction
-        _ -> False)
-      body
-  pure (spec, redBody)
-
-extractMatmulInputSetups2 :: [Stmt] -> Maybe (Stmt, Stmt)
-extractMatmulInputSetups2 body = do
-  (firstSetup : secondSetup : _) <-
-    pure
-      [ stmt
-      | stmt@(SAssign _ (RCall _ [])) <- body
-      ]
-  pure (firstSetup, secondSetup)
-
-reductionLooksLikeMatmul2 :: CVar -> (LoopSpec, [Stmt]) -> Bool
-reductionLooksLikeMatmul2 accVar (_redSpec, redBody) =
-  hasFloatMul && hasAccumulate && readCount >= 2
-  where
-    hasFloatMul =
-      any
-        (\stmt -> case stmt of
-          SAssign _ (RBinOp CMulF _ _) -> True
-          _ -> False)
-        redBody
-    hasAccumulate =
-      any
-        (\stmt -> case stmt of
-          SAssign v (RBinOp CAddF (AVar acc) _) -> v == accVar && acc == accVar
-          _ -> False)
-        redBody
-    readCount =
-      length
-        [ ()
-        | SAssign _ (RArrayLoad _ _) <- redBody
-        ]
-
-buildMatmulBlockedBody2 :: MatmulKernel -> TileM ([Stmt], Map CVar VectorAccessFact)
-buildMatmulBlockedBody2 kernel = do
-  iTile <- buildForcedStripDim2 (mkOuterIterI kernel) (mkOuterIBound kernel) (tcDefaultTile defaultTileConfig)
-  jTile <- buildForcedStripDim2 (mkOuterIterJ kernel) (mkOuterJBound kernel) (tcDefaultTile defaultTileConfig)
-  kTile <- buildForcedStripDim2 (mkReductionIter kernel) (mkReductionBound kernel) (tcReductionTile defaultTileConfig)
-  cInitRowBase <- freshLike "c_row_base_init" ""
-  cInitFlat <- freshLike "c_flat_init" ""
-  aRowBase <- freshLike "a_row_base" ""
-  bRowBase <- freshLike "b_row_base" ""
-  cRowBase <- freshLike "c_row_base" ""
-  aFlat <- freshLike "a_flat" ""
-  bFlat <- freshLike "b_flat" ""
-  cFlat <- freshLike "c_flat" ""
-  aVal <- freshLike "a_val" ""
-  bVal <- freshLike "b_val" ""
-  cVal <- freshLike "c_val" ""
-  prod <- freshLike "prod" ""
-  cNext <- freshLike "c_next" ""
-  let outputArr = AVar (mkOutputArray kernel)
-      outWidthAtom = smdBoundAtom jTile
-      redWidthAtom = smdBoundAtom kTile
-      denseAliasFact iter = VectorAccessFact
-        { vxfDenseLinearIndexOf = Just iter
-        , vxfDenseRead = False
-        , vxfIndirectRead = False
-        , vxfContiguousWrite = False
-        }
-      vectorFacts =
-        M.fromList
-          [ (cInitFlat, denseAliasFact (smdLocalIter jTile))
-          , (bFlat, denseAliasFact (smdLocalIter jTile))
-          , (cFlat, denseAliasFact (smdLocalIter jTile))
-          ]
+buildBlockedMapReductionBody2 :: BlockedMapReductionKernel -> TileM [Stmt]
+buildBlockedMapReductionBody2 kernel = do
+  iTile <- buildForcedStripDim2 (bmrOuterIterI kernel) (bmrOuterIBound kernel) (tcDefaultTile defaultTileConfig)
+  jTile <- buildForcedStripDim2 (bmrOuterIterJ kernel) (bmrOuterJBound kernel) (tcDefaultTile defaultTileConfig)
+  kTile <- buildForcedStripDim2 (bmrReductionIter kernel) (bmrReductionBound kernel) (tcReductionTile defaultTileConfig)
+  cVal <- freshLike (bmrAccVar kernel) "_tile_acc"
+  cNext <- freshLike (bmrAccVar kernel) "_tile_next"
+  let (reductionPrelude, outerSetup) =
+        extractReductionPrelude2
+          (usedVarsIndexExpr (bmrReductionBound kernel))
+          [bmrOuterIterI kernel, bmrOuterIterJ kernel]
+          (bmrOuterSetup kernel)
+      outputArr = AVar (bmrOutputArray kernel)
+      loadOutput = SAssign cVal (RArrayLoad outputArr (bmrOutputIndex kernel))
+      updateOutput =
+        SAssign
+          cNext
+          ( RBinOp
+              (bmrUpdateOp kernel)
+              (replaceAccAtom2 (bmrAccVar kernel) cVal (bmrUpdateLhs kernel))
+              (replaceAccAtom2 (bmrAccVar kernel) cVal (bmrUpdateRhs kernel))
+          )
+      storeOutput = SArrayWrite outputArr (bmrOutputIndex kernel) (AVar cNext)
       initJLoop =
         localLoop2
           jTile
           LoopMap
-          [ SAssign cInitFlat (RBinOp CAdd (AVar cInitRowBase) (AVar (mkOuterIterJ kernel)))
-          , SArrayWrite outputArr (AVar cInitFlat) (mkInitAtom kernel)
-          ]
+          (outerSetup ++ [SArrayWrite outputArr (bmrOutputIndex kernel) (bmrInitAtom kernel)])
       initILoop =
         localLoop2
           iTile
           LoopPlain
-          [ SAssign cInitRowBase (RBinOp CMul outWidthAtom (AVar (mkOuterIterI kernel)))
-          , initJLoop
-          ]
+          [initJLoop]
       computeJLoop =
         localLoop2
           jTile
           LoopMap
-          [ SAssign bFlat (RBinOp CAdd (AVar bRowBase) (AVar (mkOuterIterJ kernel)))
-          , SAssign cFlat (RBinOp CAdd (AVar cRowBase) (AVar (mkOuterIterJ kernel)))
-          , SAssign cVal (RArrayLoad outputArr (AVar cFlat))
-          , SAssign bVal (RArrayLoad (stmtAssignedVarAtom2 (mkMatBSetup kernel)) (AVar bFlat))
-          , SAssign prod (RBinOp CMulF (AVar aVal) (AVar bVal))
-          , SAssign cNext (RBinOp CAddF (AVar cVal) (AVar prod))
-          , SArrayWrite outputArr (AVar cFlat) (AVar cNext)
-          ]
+          ( outerSetup
+              ++ bmrReductionSetup kernel
+              ++ [loadOutput, updateOutput, storeOutput]
+          )
       computeKLoop =
         localLoop2
           kTile
           LoopPlain
-          [ SAssign aFlat (RBinOp CAdd (AVar aRowBase) (AVar (mkReductionIter kernel)))
-          , SAssign aVal (RArrayLoad (stmtAssignedVarAtom2 (mkMatASetup kernel)) (AVar aFlat))
-          , SAssign bRowBase (RBinOp CMul outWidthAtom (AVar (mkReductionIter kernel)))
-          , computeJLoop
-          ]
+          [computeJLoop]
+      wrapperLoop =
+        SLoop
+          LoopSpec
+            { lsIters = [bmrWrapperIter kernel]
+            , lsBounds = [IConst 1]
+            , lsExec = Serial
+            , lsRed = Nothing
+            , lsRole = LoopReductionWrapper
+            }
+          (bmrWrapperSetup kernel ++ [computeKLoop])
       computeILoop =
         localLoop2
           iTile
           LoopPlain
-          [ SAssign aRowBase (RBinOp CMul redWidthAtom (AVar (mkOuterIterI kernel)))
-          , SAssign cRowBase (RBinOp CMul outWidthAtom (AVar (mkOuterIterI kernel)))
-          , computeKLoop
-          ]
+          [wrapperLoop]
       kkLoop = tileLoop2 kTile LoopPlain [computeILoop]
       jjLoop = tileLoop2 jTile LoopPlain [initILoop, kkLoop]
       iiLoop = tileLoop2 iTile LoopPlain [jjLoop]
       tilePrelude =
-        smdBoundPrelude iTile
+        reductionPrelude
+          ++ smdBoundPrelude iTile
           ++ smdBoundPrelude jTile
           ++ smdBoundPrelude kTile
-      replacement =
-        [ mkReductionSetup kernel
-        , mkMatASetup kernel
-        , mkMatBSetup kernel
-        ]
-          ++ tilePrelude
-          ++ [iiLoop]
-  pure (replacement, vectorFacts)
+  pure (tilePrelude ++ [iiLoop])
 
 buildForcedStripDim2 :: CVar -> IndexExpr -> Integer -> TileM StripMinedDim
 buildForcedStripDim2 iter bound tileSize = do
@@ -1819,10 +1797,244 @@ localLoop2 td role body =
       }
     (assignOrigIter td : body)
 
-stmtAssignedVarAtom2 :: Stmt -> Atom
-stmtAssignedVarAtom2 stmt = case stmt of
-  SAssign v _ -> AVar v
-  _ -> error "expected assignment statement when extracting matmul setup variable"
+unsnoc2 :: [a] -> Maybe ([a], a)
+unsnoc2 xs = case reverse xs of
+  [] -> Nothing
+  y : ys -> Just (reverse ys, y)
+
+splitFirstMatching2 :: (a -> Bool) -> [a] -> Maybe ([a], a, [a])
+splitFirstMatching2 matches xs =
+  case break matches xs of
+    (prefix, target : suffix) -> Just (prefix, target, suffix)
+    _ -> Nothing
+
+isReductionWrapperStmt2 :: Stmt -> Bool
+isReductionWrapperStmt2 stmt = case stmt of
+  SLoop spec _ -> lsRole spec == LoopReductionWrapper
+  _ -> False
+
+usesVar2 :: CVar -> [Stmt] -> Bool
+usesVar2 v = S.member v . usedVarsStmts2
+
+atomRefsVar2 :: CVar -> Atom -> Bool
+atomRefsVar2 v atom = case atom of
+  AVar v' -> v == v'
+  _ -> False
+
+replaceAccAtom2 :: CVar -> CVar -> Atom -> Atom
+replaceAccAtom2 old new atom = case atom of
+  AVar v | v == old -> AVar new
+  _ -> atom
+
+extractReductionPrelude2 :: Set CVar -> [CVar] -> [Stmt] -> ([Stmt], [Stmt])
+extractReductionPrelude2 needed forbidden stmts =
+  (selected, remaining)
+  where
+    forbiddenSet = S.fromList forbidden
+    step stmt (neededNow, picked, kept)
+      | not (S.null (defs `S.intersection` neededNow))
+          && S.null (uses `S.intersection` forbiddenSet) =
+          ( (neededNow `S.difference` defs) `S.union` uses
+          , stmt : picked
+          , kept
+          )
+      | otherwise =
+          (neededNow, picked, stmt : kept)
+      where
+        defs = definedVarsStmts2 [stmt]
+        uses = usedVarsStmts2 [stmt]
+    (_, selected, remaining) =
+      foldr step (needed, [], []) stmts
+
+data DenseValueInfo
+  = DenseScalarInfo CVar
+  | DenseTupleInfo [Maybe CVar]
+
+deriveVectorAccessFacts2 :: [Stmt] -> Map CVar VectorAccessFact -> Map CVar VectorAccessFact
+deriveVectorAccessFacts2 stmts baseFacts = snd (deriveStmtFacts2 env0 baseFacts stmts)
+  where
+    env0 =
+      M.fromList
+        [ (v, DenseScalarInfo iter)
+        | (v, fact) <- M.toList baseFacts
+        , Just iter <- [vxfDenseLinearIndexOf fact]
+        ]
+
+deriveStmtFacts2
+  :: Map CVar DenseValueInfo
+  -> Map CVar VectorAccessFact
+  -> [Stmt]
+  -> (Map CVar DenseValueInfo, Map CVar VectorAccessFact)
+deriveStmtFacts2 env facts [] = (env, facts)
+deriveStmtFacts2 env facts (stmt : rest) =
+  deriveStmtFacts2 env' facts' rest
+  where
+    (env', facts') = deriveOneStmtFacts2 env facts stmt
+
+deriveOneStmtFacts2
+  :: Map CVar DenseValueInfo
+  -> Map CVar VectorAccessFact
+  -> Stmt
+  -> (Map CVar DenseValueInfo, Map CVar VectorAccessFact)
+deriveOneStmtFacts2 env facts stmt = case stmt of
+  SAssign v rhs ->
+    case inferDenseValueInfo2 env rhs of
+      Just info ->
+        ( M.insert v info env
+        , case info of
+            DenseScalarInfo iter ->
+              M.insert
+                v
+                ((M.findWithDefault emptyVectorAccessFact2 v facts) { vxfDenseLinearIndexOf = Just iter })
+                facts
+            DenseTupleInfo {} ->
+              facts
+        )
+      Nothing ->
+        (M.delete v env, facts)
+  SLoop spec body ->
+    let loopEnv =
+          M.union
+            (M.fromList [(iter, DenseScalarInfo iter) | iter <- lsIters spec])
+            env
+        (envBody, factsBody) = deriveStmtFacts2 loopEnv facts body
+    in  (M.union envBody env, factsBody)
+  SIf _ thn els ->
+    let (envThn, factsThn) = deriveStmtFacts2 env facts thn
+        (envEls, factsEls) = deriveStmtFacts2 env factsThn els
+    in  (M.union envEls envThn, factsEls)
+  _ ->
+    (env, facts)
+
+inferDenseValueInfo2 :: Map CVar DenseValueInfo -> RHS -> Maybe DenseValueInfo
+inferDenseValueInfo2 env rhs = case rhs of
+  RAtom atom ->
+    DenseScalarInfo <$> atomDenseOrigin2 env atom
+  RBinOp op a b ->
+    DenseScalarInfo <$> inferDenseBinOpOrigin2 env op a b
+  RTuple atoms ->
+    let comps = map (atomDenseOrigin2 env) atoms
+    in  if any isJust comps then Just (DenseTupleInfo comps) else Nothing
+  RProj i (AVar src) ->
+    case M.lookup src env of
+      Just (DenseTupleInfo comps)
+        | Just iter <- atMay comps (fromIntegral i) >>= id -> Just (DenseScalarInfo iter)
+      _ -> Nothing
+  RNdToFlat (AVar src) _ ->
+    case M.lookup src env of
+      Just (DenseTupleInfo comps)
+        | Just (Just iter) <- listToMaybe (reverse comps) ->
+            Just (DenseScalarInfo iter)
+      _ -> Nothing
+  RFlatToNd atom shape ->
+    do
+      iter <- atomDenseOrigin2 env atom
+      rank <- atomTupleArity2 env shape
+      pure (DenseTupleInfo (replicate (rank - 1) Nothing ++ [Just iter]))
+  _ ->
+    Nothing
+
+atomDenseOrigin2 :: Map CVar DenseValueInfo -> Atom -> Maybe CVar
+atomDenseOrigin2 env atom = case atom of
+  AVar v ->
+    case M.lookup v env of
+      Just (DenseScalarInfo iter) -> Just iter
+      _ -> Nothing
+  _ ->
+    Nothing
+
+atomTupleArity2 :: Map CVar DenseValueInfo -> Atom -> Maybe Int
+atomTupleArity2 env atom = case atom of
+  AVar v ->
+    case M.lookup v env of
+      Just (DenseTupleInfo comps) -> Just (length comps)
+      _ -> Nothing
+  _ ->
+    Nothing
+
+inferDenseBinOpOrigin2 :: Map CVar DenseValueInfo -> BinOp -> Atom -> Atom -> Maybe CVar
+inferDenseBinOpOrigin2 env op a b = case op of
+  CAdd ->
+    case (atomDenseOrigin2 env a, atomDenseOrigin2 env b) of
+      (Just iter, Nothing) -> Just iter
+      (Nothing, Just iter) -> Just iter
+      _ -> Nothing
+  CSub ->
+    case (atomDenseOrigin2 env a, atomDenseOrigin2 env b) of
+      (Just iter, Nothing) -> Just iter
+      _ -> Nothing
+  _ ->
+    Nothing
+
+blockedMapReductionElemType2 :: BlockedMapReductionKernel -> CType
+blockedMapReductionElemType2 kernel = case bmrUpdateOp kernel of
+  CAddF -> CTDouble
+  CSubF -> CTDouble
+  CMulF -> CTDouble
+  CDivF -> CTDouble
+  _ ->
+    case bmrInitAtom kernel of
+      AFloat {} -> CTDouble
+      _ -> CTInt64
+
+scheduledVectorAccessFacts2
+  :: ScheduledScop
+  -> Map CVar VectorAccessFact
+  -> Map CVar VectorAccessFact
+scheduledVectorAccessFacts2 scheduled facts =
+  M.union generatedIterFacts adjustedFacts
+  where
+    scopNames = collectScopNames (ssOriginal scheduled)
+    iterRebindings = collectStripMineIterRebindings2 (ssSchedule scheduled)
+    adjustedFacts =
+      M.mapWithKey adjustFact facts
+    adjustFact v fact
+      | v `S.member` scopNames =
+          remapDenseLinearOrigin2 iterRebindings fact
+      | otherwise =
+          fact
+    generatedIterFacts =
+      M.fromList
+        [ ( iter
+          , (M.findWithDefault emptyVectorAccessFact2 iter facts)
+              { vxfDenseLinearIndexOf = Just localIter
+              }
+          )
+        | (iter, localIter) <- M.toList iterRebindings
+        ]
+
+emptyVectorAccessFact2 :: VectorAccessFact
+emptyVectorAccessFact2 =
+  VectorAccessFact
+    { vxfDenseLinearIndexOf = Nothing
+    , vxfDenseRead = False
+    , vxfIndirectRead = False
+    , vxfContiguousWrite = False
+    }
+
+remapDenseLinearOrigin2 :: Map CVar CVar -> VectorAccessFact -> VectorAccessFact
+remapDenseLinearOrigin2 iterRebindings fact =
+  fact
+    { vxfDenseLinearIndexOf =
+        fmap (\iter -> M.findWithDefault iter iter iterRebindings) (vxfDenseLinearIndexOf fact)
+    }
+
+collectStripMineIterRebindings2 :: ScheduleTree -> Map CVar CVar
+collectStripMineIterRebindings2 sched = case sched of
+  ScheduleSequence xs ->
+    M.unions (map collectStripMineIterRebindings2 xs)
+  ScheduleStmtRef {} ->
+    M.empty
+  ScheduleLoopBand band ->
+    collectStripMineIterRebindings2 (lbBody band)
+  ScheduleStripMine band plans ->
+    M.unions
+      [ M.fromList
+          [ (smdOrigIter td, smdLocalIter td)
+          | StripTile td <- plans
+          ]
+      , collectStripMineIterRebindings2 (lbBody band)
+      ]
 
 replaceStmtRangeAtPath :: StmtId -> [Stmt] -> [Stmt] -> Maybe [Stmt]
 replaceStmtRangeAtPath [] _ _ = Nothing

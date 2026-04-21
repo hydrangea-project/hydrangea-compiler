@@ -215,6 +215,46 @@ spec = describe "Vectorize" $ do
     hasRHS (\rhs -> case rhs of C.RVecStore {} -> True; _ -> False) lowered `shouldBe` True
     hasVecIndexVar "flat" lowered `shouldBe` True
 
+  it "keeps non-contiguous scalar loads on the explicit path when vector ops still apply" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMap)
+            [ SAssign "offA" (C.RBinOp C.CAdd (C.AVar "row_base_a") (C.AVar "k"))
+            , SAssign "a" (C.RArrayLoad (C.AVar "matA") (C.AVar "offA"))
+            , SAssign "offB" (C.RBinOp C.CAdd (C.AVar "row_base_b") (C.AVar "j"))
+            , SAssign "b" (C.RArrayLoad (C.AVar "matB") (C.AVar "offB"))
+            , SAssign "offC" (C.RBinOp C.CAdd (C.AVar "row_base_c") (C.AVar "j"))
+            , SAssign "acc" (C.RArrayLoad (C.AVar "out") (C.AVar "offC"))
+            , SAssign "prod" (C.RBinOp C.CMulF (C.AVar "a") (C.AVar "b"))
+            , SAssign "sum" (C.RBinOp C.CAddF (C.AVar "acc") (C.AVar "prod"))
+            , SArrayWrite (C.AVar "out") (C.AVar "offC") (C.AVar "sum")
+            ]
+        lowered =
+          vectorizeWithFacts
+            [ ("row_base_a", C.CTInt64)
+            , ("row_base_b", C.CTInt64)
+            , ("row_base_c", C.CTInt64)
+            , ("k", C.CTInt64)
+            , ("matA", C.CTArray C.CTDouble)
+            , ("matB", C.CTArray C.CTDouble)
+            , ("out", C.CTArray C.CTDouble)
+            , ("a", C.CTDouble)
+            , ("b", C.CTDouble)
+            , ("acc", C.CTDouble)
+            , ("prod", C.CTDouble)
+            , ("sum", C.CTDouble)
+            ]
+            [ ("offB", VectorAccessFact (Just "j") False False False)
+            , ("offC", VectorAccessFact (Just "j") False False False)
+            , ("out", VectorAccessFact Nothing False False True)
+            ]
+            [loop]
+    hasRHS (\rhs -> case rhs of C.RVecLoad (C.AVar "matB") _ -> True; _ -> False) lowered `shouldBe` True
+    hasRHS (\rhs -> case rhs of C.RVecLoad (C.AVar "out") _ -> True; _ -> False) lowered `shouldBe` True
+    hasRHS (\rhs -> case rhs of C.RVecStore (C.AVar "out") _ _ -> True; _ -> False) lowered `shouldBe` True
+    hasRHS (\rhs -> case rhs of C.RArrayLoad (C.AVar "matA") _ -> True; _ -> False) lowered `shouldBe` True
+    hasRHS (\rhs -> case rhs of C.RVecBinOp C.CMulF _ _ -> True; _ -> False) lowered `shouldBe` True
+
   it "keeps indirect-access kernels off the explicit vector path even with dense index aliases" $ do
     let loop =
           SLoop

@@ -72,11 +72,9 @@ optimizePipelineWithTiling enableTiling stmts =
 preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
 preparePolyhedralProgramWithOptions opts (Program procs) =
   Program
-    [ proc { procBody = optimizePipelineWithTiling enableLegacyTiling (procBody proc) }
+    [ proc { procBody = optimizePipelineWithTiling False (procBody proc) }
     | proc <- procs
     ]
-  where
-    enableLegacyTiling = poEnableTiling opts && not (poEnablePolyhedral opts)
 
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
@@ -84,6 +82,7 @@ vectorizePipelineWithOptions opts prog =
   let prepared = preparePolyhedralProgramWithOptions opts prog
       optimized
         | poEnablePolyhedral opts && poEnableTiling opts = cleanupProgram (polyhedralTileProgram2 prepared)
+        | poEnableTiling opts = cleanupProgram (polyhedralIdentityTileProgram2 prepared)
         | poEnablePolyhedral opts = cleanupProgram (polyhedralProgram2 prepared)
         | otherwise = prepared
   in  vectorizeProgram2WithWidthAndExplicit

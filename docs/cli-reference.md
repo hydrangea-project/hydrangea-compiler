@@ -108,7 +108,7 @@ If no file is provided, Hydrangea reads from stdin.
 | `--main` | Keep only declarations reachable from the final top-level `main` binding; this is the default behavior and the flag remains for compatibility |
 | `--all-top-level-procs` | Preserve every top-level declaration instead of pruning to `main` |
 | `--no-parallel` | Disable OpenMP-oriented parallelization and compile generated C without `-fopenmp` |
-| `--tiling` | Opt in to loop-tiling in the CFG optimization pipeline (default: off) |
+| `--tiling` | Opt in to loop-tiling in the CFG optimization pipeline via the polyhedral tiler; without `--polyhedral` this keeps identity loop order, while `--polyhedral --tiling` tiles the synthesized schedule (default: off) |
 | `--explicit-vectorization` | Opt in to explicit SIMD lowering (`RVec*` IR / intrinsic-based C emission) on the C backend (default: off) |
 | `--no-solver-check` | Skip refinement-solver discharge after type inference |
 | `--simd-width=<n>` | Select the SIMD vector width used by the C backend (default: `4`) |

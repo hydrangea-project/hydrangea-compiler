@@ -223,7 +223,7 @@ spec = do
           , "let result = generate [M, N] matElem"
           ])
 
-    it "polyhedral matmul benchmark emits blocked SIMD-friendly C" $ do
+    it "matmul benchmark uses blocked generic tiling and explicit-vector polyhedral codegen" $ do
       src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"
       case readDecs src of
         Left perr -> expectationFailure $ "Parse error: " ++ perr
@@ -254,12 +254,14 @@ spec = do
               defaultCodegenOptions
               False
               decs
-          polyC `shouldNotBe` legacyC
-          legacyC `shouldSatisfy` not . isInfixOf "i76_tile_"
-          legacyC `shouldSatisfy` not . isInfixOf "j77_tile_"
+          legacyC `shouldSatisfy` isInfixOf "i76_tile_"
+          legacyC `shouldSatisfy` isInfixOf "j77_tile_"
+          legacyC `shouldSatisfy` isInfixOf "k126_tile_"
           polyC `shouldSatisfy` isInfixOf "i76_tile_"
           polyC `shouldSatisfy` isInfixOf "j77_tile_"
           polyC `shouldSatisfy` isInfixOf "k126_tile_"
+          legacyC `shouldSatisfy` not . isInfixOf "hyd_vec_loadu_f64x4"
+          legacyC `shouldSatisfy` not . isInfixOf "hyd_vec_storeu_f64x4"
           polyC `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"
           polyC `shouldSatisfy` isInfixOf "hyd_vec_storeu_f64x4"
 

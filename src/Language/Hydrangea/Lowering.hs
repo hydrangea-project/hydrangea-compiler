@@ -206,9 +206,7 @@ lowerExp expr = case expr of
     (stmtss, atoms) <- unzip <$> mapM lowerExp es
     t <- freshCVar "t"
     registerCType t CTTuple
-    case atoms of
-      [a] -> propagateDenseLinearIndex t a
-      _ -> pure ()
+    propagateTupleDenseLinearIndex t atoms
     pure (concat stmtss ++ [SAssign t (RTuple atoms)], AVar t)
 
   ENeg _ e -> do
@@ -222,6 +220,7 @@ lowerExp expr = case expr of
     t <- freshCVar "t"
     let bop = lowerBinOp op
     mapM_ (registerCType t) (binopResultCType bop)
+    propagateDenseLinearIndexBinOp t bop a1 a2
     pure (s1 ++ s2 ++ [SAssign t (RBinOp bop a1 a2)], AVar t)
 
   EUnOp _ (Not _) e -> do
@@ -654,6 +653,7 @@ lowerExp expr = case expr of
         elem' <- freshCVar "elem"
         _val <- freshCVar "val"
         registerCType idx CTTuple
+        noteDenseLinearIndex idx k
         genStmts <- inlineArrayFn genExp idx elem'
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
         let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
@@ -1238,6 +1238,7 @@ lowerExp expr = case expr of
         elem' <- freshCVar "elem"
         val <- freshCVar "val"
         registerCType idx CTTuple
+        noteDenseLinearIndex idx k
         genStmts <- inlineArrayFn genExp idx elem'
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
         let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
@@ -1432,6 +1433,7 @@ lowerExp expr = case expr of
     _flatPerm <- freshCVar "fp"
     srcElem <- freshCVar "se"
     registerCType idx CTTuple
+    noteDenseLinearIndex idx i
     pure ( sd ++ ss
          ++ [ SAssign shpDst (RArrayShape ad)
             , SAssign out (RArrayAlloc (AVar shpDst))
@@ -1486,6 +1488,7 @@ lowerExp expr = case expr of
         i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
+        noteDenseLinearIndex ndIdx i
         guardVal <- freshCVar "guard"
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
@@ -1558,6 +1561,7 @@ lowerExp expr = case expr of
         i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
+        noteDenseLinearIndex ndIdx i
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
@@ -1588,6 +1592,7 @@ lowerExp expr = case expr of
         i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
+        noteDenseLinearIndex ndIdx i
         elem' <- freshCVar "elem"
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
@@ -1623,6 +1628,7 @@ lowerExp expr = case expr of
         i <- freshIterVar "i"
         ndIdx <- freshCVar "nd"
         registerCType ndIdx CTTuple
+        noteDenseLinearIndex ndIdx i
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
@@ -2206,6 +2212,42 @@ atomHasDenseLinearOrigin :: Atom -> LowerM Bool
 atomHasDenseLinearOrigin (AVar v) =
   gets $ maybe False ((/= Nothing) . vxfDenseLinearIndexOf) . M.lookup v . lsVectorAccessFacts
 atomHasDenseLinearOrigin _ = pure False
+
+atomDenseLinearOrigin :: Atom -> LowerM (Maybe CVar)
+atomDenseLinearOrigin (AVar v) =
+  gets $ maybe Nothing vxfDenseLinearIndexOf . M.lookup v . lsVectorAccessFacts
+atomDenseLinearOrigin _ = pure Nothing
+
+propagateDenseLinearIndexBinOp :: CVar -> BinOp -> Atom -> Atom -> LowerM ()
+propagateDenseLinearIndexBinOp dst bop a b = do
+  originA <- atomDenseLinearOrigin a
+  originB <- atomDenseLinearOrigin b
+  case bop of
+    CAdd -> case (originA, originB) of
+      (Just iter, Nothing) -> noteDenseLinearIndex dst iter
+      (Nothing, Just iter) -> noteDenseLinearIndex dst iter
+      _ -> pure ()
+    CSub -> case (originA, originB) of
+      (Just iter, Nothing) -> noteDenseLinearIndex dst iter
+      _ -> pure ()
+    _ ->
+      pure ()
+
+propagateTupleDenseLinearIndex :: CVar -> [Atom] -> LowerM ()
+propagateTupleDenseLinearIndex dst atoms =
+  case unsnoc atoms of
+    Just (prefix, lastAtom) -> do
+      prefixOrigins <- mapM atomDenseLinearOrigin prefix
+      lastOrigin <- atomDenseLinearOrigin lastAtom
+      case (all (== Nothing) prefixOrigins, lastOrigin) of
+        (True, Just iter) -> noteDenseLinearIndex dst iter
+        _ -> pure ()
+    Nothing ->
+      pure ()
+  where
+    unsnoc xs = case reverse xs of
+      [] -> Nothing
+      y : ys -> Just (reverse ys, y)
 
 noteDenseReadAtom :: Atom -> LowerM ()
 noteDenseReadAtom (AVar v) =
