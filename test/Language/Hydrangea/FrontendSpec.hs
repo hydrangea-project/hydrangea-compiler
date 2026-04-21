@@ -67,6 +67,14 @@ expectTypeError src predicate = do
     Left msg -> msg `shouldSatisfy` predicate
     Right _ -> expectationFailure "Expected type error, but got success"
 
+expectDecsNoWarnings :: ByteString -> Expectation
+expectDecsNoWarnings src = do
+  decs <- parseDecsOrFail src
+  res <- inferDecsTopWithWarnings decs
+  case res of
+    Left msg -> expectationFailure ("Expected success but got error: " ++ msg)
+    Right (_, warnings) -> warnings `shouldBe` []
+
 emitCFromSource :: ByteString -> IO String
 emitCFromSource src = parseDecsOrFail src >>= compileToCOptIO False
 
@@ -565,6 +573,20 @@ spec = do
       countArrayAllocs mainProc `shouldBe` 0
 
   describe "code generation" $ do
+    it "emits scalar helpers for projected shape dimensions" $ do
+      csrc <- emitCFromSource $ BS.pack $ unlines
+        [ "let M = get_env_int \"M\""
+        , "let N = get_env_int \"N\""
+        , "let arr = read_array_float [M,N] \"data.csv\""
+        , "let s = shape_of arr"
+        , "let h = proj 0 s"
+        , "let w = proj 1 s"
+        , "let f [i,j] = index [i,j] arr"
+        , "let main = generate [h,w] f"
+        ]
+      csrc `shouldSatisfy` isInfixOf "int64_t h(void)"
+      csrc `shouldSatisfy` isInfixOf "int64_t w(void)"
+
     it "emits OpenMP parallel loops for injective scatter kernels" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
         [ "let main = scatter (+) (fill [8] 0)"
@@ -761,8 +783,21 @@ spec = do
         (Forall [] [] TyInt)
     it "typechecks dimension extraction and reuse in operations" $ do
       expectType
-        "let f _ = 1 in let arr = generate [3,4] f in let s = shape_of arr in let h = proj 0 s in let w = proj 1 s in let g1 [i] = i in let g2 [i] = i in zipwith (+) (generate [h] g1) (generate [w] g2)"
+        "let f _ = 1 in let arr = generate [3,4] f in let s = shape_of arr in let h = proj 0 s in let w = proj 1 s in let g1 [i] = i in let g2 [i] = i + w in zipwith (+) (generate [h] g1) (generate [h] g2)"
         (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
+    it "proves projected generated dimensions are safe index bounds without warnings" $ do
+      expectDecsNoWarnings $ BS.unlines
+        [ "let g n m ="
+        , "  let f [i,j] = i + j in"
+        , "  let arr = generate [n,m] f in"
+        , "  let s = shape_of arr in"
+        , "  let h = proj 0 s in"
+        , "  let w = proj 1 s in"
+        , "  index [h - 1, w - 1] arr"
+        ]
+    it "typechecks the matmul benchmark with solver-backed refinement checking" $ do
+      src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"
+      expectDecsNoWarnings src
     it "typechecks read_array with 1D shape" $ do
       expectType "read_array [3] \"data.csv\"" (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
     it "typechecks read_array with 2D shape" $ do

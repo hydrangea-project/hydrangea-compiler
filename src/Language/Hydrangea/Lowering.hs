@@ -2138,7 +2138,6 @@ isAtomConfirmedScalar stmts (AVar v) = do
           RBinOp {}        -> True
           RUnOp {}         -> True
           RArrayLoad {}    -> True
-          RCall {}         -> True
           _                -> False
         _ -> False
   if byRHS then pure True else do

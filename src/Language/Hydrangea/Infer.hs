@@ -665,11 +665,26 @@ bvalMax (ExactVal c)  (BoundOf b)   = BoundOf   (TMax (TAdd c (TConst 1)) b)
 
 -- | Conservatively compute a 'BVal' for an integer expression, given the
 -- current 'valBoundCtx'.  Returns 'Nothing' if the bound cannot be determined.
+lookupRefinedScalarTerm :: Var -> Infer (Maybe Term)
+lookupRefinedScalarTerm v = do
+  ctx <- ask
+  pure $
+    case M.lookup v ctx of
+      Just (Forall [] _ ty) ->
+        case fst (unwrapRefine ty) of
+          Just rfVar -> Just (TVar rfVar)
+          Nothing -> Nothing
+      _ -> Nothing
+
 inferBVal :: Exp Range -> Infer (Maybe BVal)
 inferBVal expr = case expr of
   EVar _ v -> do
     mb <- lookupValBound v
-    return $ Just $ maybe (ExactVal (TVar v)) BoundOf mb
+    case mb of
+      Just b -> pure $ Just $ BoundOf b
+      Nothing -> do
+        mRefined <- lookupRefinedScalarTerm v
+        pure $ Just $ ExactVal (fromMaybe (TVar v) mRefined)
   EInt _ n -> return $ Just $ ExactVal (TConst n)
   EBinOp _ e1 op e2 -> case op of
     Plus  _ -> combine bvalAdd e1 e2
@@ -882,6 +897,43 @@ extractPair r pty = case stripRefineTop pty of
     _ <- wrange r $ UTyPair ty1 ty2 =:= pty
     return (ty1, ty2)
 
+-- | Project a component type from a pair or cons-tuple while preserving any
+-- refinement wrapper already attached to that component.
+projectTupleType :: Range -> Integer -> UType -> Infer UType
+projectTupleType r i ty = do
+  ty' <- applyBindings ty
+  case stripRefineTop ty' of
+    UTyPair t1 t2 ->
+      case i of
+        0 -> applyBindings t1
+        1 -> applyBindings t2
+        _ -> throwError $ MiscError (Just r)
+    UTyCons t rest
+      | i == 0 -> applyBindings t
+      | otherwise -> projectTupleType r (i - 1) rest
+    _ -> do
+      (ts, t2) <- makeNFresh i
+      _ <- wrange r $ ty' =:= t2
+      applyBindings (ts !! fromIntegral i)
+
+-- | Reify @shape_of arr@ as a tuple of refined Ints, each tied to one source
+-- array dimension.  This preserves equality information through later
+-- projections such as @proj 0 (shape_of arr)@.
+shapeOfType :: Range -> Maybe Var -> UType -> Infer UType
+shapeOfType _ Nothing sTy = pure sTy
+shapeOfType r (Just arrVar) sTy = go 0 sTy
+  where
+    go ix ty = do
+      ty' <- applyBindings ty
+      case stripRefineTop ty' of
+        UTyUnit -> pure UTyUnit
+        UTyCons _ rest -> do
+          dimVar <- freshPredVar
+          emitPred (PEq (TVar dimVar) (TDim arrVar ix))
+          rest' <- go (ix + 1) rest
+          pure $ UTyCons (UTyRefine dimVar UTyInt) rest'
+        _ -> throwError $ MiscError (Just r)
+
 -- | Infer the type of an expression, emitting any refinement obligations.
 infer :: Exp Range -> Infer UType
 infer (EInt _ n) = do
@@ -901,12 +953,7 @@ infer (EBool _ _) = do
   return $ wrapRefine v UTyBool
 infer (EProj r i e) = do
   t1 <- infer e
-  t1b <- applyBindings t1
-  (ts, t2) <- makeNFresh i
-  _ <- wrange r $ t1b =:= t2
-  _ <- applyBindings t2
-  let elt = ts !! fromIntegral i
-  applyBindings elt
+  projectTupleType r i t1
 infer (ERecordProj r e field) = do
   recTy <- infer e
   recTy' <- applyBindings recTy
@@ -1014,8 +1061,9 @@ infer (ERecord r fields) = do
       return $ uTyRecord inferredFields
 infer (EShapeOf _ arrExp) = do
   arrTy <- infer arrExp
-  (_mArrVar, sTy, _eTy) <- asArrayType (firstParam arrExp) arrTy
-  normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  (mArrVar, sTy, _eTy) <- asArrayType (firstParam arrExp) arrTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  shapeOfType (firstParam arrExp) mArrVar sTy'
 infer (EGenerate _ shapeExp fn) = do
   sTy      <- infer shapeExp
   expected <- expectedShapeFromExp shapeExp
@@ -2241,6 +2289,19 @@ renamePolytype pty = evalState (go pty) (0 :: Int, M.empty)
     rename (TyVar v) = gets (maybe (TyVar v) TyVar . M.lookup v . snd)
     rename t         = return t
 
+-- | Top-level function declarations are checked at their call sites, where
+-- argument-shape facts are available.  Solving them in isolation rejects
+-- callback-style helpers such as generate bodies even though every use site is
+-- safe.
+shouldFinalizeTopLevelPoly :: Polytype -> Bool
+shouldFinalizeTopLevelPoly (Forall _ _ ty) = not (isFunctionType ty)
+  where
+    isFunctionType t =
+      case unFix t of
+        TyRefineF _ inner -> isFunctionType inner
+        TyFunF _ _        -> True
+        _                 -> False
+
 -- | Infer top-level declarations and return their generalized Polytypes.
 runInferDecs :: [Dec Range] -> IO (Either TypeError ([(Var, Polytype)], [String]))
 runInferDecs = runInferDecsWithOptions defaultInferOptions
@@ -2254,8 +2315,12 @@ runInferDecsWithOptions opts decs = do
     Left err -> return $ Left err
     Right ((ups, st), _preds) -> do
       pairs <- forM ups $ \(v, up) -> do
-        (res, solverWs) <- finalizePolyWithOptions opts (fromUPolytype up)
-        return (v, res, solverWs)
+        let poly = fromUPolytype up
+        if shouldFinalizeTopLevelPoly poly
+          then do
+            (res, solverWs) <- finalizePolyWithOptions opts poly
+            return (v, res, solverWs)
+          else return (v, Right poly, [])
       let warnings = inferWarnings st ++ concatMap (\(_, _, ws) -> ws) pairs
       return $ fmap (, warnings) $ traverse (\(v, res, _) -> fmap (v,) res) pairs
 

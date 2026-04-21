@@ -533,10 +533,11 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
-  describe "ungrounded obligation warnings" $ do
-    it "emits a warning for an ungrounded index obligation" $ do
-      -- i has no bound annotation and no concrete value, so its pred var is
-      -- unconstrained; the obligation i < dim(arr,0) remains ungrounded
+  describe "standalone function obligations" $ do
+    it "defers a standalone index obligation to call sites without warning" $ do
+      -- A top-level function with unconstrained parameters keeps its residual
+      -- obligation on the function scheme. The checker should not warn until a
+      -- concrete call site either proves or violates that obligation.
       let src = BS.unlines
             [ "let arr  = generate [5] (let f [i] = i in f)"
             , "let f [i] = index [i] arr"  -- standalone function, i is free
@@ -548,7 +549,7 @@ spec = describe "gather bounds checking" $ do
           case result of
             Left msg -> expectationFailure ("Expected success: " ++ msg)
             Right (_, warnings) ->
-              warnings `shouldSatisfy` any (isInfixOf "could not verify")
+              warnings `shouldBe` []
 
   describe "parametric index safety" $ do
     it "verifies index safety when generate size matches indexed array size" $ do
