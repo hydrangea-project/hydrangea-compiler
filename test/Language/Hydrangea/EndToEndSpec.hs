@@ -3,20 +3,27 @@
 module Language.Hydrangea.EndToEndSpec (spec) where
 
 import Test.Hspec
-import System.Directory (findExecutable)
+import System.Directory (copyFile, findExecutable)
 import System.Process (readProcessWithExitCode, createProcess, proc, waitForProcess, callProcess)
 import System.Exit (ExitCode(..))
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Text.Printf (printf)
 
-import Language.Hydrangea.Frontend (readDecs, compileToCOptIO, evalDecsFrontend)
+import Language.Hydrangea.Frontend
+  ( readDecs
+  , compileToCOptIO
+  , compileToCOptIOWithPipelineOptionsAndCodegenOptions
+  , evalDecsFrontend
+  )
 import Language.Hydrangea.Interpreter (Value(..))
 import qualified Data.Map as Map
-import Data.List (intercalate, dropWhileEnd)
+import Data.List (intercalate, dropWhileEnd, isInfixOf)
 import Language.Hydrangea.Syntax (Dec(..))
+import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions)
+import Language.Hydrangea.CFGPipeline (PipelineOptions(..), defaultPipelineOptions)
+import Language.Hydrangea.CodegenC (defaultCodegenOptions)
 import System.IO.Temp (withSystemTempDirectory)
 import System.FilePath ((</>))
-import System.Directory (copyFile)
 import Control.Monad (forM_, when)
 
 -- ---------------------------------------------------------------------------
@@ -179,6 +186,47 @@ spec = do
         , "let matElem [i, j] = index () (reduce_generate add 0 [K] (innerGen i j))"
         , "let result = generate [M, N] matElem"
         ]
+
+    it "polyhedral matmul benchmark emits blocked SIMD-friendly C" $ do
+      src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"
+      case readDecs src of
+        Left perr -> expectationFailure $ "Parse error: " ++ perr
+        Right decs -> do
+          let inferOpts = defaultInferOptions { inferSolveRefinements = False }
+              legacyOpts =
+                defaultPipelineOptions
+                  { poEnableTiling = True
+                  , poEnablePolyhedral = False
+                  , poEnableExplicitVectorization = False
+                  , poEnableParallelization = False
+                  }
+              polyOpts =
+                legacyOpts
+                  { poEnablePolyhedral = True
+                  , poEnableExplicitVectorization = True
+                  }
+          legacyC <-
+            compileToCOptIOWithPipelineOptionsAndCodegenOptions
+              inferOpts
+              legacyOpts
+              defaultCodegenOptions
+              False
+              decs
+          polyC <-
+            compileToCOptIOWithPipelineOptionsAndCodegenOptions
+              inferOpts
+              polyOpts
+              defaultCodegenOptions
+              False
+              decs
+          polyC `shouldNotBe` legacyC
+          legacyC `shouldSatisfy` not . isInfixOf "i76_tile_"
+          legacyC `shouldSatisfy` not . isInfixOf "j77_tile_"
+          polyC `shouldSatisfy` isInfixOf "i76_tile_"
+          polyC `shouldSatisfy` isInfixOf "j77_tile_"
+          polyC `shouldSatisfy` isInfixOf "k126_tile_"
+          polyC `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"
+          polyC `shouldSatisfy` isInfixOf "hyd_vec_storeu_f64x4"
 
   -- ---- Scatter / ScatterGenerate -------------------------------------------
 

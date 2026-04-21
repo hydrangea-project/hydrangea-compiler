@@ -52,6 +52,10 @@ defaultPipelineOptions = PipelineOptions
 fixpointOpt :: [Stmt] -> [Stmt]
 fixpointOpt = optimizeStmts2
 
+cleanupProgram :: Program -> Program
+cleanupProgram (Program procs) =
+  Program [proc { procBody = fixpointOpt (procBody proc) } | proc <- procs]
+
 -- | Optimization-only pipeline.
 optimizePipeline2 :: [Stmt] -> [Stmt]
 optimizePipeline2 = optimizePipelineWithTiling True
@@ -68,15 +72,20 @@ optimizePipelineWithTiling enableTiling stmts =
 preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
 preparePolyhedralProgramWithOptions opts (Program procs) =
   Program
-    [ proc { procBody = optimizePipelineWithTiling (poEnableTiling opts) (procBody proc) }
+    [ proc { procBody = optimizePipelineWithTiling enableLegacyTiling (procBody proc) }
     | proc <- procs
     ]
+  where
+    enableLegacyTiling = poEnableTiling opts && not (poEnablePolyhedral opts)
 
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
 vectorizePipelineWithOptions opts prog =
   let prepared = preparePolyhedralProgramWithOptions opts prog
-      optimized = if poEnablePolyhedral opts then polyhedralProgram2 prepared else prepared
+      optimized
+        | poEnablePolyhedral opts && poEnableTiling opts = cleanupProgram (polyhedralTileProgram2 prepared)
+        | poEnablePolyhedral opts = cleanupProgram (polyhedralProgram2 prepared)
+        | otherwise = prepared
   in  vectorizeProgram2WithWidthAndExplicit
         (poVectorWidth opts)
         (poEnableExplicitVectorization opts)

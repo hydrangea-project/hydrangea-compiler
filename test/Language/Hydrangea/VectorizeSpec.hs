@@ -17,6 +17,18 @@ hasRHS p = any go
       SIf _ thn els -> hasRHS p thn || hasRHS p els
       _ -> False
 
+hasVecIndexVar :: C.CVar -> [Stmt] -> Bool
+hasVecIndexVar wanted = any go
+  where
+    go stmt = case stmt of
+      SAssign _ rhs -> case rhs of
+        C.RVecLoad _ (C.AVar v) -> v == wanted
+        C.RVecStore _ (C.AVar v) _ -> v == wanted
+        _ -> False
+      SLoop _ body -> hasVecIndexVar wanted body
+      SIf _ thn els -> hasVecIndexVar wanted thn || hasVecIndexVar wanted els
+      _ -> False
+
 hasLoop :: (LoopSpec -> Bool) -> [Stmt] -> Bool
 hasLoop p = any go
   where
@@ -177,6 +189,31 @@ spec = describe "Vectorize" $ do
     hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) withoutFacts `shouldBe` False
     hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) withFacts `shouldBe` True
     hasRHS (\rhs -> case rhs of C.RVecStore {} -> True; _ -> False) withFacts `shouldBe` True
+
+  it "keeps row-base dense aliases as explicit vector indices" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMap)
+            [ SAssign "flat" (C.RBinOp C.CAdd (C.AVar "row_base") (C.AVar "j"))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "flat"))
+            , SAssign "y" (C.RBinOp C.CAddF (C.AVar "x") (C.AFloat 1.0))
+            , SArrayWrite (C.AVar "out") (C.AVar "flat") (C.AVar "y")
+            ]
+        lowered =
+          vectorizeWithFacts
+            [ ("row_base", C.CTInt64)
+            , ("arr", C.CTArray C.CTDouble)
+            , ("out", C.CTArray C.CTDouble)
+            , ("x", C.CTDouble)
+            , ("y", C.CTDouble)
+            ]
+            [ ("flat", VectorAccessFact (Just "j") False False False)
+            , ("out", VectorAccessFact Nothing False False True)
+            ]
+            [loop]
+    hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) lowered `shouldBe` True
+    hasRHS (\rhs -> case rhs of C.RVecStore {} -> True; _ -> False) lowered `shouldBe` True
+    hasVecIndexVar "flat" lowered `shouldBe` True
 
   it "keeps indirect-access kernels off the explicit vector path even with dense index aliases" $ do
     let loop =

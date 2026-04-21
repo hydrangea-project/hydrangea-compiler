@@ -310,7 +310,7 @@ contiguousVectorIndex accessFacts iter base idx =
     AVar v | v == base -> Just (AVar v)
     AVar v
       | Just fact <- M.lookup v accessFacts
-      , vxfDenseLinearIndexOf fact == Just iter -> Just (AVar base)
+      , vxfDenseLinearIndexOf fact == Just iter -> Just (AVar v)
     _ -> Nothing
 
 arrayAllowsExplicitLoad :: TypeEnv -> AccessFacts -> Atom -> Bool

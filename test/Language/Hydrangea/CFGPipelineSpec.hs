@@ -9,6 +9,7 @@ import Language.Hydrangea.CFGPipeline
   ( PipelineOptions(..)
   , defaultPipelineOptions
   , metalPipelineWithTiling
+  , preparePolyhedralProgramWithOptions
   , pipelineWithOptions
   )
 import Test.Hspec
@@ -78,6 +79,42 @@ spec = describe "CFGPipeline" $ do
         Program [tileProc] = metalPipelineWithTiling True prog
     countLoops (procBody noTileProc) `shouldBe` 1
     countLoops (procBody tileProc) `shouldSatisfy` (> 1)
+
+  it "keeps polyhedral preparation on untiled canonical loops" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+        prog = Program [mkProc "p" [] [loop]]
+        opts =
+          defaultPipelineOptions
+            { poEnableTiling = True
+            , poEnablePolyhedral = True
+            , poEnableParallelization = False
+            }
+        Program [preparedProc] = preparePolyhedralProgramWithOptions opts prog
+    countLoops (procBody preparedProc) `shouldBe` 1
+
+  it "routes tiling through polyhedral scheduling when enabled" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+        prog = Program [mkProc "p" [] [loop]]
+        optsNoPoly =
+          defaultPipelineOptions
+            { poEnableTiling = True
+            , poEnablePolyhedral = False
+            , poEnableExplicitVectorization = False
+            , poEnableParallelization = False
+            }
+        optsPoly =
+          optsNoPoly
+            { poEnablePolyhedral = True
+            }
+        Program [legacyTileProc] = pipelineWithOptions optsNoPoly prog
+        Program [polyTileProc] = pipelineWithOptions optsPoly prog
+    procBody polyTileProc `shouldBe` procBody legacyTileProc
 
 countLoops :: [Stmt] -> Int
 countLoops = sum . map go
