@@ -125,11 +125,10 @@ data InferState = InferState
     --   from generator body expressions.
   , inferWarnings  :: [String]
     -- ^ Non-fatal diagnostic messages (e.g. unverifiable bound annotations).
-  , defBodyEnv     :: Map Var (Var, Exp Range)
-    -- ^ Maps top-level single-parameter function names to their
-    --   @(paramName, bodyExp)@ pair.  Used by 'EMap' and 'EApp' to infer
-    --   output value bounds for non-inline functions without requiring PBound
-    --   annotations.  Only single-parameter definitions are registered.
+  , defBodyEnv     :: Map Var ([Var], Exp Range)
+    -- ^ Maps top-level helper function names to their parameter list and body.
+    --   Used by value-bound propagation to reason about named helper calls
+    --   without requiring inline syntax at every use site.
   , wherePrecondEnv :: Map Var ([Pat Range], RefinePred)
     -- ^ Maps function names to their where-clause preconditions.
     --   Used at call sites to emit proof obligations.
@@ -460,6 +459,17 @@ expectedShapeFromExp (EVec _ elems) = do
   return $ mkTyConsFromVec (replicate (length elems) UTyInt)
 expectedShapeFromExp e = normalizeShapeToTupleOfInts (firstParam e) =<< infer e
 
+-- | Attach the usual shape facts for a freshly-created array.
+--
+-- Every constructor that materializes a new runtime-sized array should agree on
+-- the same zero-safe invariant story: each output dimension equals the
+-- corresponding shape term, and each dimension is non-negative.
+emitArrayShapeFacts :: Var -> [Term] -> Infer ()
+emitArrayShapeFacts arrVar shapeTerms =
+  forM_ (zip [0 ..] shapeTerms) $ \(i, t) -> do
+    emitPred (PEq (TDim arrVar i) t)
+    emitPred (PLe (TConst 0) (TDim arrVar i))
+
 -- | Emit a known fact (hypothesis) into the writer.
 emitHyp :: Pred -> Infer ()
 emitHyp p = tell [Hyp p]
@@ -495,22 +505,38 @@ withValBound v t m = do
   modify (\s -> s { valBoundCtx = old })
   return x
 
+-- | Run an action with an exact scalar value in scope for one variable.
+--
+-- This is used for named helper-call propagation: when a helper is called with
+-- an exact scalar argument such as @shift_by 1 i@, we want the body to see that
+-- parameter as the exact term @1@ rather than only an upper bound like @< 2@.
+withExactScalar :: Var -> Term -> Infer a -> Infer a
+withExactScalar v t m = do
+  emitHyp (PEq (TVar v) t)
+  withBinding v (Forall [] [] (UTyRefine v UTyInt)) m
+
+collectNamedCall :: Exp Range -> Maybe (Var, [Exp Range])
+collectNamedCall = go []
+  where
+    go acc (EApp _ fn arg) = go (arg : acc) fn
+    go acc (EVar _ f) = Just (f, acc)
+    go _ _ = Nothing
+
 -- | Look up the value-bound annotation for a variable, if any.
 lookupValBound :: Var -> Infer (Maybe Term)
 lookupValBound v = gets (M.lookup v . valBoundCtx)
 
--- | Register a top-level single-parameter function's body for later
--- bound-transfer analysis.
-withDefBody :: Var -> Var -> Exp Range -> Infer a -> Infer a
-withDefBody f paramName body m = do
+-- | Register a top-level helper function body for later bound-transfer analysis.
+withDefBody :: Var -> [Var] -> Exp Range -> Infer a -> Infer a
+withDefBody f paramNames body m = do
   old <- gets defBodyEnv
-  modify (\s -> s { defBodyEnv = M.insert f (paramName, body) old })
+  modify (\s -> s { defBodyEnv = M.insert f (paramNames, body) old })
   x <- m
   modify (\s -> s { defBodyEnv = old })
   return x
 
--- | Look up the registered @(paramName, bodyExp)@ for a top-level function.
-lookupDefBody :: Var -> Infer (Maybe (Var, Exp Range))
+-- | Look up the registered parameter list and body for a top-level helper.
+lookupDefBody :: Var -> Infer (Maybe ([Var], Exp Range))
 lookupDefBody v = gets (M.lookup v . defBodyEnv)
 
 -- | Register a where-clause precondition for a function for the duration of
@@ -589,7 +615,13 @@ termsFromIndexExp (EShapeOf _ arrExp) = do
   rank <- shapeArityFromType (firstParam arrExp) sTy'
   arrVar <- maybe freshPredVar return mArrVar
   return [TDim arrVar i | i <- [0 .. rank - 1]]
-termsFromIndexExp e = (: []) <$> termFromExp e
+termsFromIndexExp e = do
+  ty <- infer e
+  ty' <- applyBindings ty
+  let dimVars = extractShapeDimVars ty'
+  if null dimVars
+    then (: []) <$> termFromExp e
+    else pure (map TVar dimVars)
 
 -- | Extract the refinement pred var from each Int component of a shape cons-list type.
 -- Shape types have the form: UTyCons (UTyRefine v0 UTyInt) (UTyCons ...) UTyUnit.
@@ -663,6 +695,48 @@ bvalMax (ExactVal c1) (ExactVal c2) = ExactVal  (TMax c1 c2)
 bvalMax (BoundOf b)   (ExactVal c)  = BoundOf   (TMax b (TAdd c (TConst 1)))
 bvalMax (ExactVal c)  (BoundOf b)   = BoundOf   (TMax (TAdd c (TConst 1)) b)
 
+withHelperArgBounds :: [(Var, BVal)] -> Infer a -> Infer a
+withHelperArgBounds [] m = m
+withHelperArgBounds ((v, bval) : rest) m =
+  let bindNext = withHelperArgBounds rest m
+  in case bval of
+       ExactVal t -> withExactScalar v t bindNext
+       BoundOf t -> withValBound v t bindNext
+
+withHelperTrailingBounds :: [(Var, Term)] -> Infer a -> Infer a
+withHelperTrailingBounds [] m = m
+withHelperTrailingBounds ((v, t) : rest) m =
+  withValBound v t (withHelperTrailingBounds rest m)
+
+inferNamedHelperBValWithArgs :: Var -> [BVal] -> Infer (Maybe BVal)
+inferNamedHelperBValWithArgs f argBounds = do
+  mDefBody <- lookupDefBody f
+  case mDefBody of
+    Just (params, defBody)
+      | length params == length argBounds ->
+          withHelperArgBounds (zip params argBounds) $
+            inferBVal defBody
+    _ -> pure Nothing
+
+inferNamedHelperValBoundWithTrailingBounds :: Exp Range -> [Term] -> Infer (Maybe Term)
+inferNamedHelperValBoundWithTrailingBounds fn trailingBounds =
+  case collectNamedCall fn of
+    Just (f, suppliedArgs) -> do
+      mDefBody <- lookupDefBody f
+      case mDefBody of
+        Just (params, defBody)
+          | length params == length suppliedArgs + length trailingBounds -> do
+              mSuppliedBounds <- mapM inferBVal suppliedArgs
+              case sequence mSuppliedBounds of
+                Just suppliedBounds ->
+                  let (suppliedParams, trailingParams) = splitAt (length suppliedArgs) params
+                  in withHelperArgBounds (zip suppliedParams suppliedBounds) $
+                       withHelperTrailingBounds (zip trailingParams trailingBounds) $
+                         inferValBound defBody
+                Nothing -> pure Nothing
+        _ -> pure Nothing
+    Nothing -> pure Nothing
+
 -- | Conservatively compute a 'BVal' for an integer expression, given the
 -- current 'valBoundCtx'.  Returns 'Nothing' if the bound cannot be determined.
 lookupRefinedScalarTerm :: Var -> Infer (Maybe Term)
@@ -686,6 +760,19 @@ inferBVal expr = case expr of
         mRefined <- lookupRefinedScalarTerm v
         pure $ Just $ ExactVal (fromMaybe (TVar v) mRefined)
   EInt _ n -> return $ Just $ ExactVal (TConst n)
+  EApp _ (EApp _ (EVar _ "max") e1) e2 -> do
+    -- Saturated application of the built-in `max` function.
+    mb1 <- inferBVal e1
+    mb2 <- inferBVal e2
+    return $ bvalMax <$> mb1 <*> mb2
+  EApp _ _ _ ->
+    case collectNamedCall expr of
+      Just (f, args) -> do
+        mArgBounds <- mapM inferBVal args
+        case sequence mArgBounds of
+          Just argBounds -> inferNamedHelperBValWithArgs f argBounds
+          Nothing -> pure Nothing
+      Nothing -> pure Nothing
   EBinOp _ e1 op e2 -> case op of
     Plus  _ -> combine bvalAdd e1 e2
     Minus _ -> combine bvalSub e1 e2
@@ -716,11 +803,6 @@ inferBVal expr = case expr of
     _ -> return Nothing
   EIfThenElse _ _ e1 e2 -> do
     -- Bound of an if-then-else is the max of both branch bounds (conservative).
-    mb1 <- inferBVal e1
-    mb2 <- inferBVal e2
-    return $ bvalMax <$> mb1 <*> mb2
-  EApp _ (EApp _ (EVar _ "max") e1) e2 -> do
-    -- Saturated application of the built-in `max` function.
     mb1 <- inferBVal e1
     mb2 <- inferBVal e2
     return $ bvalMax <$> mb1 <*> mb2
@@ -880,7 +962,6 @@ emitRefineLink r expected actual = do
           emitRefineLink r te1 ta1
           emitRefineLink r te2 ta2
         _ -> return ()
-
 
 -- | Decompose a type into its two pair (or cons-tuple) components.
 -- Handles 'UTyPair', cons-list shapes (@TyCons t1 (TyCons t2 TyUnit)@), and
@@ -1080,12 +1161,7 @@ infer (EGenerate _ shapeExp fn) = do
   _ <- wrange (firstParam shapeExp) $ fty =:= UTyFun sTy' elemTy
   (arrVar, arrTy) <- freshRefined (UTyArray sTy' elemTy)
   shapeTerms <- termsFromIndexExp shapeExp
-  forM_ (zip [0 ..] shapeTerms) $ \(i, t) -> do
-    emitPred (PEq (TDim arrVar i) t)
-    -- Implicit invariant: all generate dimensions are ≥ 1.  Emit as hypothesis
-    -- so the validity checker can use it (e.g., index [0] on a symbolic-size
-    -- array is safe when dim ≥ 1).
-    emitHyp (PLe (TConst 1) (TDim arrVar i))
+  emitArrayShapeFacts arrVar shapeTerms
   -- Emit bounds hypotheses for the generator function's index argument pred vars.
   -- For each dimension i, assert that the index component is in [0, TDim arrVar i).
   -- Pred vars are extracted from the function's argument type (fty'), since after
@@ -1139,7 +1215,12 @@ infer (EGenerate _ shapeExp fn) = do
                 Nothing -> inferBodyBound fn   -- arithmetic fallback (Case 4)
             forM_ mOutBound $ \outBound ->
               emitPred (PEq (TValBoundDim arrVar 0) outBound)
-        [] -> return ()
+        [] ->
+          when (length shapeTerms == 1) $ do
+            let idxBound = TDim arrVar 0
+            mOutBound <- inferNamedHelperValBoundWithTrailingBounds fn [idxBound]
+            forM_ mOutBound $ \outBound ->
+              emitPred (PEq (TValBoundDim arrVar 0) outBound)
   return arrTy
 infer (EReadArray _ shapeExp fileExp) = do
   fTy <- infer fileExp
@@ -1148,8 +1229,7 @@ infer (EReadArray _ shapeExp fileExp) = do
   sTy' <- normalizeShapeToTupleOf (firstParam shapeExp) UTyInt sTy
   (arrVar, arrTy) <- freshRefined (UTyArray sTy' UTyInt)
   shapeTerms <- termsFromIndexExp shapeExp
-  forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
-    emitPred (PEq (TDim arrVar i) t)
+  emitArrayShapeFacts arrVar shapeTerms
   return arrTy
 infer (EReadArrayFloat _ shapeExp fileExp) = do
   fTy <- infer fileExp
@@ -1158,8 +1238,7 @@ infer (EReadArrayFloat _ shapeExp fileExp) = do
   sTy' <- normalizeShapeToTupleOf (firstParam shapeExp) UTyInt sTy
   (arrVar, arrTy) <- freshRefined (UTyArray sTy' UTyFloat)
   shapeTerms <- termsFromIndexExp shapeExp
-  forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
-    emitPred (PEq (TDim arrVar i) t)
+  emitArrayShapeFacts arrVar shapeTerms
   return arrTy
 infer (EWriteArray _ arrExp fileExp) = do
   arrTy <- infer arrExp
@@ -1189,8 +1268,7 @@ infer (EFill _ shapeExp valExp) = do
   elemTy <- infer valExp
   (arrVar, arrTy) <- freshRefined (UTyArray sTy' elemTy)
   shapeTerms <- termsFromIndexExp shapeExp
-  forM_ (zip [0 ..] shapeTerms) $ \(i, t) ->
-    emitPred (PEq (TDim arrVar i) t)
+  emitArrayShapeFacts arrVar shapeTerms
   -- Propagate value bound from the fill value expression.
   mBound <- inferValBound valExp
   forM_ mBound $ \b -> emitPred (PEq (TValBoundDim arrVar 0) b)
@@ -1278,10 +1356,8 @@ infer (EReshape _ shapeExp arrExp) = do
   let termProduct [] = TConst 1
       termProduct (t : ts) = foldl TMul t ts
   emitPred (PEq (termProduct srcTerms) (termProduct outTerms))
-  forM_ outTerms $ \t -> emitPred (PLe (TConst 0) t)
   (arrVar, arrTyOut) <- freshRefined (UTyArray sOutTy' eTy)
-  forM_ (zip [0 ..] outTerms) $ \(i, t) ->
-    emitPred (PEq (TDim arrVar i) t)
+  emitArrayShapeFacts arrVar outTerms
   -- Propagate value bound: reshape rearranges elements without changing values.
   case mArrVar of
     Just sv -> emitPred (PEq (TValBoundDim arrVar 0) (TValBoundDim sv 0))
@@ -1332,19 +1408,12 @@ infer (EMap _ fn arrExp) = do
                   emitHyp (PLt (TVar elemPV) (TValBoundDim srcVar 0))
                 Nothing -> return ()
             _ -> return ()
-          -- Independently attempt to establish the output element bound by
-          -- running inferValBound on the callee's registered definition body
-          -- with the parameter name bounded by the source element bound.
-          -- This covers non-inline functions like `let f x = x+1`.
-          case fn of
-            EVar _ f -> do
-              mDefBody <- lookupDefBody f
-              forM_ mDefBody $ \(paramName, defBody) -> do
-                mOutBound <- withValBound paramName (TValBoundDim srcVar 0) $
-                             inferValBound defBody
-                forM_ mOutBound $ \outBound ->
-                  emitPred (PEq (TValBoundDim arrVar 0) outBound)
-            _ -> return ()
+          -- Independently attempt to establish the output element bound through
+          -- a registered named helper body. This covers direct helpers like
+          -- `f` as well as partial applications such as `shift_by 1`.
+          mOutBound <- inferNamedHelperValBoundWithTrailingBounds fn [TValBoundDim srcVar 0]
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
       return arrTyOut
 infer (EZipWith _ fn arrExp1 arrExp2) = do
   arrTy1 <- infer arrExp1
@@ -1374,7 +1443,12 @@ infer (EZipWith _ fn arrExp1 arrExp2) = do
                            inferBodyBound fn
           forM_ mOutBound $ \outBound ->
             emitPred (PEq (TValBoundDim arrVar 0) outBound)
-        _ -> return ()
+        _ -> do
+          let b1 = TValBoundDim v1 0
+              b2 = TValBoundDim v2 0
+          mOutBound <- inferNamedHelperValBoundWithTrailingBounds fn [b1, b2]
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
       return arrTyOut
     _ -> return arrTyOut
 infer (EReduce _ fn initExp arrExp) = do
@@ -1404,7 +1478,11 @@ infer (EReduce _ fn initExp arrExp) = do
                            inferBodyBound fn
           forM_ mOutBound $ \outBound ->
             emitPred (PEq (TValBoundDim arrVar 0) outBound)
-        _ -> return ()
+        _ -> do
+          let elemBound = TValBoundDim srcVar 0
+          mOutBound <- inferNamedHelperValBoundWithTrailingBounds fn [elemBound, elemBound]
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
       return arrTyOut
 infer (EReduceGenerate r fn initExp shapeExp genFn) =
   infer (EReduce r fn initExp (EGenerate r shapeExp genFn))
@@ -1454,7 +1532,11 @@ infer (EScan _ fn initExp arrExp) = do
                            inferBodyBound fn
           forM_ mOutBound $ \outBound ->
             emitPred (PEq (TValBoundDim arrVar 0) outBound)
-        _ -> return ()
+        _ -> do
+          let elemBound = TValBoundDim srcVar 0
+          mOutBound <- inferNamedHelperValBoundWithTrailingBounds fn [elemBound, elemBound]
+          forM_ mOutBound $ \outBound ->
+            emitPred (PEq (TValBoundDim arrVar 0) outBound)
       return arrTyOut
 infer (EScanInclusive a fn initExp arrExp) =
   infer (EScan a fn initExp arrExp)
@@ -2190,9 +2272,11 @@ inferDecs (Dec r var pats mwhere mty e : rest) = do
   -- and EApp can infer output value bounds for non-inline call sites.  We
   -- extract the parameter name via 'patVar'; if it cannot be extracted (e.g.
   -- PVec with multiple sub-patterns), we skip registration.
-  let registerDef = case pats of
-        [pat] | Just paramName <- patVar pat -> withDefBody var paramName e
-        _                                    -> id
+  let registerDef =
+        let paramNames = mapMaybe patVar pats
+        in if length paramNames == length pats && not (null paramNames)
+             then withDefBody var paramNames e
+             else id
   -- Register where-clause precondition so callers later in this declaration
   -- sequence can emit proof obligations.
   let registerWhere = case mwhere of

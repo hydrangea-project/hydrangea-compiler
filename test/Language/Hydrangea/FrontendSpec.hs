@@ -795,9 +795,26 @@ spec = do
         , "  let w = proj 1 s in"
         , "  index [h - 1, w - 1] arr"
         ]
+    it "accepts zero-sized generate and gather pipelines without warnings" $ do
+      expectDecsNoWarnings $ BS.unlines
+        [ "let idx = generate [0] (let f [i] = i in f)"
+        , "let src = fill [0] 0"
+        , "let main = gather idx src"
+        ]
     it "typechecks the matmul benchmark with solver-backed refinement checking" $ do
       src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"
       expectDecsNoWarnings src
+    it "proves projected-shape helper callback chains without warnings" $ do
+      expectDecsNoWarnings $ BS.unlines
+        [ "let add x y = x + y"
+        , "let src = generate [4, 5] (let cell [i, j] = i + j in cell)"
+        , "let s = shape_of src"
+        , "let h = proj 0 s"
+        , "let w = proj 1 s"
+        , "let rowElem row [i] = index [row, i] src"
+        , "let rowSum [row] = index () (reduce_generate add 0 [w] (rowElem row))"
+        , "let main = generate [h] rowSum"
+        ]
     it "typechecks read_array with 1D shape" $ do
       expectType "read_array [3] \"data.csv\"" (Forall [] [] (TyArray (TyCons TyInt TyUnit) TyInt))
     it "typechecks read_array with 2D shape" $ do

@@ -13,7 +13,7 @@ import Language.Hydrangea.CFGPipeline
   )
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.Frontend (lowerToCFG2WithTypesWithOptions, readDecs)
-import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions)
+import Language.Hydrangea.Infer (defaultInferOptions)
 import Language.Hydrangea.Polyhedral
 import Language.Hydrangea.Tile (tileStmts2)
 import Test.Hspec
@@ -615,14 +615,13 @@ loadPreparedMatmulBenchmarkDiagnostics = do
     Left perr ->
       expectationFailure ("Parse error: " ++ perr) >> pure []
     Right decs -> do
-      let inferOpts = defaultInferOptions { inferSolveRefinements = False }
-          pipelineOpts =
+      let pipelineOpts =
             defaultPipelineOptions
               { poEnableTiling = True
               , poEnablePolyhedral = True
               , poEnableParallelization = True
               }
-      prog <- lowerToCFG2WithTypesWithOptions inferOpts decs
+      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
       pure (collectProgramScopDiagnostics2 (preparePolyhedralProgramWithOptions pipelineOpts prog))
 
 extractedProcNames :: [ScopDiagnostic] -> [C.CVar]

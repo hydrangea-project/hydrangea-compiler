@@ -228,8 +228,7 @@ spec = do
       case readDecs src of
         Left perr -> expectationFailure $ "Parse error: " ++ perr
         Right decs -> do
-          let inferOpts = defaultInferOptions { inferSolveRefinements = False }
-              legacyOpts =
+          let legacyOpts =
                 defaultPipelineOptions
                   { poEnableTiling = True
                   , poEnablePolyhedral = False
@@ -243,14 +242,14 @@ spec = do
                   }
           legacyC <-
             compileToCOptIOWithPipelineOptionsAndCodegenOptions
-              inferOpts
+              defaultInferOptions
               legacyOpts
               defaultCodegenOptions
               False
               decs
           polyC <-
             compileToCOptIOWithPipelineOptionsAndCodegenOptions
-              inferOpts
+              defaultInferOptions
               polyOpts
               defaultCodegenOptions
               False

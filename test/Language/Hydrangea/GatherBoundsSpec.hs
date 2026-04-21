@@ -765,6 +765,62 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
+  describe "named helper bounds propagation" $ do
+
+    it "tracks a named helper through generate for safe gather without warnings" $ do
+      let src = BS.unlines
+            [ "let shift x = x + 1"
+            , "let src   = generate [6] (let g [i] = i in g)"
+            , "let idx   = generate [5] (let f [i] = shift i in f)"
+            , "let main  = gather idx src"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` all (not . isInfixOf "could not verify")
+
+    it "rejects a named helper through generate when the source is too small" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let shift x = x + 1"
+            , "let src   = generate [5] (let g [i] = i in g)"
+            , "let idx   = generate [5] (let f [i] = shift i in f)"
+            , "let main  = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "tracks a curried helper with an exact scalar argument through generate" $ do
+      let src = BS.unlines
+            [ "let shift_by k x = x + k"
+            , "let src   = generate [6] (let g [i] = i in g)"
+            , "let idx   = generate [5] (let f [i] = shift_by 1 i in f)"
+            , "let main  = gather idx src"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Right (_, warnings) ->
+              warnings `shouldSatisfy` all (not . isInfixOf "could not verify")
+
+    it "rejects a curried helper through generate when the source is too small" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let shift_by k x = x + k"
+            , "let src   = generate [5] (let g [i] = i in g)"
+            , "let idx   = generate [5] (let f [i] = shift_by 1 i in f)"
+            , "let main  = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
     it "map with non-inline fn: out-of-bounds caught (f x = x+1, iota 5 vs src [3])" $ do
       -- Phase 4: output bound of map propagated from definition body.
       -- f x = x + 1  over iota 5 gives elements [1..5]; src has only 3 elements → UnsatConstraints.
