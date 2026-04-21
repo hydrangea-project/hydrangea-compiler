@@ -71,13 +71,68 @@ spec = describe "Polyhedral" $ do
             , inner
             ]
         diagnostics = collectProcScopDiagnostics2 (mkProc "p" ["n", "m", "arr", "out"] [outer])
+        isOuterReject diag = case diag of
+          ScopRejected _ [0] (RejectUnsupportedRHS _) -> True
+          _ -> False
+        isInnerScop diag = case diag of
+          ScopExtracted scop -> scRootPath scop == [0, 1]
+          _ -> False
     any isOuterReject diagnostics `shouldBe` True
     any isInnerScop diagnostics `shouldBe` True
-  where
-    isOuterReject diag = case diag of
-      ScopRejected _ [0] (RejectUnsupportedRHS _) -> True
-      _ -> False
 
-    isInnerScop diag = case diag of
-      ScopExtracted scop -> scRootPath scop == [0, 1]
-      _ -> False
+  it "collects simple affine RAW dependences inside a scop" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SAssign "ix" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+      [scop] ->
+        collectScopDependences2 scop `shouldBe`
+          [ PolyhedralDependence
+              { pdKind = PolyDepRAW
+              , pdArray = "arr"
+              , pdSourceStmt = [0, 1]
+              , pdTargetStmt = [0, 2]
+              , pdDirection = PolyDepForward
+              , pdIsLoopCarried = True
+              , pdDistance = Just [1]
+              }
+          ]
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "reifies an identity schedule back into the original loop nest" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+            [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "j"))
+            , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "x")
+            ]
+        loop =
+          SLoop
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SAssign "base" (C.RAtom (C.AVar "i"))
+            , inner
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+      [scop] ->
+        reifyScheduledScop2 (buildIdentitySchedule2 scop) `shouldBe` Just [loop]
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "rewrites nested scop roots without changing surrounding CFG" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+            [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "j"))
+            , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "x")
+            ]
+        outer =
+          SLoop
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SAssign "opaque" (C.RCall "f" [C.AVar "i"])
+            , inner
+            ]
+        proc = mkProc "p" ["n", "m", "arr", "out"] [outer]
+    polyhedralProgram2 (Program [proc]) `shouldBe` Program [proc]

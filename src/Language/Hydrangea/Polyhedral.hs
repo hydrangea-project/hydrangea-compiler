@@ -7,31 +7,42 @@
 -- static-control regions (SCoPs) from serial CFG loop nests and preserves
 -- their schedule structure separately from the executable CFG.
 module Language.Hydrangea.Polyhedral
-  ( AffineExpr(..)
+  ( StmtId
+  , AffineExpr(..)
   , AffineConstraintOp(..)
   , AffineConstraint(..)
   , PolyhedralAccessType(..)
   , PolyhedralAccess(..)
   , PolyhedralStmt(..)
+  , PolyhedralDependenceKind(..)
+  , PolyhedralDependenceDirection(..)
+  , PolyhedralDependence(..)
   , LoopBand(..)
   , ScheduleTree(..)
   , Scop(..)
+  , ScheduledScop(..)
   , ScopRejectReason(..)
   , ScopDiagnostic(..)
   , affineExprFromIndexExpr2
+  , buildIdentitySchedule2
   , collectProcScopDiagnostics2
   , collectProgramScopDiagnostics2
+  , collectScopDependences2
   , extractProcScops2
   , extractProgramScops2
   , polyhedralProgram2
+  , reifyScheduledScop2
   ) where
 
-import Data.List (nub, sort)
+import Control.Applicative ((<|>))
+import Data.List (nub, sort, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Control.Applicative ((<|>))
+import Data.Maybe (fromMaybe)
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..))
+
+type StmtId = [Int]
 
 data AffineExpr = AffineExpr
   { aeTerms :: Map CVar Integer
@@ -59,11 +70,28 @@ data PolyhedralAccess = PolyhedralAccess
   deriving (Eq, Show)
 
 data PolyhedralStmt = PolyhedralStmt
-  { psPath :: [Int]
+  { psPath :: StmtId
   , psDomain :: [AffineConstraint]
   , psReads :: [PolyhedralAccess]
   , psWrites :: [PolyhedralAccess]
   , psStmt :: Stmt
+  }
+  deriving (Eq, Show)
+
+data PolyhedralDependenceKind = PolyDepRAW | PolyDepWAR | PolyDepWAW
+  deriving (Eq, Show)
+
+data PolyhedralDependenceDirection = PolyDepForward | PolyDepBackward | PolyDepUnknown
+  deriving (Eq, Show)
+
+data PolyhedralDependence = PolyhedralDependence
+  { pdKind :: PolyhedralDependenceKind
+  , pdArray :: CVar
+  , pdSourceStmt :: StmtId
+  , pdTargetStmt :: StmtId
+  , pdDirection :: PolyhedralDependenceDirection
+  , pdIsLoopCarried :: Bool
+  , pdDistance :: Maybe [Integer]
   }
   deriving (Eq, Show)
 
@@ -80,17 +108,23 @@ data LoopBand = LoopBand
 data ScheduleTree
   = ScheduleSequence [ScheduleTree]
   | ScheduleLoopBand LoopBand
-  | ScheduleStmtRef [Int]
+  | ScheduleStmtRef StmtId
   deriving (Eq, Show)
 
 data Scop = Scop
   { scProcName :: CVar
-  , scRootPath :: [Int]
+  , scRootPath :: StmtId
   , scSchedule :: ScheduleTree
   , scStatements :: [PolyhedralStmt]
   , scIterators :: [CVar]
   , scParameters :: [CVar]
   , scArrays :: [CVar]
+  }
+  deriving (Eq, Show)
+
+data ScheduledScop = ScheduledScop
+  { ssOriginal :: Scop
+  , ssSchedule :: ScheduleTree
   }
   deriving (Eq, Show)
 
@@ -107,7 +141,7 @@ data ScopDiagnostic
   = ScopExtracted Scop
   | ScopRejected
       { sdProcName :: CVar
-      , sdRootPath :: [Int]
+      , sdRootPath :: StmtId
       , sdReason :: ScopRejectReason
       }
   deriving (Eq, Show)
@@ -119,7 +153,24 @@ data AffineValue
 type AffineEnv = Map CVar AffineValue
 
 polyhedralProgram2 :: Program -> Program
-polyhedralProgram2 = id
+polyhedralProgram2 (Program procs) = Program (map rewriteProc procs)
+  where
+    rewriteProc proc =
+      foldl applyScheduled proc scheduledScops
+      where
+        scheduledScops =
+          reverse . sortOn (scRootPath . ssOriginal) $
+            map buildIdentitySchedule2 (extractProcScops2 proc)
+
+        applyScheduled acc scheduled =
+          fromMaybe acc (applyScheduledScopToProc2 scheduled acc)
+
+buildIdentitySchedule2 :: Scop -> ScheduledScop
+buildIdentitySchedule2 scop =
+  ScheduledScop
+    { ssOriginal = scop
+    , ssSchedule = scSchedule scop
+    }
 
 extractProgramScops2 :: Program -> [Scop]
 extractProgramScops2 = foldMap extractProcScops2 . programProcs
@@ -153,6 +204,35 @@ collectProcScopDiagnostics2 proc = go [] (procBody proc)
         go (path ++ [0]) thn ++ go (path ++ [1]) els
       _ ->
         []
+
+collectScopDependences2 :: Scop -> [PolyhedralDependence]
+collectScopDependences2 scop =
+  [ PolyhedralDependence
+      { pdKind = depKind
+      , pdArray = paArray srcAccess
+      , pdSourceStmt = psPath srcStmt
+      , pdTargetStmt = psPath tgtStmt
+      , pdDirection = depDirection
+      , pdIsLoopCarried = maybe True (any (/= 0)) depDistance
+      , pdDistance = depDistance
+      }
+  | (srcPos, srcStmt) <- orderedStmts
+  , (tgtPos, tgtStmt) <- orderedStmts
+  , srcPos < tgtPos
+  , srcAccess <- psReads srcStmt ++ psWrites srcStmt
+  , tgtAccess <- psReads tgtStmt ++ psWrites tgtStmt
+  , paArray srcAccess == paArray tgtAccess
+  , Just depKind <- [dependenceKindFromAccesses srcAccess tgtAccess]
+  , let (depDirection, depDistance) =
+          analyzeAccessDistance (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
+  ]
+  where
+    stmtMap = M.fromList [(psPath stmt, stmt) | stmt <- scStatements scop]
+    orderedStmts =
+      [ (pos, stmt)
+      | (pos, stmtId) <- zip [0 :: Int ..] (scheduleStmtOrder (scSchedule scop))
+      , Just stmt <- [M.lookup stmtId stmtMap]
+      ]
 
 buildScop :: CVar -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
 buildScop procName rootPath spec body = do
@@ -218,6 +298,12 @@ scheduleTreeVars sched = case sched of
   ScheduleStmtRef {} -> []
   ScheduleLoopBand band ->
     foldMap affineExprVars (lbBounds band) ++ scheduleTreeVars (lbBody band)
+
+scheduleStmtOrder :: ScheduleTree -> [StmtId]
+scheduleStmtOrder sched = case sched of
+  ScheduleSequence xs -> foldMap scheduleStmtOrder xs
+  ScheduleLoopBand band -> scheduleStmtOrder (lbBody band)
+  ScheduleStmtRef stmtId -> [stmtId]
 
 extractLoop
   :: [Int]
@@ -475,3 +561,161 @@ atMay xs n
     go [] _ = Nothing
     go (y : _) 0 = Just y
     go (_ : ys) k = go ys (k - 1)
+
+dependenceKindFromAccesses :: PolyhedralAccess -> PolyhedralAccess -> Maybe PolyhedralDependenceKind
+dependenceKindFromAccesses src tgt = case (paType src, paType tgt) of
+  (PolyWrite, PolyRead) -> Just PolyDepRAW
+  (PolyRead, PolyWrite) -> Just PolyDepWAR
+  (PolyWrite, PolyWrite) -> Just PolyDepWAW
+  _ -> Nothing
+
+analyzeAccessDistance
+  :: [CVar]
+  -> [AffineExpr]
+  -> [AffineExpr]
+  -> (PolyhedralDependenceDirection, Maybe [Integer])
+analyzeAccessDistance iterators srcIdx tgtIdx
+  | length srcIdx /= length tgtIdx = (PolyDepUnknown, Nothing)
+  | otherwise =
+      case foldl step (Just (M.fromList [(iter, 0) | iter <- iterators])) (zip srcIdx tgtIdx) of
+        Nothing -> (PolyDepUnknown, Nothing)
+        Just distancesByIter ->
+          let distances = [M.findWithDefault 0 iter distancesByIter | iter <- iterators]
+          in (classifyDistance distances, Just distances)
+  where
+    step Nothing _ = Nothing
+    step (Just distances) (srcExpr, tgtExpr) =
+      case analyzeAffineDimension iterators srcExpr tgtExpr of
+        DimExact -> Just distances
+        DimUnknown -> Nothing
+        DimShift iter distance ->
+          let existing = M.findWithDefault 0 iter distances
+          in if existing == 0
+               then Just (M.insert iter distance distances)
+               else Nothing
+
+data DimDistance
+  = DimExact
+  | DimShift CVar Integer
+  | DimUnknown
+
+analyzeAffineDimension :: [CVar] -> AffineExpr -> AffineExpr -> DimDistance
+analyzeAffineDimension iterators src tgt
+  | src == tgt = DimExact
+  | srcOtherTerms /= tgtOtherTerms = DimUnknown
+  | srcIterTerms /= tgtIterTerms = DimUnknown
+  | otherwise =
+      case M.toList srcIterTerms of
+        [(iter, coeff)]
+          | coeff /= 0
+          , let distance = aeConstant tgt - aeConstant src
+          , distance `mod` coeff == 0 ->
+              DimShift iter (distance `div` coeff)
+        _ ->
+          DimUnknown
+  where
+    iteratorSet = M.fromList [(iter, ()) | iter <- iterators]
+    (srcIterTerms, srcOtherTerms) = partitionAffineTerms iteratorSet src
+    (tgtIterTerms, tgtOtherTerms) = partitionAffineTerms iteratorSet tgt
+
+partitionAffineTerms :: Map CVar () -> AffineExpr -> (Map CVar Integer, Map CVar Integer)
+partitionAffineTerms iteratorSet expr =
+  M.partitionWithKey (\var _ -> M.member var iteratorSet) (aeTerms expr)
+
+classifyDistance :: [Integer] -> PolyhedralDependenceDirection
+classifyDistance distances
+  | all (>= 0) distances = PolyDepForward
+  | all (<= 0) distances = PolyDepBackward
+  | otherwise = PolyDepUnknown
+
+reifyScheduledScop2 :: ScheduledScop -> Maybe [Stmt]
+reifyScheduledScop2 scheduled =
+  reifyScheduleTree stmtMap (ssSchedule scheduled)
+  where
+    stmtMap =
+      M.fromList
+        [ (psPath stmt, psStmt stmt)
+        | stmt <- scStatements (ssOriginal scheduled)
+        ]
+
+reifyScheduleTree :: Map StmtId Stmt -> ScheduleTree -> Maybe [Stmt]
+reifyScheduleTree stmtMap sched = case sched of
+  ScheduleSequence xs ->
+    fmap concat (mapM (reifyScheduleTree stmtMap) xs)
+  ScheduleLoopBand band -> do
+    bounds <- pure (map affineExprToIndexExpr (lbBounds band))
+    body <- reifyScheduleTree stmtMap (lbBody band)
+    pure
+      [ SLoop
+          LoopSpec
+            { lsIters = lbIters band
+            , lsBounds = bounds
+            , lsExec = lbExec band
+            , lsRed = lbReduction band
+            , lsRole = lbRole band
+            }
+          body
+      ]
+  ScheduleStmtRef stmtId ->
+    pure . pure =<< M.lookup stmtId stmtMap
+
+affineExprToIndexExpr :: AffineExpr -> IndexExpr
+affineExprToIndexExpr expr =
+  simplifyIndexExpr $
+    case terms ++ constantTerm of
+      [] -> IConst 0
+      [single] -> single
+      xs -> foldr1 IAdd xs
+  where
+    terms =
+      [ affineTermToIndexExpr coeff var
+      | (var, coeff) <- M.toAscList (aeTerms expr)
+      , coeff /= 0
+      ]
+    constantTerm
+      | aeConstant expr == 0 = []
+      | otherwise = [IConst (aeConstant expr)]
+
+affineTermToIndexExpr :: Integer -> CVar -> IndexExpr
+affineTermToIndexExpr coeff var
+  | coeff == 1 = IVar var
+  | otherwise = IMul (IConst coeff) (IVar var)
+
+applyScheduledScopToProc2 :: ScheduledScop -> Proc -> Maybe Proc
+applyScheduledScopToProc2 scheduled proc
+  | procName proc /= scProcName (ssOriginal scheduled) = Nothing
+  | otherwise = do
+      replacement <- reifyScheduledScop2 scheduled
+      body' <- replaceStmtRangeAtPath (scRootPath (ssOriginal scheduled)) replacement (procBody proc)
+      pure proc { procBody = body' }
+
+replaceStmtRangeAtPath :: StmtId -> [Stmt] -> [Stmt] -> Maybe [Stmt]
+replaceStmtRangeAtPath [] _ _ = Nothing
+replaceStmtRangeAtPath (ix : rest) replacement stmts = do
+  (prefix, target, suffix) <- splitStmtListAt ix stmts
+  case rest of
+    [] ->
+      pure (prefix ++ replacement ++ suffix)
+    _ -> do
+      target' <- descendIntoStmt rest replacement target
+      pure (prefix ++ (target' : suffix))
+
+splitStmtListAt :: Int -> [Stmt] -> Maybe ([Stmt], Stmt, [Stmt])
+splitStmtListAt ix stmts
+  | ix < 0 = Nothing
+  | otherwise =
+      case splitAt ix stmts of
+        (prefix, target : suffix) -> Just (prefix, target, suffix)
+        _ -> Nothing
+
+descendIntoStmt :: StmtId -> [Stmt] -> Stmt -> Maybe Stmt
+descendIntoStmt path replacement stmt = case (path, stmt) of
+  (ix : rest, SLoop spec body) ->
+    SLoop spec <$> replaceStmtRangeAtPath (ix : rest) replacement body
+  (branch : ix : rest, SIf cond thn els)
+    | branch == 0 ->
+        (\thn' -> SIf cond thn' els) <$> replaceStmtRangeAtPath (ix : rest) replacement thn
+    | branch == 1 ->
+        (\els' -> SIf cond thn els') <$> replaceStmtRangeAtPath (ix : rest) replacement els
+  _ ->
+    Nothing
