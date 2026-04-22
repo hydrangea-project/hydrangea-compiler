@@ -7,6 +7,7 @@
 module Language.Hydrangea.Pretty where
 import Language.Hydrangea.Predicate
 import Language.Hydrangea.Syntax
+import Language.Hydrangea.Util (stripStringQuotes)
 import Text.PrettyPrint.HughesPJClass
 import Prelude hiding ((<>))
 import Data.ByteString.Lazy.Char8 (unpack)
@@ -207,11 +208,6 @@ instance Pretty (UnOperator a) where
   pPrint (Erf    _) = text "erf"
   pPrint (FloatOf _) = text "float_of"
 
--- | Remove the surrounding quotes from a lexer-produced string literal.
-stripStringQuotes :: BS.ByteString -> BS.ByteString
-stripStringQuotes s
-  | BS.length s >= 2 && BS.head s == '"' && BS.last s == '"' = BS.tail (BS.init s)
-  | otherwise = s
 
 instance Pretty (Operator a) where
   pPrint (Plus _) = text "+"

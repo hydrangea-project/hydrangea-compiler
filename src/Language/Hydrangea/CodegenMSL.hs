@@ -803,6 +803,7 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
                     ++ " };",
                   "    return _ret;"
                 ]
+              [] -> error "internal error: generateOutputReturn: no output arrays"
               _ -> ["    return _result_" ++ sanitize (head outputArrs) ++ ";"]
 
 -- | Analyze a single proc for Metal kernel generation.
@@ -1363,7 +1364,9 @@ genMSLKernelFunction
       bounds = C2.lsBounds loopSpec
       -- For multi-dim loops, use a synthetic flat gid variable
       isMultiDim = length iters > 1
-      gidVar = if isMultiDim then "_flat_gid" else head iters
+      gidVar = case iters of
+        []    -> error "internal error: MSL kernel loop spec has no iterators"
+        (i:_) -> if isMultiDim then "_flat_gid" else i
 
       -- Decompose flat gid into individual iterators (row-major order)
       -- iter[n-1] = _flat_gid % bound[n-1]; remaining /= bound[n-1]; ...
@@ -2034,7 +2037,9 @@ genObjCHarnessSrc
              "}"
            ]
     where
-      iter = head (C2.lsIters loopSpec)
+      iter = case C2.lsIters loopSpec of
+        (i:_) -> i
+        []    -> error "internal error: genSingleKernelHarnessSrc: loop spec has no iterators"
       nInputArrays = length inputArrays
       totalBufs = nInputArrays * 2 + length outputArrays + length scalarInputs -- data + shape per input
 
@@ -2501,31 +2506,32 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
           ++ ["((hyd_tuple_t){0})"]
 
     -- Print output from the last kernel only
-    genLastKernelPrint =
-      let (ki, ka) = last indexedKernels
-          p = kPrefix ki
-          ae = kaArrayElemTys ka
-          te = kaTypeEnv ka
-          outArrs = kaOutputArrays ka
-          nIn = length (kaInputArrays ka)
-       in concat
-            [ let sub = nIn * 2 + idx
-                  bufName = p ++ "buf" ++ show sub
-                  sizeVar = p ++ "outN" ++ show sub
-                  elemTy = mslElemTyFor ae te v
-                  fmt = if elemTy == "float" then "%.17g" else "%ld"
-                  cast = if elemTy == "float" then "(double)" else "(long)"
-               in [ "    // Print output: " ++ sanitize v,
-                    "    " ++ elemTy ++ "* " ++ p ++ "out" ++ show sub ++ " = (" ++ elemTy ++ "*)" ++ bufName ++ ".contents;",
-                    "    printf(\"[\");",
-                    "    for (long _pi = 0; _pi < " ++ sizeVar ++ "; _pi++) {",
-                    "        if (_pi > 0) printf(\", \");",
-                    "        printf(\"" ++ fmt ++ "\", " ++ cast ++ p ++ "out" ++ show sub ++ "[_pi]);",
-                    "    }",
-                    "    printf(\"]\\n\");"
-                  ]
-            | (idx, v) <- zip [0 ..] outArrs
-            ]
+    genLastKernelPrint = case reverse indexedKernels of
+      [] -> []
+      ((ki, ka) : _) ->
+        let p = kPrefix ki
+            ae = kaArrayElemTys ka
+            te = kaTypeEnv ka
+            outArrs = kaOutputArrays ka
+            nIn = length (kaInputArrays ka)
+         in concat
+              [ let sub = nIn * 2 + idx
+                    bufName = p ++ "buf" ++ show sub
+                    sizeVar = p ++ "outN" ++ show sub
+                    elemTy = mslElemTyFor ae te v
+                    fmt = if elemTy == "float" then "%.17g" else "%ld"
+                    cast = if elemTy == "float" then "(double)" else "(long)"
+                 in [ "    // Print output: " ++ sanitize v,
+                      "    " ++ elemTy ++ "* " ++ p ++ "out" ++ show sub ++ " = (" ++ elemTy ++ "*)" ++ bufName ++ ".contents;",
+                      "    printf(\"[\");",
+                      "    for (long _pi = 0; _pi < " ++ sizeVar ++ "; _pi++) {",
+                      "        if (_pi > 0) printf(\", \");",
+                      "        printf(\"" ++ fmt ++ "\", " ++ cast ++ p ++ "out" ++ show sub ++ "[_pi]);",
+                      "    }",
+                      "    printf(\"]\\n\");"
+                    ]
+              | (idx, v) <- zip [0 ..] outArrs
+              ]
 
     mslElemTyFor ae te v = case Map.lookup v ae of
       Just elt -> mslTypeName elt

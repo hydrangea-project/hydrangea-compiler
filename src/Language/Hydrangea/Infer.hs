@@ -360,8 +360,14 @@ toUPolytype :: Polytype -> UPolytype
 toUPolytype = fmap unfreeze
 
 -- | Freeze a unification-based type scheme back into a surface polytype.
+-- Crashes with an informative message if any unification variable remains
+-- unresolved (which indicates a bug in the inference engine — callers must
+-- call 'applyBindings' before invoking this function).
 fromUPolytype :: UPolytype -> Polytype
-fromUPolytype = fmap (fromJust . freeze)
+fromUPolytype = fmap $ \ut ->
+  case freeze ut of
+    Just t  -> t
+    Nothing -> error "internal error: fromUPolytype: unresolved unification variable (applyBindings was not called)"
 
 -- | Attach a source range to an error when it does not already carry one.
 addErrorRange :: Range -> TypeError -> TypeError

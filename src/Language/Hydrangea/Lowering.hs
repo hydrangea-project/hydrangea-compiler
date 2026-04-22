@@ -33,6 +33,7 @@ import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
 import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Syntax
+import Language.Hydrangea.Util (stripStringQuotes)
 
 data LowerState = LowerState
   { lsFresh :: !Int
@@ -189,7 +190,7 @@ lowerExp expr = case expr of
   EInt _ n -> pure ([], AInt n)
   EFloat _ f -> pure ([], AFloat f)
   EBool _ b -> pure ([], ABool b)
-  EString _ s -> pure ([], AString (stripQuotes s))
+  EString _ s -> pure ([], AString (stripStringQuotes s))
   EUnit _ -> pure ([], AUnit)
 
   EVar _ v -> do
@@ -2360,11 +2361,6 @@ lowerMathUnOp op e = do
   t <- freshCVar "t"
   registerCType t CTDouble
   pure (s ++ [SAssign t (RUnOp op a)], AVar t)
-
-stripQuotes :: BS.ByteString -> BS.ByteString
-stripQuotes s
-  | BS.head s == '"' && BS.last s == '"' = BS.init (BS.tail s)
-  | otherwise = s
 
 atomToIndexExpr :: Atom -> IndexExpr
 atomToIndexExpr (AVar v) = IVar v

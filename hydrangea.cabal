@@ -48,6 +48,7 @@ library
                    , Language.Hydrangea.CodegenMSL
                    , Language.Hydrangea.Dependence
                    , Language.Hydrangea.ErrorFormat
+                   , Language.Hydrangea.Util
     build-depends:   base  >= 4.17 && < 5
                     , bytestring
                     , ansi-terminal

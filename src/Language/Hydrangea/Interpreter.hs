@@ -30,6 +30,7 @@ import qualified Data.Map as Map
 import Data.Map (Map)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Shape (generateIndicesRowMajor, computeOffsetRowMajor)
+import Language.Hydrangea.Util (stripStringQuotes)
 import Text.PrettyPrint.HughesPJClass
 import Prelude hiding ((<>))
 import System.Environment (getEnv)
@@ -669,7 +670,7 @@ evalExp expr env = case expr of
     vFile <- evalExp fileExpr env
     case vFile of
       VString s -> do
-        let filename = BS.unpack (stripQuotes s)
+        let filename = BS.unpack (stripStringQuotes s)
         contents <- liftIO $ readFile filename
         let values = parseCSVInts contents
             expected = product shape
@@ -685,7 +686,7 @@ evalExp expr env = case expr of
     vFile <- evalExp fileExpr env
     case vFile of
       VString s -> do
-        let filename = BS.unpack (stripQuotes s)
+        let filename = BS.unpack (stripStringQuotes s)
         contents <- liftIO $ readFile filename
         let values = parseCSVFloats contents
             expected = product shape
@@ -700,7 +701,7 @@ evalExp expr env = case expr of
     vFile <- evalExp fileExpr env
     case (vArr, vFile) of
       (VArray _ vals, VString s) -> do
-        let filename = BS.unpack (stripQuotes s)
+        let filename = BS.unpack (stripStringQuotes s)
             values = map (\case VInt i -> show i; _ -> "0") vals
             content = intercalate "," values ++ "\n"
         liftIO $ writeFile filename content
@@ -712,7 +713,7 @@ evalExp expr env = case expr of
     vFile <- evalExp fileExpr env
     case (vArr, vFile) of
       (VArray _ vals, VString s) -> do
-        let filename = BS.unpack (stripQuotes s)
+        let filename = BS.unpack (stripStringQuotes s)
             values = map (\case VFloat f -> show f; _ -> "0") vals
             content = intercalate "," values ++ "\n"
         liftIO $ writeFile filename content
@@ -723,7 +724,7 @@ evalExp expr env = case expr of
     vVar <- evalExp varExpr env
     case vVar of
       VString s -> do
-        let varName = BS.unpack (stripQuotes s)
+        let varName = BS.unpack (stripStringQuotes s)
         val <- liftIO $ getEnv varName
         case readMaybe val of
           Just i -> pure $ VInt i
@@ -734,7 +735,7 @@ evalExp expr env = case expr of
     vVar <- evalExp varExpr env
     case vVar of
       VString s -> do
-        let varName = BS.unpack (stripQuotes s)
+        let varName = BS.unpack (stripStringQuotes s)
         val <- liftIO $ getEnv varName
         pure $ VString (BS.pack val)
       _ -> throwError $ TypeError "get_env_string: argument must be a string"
@@ -749,12 +750,6 @@ evalExp expr env = case expr of
           evalApp vFn (buildStencilAccessor bnd shape vals ndIdx) env
         pure $ VArray shape outVals
       _ -> throwError $ TypeError "stencil: source must be an array"
-
--- | Strip surrounding quotes from a ByteString
-stripQuotes :: ByteString -> ByteString
-stripQuotes s
-  | BS.length s >= 2 && BS.head s == '"' && BS.last s == '"' = BS.tail (BS.init s)
-  | otherwise = s
 
 -- | Project an integer out of a 'VInt', returning 'Nothing' for any other value.
 valueAsInt :: Value -> Maybe Integer
