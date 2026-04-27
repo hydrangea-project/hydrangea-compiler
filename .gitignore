@@ -32,3 +32,10 @@ tmp/
 *out.c
 /demo/*/out
 bench/matmul/gen_mats
+
+# Compiled C reference binaries (built by run_quick.sh / run_sweep.sh)
+bench/*/**_ref
+bench/repa/**/*.ll
+
+# Benchmark sweep results
+bench/results/

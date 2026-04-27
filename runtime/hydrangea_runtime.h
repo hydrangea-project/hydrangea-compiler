@@ -217,7 +217,7 @@ typedef struct {
 
 typedef struct {
     unsigned char* data;
-    int64_t refcount;
+    _Atomic int64_t refcount;
 } hyd_array_storage_t;
 
 typedef struct {

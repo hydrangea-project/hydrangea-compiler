@@ -1,0 +1,98 @@
+(* excitable_live.hyd - Batched excitable-media / cyclic cellular automaton
+   kernel for the SDL live viewer.
+
+   Exports:
+     excitable_frame : [grid_h, grid_w] int -> int -> [grid_h, grid_w] int
+
+   State:
+     each cell stores an integer phase in [0, phase_count).
+
+   Control encoding:
+     control = brush_x
+             + grid_w * (brush_y
+             + grid_h * (brush_phase
+             + phase_count * (brush_on + 2 * substeps)))
+
+   Each exported call:
+     1. optionally paints a phase ramp into the current state
+     2. runs several CCA substeps inside Hydrangea via foldl
+
+   Each substep is kept in two logical stages:
+     - count neighbours already in the successor phase
+     - update the phase field from that count
+
+   The interior update uses a fixed 3x3 stencil and leaves a 1-cell border
+   unchanged, which keeps the main stencil recurrence affine-friendly for
+   future polyhedral schedule/fusion/skew work. *)
+
+let grid_h = 320
+let grid_w = 320
+let phase_count = 24
+let transition_threshold = 1
+let brush_radius = 14
+
+let imod x m = x - ((x / m) * m)
+let abs_i x = if x < 0 then 0 - x else x
+
+let apply_brush state brush_x brush_y brush_phase brush_on =
+  if brush_on = 0 then state else
+    generate [grid_h, grid_w]
+      (let f [i, j] =
+         let old = index [i, j] state in
+         if i = 0 then old
+         else if j = 0 then old
+         else if i >= grid_h - 1 then old
+         else if j >= grid_w - 1 then old
+         else
+           let di = abs_i (i - brush_y) in
+           let dj = abs_i (j - brush_x) in
+           if di * di + dj * dj <= brush_radius * brush_radius
+           then imod (brush_phase + di + dj) phase_count
+           else old
+       in f)
+
+let successor_hits state =
+  generate [grid_h, grid_w]
+    (let f [i, j] =
+       if i = 0 then 0
+       else if j = 0 then 0
+       else if i >= grid_h - 1 then 0
+       else if j >= grid_w - 1 then 0
+       else
+         let cell = index [i, j] state in
+         let want = imod (cell + 1) phase_count in
+         (if index [i - 1, j - 1] state = want then 1 else 0)
+         + (if index [i - 1, j] state = want then 1 else 0)
+         + (if index [i - 1, j + 1] state = want then 1 else 0)
+         + (if index [i, j - 1] state = want then 1 else 0)
+         + (if index [i, j + 1] state = want then 1 else 0)
+         + (if index [i + 1, j - 1] state = want then 1 else 0)
+         + (if index [i + 1, j] state = want then 1 else 0)
+         + (if index [i + 1, j + 1] state = want then 1 else 0)
+      in f)
+
+let cca_step state dummy =
+  let hits = successor_hits state in
+  generate [grid_h, grid_w]
+    (let f [i, j] =
+       let cell = index [i, j] state in
+       if i = 0 then cell
+       else if j = 0 then cell
+       else if i >= grid_h - 1 then cell
+       else if j >= grid_w - 1 then cell
+       else if index [i, j] hits >= transition_threshold
+       then imod (cell + 1) phase_count
+       else cell
+     in f)
+
+let excitable_frame state control =
+  let brush_x = imod control grid_w in
+  let q0 = control / grid_w in
+  let brush_y = imod q0 grid_h in
+  let q1 = q0 / grid_h in
+  let brush_phase = imod q1 phase_count in
+  let q2 = q1 / phase_count in
+  let brush_on = imod q2 2 in
+  let substeps = q2 / 2 in
+  let seeded = apply_brush state brush_x brush_y brush_phase brush_on in
+  foldl cca_step seeded (fill [substeps] 0)

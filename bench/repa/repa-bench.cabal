@@ -1,0 +1,41 @@
+cabal-version:      3.0
+name:               repa-bench
+version:            0.1.0.0
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:          warnings
+    ghc-options:     -fllvm -keep-llvm-files
+    hs-source-dirs:  src
+    exposed-modules: Hydrangea.RepaBench.Common
+                   , Hydrangea.RepaBench.Benchmarks
+                   , Hydrangea.RepaBench.Harness
+                   , Hydrangea.RepaBench.NBodyHarness
+    build-depends:   base >= 4.17 && < 5
+                   , bytestring
+                   , directory
+                   , filepath
+                   , containers
+                   , time
+                   , vector
+                   , repa >= 3.4 && < 4
+    default-language: GHC2021
+    other-extensions: ForeignFunctionInterface
+
+executable repa-bench
+    import:           warnings
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N -fllvm -keep-llvm-files
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:    base >= 4.17 && < 5
+                    , repa-bench
+                    , directory
+                    , filepath
+                    , containers
+                    , time
+                    , vector
+    default-language: GHC2021
+    other-extensions: ForeignFunctionInterface
