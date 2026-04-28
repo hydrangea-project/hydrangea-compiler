@@ -4,6 +4,8 @@
 # Usage:
 #   ./bench/run_quick.sh [<benchmark>] [--warmup=N] [--iters=N] [--cc=<compiler>]
 #
+# Columns: hydrangea (compiled C+OpenMP), repa, accelerate (LLVM CPU), C+OMP reference.
+#
 # Optional env overrides (set before calling):
 #   BS_N, NBODY_N, MAND_W, MAND_H, MAND_ITERS, SPMV_NROWS, SPMV_NCOLS, SPMV_NNZ,
 #   MAT_M, MAT_K, MAT_N, WH_N, WH_BINS, GWH_N, GWH_BINS, GWH_KEEP_PERIOD,
@@ -31,12 +33,21 @@ for arg in "$@"; do
   esac
 done
 
-# Set up LLVM for GHC's LLVM backend (needed to build/run Repa benchmarks).
+# Set up LLVM for GHC's LLVM backend (needed to build/run Repa/Accelerate benchmarks).
 if [ -f ~/use-llvm.sh ]; then
   : "${LDFLAGS:=}" "${CPPFLAGS:=}"
   export LDFLAGS CPPFLAGS
   # shellcheck source=/dev/null
   source ~/use-llvm.sh 15
+fi
+
+# On macOS, the Accelerate LLVM JIT links with -lm which requires the SDK lib
+# path.  Set LIBRARY_PATH so the JIT linker can find the stub.
+if [[ "$(uname -s)" == "Darwin" ]] && [[ -z "${LIBRARY_PATH:-}" ]]; then
+  _sdk_lib="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)/usr/lib" || true
+  if [[ -d "${_sdk_lib:-}" ]]; then
+    export LIBRARY_PATH="$_sdk_lib"
+  fi
 fi
 
 # Find a C compiler that supports -fopenmp.
@@ -85,6 +96,14 @@ if (cd bench/repa && cabal build >/dev/null 2>&1); then
   REPA_BIN="$(cd bench/repa && cabal list-bin repa-bench 2>/dev/null)"
 else
   echo "WARNING: Repa build failed; repa results will show N/A" >&2
+fi
+
+echo "Building Accelerate benchmarks..." >&2
+ACCEL_BIN=""
+if (cd bench/accel && cabal build >/dev/null 2>&1); then
+  ACCEL_BIN="$(cd bench/accel && cabal list-bin accel-bench 2>/dev/null)"
+else
+  echo "WARNING: Accelerate build failed; accel results will show N/A" >&2
 fi
 
 # ---- Utility functions -----------------------------------------------------
@@ -151,6 +170,15 @@ run_repa() {
   echo "${result:-N/A}"
 }
 
+run_accel() {
+  local name="$1"
+  if [ -z "$ACCEL_BIN" ] || [ ! -x "$ACCEL_BIN" ]; then echo "N/A"; return; fi
+  local result
+  result=$("$ACCEL_BIN" bench "$name" --warmup="$WARMUP" --iters="$ITERS" \
+    2>/dev/null | parse_min_ms) || true
+  echo "${result:-N/A}"
+}
+
 run_c() {
   local name="$1"
   local bin="$REPO_ROOT/bench/$name/${name}_ref"
@@ -165,19 +193,20 @@ run_bench() {
   local name="$1" hyd_file="$2" proc="${3:-main}" extra_flags="${4:-}"
   gen_inputs "$name"
   build_c "$name" 2>/dev/null || true
-  local hyd repa c
+  local hyd repa accel c
   hyd=$(run_hydrangea "$name" "$hyd_file" "$proc" "$extra_flags")
   repa=$(run_repa "$name")
+  accel=$(run_accel "$name")
   c=$(run_c "$name")
-  printf "%-35s %15s %15s %15s\n" "$name" "$hyd" "$repa" "$c"
+  printf "%-35s %15s %15s %15s %15s\n" "$name" "$hyd" "$repa" "$accel" "$c"
 }
 
 # ---- Table header ----------------------------------------------------------
 
 printf "\n"
-printf "%-35s %15s %15s %15s\n" "benchmark" "hydrangea(ms)" "repa(ms)" "c+omp(ms)"
-printf "%-35s %15s %15s %15s\n" \
-  "-----------------------------------" "---------------" "---------------" "---------------"
+printf "%-35s %15s %15s %15s %15s\n" "benchmark" "hydrangea(ms)" "repa(ms)" "accel(ms)" "c+omp(ms)"
+printf "%-35s %15s %15s %15s %15s\n" \
+  "-----------------------------------" "---------------" "---------------" "---------------" "---------------"
 
 # ---- Run benchmarks --------------------------------------------------------
 

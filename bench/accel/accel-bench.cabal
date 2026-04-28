@@ -1,0 +1,39 @@
+cabal-version:      3.0
+name:               accel-bench
+version:            0.1.0.0
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:          warnings
+    ghc-options:     -O2 -fllvm -keep-llvm-files
+    hs-source-dirs:  src
+    exposed-modules: Hydrangea.AccelBench.Common
+                   , Hydrangea.AccelBench.Benchmarks
+                   , Hydrangea.AccelBench.Harness
+    build-depends:   base >= 4.17 && < 5
+                   , bytestring
+                   , directory
+                   , filepath
+                   , containers
+                   , time
+                   , vector
+                   , accelerate >= 1.4 && < 2
+                   , accelerate-llvm-native >= 1.4 && < 2
+    default-language: GHC2021
+
+executable accel-bench
+    import:           warnings
+    ghc-options:      -O2 -threaded -rtsopts -with-rtsopts=-N -fllvm -keep-llvm-files
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:    base >= 4.17 && < 5
+                    , accel-bench
+                    , directory
+                    , filepath
+                    , containers
+                    , time
+                    , vector
+    default-language: GHC2021
