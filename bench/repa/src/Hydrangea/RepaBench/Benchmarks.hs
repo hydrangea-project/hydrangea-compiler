@@ -11,6 +11,7 @@ module Hydrangea.RepaBench.Benchmarks
   , runNBodyOutputs
   , runNBodyOutputsIO
   , runNBodyImperativeOutputsIO
+  , runNBodyFusedOutputsIO
   , nBodyChecksum
   ) where
 
@@ -88,9 +89,9 @@ blackScholesKernel
   -> R.Array R.U R.DIM1 Double
   -> R.Array R.U R.DIM1 Double
   -> R.Array R.U R.DIM1 Double
-  -> R.Array R.U R.DIM1 Double
+  -> IO (R.Array R.U R.DIM1 Double)
 blackScholesKernel n spots strikes rates vols times =
-  R.computeUnboxedS $
+  R.computeUnboxedP $
     R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
       let s = spots R.! (R.Z R.:. i)
           k = strikes R.! (R.Z R.:. i)
@@ -176,6 +177,11 @@ runNBodyImperativeOutputsIO :: NBodyInputs -> IO (R.Array R.U R.DIM1 Double, R.A
 {-# NOINLINE runNBodyImperativeOutputsIO #-}
 runNBodyImperativeOutputsIO NBodyInputs{..} =
   nBodyKernelImperativeP nbodyN nbodyXs nbodyYs nbodyZs nbodyMs nbodyVxs nbodyVys nbodyVzs
+
+runNBodyFusedOutputsIO :: NBodyInputs -> IO (R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double)
+{-# NOINLINE runNBodyFusedOutputsIO #-}
+runNBodyFusedOutputsIO NBodyInputs{..} =
+  nBodyKernelFusedP nbodyN nbodyXs nbodyYs nbodyZs nbodyMs nbodyVxs nbodyVys nbodyVzs
 
 nBodyChecksum :: (R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double) -> Double
 {-# NOINLINE nBodyChecksum #-}
@@ -267,25 +273,80 @@ nBodyKernelImperativeP n xs ys zs ms vxs vys vzs = do
                      in go (j + 1) (acc + component dx dy dz * scale)
            in go 0 0.0
 
-mandelbrotKernel :: Int -> Int -> Int -> R.Array R.U R.DIM2 Double
+-- Single-pass fused nbody: computes all three acceleration components in one
+-- O(n²) traversal instead of three separate ones, saving 2 parallel barriers
+-- and reading xs/ys/zs/ms only once per (i,j) pair instead of three times.
+nBodyKernelFusedP
+  :: Int
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> IO (R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double)
+nBodyKernelFusedP n xs ys zs ms vxs vys vzs = do
+  -- Single O(n²) parallel pass: all three acceleration components together
+  accXYZ <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let !xi = xs R.! (R.Z R.:. i)
+          !yi = ys R.! (R.Z R.:. i)
+          !zi = zs R.! (R.Z R.:. i)
+          go !j !ax !ay !az
+            | j >= n = (ax, ay, az)
+            | otherwise =
+                let !dx    = (xs R.! (R.Z R.:. j)) - xi
+                    !dy    = (ys R.! (R.Z R.:. j)) - yi
+                    !dz    = (zs R.! (R.Z R.:. j)) - zi
+                    !r2    = dx*dx + dy*dy + dz*dz + eps2
+                    !r3    = r2 * sqrt r2
+                    !scale = g * (ms R.! (R.Z R.:. j)) / r3
+                in go (j+1) (ax + dx*scale) (ay + dy*scale) (az + dz*scale)
+       in go 0 0.0 0.0 0.0
+  -- Fused velocity + position update: new velocity, then new position
+  newVsXYZ <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (ax, ay, az) = accXYZ R.! (R.Z R.:. i)
+       in ( (vxs R.! (R.Z R.:. i)) + ax * dt
+          , (vys R.! (R.Z R.:. i)) + ay * dt
+          , (vzs R.! (R.Z R.:. i)) + az * dt )
+  newXs <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (vx', _, _) = newVsXYZ R.! (R.Z R.:. i)
+       in (xs R.! (R.Z R.:. i)) + vx' * dt
+  newYs <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (_, vy', _) = newVsXYZ R.! (R.Z R.:. i)
+       in (ys R.! (R.Z R.:. i)) + vy' * dt
+  newZs <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (_, _, vz') = newVsXYZ R.! (R.Z R.:. i)
+       in (zs R.! (R.Z R.:. i)) + vz' * dt
+  pure (newXs, newYs, newZs)
+  where
+    eps2 = 0.01
+    g    = 6.674e-11
+    dt   = 0.01
+
+mandelbrotKernel :: Int -> Int -> Int -> IO (R.Array R.U R.DIM2 Double)
 mandelbrotKernel width height iters =
-  R.computeUnboxedS $
+  R.computeUnboxedP $
     R.fromFunction (R.Z R.:. width R.:. height) $ \(R.Z R.:. px R.:. py) ->
       let w = fromIntegral width
           h = fromIntegral height
           cx = (-2.5) + 3.5 * fromIntegral px / (w - 1.0)
           cy = (-1.0) + 2.0 * fromIntegral py / (h - 1.0)
-          step ((re, im), count) _ =
-            let re2 = re * re
-                im2 = im * im
-                re' = re2 - im2 + cx
-                im' = 2.0 * re * im + cy
-             in ((re', im'), count + 1)
-          dummy =
-            R.fromFunction (R.Z R.:. iters) $
-              const (((0.0 :: Double), (0.0 :: Double)), 0 :: Int)
-          finalState = R.foldAllS step ((0.0, 0.0), 0) dummy
-       in fromIntegral (snd finalState)
+          -- Direct tail-recursive loop: matches foldl_while semantics.
+          -- Check |z|^2 > 4.0 before each update; break on escape.
+          go !re !im !count
+            | count >= iters        = count
+            | re*re + im*im > 4.0   = count
+            | otherwise =
+                let !re' = re*re - im*im + cx
+                    !im' = 2.0*re*im + cy
+                in go re' im' (count + 1)
+       in fromIntegral (go 0.0 0.0 0)
 
 spmvKernel
   :: Int
@@ -293,17 +354,18 @@ spmvKernel
   -> R.Array R.U R.DIM1 Double
   -> R.Array R.U R.DIM1 Int
   -> R.Array R.U R.DIM1 Double
-  -> R.Array R.U R.DIM1 Double
+  -> IO (R.Array R.U R.DIM1 Double)
 spmvKernel nrows rowPtr values colIdx x =
-  R.computeUnboxedS $
+  R.computeUnboxedP $
     R.fromFunction (R.Z R.:. nrows) $ \(R.Z R.:. i) ->
       let rowStart = rowPtr R.! (R.Z R.:. i)
           rowEnd = rowPtr R.! (R.Z R.:. (i + 1))
-       in sumAll $
-            R.fromFunction (R.Z R.:. (rowEnd - rowStart)) $ \(R.Z R.:. k) ->
-              let kk = rowStart + k
-                  col = colIdx R.! (R.Z R.:. kk)
-               in values R.! (R.Z R.:. kk) * x R.! (R.Z R.:. col)
+          go !acc !k
+            | k >= rowEnd = acc
+            | otherwise =
+                let col = colIdx R.! (R.Z R.:. k)
+                 in go (acc + values R.! (R.Z R.:. k) * x R.! (R.Z R.:. col)) (k + 1)
+       in go 0.0 rowStart
 
 matMulKernel
   :: Int
@@ -311,13 +373,14 @@ matMulKernel
   -> Int
   -> R.Array R.U R.DIM2 Double
   -> R.Array R.U R.DIM2 Double
-  -> R.Array R.U R.DIM2 Double
+  -> IO (R.Array R.U R.DIM2 Double)
 matMulKernel m k n a b =
-  R.computeUnboxedS $
+  R.computeUnboxedP $
     R.fromFunction (R.Z R.:. m R.:. n) $ \(R.Z R.:. i R.:. j) ->
-      sumAll $
-        R.fromFunction (R.Z R.:. k) $ \(R.Z R.:. t) ->
-          a R.! (R.Z R.:. i R.:. t) * b R.! (R.Z R.:. t R.:. j)
+      let go !acc !t
+            | t >= k    = acc
+            | otherwise = go (acc + a R.! (R.Z R.:. i R.:. t) * b R.! (R.Z R.:. t R.:. j)) (t + 1)
+       in go 0.0 0
 
 softmaxKernel
   :: Int
@@ -423,19 +486,20 @@ cooCsrBuildKernel nrows ncols nnz dup =
         collapse [] = error "empty group"
         collapse xs@((k, r, c, _) : _) = (k, r, c, sum [v | (_, _, _, v) <- xs])
 
-graphMessagesKernel :: Int -> Int -> R.Array R.U R.DIM1 Int
-graphMessagesKernel n degree =
+graphMessagesKernel :: Int -> Int -> IO (R.Array R.U R.DIM1 Int)
+graphMessagesKernel n degree = do
   let nnz = n * degree
-      nodeVals = R.computeUnboxedS $ R.fromFunction (R.Z R.:. n) (\(R.Z R.:. j) -> j + 1)
-      messages = R.computeUnboxedS $ R.fromFunction (R.Z R.:. nnz) $ \(R.Z R.:. k) ->
-        let dst = k `div` degree
-            edgeVal = k + 1
-         in edgeVal * (nodeVals R.! (R.Z R.:. dst))
-   in R.computeUnboxedS $
-        R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
-          sumAll $
-            R.fromFunction (R.Z R.:. degree) $ \(R.Z R.:. j) ->
-              messages R.! (R.Z R.:. (i * degree + j))
+  nodeVals <- R.computeUnboxedP $ R.fromFunction (R.Z R.:. n) (\(R.Z R.:. j) -> j + 1)
+  messages <- R.computeUnboxedP $ R.fromFunction (R.Z R.:. nnz) $ \(R.Z R.:. k) ->
+    let dst = k `div` degree
+        edgeVal = k + 1
+     in edgeVal * (nodeVals R.! (R.Z R.:. dst))
+  R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let go !acc !j
+            | j >= degree = acc
+            | otherwise   = go (acc + messages R.! (R.Z R.:. (i * degree + j))) (j + 1)
+       in go 0 0
 
 voxelRasterizationKernel :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
 voxelRasterizationKernel n nx ny nz keepPeriod =
@@ -520,7 +584,7 @@ runBlackScholes = do
   rates <- vecFromVector <$> readCSVDoubles "bench/blackscholes/rates.csv"
   vols <- vecFromVector <$> readCSVDoubles "bench/blackscholes/vols.csv"
   times <- vecFromVector <$> readCSVDoubles "bench/blackscholes/times.csv"
-  let result = blackScholesKernel n spots strikes rates vols times
+  result <- blackScholesKernel n spots strikes rates vols times
   writeCSVDoubles "bench/blackscholes/out.csv" (vecToVector n result)
 
 runNBody :: IO ()
@@ -544,7 +608,7 @@ runMandelbrot = do
   width <- readEnvInt "MAND_W"
   height <- readEnvInt "MAND_H"
   iters <- readEnvInt "MAND_ITERS"
-  let result = mandelbrotKernel width height iters
+  result <- mandelbrotKernel width height iters
   writeCSVDoubles2D "bench/mandelbrot/out.csv" width height (matToVector width height result)
 
 runSpMV :: IO ()
@@ -556,7 +620,7 @@ runSpMV = do
   colIdx <- vecFromVector <$> readCSVInts "bench/spmv/col_idx.csv"
   rowPtr <- vecFromVector <$> readCSVInts "bench/spmv/row_ptr.csv"
   x <- vecFromVector <$> readCSVDoubles "bench/spmv/x.csv"
-  let result = spmvKernel nrows rowPtr values colIdx x
+  result <- spmvKernel nrows rowPtr values colIdx x
   writeCSVDoubles "bench/spmv/out.csv" (vecToVector nrows result)
 
 runMatMul :: IO ()
@@ -566,7 +630,7 @@ runMatMul = do
   n <- readEnvInt "MAT_N"
   a <- matFromVector m k <$> readCSVDoubles "bench/matmul/matA.csv"
   b <- matFromVector k n <$> readCSVDoubles "bench/matmul/matB.csv"
-  let result = matMulKernel m k n a b
+  result <- matMulKernel m k n a b
   writeCSVDoubles2D "bench/matmul/out.csv" m n (matToVector m n result)
 
 runSoftmax :: IO ()
@@ -617,7 +681,7 @@ runGraphMessages :: IO ()
 runGraphMessages = do
   n <- readEnvInt "GRAPH_NODES"
   degree <- readEnvInt "GRAPH_DEGREE"
-  let result = graphMessagesKernel n degree
+  result <- graphMessagesKernel n degree
   print (R.sumAllS result)
 
 runVoxelRasterization :: IO ()
@@ -660,7 +724,7 @@ runBenchmarkByNameTimed opts name = case name of
   _ -> die $ "no timed harness for benchmark: " ++ name
 
 timedBlackScholes :: TimingOptions -> IO ()
-timedBlackScholes opts = runTimingHarness "main" opts load run R.sumAllS
+timedBlackScholes opts = runTimingHarnessIO "main" opts load run R.sumAllS
   where
     load = do
       n      <- readEnvInt "BS_N"
@@ -674,10 +738,10 @@ timedBlackScholes opts = runTimingHarness "main" opts load run R.sumAllS
       blackScholesKernel n spots strikes rates vols times
 
 timedNBody :: TimingOptions -> IO ()
-timedNBody opts = runTimingHarnessIO "main" opts loadNBodyInputs runNBodyOutputsIO nBodyChecksum
+timedNBody opts = runTimingHarnessIO "main" opts loadNBodyInputs runNBodyFusedOutputsIO nBodyChecksum
 
 timedMandelbrot :: TimingOptions -> IO ()
-timedMandelbrot opts = runTimingHarness "main" opts load run R.sumAllS
+timedMandelbrot opts = runTimingHarnessIO "main" opts load run R.sumAllS
   where
     load = do
       w <- readEnvInt "MAND_W"
@@ -687,7 +751,7 @@ timedMandelbrot opts = runTimingHarness "main" opts load run R.sumAllS
     run (w, h, i) = mandelbrotKernel w h i
 
 timedSpMV :: TimingOptions -> IO ()
-timedSpMV opts = runTimingHarness "main" opts load run R.sumAllS
+timedSpMV opts = runTimingHarnessIO "main" opts load run R.sumAllS
   where
     load = do
       nrows  <- readEnvInt "SPMV_NROWS"
@@ -700,7 +764,7 @@ timedSpMV opts = runTimingHarness "main" opts load run R.sumAllS
       spmvKernel nrows rowPtr values colIdx x
 
 timedMatMul :: TimingOptions -> IO ()
-timedMatMul opts = runTimingHarness "main" opts load run R.sumAllS
+timedMatMul opts = runTimingHarnessIO "main" opts load run R.sumAllS
   where
     load = do
       m <- readEnvInt "MAT_M"
@@ -746,7 +810,7 @@ timedCooCsrBuild opts =
 
 timedGraphMessages :: TimingOptions -> IO ()
 timedGraphMessages opts =
-  runTimingHarness "main" opts load run (fromIntegral . R.sumAllS)
+  runTimingHarnessIO "main" opts load run (fromIntegral . R.sumAllS)
   where
     load = do
       n      <- readEnvInt "GRAPH_NODES"

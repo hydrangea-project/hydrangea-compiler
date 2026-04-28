@@ -1,10 +1,9 @@
 /* bench/mandelbrot/mandelbrot_ref.c
- * Mandelbrot iteration benchmark (no escape detection) — C+OpenMP reference.
+ * Mandelbrot escape-iteration benchmark — C+OpenMP reference.
  *
- * Matches the Hydrangea and Repa versions exactly: for each pixel, iterate
- * MAND_ITERS complex squaring steps unconditionally and return the iteration
- * count (which is always MAND_ITERS).  The kernel work is the complex
- * arithmetic itself, not the escape test.
+ * Matches the Hydrangea (foldl_while) and Repa versions: for each pixel,
+ * iterate until |z|^2 > 4.0 (checked before each update) or MAND_ITERS
+ * steps complete.  Returns the iteration count at which escape occurred.
  *
  * Environment variables:
  *   MAND_W       -- image width   (required)
@@ -39,6 +38,7 @@ static double mandelbrot_run_once(void *vdata)
             for (int k = 0; k < ITERS; k++) {
                 double re2 = re * re;
                 double im2 = im * im;
+                if (re2 + im2 > 4.0) break;  /* escape: check before update */
                 double re_new = re2 - im2 + cx;
                 double im_new = 2.0 * re * im + cy;
                 re = re_new;

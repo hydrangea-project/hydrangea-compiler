@@ -1,6 +1,7 @@
-(* Mandelbrot set benchmark (foldl iteration version with actual complex iteration).
-   For each pixel (px, py) in [width x height], computes the escape iteration count
-   by folding over a dummy array. State is ((re, im), count): a nested pair.
+(* Mandelbrot set benchmark (foldl_while iteration version with early escape).
+   For each pixel (px, py) in [width x height], computes the escape iteration
+   count using foldl_while: iteration stops as soon as |z|^2 > 4.0.
+   State is ((re, im), count): a nested pair.
 
    Parameterized via environment variables:
      MAND_W       -- image width
@@ -16,12 +17,16 @@ let w_f = float_of width
 let h_f = float_of height
 
 (* For each pixel, fold over [iters] steps accumulating ((re,im), count).
-   The fold function updates the complex state; we only count escaped steps
-   as a proxy (full escape detection needs conditionals, deferred for now). *)
+   Predicate continues while |z|^2 <= 4.0; exits early as soon as z escapes. *)
 let mandelbrot_pixel cx cy =
   let init_state = ((0.0, 0.0), 0) in
   let final_state =
-    foldl
+    foldl_while
+      (fn acc =>
+        let xy = fst acc in
+        let re = fst xy in
+        let im = snd xy in
+        re *. re +. im *. im <=. 4.0)
       (fn acc _ =>
         let xy    = fst acc in
         let re    = fst xy in
