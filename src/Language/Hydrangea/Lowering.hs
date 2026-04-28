@@ -513,6 +513,13 @@ lowerExp expr = case expr of
     i <- freshIterVar "i"
     elem' <- freshCVar "elem"
     val <- freshCVar "val"
+    -- Register the element type of elem' from the source array so that
+    -- inlineScalarFn can correctly handle index-pattern functions applied
+    -- to scalar-element arrays (e.g. map over sort_indices output).
+    arrTy <- ctypeOfAtom aa
+    case arrTy of
+      CTArray et -> registerCType elem' et
+      _          -> pure ()
     bodyStmts <- inlineScalarFn fnExp elem' val
     valTy <- ctypeOfAtom (AVar val)
     registerCType arr (CTArray valTy)
@@ -2003,7 +2010,13 @@ handleApp fn arg = case fn of
         (sa, aa) <- lowerExp arg
         case pats of
           (pat1:restPats) -> do
-            bindStmts <- bindPatAtom pat1 aa
+            -- Use bindAppliedPat (not bindPatAtom) so that a PVec [p]
+            -- pattern applied to a CTInt64 atom correctly wraps the scalar
+            -- in a 1-element tuple before projecting.  This matches how
+            -- multi-arg application sites (lines ~2046, ~2066) work, and
+            -- is necessary when a map over sort_indices output calls a
+            -- function with an index-pattern ([i]) parameter.
+            bindStmts <- bindAppliedPat pat1 arg aa
             if null restPats
               then do
                 (sb, ab) <- lowerExp body
@@ -2694,6 +2707,12 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
     mFn <- lookupFn name
     case mFn of
       Just ([PVar _ x], body) -> do
+        -- Propagate paramVar's type to x before lowering the body so that
+        -- index-pattern functions applied to x inside (e.g. `row_of x` where
+        -- row_of expects [i]) can correctly determine whether to wrap the
+        -- argument in a tuple.
+        paramTy <- ctypeOfAtom (AVar paramVar)
+        when (paramTy /= CTUnknown) $ registerCType x paramTy
         (stmts, atom) <- lowerExp body
         px <- freshCVar "p"
         let stmts' = renameVarInStmts x px stmts
@@ -2704,6 +2723,8 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
         bindParam <- bindCopyVar px (AVar paramVar)
         pure $ bindParam ++ stmts' ++ [SAssign resultVar (RAtom atom')]
       Just ([PBound _ x _], body) -> do
+        paramTy <- ctypeOfAtom (AVar paramVar)
+        when (paramTy /= CTUnknown) $ registerCType x paramTy
         (stmts, atom) <- lowerExp body
         px <- freshCVar "p"
         let stmts' = renameVarInStmts x px stmts

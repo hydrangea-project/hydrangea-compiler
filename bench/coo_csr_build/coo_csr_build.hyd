@@ -34,33 +34,29 @@ let val_of [i] =
   let g = group_of [i] in
   (g * 13) + i + 1
 
-let rows = generate [nnz] row_of
-let cols = generate [nnz] col_of
-let vals = generate [nnz] val_of
-
-let packed_keys =
-  generate [nnz]
-    (let f [i] = index [i] rows * ncols + index [i] cols in f)
-
-let perm = sort_indices packed_keys
-
-let sorted_rows = gather perm rows
-let sorted_cols = gather perm cols
-let sorted_vals = gather perm vals
-
-let canonical = coo_sum_duplicates nrows ncols nnz sorted_rows sorted_cols sorted_vals
-
-let csr =
-  csr_from_sorted_coo
-    canonical.nrows
-    canonical.ncols
-    canonical.nnz
-    canonical.rows
-    canonical.cols
-    canonical.vals
-
-let row_ptr_sum = index () (reduce (+) 0 csr.row_ptr)
-let col_idx_sum = index () (reduce (+) 0 csr.col_idx)
-let vals_sum = index () (reduce (+) 0 csr.vals)
-
-let main = row_ptr_sum + col_idx_sum + vals_sum + canonical.nnz
+let main =
+  let rows = generate [nnz] row_of in
+  let cols = generate [nnz] col_of in
+  let vals = generate [nnz] val_of in
+  let packed_keys =
+    generate [nnz]
+      (let f [i] = row_of [i] * ncols + col_of [i] in f)
+  in
+  let perm = sort_indices packed_keys in
+  let sorted_rows = gather perm rows in
+  let sorted_cols = gather perm cols in
+  let sorted_vals = gather perm vals in
+  let canonical = coo_sum_duplicates nrows ncols nnz sorted_rows sorted_cols sorted_vals in
+  let csr =
+    csr_from_sorted_coo
+      canonical.nrows
+      canonical.ncols
+      canonical.nnz
+      canonical.rows
+      canonical.cols
+      canonical.vals
+  in
+  index () (reduce (+) 0 csr.row_ptr) +
+  index () (reduce (+) 0 csr.col_idx) +
+  index () (reduce (+) 0 csr.vals) +
+  canonical.nnz

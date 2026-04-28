@@ -12,34 +12,34 @@ let n = get_env_int "GRAPH_NODES"
 let degree = get_env_int "GRAPH_DEGREE"
 let nnz = n * degree
 
-let imod x m = x - ((x / m) * m)
-
-let offsets =
-  generate [n + 1]
-    (let f [i] = i * degree in f)
-
-let dsts =
-  generate [nnz]
-    (let f [i] = i / degree in f)
-
-let edge_vals =
-  generate [nnz]
-    (let f [i] = i + 1 in f)
-
-let node_vals =
-  generate [n]
-    (let f [i] = i + 1 in f)
-
-let dst_features =
-  generate [nnz]
-    (let f [i] =
-      let dst = index [i] dsts in
-      check_index [dst] 0 node_vals in f)
-
-let messages =
-  zipwith (let mul x y = x * y in mul) edge_vals dst_features
-
-let node_out =
-  segmented_reduce (let add acc x = acc + x in add) 0 offsets messages
-
-let main = index () (reduce (+) 0 node_out)
+let main =
+  let offsets =
+    generate [n + 1]
+      (let f [i] = i * degree in f)
+  in
+  let dsts =
+    generate [nnz]
+      (let f [i] = i / degree in f)
+  in
+  let edge_vals =
+    generate [nnz]
+      (let f [i] = i + 1 in f)
+  in
+  let node_vals =
+    generate [n]
+      (let f [i] = i + 1 in f)
+  in
+  let dst_features =
+    generate [nnz]
+      (let f [i] =
+        let dst = index [i] dsts in
+        index [dst] node_vals
+      in f)
+  in
+  let messages =
+    zipwith (let mul x y = x * y in mul) edge_vals dst_features
+  in
+  let node_out =
+    segmented_reduce (let add acc x = acc + x in add) 0 offsets messages
+  in
+  index () (reduce (+) 0 node_out)
