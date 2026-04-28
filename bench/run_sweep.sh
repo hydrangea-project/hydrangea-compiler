@@ -116,6 +116,7 @@ run_hydrangea() {
   # Hydrangea's benchmark harness writes timing to stderr; merge with stdout for parsing.
   result=$(cabal run hydrangea-compiler -- \
     --cc="$BENCH_CC" \
+    --tiling --polyhedral \
     $extra_flags \
     --benchmark="$proc" \
     --bench-warmup="$WARMUP" --bench-iters="$ITERS" \

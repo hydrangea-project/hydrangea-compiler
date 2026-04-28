@@ -34,9 +34,11 @@ spec = describe "Parallelize" $ do
       _ -> expectationFailure "Expected a single parallelized map loop"
 
   it "uses procArrayFacts to parallelize conservative LoopMap bodies" $ do
-    -- The fallback path sees two opaque reads from the same source array and
-    -- stays conservative. Procedure-level array facts recover the original
-    -- map-like meaning: read-only input, fresh write-once output.
+    -- After the read-read dependence fix, the fallback path no longer treats
+    -- two opaque reads from the same source array as blocking (reads never
+    -- create races).  Both the fallback path and the fact-guided path now
+    -- parallelize this loop; the difference is that the fact-guided path can
+    -- handle loops where the fallback would block on a true write hazard.
     let loop =
           SLoop
             (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
@@ -53,8 +55,8 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case parallelizeStmts2 [loop] of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
-      _ -> expectationFailure "Expected a single conservative loop"
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+      _ -> expectationFailure "Expected a single parallelized loop"
     case procBody (parallelizeProc2 proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
       _ -> expectationFailure "Expected a single fact-parallelized loop"

@@ -31,6 +31,8 @@ module Language.Hydrangea.Parallelize
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Set (Set)
+import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..))
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGTyping (recoverProcTypeEnv2)
@@ -43,6 +45,7 @@ import Language.Hydrangea.Dependence
   ( findDependences2
   , ArrayAccess2(..)
   , AccessType2(..)
+  , Dependence2(..)
   , depDirection2
   , depIsLoopCarried2
   , DependenceDirection2(..)
@@ -139,22 +142,72 @@ collectLoopArrayUsage = foldl' record M.empty . extractAccesses2
 --
 -- * the loop has a parallelizable trip count,
 -- * no loop-carried non-forward dependence is found among the body's
---   array accesses, and
--- * no array is both read and written inside the body.
+--   array accesses (read-read pairs are excluded — they are never blocking),
+-- * no array is both read and written inside the body, and
+-- * no scalar variable exhibits a loop-carried mutation pattern — unless the
+--   loop is a 'LoopReduction', whose accumulator is intentionally loop-carried
+--   and handled by the OpenMP reduction clause.
 passesConservativeDependenceCheck :: LoopSpec -> [Stmt] -> Bool
 passesConservativeDependenceCheck spec body =
   isParallelTripCount2 (loopTripCount2 spec)
   && not hasBlockingDependence
   && not hasReadWriteHazard
+  && (lsRole spec == LoopReduction || not (hasScalarCarriedDep spec body))
   where
     accesses = extractAccesses2 body
     deps     = findDependences2 accesses
     usage    = collectLoopArrayUsage body
 
+    -- Read-read dependences never block parallelism; only consider pairs
+    -- where at least one access is a write.
+    isWriteAccess at = at == Write2 || at == ReadWrite2
+    hasWriteEnd d    = isWriteAccess (aa2AccessType (depSource2 d))
+                    || isWriteAccess (aa2AccessType (depTarget2 d))
+
     hasBlockingDependence =
-      any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward) deps
+      any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward && hasWriteEnd d) deps
     hasReadWriteHazard =
       any (\u -> lauReads u && lauWrites u) (M.elems usage)
+
+-- | Returns 'True' when the top-level body of a loop contains a scalar
+-- variable that is both (a) read before it is first assigned at that level
+-- AND (b) also assigned somewhere in the body — the hallmark of a
+-- loop-carried accumulator (e.g. a prefix-sum @acc@).
+--
+-- Variables that are only read from the outer scope (loop-invariant) satisfy
+-- (a) but not (b), so they are correctly excluded.  Loop iterator variables
+-- (from 'lsIters') are treated as pre-initialised and never trigger the check.
+-- Inner loop and conditional bodies are not recursed into.
+hasScalarCarriedDep :: LoopSpec -> [Stmt] -> Bool
+hasScalarCarriedDep spec body = not (S.null (rbw `S.intersection` writtenInBody))
+  where
+    initWritten :: Set CVar
+    initWritten = S.fromList (lsIters spec)
+
+    -- rbw: read before write at the top level; writtenInBody: all SAssign targets
+    (rbw, _, writtenInBody) = foldl stepStmt (S.empty, initWritten, S.empty) body
+
+    stepStmt :: (Set CVar, Set CVar, Set CVar) -> Stmt -> (Set CVar, Set CVar, Set CVar)
+    stepStmt (rbw0, seenWritten, wib) stmt = case stmt of
+      SAssign v rhs ->
+        let used = atomsInRhs rhs `S.difference` seenWritten
+        in  (rbw0 `S.union` used, S.insert v seenWritten, S.insert v wib)
+      SArrayWrite _ idx val ->
+        let used = S.fromList (atomVars idx ++ atomVars val) `S.difference` seenWritten
+        in  (rbw0 `S.union` used, seenWritten, wib)
+      -- Inner loops and conditionals are not recursed into; their scalar
+      -- uses are not loop-carried at the outer level.
+      _             -> (rbw0, seenWritten, wib)
+
+    atomsInRhs :: RHS -> Set CVar
+    atomsInRhs (RBinOp _ a b) = S.fromList (atomVars a ++ atomVars b)
+    atomsInRhs (RUnOp  _ a)   = S.fromList (atomVars a)
+    atomsInRhs (RAtom    a)   = S.fromList (atomVars a)
+    atomsInRhs _              = S.empty
+
+    atomVars :: Atom -> [CVar]
+    atomVars (AVar v) = [v]
+    atomVars _        = []
 
 -- | Returns 'True' when lowering-provided array facts are sufficient to
 -- prove that the loop body is embarrassingly parallel.  Every array
