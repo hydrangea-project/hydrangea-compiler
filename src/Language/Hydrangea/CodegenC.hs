@@ -689,7 +689,17 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
       benchClosureHit = maybe False (name `S.member`) mBenchReachable
       benchmarkUsesMemo = benchClosureHit && not (procUsesIO body)
       useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel && not benchmarkUsesMemo
+      -- Scalar zero-arg procs (e.g. getenv-based config procs like iters(), w_f()) are
+      -- memoized with a static bool+value pair so callers inside hot loops don't re-invoke
+      -- the body (which may call getenv) on every iteration.
+      useScalarMemo =
+        null params
+          && (procRetKind == KScalar || procRetKind == KFloat)
+          && not isBenchKernel
+          && not (procUsesIO body)
       cacheVar = text "__cache_" <> text cName
+      scalarComputedVar = text "__scalar_computed_" <> text cName
+      scalarCacheVar = text "__scalar_cache_" <> text cName
       benchCacheVar = text "__bench_cache_" <> text cName
       benchmarkBody = if isBenchKernel then stripBenchmarkIOStmts body else body
       (bodyWithoutReturn, finalReturn) = splitFinalReturn benchmarkBody
@@ -739,6 +749,15 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
               <+> text "="
               <+> genAtom retAtom
               <> text ";"
+          Nothing ->
+            genStmts2 env S.empty S.empty body
+      -- Body for scalar-memoized proc: compute once, cache in static variable.
+      procBodyScalarMemo =
+        case finalReturn of
+          Just retAtom ->
+            genStmts2 env S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
+              $$ cleanupDoc retAtom
+              $$ scalarCacheVar <+> text "=" <+> genAtom retAtom <> text ";"
           Nothing ->
             genStmts2 env S.empty S.empty body
       procBodyNormal =
@@ -792,13 +811,42 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
                       <> text "->shape);"
                   )
                 $$ text "}"
-            else
-              text retType
-                <+> text cName
-                <> parens cParams
-                <+> text "{"
-                $$ nest 4 procBodyNormal
-                $$ text "}"
+            else if useScalarMemo
+              then
+                -- Scalar memoization: static bool + static value; compute once.
+                text "static int"
+                  <+> scalarComputedVar
+                  <+> text "= 0;"
+                  $$ text "static"
+                  <+> text retType
+                  <+> scalarCacheVar
+                  <> text ";"
+                  $$ text retType
+                  <+> text cName
+                  <> text "(void) {"
+                  $$ nest
+                    4
+                    ( text "if (!"
+                        <> scalarComputedVar
+                        <> text ") {"
+                        $$ nest
+                          4
+                          ( scalarComputedVar <+> text "= 1;"
+                              $$ procBodyScalarMemo
+                          )
+                        $$ text "}"
+                        $$ text "return"
+                        <+> scalarCacheVar
+                        <> text ";"
+                    )
+                  $$ text "}"
+              else
+                text retType
+                  <+> text cName
+                  <> parens cParams
+                  <+> text "{"
+                  $$ nest 4 procBodyNormal
+                  $$ text "}"
 
 genStmts2 :: CodegenEnv -> Set CVar -> Set CVar -> [C2.Stmt] -> Doc
 genStmts2 env declared liveAfter stmts =
@@ -919,7 +967,11 @@ genLoop2 env declared spec body =
       collapseClause
         | length iters > 1 = space <> text "collapse(" <> int (length iters) <> text ")"
         | otherwise = empty
-      parallelPragma extraClauses = text "#pragma omp parallel for" <> parallelPolicyClause <> collapseClause <> extraClauses
+      parallelPragma extraClauses =
+        let simdClause = case C2.lsExec spec of
+              C2.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
+              _             -> empty
+        in text "#pragma omp parallel for" <> simdClause <> parallelPolicyClause <> collapseClause <> extraClauses
       simdPragma extraClauses = text "#pragma omp simd simdlen(" <> int defaultSimdLen <> text ")" <> extraClauses
       roleComment = case role of
         C2.LoopPlain -> text "loop"
@@ -2009,11 +2061,15 @@ genRHS _ _ _ _ (RUnOp op a) = case op of
   CNot -> parens (text "!" <> genAtom a)
   CNeg -> parens (text "-" <> genAtom a)
   _ -> genUnOp op <> parens (genAtom a) -- math function call: f(arg)
+-- Emit a compound struct literal instead of hyd_tuple_make() so GCC sees
+-- no memory-clobbering side effects.  Dead tuple assignments then become
+-- pure stack stores that GCC's DCE eliminates, allowing the surrounding
+-- #pragma omp simd loop to be vectorized.
 genRHS _ _ _ _ (RTuple atoms) =
-  text "hyd_tuple_make("
+  text "(hyd_tuple_t){.ndims="
     <> int (length atoms)
-    <> (if null atoms then empty else text "," <+> hsep (punctuate (text ",") (map (\a -> text "(int64_t)" <> genAtom a) atoms)))
-    <> text ")"
+    <> (if null atoms then empty else text ",.elems={" <> hsep (punctuate (text ",") (map (\a -> text "(int64_t)" <> genAtom a) atoms)) <> text "}")
+    <> text "}"
 genRHS _ _ _ _ (RProj i a) = genAtom a <> text ".elems[" <> integer i <> text "]"
 genRHS _ _ _ _ (RRecord fields) =
   text "{"

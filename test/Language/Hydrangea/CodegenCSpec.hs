@@ -23,7 +23,7 @@ spec = describe "CodegenC" $ do
   it "emits parallel pragma from Parallel ExecPolicy" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -52,7 +52,7 @@ spec = describe "CodegenC" $ do
 
   it "emits parallel reduction clause from ReductionSpec" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AInt 1))]
-        spec' = LoopSpec ["i"] [IConst 16] (Parallel (ParallelSpec ParallelGeneric Nothing))
+        spec' = LoopSpec ["i"] [IConst 16] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing))
                   (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
@@ -60,20 +60,20 @@ spec = describe "CodegenC" $ do
 
   it "emits collapse for ND parallel loops" $ do
     let spec' = LoopSpec ["i", "j", "k"] [IConst 2, IConst 3, IConst 4]
-                  (Parallel (ParallelSpec ParallelGeneric Nothing)) Nothing LoopPlain
+                  (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for collapse(3)"
 
   it "emits policy clauses carried by ParallelSpec" $ do
     let spec' = LoopSpec ["i"] [IConst 8]
-                  (Parallel (ParallelSpec ParallelGeneric (Just "schedule(static)"))) Nothing LoopPlain
+                  (Parallel (ParallelSpec ParallelGeneric (Just "schedule(static)") Nothing)) Nothing LoopPlain
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for schedule(static)"
 
   it "emits role-aware comments for outer map-reduction loops" $ do
-    let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing)) Nothing LoopMapReduction
+    let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopMapReduction
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "map-reduction outer loop"
@@ -81,7 +81,7 @@ spec = describe "CodegenC" $ do
   it "emits ND reduction pragmas with collapse" $ do
     let body = [SAssign "acc" (C.RBinOp C.CMul (C.AVar "acc") (C.AInt 2))]
         spec' = LoopSpec ["i", "j"] [IConst 3, IConst 4]
-                  (Parallel (ParallelSpec ParallelGeneric Nothing))
+                  (Parallel (ParallelSpec ParallelGeneric Nothing Nothing))
                   (Just (ReductionSpec "acc" (IConst 1) C.RMul)) LoopReduction
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AVar "acc")]]
         c = codegenProgram2 prog
@@ -90,7 +90,7 @@ spec = describe "CodegenC" $ do
   it "emits strategy comments for direct scatter parallel loops" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterDirect Nothing)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)) Nothing LoopPlain) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -108,7 +108,7 @@ spec = describe "CodegenC" $ do
         prog = Program
           [ (mkProc "p" []
               [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
-              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)) Nothing LoopPlain) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
@@ -130,7 +130,7 @@ spec = describe "CodegenC" $ do
           [ (mkProc "p" []
               [ SAssign "shp" (C.RTuple [C.AInt 8])
               , SAssign "out" (C.RArrayAlloc (C.AVar "shp"))
-              , SLoop (LoopSpec ["i"] [IConst 64] (Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 64] (Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)) Nothing LoopPlain) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64), ("routes", C.CTArray C.CTInt64), ("vals", C.CTArray C.CTInt64)] }
@@ -156,7 +156,7 @@ spec = describe "CodegenC" $ do
         prog = Program
           [ (mkProc "p" []
               [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
-              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)) Nothing LoopPlain) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
@@ -177,7 +177,7 @@ spec = describe "CodegenC" $ do
         prog = Program
           [ (mkProc "p" []
               [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
-              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing Nothing)) Nothing LoopPlain) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTDouble)] }
@@ -230,7 +230,7 @@ spec = describe "CodegenC" $ do
               ]
           ]
         c = codegenProgram2 prog
-    c `shouldSatisfy` isInfixOf "hyd_tuple_make"
+    c `shouldSatisfy` isInfixOf "(hyd_tuple_t){.ndims="
 
   it "emits array shape operation" $ do
     let prog = Program

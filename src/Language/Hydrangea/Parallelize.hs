@@ -97,7 +97,10 @@ extractAccesses2 stmts =
       [ArrayAccess2 arr (atomToIndexExpr idx) Write2 0]
     collectStmt (SAssign _ (RArrayLoad (AVar arr) idx)) =
       [ArrayAccess2 arr (atomToIndexExpr idx) Read2 0]
-    collectStmt (SLoop _ body)  = collect body
+    -- Do not recurse into nested loops: the outer loop's legality is
+    -- determined only by accesses at this level; nested-loop deps are
+    -- handled by those loops' own legality checks.
+    collectStmt (SLoop _ _)     = []
     collectStmt (SIf _ thn els) = collect thn ++ collect els
     collectStmt _               = []
 
@@ -526,12 +529,25 @@ parallelizeLoop
   -> [Stmt]
   -> Maybe (LoopSpec, [Stmt])
 parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
-  | lsExec spec /= Serial                    = Nothing
+  | execIsUnsupported                          = Nothing
   | not (shouldParallelizeLoop insideLoop spec) = Nothing
-  | bodyContainsBreak body                   = Nothing
-  | not eligible                             = Nothing
-  | otherwise = Just (spec { lsExec = Parallel (ParallelSpec strategy Nothing) }, body)
+  | bodyContainsBreak body                     = Nothing
+  | not eligible                               = Nothing
+  | otherwise = Just (spec { lsExec = Parallel (ParallelSpec strategy Nothing simdLen) }, body)
   where
+    -- Already-parallel loops are never re-parallelized; Serial and Vector
+    -- loops are both eligible (Vector loops become combined parallel+simd).
+    execIsUnsupported = case lsExec spec of
+      Serial   -> False
+      Vector _ -> False
+      _        -> True
+
+    -- Preserve the SIMD width when upgrading a Vector loop to Parallel so
+    -- that CodegenC can emit '#pragma omp parallel for simd simdlen(N)'.
+    simdLen = case lsExec spec of
+      Vector v -> Just (vsWidth v)
+      _        -> Nothing
+
     eligible =
          canParallelizeWithFacts
       || canParallelizeDirectScatter

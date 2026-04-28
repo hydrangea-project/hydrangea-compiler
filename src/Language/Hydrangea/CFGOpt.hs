@@ -27,6 +27,10 @@ module Language.Hydrangea.CFGOpt
   , copyProp2
   , deadAssignElim2
   , loopInvariantCodeMotion2
+    -- * Atom/statement substitution utilities
+  , substAtom2
+  , substRHS2
+  , substStmts2
   ) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
@@ -128,6 +132,20 @@ substRHS2 env rhs =
     RPairSnd ct a           -> RPairSnd ct (sub a)
     _                       -> rhs
 
+-- | Apply a variable-to-atom substitution map throughout a list of
+-- statements, replacing every 'AVar' leaf that appears in the map.
+substStmts2 :: Map ByteString Atom -> [Stmt] -> [Stmt]
+substStmts2 env = map go
+  where
+    go (SAssign v rhs)              = SAssign v (substRHS2 env rhs)
+    go (SArrayWrite arr idx val)    =
+      SArrayWrite (substAtom2 env arr) (substAtom2 env idx) (substAtom2 env val)
+    go (SLoop spec body)            = SLoop spec (substStmts2 env body)
+    go (SIf cond thn els)           =
+      SIf (substAtom2 env cond) (substStmts2 env thn) (substStmts2 env els)
+    go (SReturn a)                  = SReturn (substAtom2 env a)
+    go s                            = s
+
 -- | Substitute variables appearing in an 'IndexExpr' using the copy-prop
 -- environment.  Integer atom bindings are folded to constants so loop bounds
 -- can become static trip counts.
@@ -222,6 +240,13 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
             let a' = AInt (product ns)
             in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
 
+      -- Fold RProj on a statically-known tuple: extract the i-th element.
+      SAssign x (RProj i (AVar v))
+        | Just atoms <- M.lookup v tupEnv
+        , fromIntegral i < length atoms ->
+            let a' = atoms !! fromIntegral i
+            in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+
       -- Call CSE: zero-argument value procs are idempotent (cached).
       -- Replace a second call to the same proc with a copy of the first result.
       SAssign x (RCall proc []) ->
@@ -276,6 +301,22 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
       SArrayWrite a1 a2 a3 ->
         SArrayWrite (substAtom2 env a1) (substAtom2 env a2) (substAtom2 env a3)
           : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+
+      -- Single-iteration serial loop: substitute the iterator to 0 and
+      -- inline the body into the surrounding statement sequence.
+      -- LoopReductionWrapper loops are excluded here: they carry pattern
+      -- information needed by the polyhedral blocked-matmul recogniser.
+      -- GCC at -O3 eliminates single-iteration LoopReductionWrapper loops
+      -- with no overhead after compilation.
+      SLoop spec body
+        | [IConst 1] <- lsBounds spec
+        , [iter]     <- lsIters spec
+        , lsExec spec == Serial
+        , Nothing    <- lsRed spec
+        , lsRole spec /= LoopReductionWrapper ->
+            let env' = M.insert iter (AInt 0) env
+            in go env' tupEnv callEnv shapeEnv flatToNdEnv (body ++ rest)
+
       SLoop spec body ->
         let spec' =
               spec

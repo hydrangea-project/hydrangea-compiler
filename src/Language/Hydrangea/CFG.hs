@@ -193,6 +193,7 @@ data ParallelStrategy
 data ParallelSpec = ParallelSpec
   { psStrategy :: ParallelStrategy
   , psPolicy   :: Maybe ByteString
+  , psSimdLen  :: Maybe Int  -- ^ When set, emit 'parallel for simd simdlen(N)' pragma.
   }
   deriving (Eq, Show)
 

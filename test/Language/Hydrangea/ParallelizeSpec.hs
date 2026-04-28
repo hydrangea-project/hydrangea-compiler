@@ -15,7 +15,7 @@ spec = describe "Parallelize" $ do
                   [SAssign "acc" (RBinOp CMul (AVar "acc") (AInt 2))]
     case parallelizeStmts2 [inner] of
       [SLoop spec' _] -> do
-        lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+        lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsRed spec' `shouldBe` Just (ReductionSpec "acc" (IConst 1) RMul)
       _ -> expectationFailure "Expected a single parallelized loop"
 
@@ -23,14 +23,14 @@ spec = describe "Parallelize" $ do
     let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
                  [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
     case parallelizeStmts2 [loop] of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized loop"
 
   it "parallelizes simple LoopMap kernels at top level" $ do
     let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
                  [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
     case parallelizeStmts2 [loop] of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized map loop"
 
   it "uses procArrayFacts to parallelize conservative LoopMap bodies" $ do
@@ -55,10 +55,10 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case parallelizeStmts2 [loop] of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized loop"
     case procBody (parallelizeProc2 proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single fact-parallelized loop"
 
   it "does not use procArrayFacts to justify read-write updates of the same array" $ do
@@ -112,7 +112,7 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc2 proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterDirect Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)
       _ -> expectationFailure "Expected injective scatter loop to parallelize"
 
   it "keeps non-injective scatter kernels serial even with fresh destinations" $ do
@@ -143,7 +143,7 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc2 proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)
       _ -> expectationFailure "Expected non-injective integer scatter-add loop to use atomic strategy"
 
   it "keeps unsupported colliding scatter combines serial" $ do
@@ -210,7 +210,7 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc2 proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)
       _ -> expectationFailure "Expected guarded integer scatter-add loop to use atomic strategy"
 
   it "uses atomic scatter for colliding floating-point add kernels" $ do
@@ -241,7 +241,7 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc2 proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing)
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing Nothing)
       _ -> expectationFailure "Expected floating-point scatter-add loop to use atomic strategy"
 
   it "uses privatized scatter for dense colliding integer add kernels with enough work" $ do
@@ -272,7 +272,7 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc2 proc) of
-      [_, _, SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing)
+      [_, _, SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)
       _ -> expectationFailure "Expected dense colliding scatter loop to use privatized strategy"
 
   it "keeps inner reduction loops serial under a map-reduction outer loop" $ do
@@ -282,7 +282,7 @@ spec = describe "Parallelize" $ do
                   [SAssign "acc" (RAtom (AInt 0)), inner]
     case parallelizeStmts2 [outer] of
       [SLoop outerSpec [_, SLoop innerSpec _]] -> do
-        lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+        lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsExec innerSpec `shouldBe` Serial
       _ -> expectationFailure "Expected nested map-reduction structure"
 
@@ -304,6 +304,6 @@ spec = describe "Parallelize" $ do
                   [SAssign "acc" (RAtom (AInt 0)), inner]
     case parallelizeStmts2 [outer] of
       [SLoop outerSpec [_, SLoop innerSpec _]] -> do
-        lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing)
+        lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsExec innerSpec `shouldBe` Serial
       _ -> expectationFailure "Expected outer loop with nested reduction"

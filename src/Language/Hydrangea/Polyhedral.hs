@@ -68,6 +68,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts2, usedVarsIndexExpr, usedVarsStmts2)
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
+import Language.Hydrangea.CFGOpt (substStmts2)
 
 type StmtId = [Int]
 
@@ -1685,6 +1686,18 @@ buildBlockedMapReductionBody2 kernel = do
   kTile <- buildForcedStripDim2 (bmrReductionIter kernel) (bmrReductionBound kernel) (tcReductionTile defaultTileConfig)
   cVal <- freshLike (bmrAccVar kernel) "_tile_acc"
   cNext <- freshLike (bmrAccVar kernel) "_tile_next"
+  -- When the reduction setup contains the pattern:
+  --   flatIn = base + k;  ndIdx = flat_to_nd(flatIn, {k_size});  projVar = ndIdx.elems[0]
+  -- the projection is redundant because k < k_size is guaranteed by the loop bounds
+  -- (base is always a multiple of k_size from the wrapper setup).  Substitute
+  -- projVar → k directly so downstream optimizers can eliminate the dead chain.
+  let reductionSetup =
+        case findReductionNdProjection (bmrReductionIter kernel) (bmrReductionSetup kernel) of
+          Just projVar ->
+            substStmts2
+              (M.singleton projVar (AVar (bmrReductionIter kernel)))
+              (bmrReductionSetup kernel)
+          Nothing -> bmrReductionSetup kernel
   let (reductionPrelude, outerSetup) =
         extractReductionPrelude2
           (usedVarsIndexExpr (bmrReductionBound kernel))
@@ -1716,7 +1729,7 @@ buildBlockedMapReductionBody2 kernel = do
           jTile
           LoopMap
           ( outerSetup
-              ++ bmrReductionSetup kernel
+              ++ reductionSetup
               ++ [loadOutput, updateOutput, storeOutput]
           )
       computeKLoop =
@@ -1825,6 +1838,22 @@ replaceAccAtom2 :: CVar -> CVar -> Atom -> Atom
 replaceAccAtom2 old new atom = case atom of
   AVar v | v == old -> AVar new
   _ -> atom
+
+-- | Detect the pattern in @bmrReductionSetup@ where a flat index computed as
+-- @flatIn = base + reductionIter@ is immediately converted back via
+-- @ndIdx = hyd_flat_to_nd(flatIn, {k_size})@ and projected as
+-- @projVar = ndIdx.elems[0]@.  When @reductionIter < k_size@ (guaranteed by
+-- the enclosing loop), @projVar == reductionIter@.  Returns the variable to
+-- substitute away, if found.
+findReductionNdProjection :: CVar -> [Stmt] -> Maybe CVar
+findReductionNdProjection reductionIter stmts = do
+  flatIn  <- listToMaybe [v | SAssign v (RBinOp CAdd a1 a2) <- stmts
+                             , a1 == AVar reductionIter || a2 == AVar reductionIter]
+  ndIdx   <- listToMaybe [v | SAssign v (RFlatToNd a _) <- stmts
+                             , a == AVar flatIn]
+  projVar <- listToMaybe [v | SAssign v (RProj 0 a) <- stmts
+                             , a == AVar ndIdx]
+  pure projVar
 
 extractReductionPrelude2 :: Set CVar -> [CVar] -> [Stmt] -> ([Stmt], [Stmt])
 extractReductionPrelude2 needed forbidden stmts =
