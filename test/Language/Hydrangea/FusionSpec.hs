@@ -292,10 +292,23 @@ spec = do
         "let id [i] = i in let arr = generate [3] id in let f x = x + 1 in let g x = x * 2 in let h = map f arr in map g h"
         (\fused -> hasMap fused `shouldBe` False)
 
-    it "preserves results with multiple uses of let-bound array" $ do
+    it "fuses multi-use generate through zipwith (generate inlined at all use sites)" $ do
       expectFusionSensible
         "let inc x = x + 1 in let add x y = x + y in let arr = map inc (fill [3] 1) in zipwith add arr arr"
-        (\fused -> hasZipWith fused `shouldBe` True)
+        (\fused -> do
+            -- arr = map inc (fill [3] 1) fuses to fill [3] 2 (element is constant),
+            -- which is a producer and gets inlined at both use sites. Then
+            -- zipwith add (fill [3] 2) (fill [3] 2) fuses to fill [3] 4.
+            hasZipWith fused `shouldBe` False
+            hasFill fused `shouldBe` True)
+
+    it "preserves results with multiple uses of non-producer let-bound array" $ do
+      expectFusionSensible
+        "let add x y = x + y in let idx [i] = [i] in let arr = scatter add (fill [3] 0) (generate [3] idx) (fill [3] 1) in zipwith add arr arr"
+        (\fused ->
+            -- arr = scatter result (not a producer), so it must NOT be inlined
+            -- at multiple use sites — the zipwith is preserved.
+            hasZipWith fused `shouldBe` True)
 
     -- Slice fusion tests
     it "fuses slice over zipWith of two generates (1D)" $ do

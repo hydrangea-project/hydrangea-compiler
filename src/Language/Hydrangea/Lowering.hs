@@ -1525,38 +1525,63 @@ lowerExp expr = case expr of
         (sshp, ashp) <- lowerExp shpExp
         n <- freshCVar "n"
         i <- freshIterVar "i"
-        ndIdx <- freshCVar "nd"
-        registerCType ndIdx CTTuple
-        noteDenseLinearIndex ndIdx i
         guardVal <- freshCVar "guard"
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
-        routeStmts <- inlineArrayFn routeFn ndIdx idx
-        valStmts <- inlineArrayFn valFnExp ndIdx val
-        guardStmts <- inlineArrayFn guardFnExp ndIdx guardVal
-        (hoistedCalls, kernelStmts) <-
-          hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
         combStmts <- inlineBinaryFn combExp val oldVal newVal
-        pure ( sd ++ sshp
-             ++ hoistedCalls
-             ++ [ SAssign n (RShapeSize ashp)
-                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
-                    ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
-                      ] ++ kernelStmts ++
-                      [ SIf (AVar guardVal)
-                          ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                            ] ++ combStmts ++
-                            [ SArrayWrite ad (AVar idx) (AVar newVal)
-                            ]
-                          )
-                          []
-                      ]
-                    )
-                ]
-             , ad
-             )
+        if is1DShapeExp shpExp
+          then do
+            routeStmts <- inlineArrayFn1D routeFn i idx
+            valStmts <- inlineArrayFn1D valFnExp i val
+            guardStmts <- inlineArrayFn1D guardFnExp i guardVal
+            (hoistedCalls, kernelStmts) <-
+              hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
+            pure ( sd ++ sshp
+                 ++ hoistedCalls
+                 ++ [ SAssign n (RShapeSize ashp)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                        ( kernelStmts ++
+                          [ SIf (AVar guardVal)
+                              ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                ] ++ combStmts ++
+                                [ SArrayWrite ad (AVar idx) (AVar newVal)
+                                ]
+                              )
+                              []
+                          ]
+                        )
+                    ]
+                 , ad
+                 )
+          else do
+            ndIdx <- freshCVar "nd"
+            registerCType ndIdx CTTuple
+            noteDenseLinearIndex ndIdx i
+            routeStmts <- inlineArrayFn routeFn ndIdx idx
+            valStmts <- inlineArrayFn valFnExp ndIdx val
+            guardStmts <- inlineArrayFn guardFnExp ndIdx guardVal
+            (hoistedCalls, kernelStmts) <-
+              hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
+            pure ( sd ++ sshp
+                 ++ hoistedCalls
+                 ++ [ SAssign n (RShapeSize ashp)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                        ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
+                          ] ++ kernelStmts ++
+                          [ SIf (AVar guardVal)
+                              ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                ] ++ combStmts ++
+                                [ SArrayWrite ad (AVar idx) (AVar newVal)
+                                ]
+                              )
+                              []
+                          ]
+                        )
+                    ]
+                 , ad
+                 )
       _ -> do
         (sd, ad) <- lowerExp defaultsExp
         (si, ai) <- lowerExp idxArrExp
@@ -1598,31 +1623,50 @@ lowerExp expr = case expr of
         (sshp, ashp) <- lowerExp shpExp
         n <- freshCVar "n"
         i <- freshIterVar "i"
-        ndIdx <- freshCVar "nd"
-        registerCType ndIdx CTTuple
-        noteDenseLinearIndex ndIdx i
         val <- freshCVar "val"
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
-        routeStmts <- inlineArrayFn routeFn ndIdx idx
-        valStmts <- inlineArrayFn valFnExp ndIdx val
-        (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
         combStmts <- inlineBinaryFn combExp val oldVal newVal
-        pure ( sd ++ sshp
-             ++ hoistedCalls
-             ++ [ SAssign n (RShapeSize ashp)
-                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
-                    ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
-                      ] ++ kernelStmts ++
-                      [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                      ] ++ combStmts ++
-                      [ SArrayWrite ad (AVar idx) (AVar newVal)
-                      ]
-                    )
-                ]
-             , ad
-             )
+        if is1DShapeExp shpExp
+          then do
+            routeStmts <- inlineArrayFn1D routeFn i idx
+            valStmts <- inlineArrayFn1D valFnExp i val
+            (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+            pure ( sd ++ sshp
+                 ++ hoistedCalls
+                 ++ [ SAssign n (RShapeSize ashp)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                        ( kernelStmts ++
+                          [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                          ] ++ combStmts ++
+                          [ SArrayWrite ad (AVar idx) (AVar newVal)
+                          ]
+                        )
+                    ]
+                 , ad
+                 )
+          else do
+            ndIdx <- freshCVar "nd"
+            registerCType ndIdx CTTuple
+            noteDenseLinearIndex ndIdx i
+            routeStmts <- inlineArrayFn routeFn ndIdx idx
+            valStmts <- inlineArrayFn valFnExp ndIdx val
+            (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+            pure ( sd ++ sshp
+                 ++ hoistedCalls
+                 ++ [ SAssign n (RShapeSize ashp)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                        ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
+                          ] ++ kernelStmts ++
+                          [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                          ] ++ combStmts ++
+                          [ SArrayWrite ad (AVar idx) (AVar newVal)
+                          ]
+                        )
+                    ]
+                 , ad
+                 )
       EMap _ routeFn srcArrExp -> do
         (sd, ad) <- lowerExp defaultsExp
         (ssrc, asrc) <- lowerExp srcArrExp
@@ -2614,6 +2658,13 @@ lowerReductionStep fnExp acc elem' = case fnExp of
   _ -> do
     stmts <- inlineBinaryFn fnExp acc elem' acc
     pure (stmts, reductionRedopFromStmts stmts)
+
+-- | Returns True when the given shape expression is a 1-element vector,
+-- meaning the array is 1-dimensional. Used to skip hyd_flat_to_nd in scatter
+-- loops, replacing it with the raw loop counter.
+is1DShapeExp :: Exp a -> Bool
+is1DShapeExp (EVec _ [_]) = True
+is1DShapeExp _            = False
 
 inlineArrayFn :: Exp Range -> CVar -> CVar -> LowerM [Stmt]
 inlineArrayFn fnExp paramVar resultVar = case fnExp of

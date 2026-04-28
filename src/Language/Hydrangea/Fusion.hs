@@ -590,6 +590,14 @@ peelApps expr = go expr []
     go (EApp _ fn arg) acc = go fn (arg : acc)
     go fn acc = (fn, acc)
 
+-- | Returns True for expressions that produce a new array from a shape + function,
+-- with no data dependency on external arrays. These can be safely inlined even at
+-- multiple use sites because each use only needs the shape and the per-element function.
+isProducerExp :: Exp a -> Bool
+isProducerExp (EGenerate {}) = True
+isProducerExp (EFill {})     = True
+isProducerExp _              = False
+
 isArrayExp :: Exp a -> Bool
 isArrayExp expr =
   case expr of
@@ -1285,8 +1293,11 @@ fuseOnce expr =
               captureRisk = not $ S.null (freeVarsExp body `S.intersection` boundVarsExp e')
               -- Inline array expressions (fusion), or function-valued expressions
               -- that appear exactly once (enables cross-binding beta reduction).
-              shouldInline = inlineable && usage == 1 && not captureRisk
+              -- Producer expressions (generate/fill) are pure and cheap to re-evaluate,
+              -- so inline them even at multiple use sites to enable scatter fusion.
+              shouldInline = inlineable && not captureRisk
                           && (isArrayExp body || isFunctionExp body)
+                          && (usage == 1 || isProducerExp body)
           in if shouldInline
                then fuseOnce (substExp name body e')
                else pure (ELetIn a d' e')
@@ -1379,7 +1390,12 @@ fuseOnce expr =
       fuseIndex a idx' arr'
     ECheckIndex a idx def arr -> ECheckIndex a <$> fuseOnce idx <*> fuseOnce def <*> fuseOnce arr
     EFill a s v -> EFill a <$> fuseOnce s <*> fuseOnce v
-    EShapeOf a arr -> EShapeOf a <$> fuseOnce arr
+    EShapeOf a arr -> do
+      arr' <- fuseOnce arr
+      case arr' of
+        EGenerate _ shp _ -> fuseOnce shp
+        EFill _ shp _     -> fuseOnce shp
+        _                 -> pure (EShapeOf a arr')
     EReplicate a dims arr -> do
       dims' <- mapM fuseShapeDim dims
       arr' <- fuseOnce arr
