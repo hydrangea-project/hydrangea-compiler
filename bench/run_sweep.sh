@@ -27,11 +27,18 @@ for arg in "$@"; do
 done
 
 # Set up LLVM for GHC's LLVM backend (needed to build/run Repa benchmarks).
-if [ -f ~/use-llvm.sh ]; then
-  : "${LDFLAGS:=}" "${CPPFLAGS:=}"
-  export LDFLAGS CPPFLAGS
-  # shellcheck source=/dev/null
-  source ~/use-llvm.sh 15
+# On macOS, probe Homebrew for an LLVM installation if llc/opt are not already on PATH.
+if [[ "$(uname -s)" == "Darwin" ]] && ! command -v llc >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    for _llvm_ver in 15 16 14 17; do
+      _llvm_prefix="$(brew --prefix "llvm@${_llvm_ver}" 2>/dev/null)" || true
+      if [[ -n "$_llvm_prefix" && -d "$_llvm_prefix/bin" ]]; then
+        export PATH="$_llvm_prefix/bin:$PATH"
+        break
+      fi
+    done
+    unset _llvm_ver _llvm_prefix
+  fi
 fi
 
 # Find a C compiler that supports -fopenmp.

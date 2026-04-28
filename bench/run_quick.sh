@@ -34,11 +34,18 @@ for arg in "$@"; do
 done
 
 # Set up LLVM for GHC's LLVM backend (needed to build/run Repa/Accelerate benchmarks).
-if [ -f ~/use-llvm.sh ]; then
-  : "${LDFLAGS:=}" "${CPPFLAGS:=}"
-  export LDFLAGS CPPFLAGS
-  # shellcheck source=/dev/null
-  source ~/use-llvm.sh 15
+# On macOS, probe Homebrew for an LLVM installation if llc/opt are not already on PATH.
+if [[ "$(uname -s)" == "Darwin" ]] && ! command -v llc >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    for _llvm_ver in 15 16 14 17; do
+      _llvm_prefix="$(brew --prefix "llvm@${_llvm_ver}" 2>/dev/null)" || true
+      if [[ -n "$_llvm_prefix" && -d "$_llvm_prefix/bin" ]]; then
+        export PATH="$_llvm_prefix/bin:$PATH"
+        break
+      fi
+    done
+    unset _llvm_ver _llvm_prefix
+  fi
 fi
 
 # On macOS, the Accelerate LLVM JIT links with -lm which requires the SDK lib
@@ -57,7 +64,7 @@ find_openmp_cc() {
   for candidate in gcc-15 gcc-14 gcc-13 gcc-12; do
     if command -v "$candidate" >/dev/null 2>&1; then echo "$candidate"; return; fi
   done
-  # Fall back to whatever CC is (set by use-llvm.sh or environment)
+  # Fall back to whatever CC is set in the environment
   echo "${CC:-cc}"
 }
 BENCH_CC="$(find_openmp_cc)"

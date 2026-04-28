@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure LLVM 15 is on PATH so cabal can find llc/opt for -fllvm compilation.
-# shellcheck disable=SC1090
-source ~/use-llvm.sh 15
+# Ensure LLVM is on PATH so cabal can find llc/opt for -fllvm compilation.
+# On macOS, probe Homebrew for an LLVM installation if llc/opt are not already on PATH.
+if [[ "$(uname -s)" == "Darwin" ]] && ! command -v llc >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    for _llvm_ver in 15 16 14 17; do
+      _llvm_prefix="$(brew --prefix "llvm@${_llvm_ver}" 2>/dev/null)" || true
+      if [[ -n "$_llvm_prefix" && -d "$_llvm_prefix/bin" ]]; then
+        export PATH="$_llvm_prefix/bin:$PATH"
+        break
+      fi
+    done
+    unset _llvm_ver _llvm_prefix
+  fi
+fi
 
 # On macOS, libm is part of libSystem and not found by the default linker search
 # path.  Set LIBRARY_PATH to the SDK so the Accelerate JIT linker can resolve -lm.
