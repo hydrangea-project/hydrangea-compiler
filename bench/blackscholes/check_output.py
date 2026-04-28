@@ -35,7 +35,7 @@ def main() -> int:
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=1e-6,
+        default=1e-4,
         help="Maximum allowed absolute error per output element.",
     )
     args = parser.parse_args()

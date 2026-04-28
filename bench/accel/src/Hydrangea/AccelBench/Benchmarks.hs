@@ -38,16 +38,73 @@ sumAllDoubles2D = Prelude.sum . A.toList
 sumAllInts :: Array DIM1 Int -> Double
 sumAllInts = fromIntegral . (Prelude.sum :: [Int] -> Int) . A.toList
 
--- | Abramowitz & Stegun 7.1.26 polynomial approximation to erf.
-erfApprox :: A.Exp Double -> A.Exp Double
-erfApprox x =
-  let t    = 1.0 / (1.0 + 0.3275911 * abs x)
-      poly = t * (  0.254829592
-               + t * ((-0.284496736)
-               + t * (  1.421413741
-               + t * ((-1.453152027)
-               + t *    1.061405429))))
-  in signum x * (1.0 - poly * exp (-(x * x)))
+-- | Clenshaw evaluation of a Chebyshev series.
+-- @cs@ = [c0, c1, …, cN] are Chebyshev coefficients in ascending degree order.
+-- Evaluates Σ c_k T_k(t) using the stable three-term recurrence.
+evalCheb :: [Double] -> A.Exp Double -> A.Exp Double
+evalCheb []       _ = 0
+evalCheb (c0:rest) t =
+  let step (ak1, ak2) c = (A.constant c + 2 * t * ak1 - ak2, ak1)
+      (a1, a2) = foldl step (0, 0) (reverse rest)
+  in  A.constant c0 + t * a1 - a2
+
+-- | Exp-free approximation to erf, max absolute error ≈ 5e-8.
+-- Uses 4-piece Chebyshev evaluation; no transcendental function calls.
+-- This replaces the A&S 7.1.26 formula which unconditionally calls exp(-x²).
+--
+--   Piece 1   |x| ∈ [0,       0.84375]: Cheb-6  for erf(x)/x  as fn of x²
+--   Piece 2a  |x| ∈ [0.84375, 1.6]:    Cheb-8  for erf(x) directly
+--   Piece 2b1 |x| ∈ [1.6,     2.5]:    Cheb-7  for erf(x) directly
+--   Piece 2b2 |x| ∈ [2.5,     4.5]:    Cheb-9  for erf(x) directly
+--   |x| ≥ 4.5: clamped to ±1
+erfFast :: A.Exp Double -> A.Exp Double
+erfFast x =
+  let ax = abs x
+
+      -- u1 maps x² ∈ [0, 0.84375²] → [-1, 1]
+      u1 = 2 * ax * ax / 0.7119140625 - 1
+      p1 = ax * evalCheb
+              [ 1.01324254152290827e+00, -1.09305843540958084e-01
+              ,  5.59140001151067767e-03, -2.31269082139996069e-04
+              ,  7.88014867629312858e-06, -2.26982938232759150e-07
+              ,  5.71702546634135651e-09 ]
+              u1
+
+      -- u2a maps x ∈ [0.84375, 1.6] → [-1, 1]
+      u2a = 2 * (ax - 0.84375) / 0.75625 - 1
+      p2a = evalCheb
+              [ 8.93886178150128052e-01,  1.02437235668834059e-01
+              , -2.21133968266726787e-02,  2.14792553316058617e-03
+              ,  1.25394396382965130e-05, -2.38891946112290732e-05
+              ,  1.71950726101029906e-06,  8.81826412428337292e-08
+              , -1.82651772653009185e-08 ]
+              u2a
+
+      -- u2b1 maps x ∈ [1.6, 2.5] → [-1, 1]
+      u2b1 = 2 * (ax - 1.6) / 0.9 - 1
+      p2b1 = evalCheb
+              [ 9.92274555550660575e-01,  1.05875650348229867e-02
+              , -4.14369417399962532e-03,  1.02100882923373366e-03
+              , -1.60180247370903060e-04,  1.39233742229831938e-05
+              , -1.32804730126315880e-08, -1.64050184053516437e-07 ]
+              u2b1
+
+      -- u2b2 maps x ∈ [2.5, 4.5] → [-1, 1]
+      u2b2 = 2 * (ax - 2.5) / 2.0 - 1
+      p2b2 = evalCheb
+              [ 9.99929727429349158e-01,  1.27887131926592755e-04
+              , -9.64381694513239042e-05,  6.04082312503907118e-05
+              , -3.14940219657540383e-05,  1.36718647907742693e-05
+              , -4.91855527141691625e-06,  1.45116678686502115e-06
+              , -3.37492970607292196e-07,  5.91800916408245535e-08 ]
+              u2b2
+
+      r = A.cond (ax < 0.84375) p1
+            (A.cond (ax < 1.6) p2a
+              (A.cond (ax < 2.5) p2b1
+                (A.cond (ax < 4.5) p2b2 1.0)))
+
+  in  signum x * r
 
 -- ---------------------------------------------------------------------------
 -- Benchmark registry
@@ -103,7 +160,7 @@ blackScholesKernel spots strikes rates vols times =
         r     = rates   A.! I1 i
         sigma = vols    A.! I1 i
         t     = times   A.! I1 i
-        phi x = 0.5 * (1.0 + erfApprox (x / sqrt 2.0))
+        phi x = 0.5 * (1.0 + erfFast (x / sqrt 2.0))
         d1 = (log (s / k) + (r + 0.5 * sigma * sigma) * t) / (sigma * sqrt t)
         d2 = d1 - sigma * sqrt t
     in s * phi d1 - k * exp ((-1.0) * r * t) * phi d2

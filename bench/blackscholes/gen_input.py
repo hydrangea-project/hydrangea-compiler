@@ -40,7 +40,7 @@ def main():
         d2 = d1 - sigma*math.sqrt(t)
         return s*phi(d1) - k*math.exp(-r*t)*phi(d2)
 
-    ref = [round(bs_call(spots[i], strikes[i], rates[i], vols[i], times[i]), 6)
+    ref = [round(bs_call(spots[i], strikes[i], rates[i], vols[i], times[i]), 10)
            for i in range(n)]
     write_csv("reference.csv", ref)
 

