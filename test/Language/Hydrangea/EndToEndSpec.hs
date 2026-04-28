@@ -254,12 +254,12 @@ spec = do
               defaultCodegenOptions
               False
               decs
-          legacyC `shouldSatisfy` isInfixOf "i76_tile_"
-          legacyC `shouldSatisfy` isInfixOf "j77_tile_"
-          legacyC `shouldSatisfy` isInfixOf "k126_tile_"
-          polyC `shouldSatisfy` isInfixOf "i76_tile_"
-          polyC `shouldSatisfy` isInfixOf "j77_tile_"
-          polyC `shouldSatisfy` isInfixOf "k126_tile_"
+          legacyC `shouldSatisfy` isInfixOf "i59_tile_"
+          legacyC `shouldSatisfy` isInfixOf "j60_tile_"
+          legacyC `shouldSatisfy` isInfixOf "k91_tile_"
+          polyC `shouldSatisfy` isInfixOf "i59_tile_"
+          polyC `shouldSatisfy` isInfixOf "j60_tile_"
+          polyC `shouldSatisfy` isInfixOf "k91_tile_"
           legacyC `shouldSatisfy` not . isInfixOf "hyd_vec_loadu_f64x4"
           legacyC `shouldSatisfy` not . isInfixOf "hyd_vec_storeu_f64x4"
           polyC `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"

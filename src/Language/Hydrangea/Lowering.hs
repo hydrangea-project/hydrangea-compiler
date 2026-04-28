@@ -1235,42 +1235,73 @@ lowerExp expr = case expr of
       EUnit{} -> do
         (si, ai) <- lowerExp initExp
         (ss, as') <- lowerExp shapeExp
-        redDim <- freshCVar "red_dim"
-        outN <- freshCVar "out_n"
-        j <- freshIterVar "j"
-        acc <- freshCVar "acc"
-        k <- freshCVar "k"
-        base <- freshCVar "base"
-        flatIn <- freshCVar "flat_in"
-        idx <- freshCVar "idx"
-        elem' <- freshCVar "elem"
-        val <- freshCVar "val"
-        registerCType idx CTTuple
-        noteDenseLinearIndex idx k
-        genStmts <- inlineArrayFn genExp idx elem'
-        (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-        let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
-        outShp <- freshCVar "out_shp"
-        pure ( si ++ ss
-             ++ [ SAssign outShp (RShapeInit as')
-                , SAssign redDim (RShapeLast as')
-                , SAssign outN (RShapeSize (AVar outShp))
-                , SAssign acc (RAtom ai)
-                , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopReductionWrapper)
-                    ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
-                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
-                          ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
-                            , SAssign idx (RFlatToNd (AVar flatIn) as')
-                            ]
-                            ++ genStmts
-                            ++ bodyStmts
-                          )
-                      ]
-                    )
-                , SAssign val (RAtom (AVar acc))
-                ]
-             , AVar val
-             )
+        mRank <- shapeRankM shapeExp
+        case mRank of
+          Just 1 -> do
+            -- 1-D reduction into a scalar: preserve the LoopReductionWrapper (so
+            -- downstream polyhedral analysis keeps finding the standard structure)
+            -- but use the loop counter k directly as the array index, skipping
+            -- the flat_to_nd / base / flat_in overhead that would otherwise live
+            -- inside the hot inner loop.
+            redDim <- freshCVar "red_dim"
+            j      <- freshIterVar "j"
+            acc    <- freshCVar "acc"
+            k      <- freshIterVar "k"
+            elem'  <- freshCVar "elem"
+            val    <- freshCVar "val"
+            genStmts <- inlineArrayFn1D genExp k elem'
+            (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+            let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+            pure ( si ++ ss
+                 ++ [ SAssign redDim (RShapeLast as')
+                    , SAssign acc (RAtom ai)
+                    , SLoop (LoopSpec [j] [IConst 1] Serial Nothing LoopReductionWrapper)
+                        [ SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                            ( genStmts ++ bodyStmts )
+                        ]
+                    , SAssign val (RAtom (AVar acc))
+                    ]
+                 , AVar val
+                 )
+          _ -> do
+            -- General N-D case: materialise the shape, iterate over the outer
+            -- dimension with j, compute flat index, convert to nd index.
+            redDim <- freshCVar "red_dim"
+            outN <- freshCVar "out_n"
+            j <- freshIterVar "j"
+            acc <- freshCVar "acc"
+            k <- freshCVar "k"
+            base <- freshCVar "base"
+            flatIn <- freshCVar "flat_in"
+            idx <- freshCVar "idx"
+            elem' <- freshCVar "elem"
+            val <- freshCVar "val"
+            registerCType idx CTTuple
+            noteDenseLinearIndex idx k
+            genStmts <- inlineArrayFn genExp idx elem'
+            (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+            let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+            outShp <- freshCVar "out_shp"
+            pure ( si ++ ss
+                 ++ [ SAssign outShp (RShapeInit as')
+                    , SAssign redDim (RShapeLast as')
+                    , SAssign outN (RShapeSize (AVar outShp))
+                    , SAssign acc (RAtom ai)
+                    , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopReductionWrapper)
+                        ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
+                          , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                              ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
+                                , SAssign idx (RFlatToNd (AVar flatIn) as')
+                                ]
+                                ++ genStmts
+                                ++ bodyStmts
+                              )
+                          ]
+                        )
+                    , SAssign val (RAtom (AVar acc))
+                    ]
+                 , AVar val
+                 )
       _ -> do
         (si, ai) <- lowerExp idxExp
         (sa, aa) <- lowerExp arrExp
