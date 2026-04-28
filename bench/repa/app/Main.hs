@@ -14,10 +14,14 @@ main = do
   case args of
     ["--list"] -> mapM_ putStrLn benchmarkNames
     ["all"] -> runAllBenchmarks
-    ["bench", "nbody"] -> runNBodyTiming defaultTimingOptions
-    ("bench" : "nbody" : rest) -> runNBodyTiming (parseTimingOptions rest)
+    ["bench", "nbody"] -> runNBodyAccelStyleTiming defaultTimingOptions
+    ("bench" : "nbody" : rest) -> runNBodyAccelStyleTiming (parseTimingOptions rest)
     ["bench", "nbody-imperative"] -> runNBodyImperativeTiming defaultTimingOptions
     ("bench" : "nbody-imperative" : rest) -> runNBodyImperativeTiming (parseTimingOptions rest)
+    ["bench", "nbody-accel-style"] ->
+      runTimingHarnessIO "main_accel_style" defaultTimingOptions loadNBodyInputs runNBodyAccelStyleOutputsIO nBodyChecksum
+    ("bench" : "nbody-accel-style" : rest) ->
+      runTimingHarnessIO "main_accel_style" (parseTimingOptions rest) loadNBodyInputs runNBodyAccelStyleOutputsIO nBodyChecksum
     ["bench", name] -> runBenchmarkByNameTimed defaultTimingOptions name
     ("bench" : name : rest) -> runBenchmarkByNameTimed (parseTimingOptions rest) name
     [name] -> runBenchmarkByName name

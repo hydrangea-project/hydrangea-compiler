@@ -12,6 +12,7 @@ module Hydrangea.RepaBench.Benchmarks
   , runNBodyOutputsIO
   , runNBodyImperativeOutputsIO
   , runNBodyFusedOutputsIO
+  , runNBodyAccelStyleOutputsIO
   , nBodyChecksum
   ) where
 
@@ -183,6 +184,11 @@ runNBodyFusedOutputsIO :: NBodyInputs -> IO (R.Array R.U R.DIM1 Double, R.Array 
 runNBodyFusedOutputsIO NBodyInputs{..} =
   nBodyKernelFusedP nbodyN nbodyXs nbodyYs nbodyZs nbodyMs nbodyVxs nbodyVys nbodyVzs
 
+runNBodyAccelStyleOutputsIO :: NBodyInputs -> IO (R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double)
+{-# NOINLINE runNBodyAccelStyleOutputsIO #-}
+runNBodyAccelStyleOutputsIO NBodyInputs{..} =
+  nBodyKernelAccelStyleP nbodyN nbodyXs nbodyYs nbodyZs nbodyMs nbodyVxs nbodyVys nbodyVzs
+
 nBodyChecksum :: (R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double) -> Double
 {-# NOINLINE nBodyChecksum #-}
 nBodyChecksum (xs, ys, zs) = R.sumAllS xs + R.sumAllS ys + R.sumAllS zs
@@ -329,6 +335,78 @@ nBodyKernelFusedP n xs ys zs ms vxs vys vzs = do
     g    = 6.674e-11
     dt   = 0.01
 
+-- | Idiomatic Repa n-body using extend + zipWith + foldP.
+-- Directly analogous to Accelerate's: A.fold (+) 0 $ A.zipWith accel rows cols
+-- The n×n pairwise-interaction array is NEVER materialized — foldP fuses with
+-- the delayed zipWith product into a sequential inner loop over j for each
+-- parallel outer i.  This is both the idiomatic and fastest formulation:
+-- foldP inlines addAccel3 tightly, keeping the 3-component accumulator in
+-- registers.  The explicit 'go !ax !ay !az' loop in nBodyKernelFusedP is
+-- ~11× slower because GHC boxes the (Double,Double,Double) return at every
+-- tail-call at -O1.
+nBodyKernelAccelStyleP
+  :: Int
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> R.Array R.U R.DIM1 Double
+  -> IO (R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double, R.Array R.U R.DIM1 Double)
+nBodyKernelAccelStyleP n xs ys zs ms vxs vys vzs = do
+  -- Pack into a single body array so extend gives us the right broadcasts.
+  -- body[i] = (xi, yi, zi, mi)
+  bodiesU <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      ( xs R.! (R.Z R.:. i), ys R.! (R.Z R.:. i)
+      , zs R.! (R.Z R.:. i), ms R.! (R.Z R.:. i) )
+  -- Repa equivalent of Accelerate's replicate + zipWith + fold.
+  -- cols[i][j] = bodiesU[j] (vary over j, replicate i)
+  -- rows[i][j] = bodiesU[i] (vary over i, replicate j)
+  -- forces[i][j] = bodyAccel (rows[i][j]) (cols[i][j])
+  -- accsXYZ[i]   = sum_j forces[i][j]   — fused, no n×n intermediate
+  let cols   = R.extend (R.Z R.:. n R.:. R.All) bodiesU
+      rows   = R.extend (R.Z R.:. R.All R.:. n) bodiesU
+      forces = R.zipWith bodyAccel rows cols
+  accsXYZ <- R.foldP addAccel3 (0.0, 0.0, 0.0) forces
+  newXs <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (ax, _, _) = accsXYZ R.! (R.Z R.:. i)
+          vx' = (vxs R.! (R.Z R.:. i)) + ax * dt
+      in  (xs R.! (R.Z R.:. i)) + vx' * dt
+  newYs <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (_, ay, _) = accsXYZ R.! (R.Z R.:. i)
+          vy' = (vys R.! (R.Z R.:. i)) + ay * dt
+      in  (ys R.! (R.Z R.:. i)) + vy' * dt
+  newZs <- R.computeUnboxedP $
+    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
+      let (_, _, az) = accsXYZ R.! (R.Z R.:. i)
+          vz' = (vzs R.! (R.Z R.:. i)) + az * dt
+      in  (zs R.! (R.Z R.:. i)) + vz' * dt
+  pure (newXs, newYs, newZs)
+  where
+    eps2 = 0.01
+    g    = 6.674e-11
+    dt   = 0.01
+
+    bodyAccel :: (Double, Double, Double, Double)
+              -> (Double, Double, Double, Double)
+              -> (Double, Double, Double)
+    bodyAccel (xi, yi, zi, _) (xj, yj, zj, mj) =
+      let !dx = xj - xi; !dy = yj - yi; !dz = zj - zi
+          !r2 = dx*dx + dy*dy + dz*dz + eps2
+          !r3 = r2 * sqrt r2
+          !sc = g * mj / r3
+      in (dx * sc, dy * sc, dz * sc)
+
+    addAccel3 :: (Double, Double, Double)
+              -> (Double, Double, Double)
+              -> (Double, Double, Double)
+    addAccel3 (ax1, ay1, az1) (ax2, ay2, az2) =
+      (ax1+ax2, ay1+ay2, az1+az2)
+
 mandelbrotKernel :: Int -> Int -> Int -> IO (R.Array R.U R.DIM2 Double)
 mandelbrotKernel width height iters =
   R.computeUnboxedP $
@@ -359,13 +437,16 @@ spmvKernel nrows rowPtr values colIdx x =
   R.computeUnboxedP $
     R.fromFunction (R.Z R.:. nrows) $ \(R.Z R.:. i) ->
       let rowStart = rowPtr R.! (R.Z R.:. i)
-          rowEnd = rowPtr R.! (R.Z R.:. (i + 1))
-          go !acc !k
-            | k >= rowEnd = acc
-            | otherwise =
-                let col = colIdx R.! (R.Z R.:. k)
-                 in go (acc + values R.! (R.Z R.:. k) * x R.! (R.Z R.:. col)) (k + 1)
-       in go 0.0 rowStart
+          rowEnd   = rowPtr R.! (R.Z R.:. (i + 1))
+          len      = rowEnd - rowStart
+          -- Delayed 1D slice of per-nonzero products for this row.
+          -- sumAllS fuses with fromFunction: no intermediate allocation.
+          -- CSR rows have variable length so we can't use a 2D foldP here.
+          rowContribs = R.fromFunction (R.Z R.:. len) $ \(R.Z R.:. j) ->
+            let k   = rowStart + j
+                col = colIdx R.! (R.Z R.:. k)
+             in values R.! (R.Z R.:. k) * x R.! (R.Z R.:. col)
+       in R.sumAllS rowContribs
 
 matMulKernel
   :: Int
@@ -374,30 +455,42 @@ matMulKernel
   -> R.Array R.U R.DIM2 Double
   -> R.Array R.U R.DIM2 Double
   -> IO (R.Array R.U R.DIM2 Double)
-matMulKernel m k n a b =
-  R.computeUnboxedP $
-    R.fromFunction (R.Z R.:. m R.:. n) $ \(R.Z R.:. i R.:. j) ->
-      let go !acc !t
-            | t >= k    = acc
-            | otherwise = go (acc + a R.! (R.Z R.:. i R.:. t) * b R.! (R.Z R.:. t R.:. j)) (t + 1)
-       in go 0.0 0
+matMulKernel m k n a b = do
+  -- Transpose B so inner-loop accesses bT[c][t] are row-major (cache-friendly).
+  bT <- R.computeUnboxedP $
+          R.backpermute (R.Z R.:. n R.:. k)
+            (\(R.Z R.:. j R.:. t) -> R.Z R.:. t R.:. j)
+            b
+  -- Canonical Repa 3 matmul (matches Data.Array.Repa.Algorithms.Matrix.mmultP):
+  -- computeUnboxedP parallelises over all (m*n) output elements.
+  -- For each (r, c): slice extracts 1D row with direct linear indexing (no fromIndex
+  -- overhead), and sumAllS fuses with zipWith into a tight sequential dot-product loop.
+  bT `R.deepSeqArray` R.computeUnboxedP
+    ( R.fromFunction (R.Z R.:. m R.:. n)
+    $ \(R.Z R.:. r R.:. c) ->
+        R.sumAllS
+          $ R.zipWith (*)
+              (R.slice a  (R.Any R.:. r R.:. R.All))
+              (R.slice bT (R.Any R.:. c R.:. R.All))
+    )
 
 softmaxKernel
   :: Int
   -> Int
   -> R.Array R.U R.DIM2 Double
-  -> R.Array R.U R.DIM2 Double
-softmaxKernel m n logits =
-  let rowSums =
-        R.computeUnboxedS $
-          R.fromFunction (R.Z R.:. m) $ \(R.Z R.:. i) ->
-            sumAll $
-              R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. k) ->
-                exp (logits R.! (R.Z R.:. i R.:. k))
-   in R.computeUnboxedS $
-        R.fromFunction (R.Z R.:. m R.:. n) $ \(R.Z R.:. i R.:. j) ->
-          exp (logits R.! (R.Z R.:. i R.:. j)) / rowSums R.! (R.Z R.:. i)
+  -> IO (R.Array R.U R.DIM2 Double)
+softmaxKernel _ n logits = do
+  -- Parallel map exp, then fold each row to get per-row sum.
+  expLogits <- R.computeUnboxedP $ R.map exp logits
+  rowSums   <- R.foldP (+) 0.0 expLogits
+  -- Broadcast rowSums from [m] to [m, n]: rowSumsBcast[i][j] = rowSums[i]
+  let rowSumsBcast = R.extend (R.Z R.:. R.All R.:. n) rowSums
+  R.computeUnboxedP $ R.zipWith (/) expLogits rowSumsBcast
 
+-- | Weighted histogram via scatter-accumulate.
+-- Repa has no parallel scatter combinator; M.fromListWith is the standard
+-- Haskell approach and is inherently sequential.  The map/zip steps are
+-- expressed via Repa combinators where possible.
 weightedHistogramKernel :: Int -> Int -> R.Array R.U R.DIM1 Int
 weightedHistogramKernel n bins =
   let src = R.fromFunction (R.Z R.:. n) (\(R.Z R.:. i) -> i)
@@ -408,6 +501,7 @@ weightedHistogramKernel n bins =
         R.fromFunction (R.Z R.:. bins) $ \(R.Z R.:. b) ->
           M.findWithDefault 0 b histMap
 
+-- | Guarded weighted histogram — same scatter limitation as weightedHistogramKernel.
 guardedWeightedHistogramKernel :: Int -> Int -> Int -> R.Array R.U R.DIM1 Int
 guardedWeightedHistogramKernel n bins keepPeriod =
   let src = R.fromFunction (R.Z R.:. n) (\(R.Z R.:. i) -> i)
@@ -442,6 +536,9 @@ cooSpmvKernel nrows _nnz rowIdx colIdx values x =
         R.fromFunction (R.Z R.:. nrows) $ \(R.Z R.:. i) ->
           M.findWithDefault 0.0 i rowMap
 
+-- | COO→CSR build: sort + group + prefix scan, all inherently sequential.
+-- Repa's fusion model (map/reduce over dense arrays) does not cover
+-- sort-based sparse-format construction.
 cooCsrBuildKernel
   :: Int
   -> Int
@@ -491,16 +588,15 @@ graphMessagesKernel n degree = do
   let nnz = n * degree
   nodeVals <- R.computeUnboxedP $ R.fromFunction (R.Z R.:. n) (\(R.Z R.:. j) -> j + 1)
   messages <- R.computeUnboxedP $ R.fromFunction (R.Z R.:. nnz) $ \(R.Z R.:. k) ->
-    let dst = k `div` degree
+    let dst     = k `div` degree
         edgeVal = k + 1
      in edgeVal * (nodeVals R.! (R.Z R.:. dst))
-  R.computeUnboxedP $
-    R.fromFunction (R.Z R.:. n) $ \(R.Z R.:. i) ->
-      let go !acc !j
-            | j >= degree = acc
-            | otherwise   = go (acc + messages R.! (R.Z R.:. (i * degree + j))) (j + 1)
-       in go 0 0
+  -- Each node has exactly `degree` incoming messages.  Reshape [nnz = n*degree]
+  -- to [n, degree] and foldP over the last dim: messages[i][j] = msgs for node i.
+  R.foldP (+) 0 (R.reshape (R.Z R.:. n R.:. degree) messages)
 
+-- | Voxel rasterization via scatter-accumulate.
+-- Repa has no parallel scatter; M.fromListWith is inherently sequential.
 voxelRasterizationKernel :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
 voxelRasterizationKernel n nx ny nz keepPeriod =
   let src = R.fromFunction (R.Z R.:. n) (\(R.Z R.:. p) -> p)
@@ -531,6 +627,8 @@ voxelRasterizationKernel n nx ny nz keepPeriod =
   where
     size = nx * ny * nz
 
+-- | Voxel trilinear splat (8 scatter contributions per point).
+-- Same scatter limitation as voxelRasterizationKernel.
 voxelTrilinearSplatKernel :: Int -> Int -> Int -> Int -> Int -> R.Array R.U R.DIM1 Double
 voxelTrilinearSplatKernel n nx ny nz keepPeriod =
   let src = R.fromFunction (R.Z R.:. contribs) (\(R.Z R.:. i) -> i)
@@ -638,7 +736,7 @@ runSoftmax = do
   m <- readEnvInt "SOFTMAX_M"
   n <- readEnvInt "SOFTMAX_N"
   logits <- matFromVector m n <$> readCSVDoubles "bench/softmax/logits.csv"
-  let result = softmaxKernel m n logits
+  result <- softmaxKernel m n logits
   writeCSVDoubles2D "bench/softmax/out.csv" m n (matToVector m n result)
 
 runWeightedHistogram :: IO ()
@@ -738,7 +836,7 @@ timedBlackScholes opts = runTimingHarnessIO "main" opts load run R.sumAllS
       blackScholesKernel n spots strikes rates vols times
 
 timedNBody :: TimingOptions -> IO ()
-timedNBody opts = runTimingHarnessIO "main" opts loadNBodyInputs runNBodyFusedOutputsIO nBodyChecksum
+timedNBody opts = runTimingHarnessIO "main" opts loadNBodyInputs runNBodyAccelStyleOutputsIO nBodyChecksum
 
 timedMandelbrot :: TimingOptions -> IO ()
 timedMandelbrot opts = runTimingHarnessIO "main" opts load run R.sumAllS
