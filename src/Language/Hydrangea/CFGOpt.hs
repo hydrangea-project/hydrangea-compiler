@@ -485,8 +485,10 @@ loopInvariantCodeMotion2 = concatMap goStmt
     isHoistable iterDefs loopDeps defCounts (SAssign x rhs) =
       not (x `S.member` iterDefs)
       && M.findWithDefault 0 x defCounts == 1
-      && rhsIsPure2 rhs
+      && (rhsIsPure2 rhs || isZeroArgCall rhs)
       && S.null (usedVarsRHS2 rhs `S.intersection` loopDeps)
+      where isZeroArgCall (RCall _ []) = True
+            isZeroArgCall _            = False
     isHoistable _ _ _ _ = False
 
     hoistCommonBranchPrefix :: Set ByteString -> Stmt -> [Stmt]
@@ -505,7 +507,7 @@ loopInvariantCodeMotion2 = concatMap goStmt
 
     isBranchHoistable :: Set ByteString -> Stmt -> Bool
     isBranchHoistable loopDeps (SAssign _ rhs) =
-      rhsIsPure2 rhs
+      (rhsIsPure2 rhs || (case rhs of RCall _ [] -> True; _ -> False))
       && S.null (usedVarsRHS2 rhs `S.intersection` loopDeps)
     isBranchHoistable _ _ = False
 

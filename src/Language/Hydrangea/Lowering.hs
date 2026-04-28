@@ -1065,9 +1065,8 @@ lowerExp expr = case expr of
     (srNRows, arNRows) <- lowerExp nrowsExp
     (srNCols, arNCols) <- lowerExp ncolsExp
     (srNnz, arNnz) <- lowerExp nnzExp
-    (srRows, arRows) <- lowerExp rowsExp
-    (srCols, arCols) <- lowerExp colsExp
-    (srVals, arVals) <- lowerExp valsExp
+    -- Create loop variables first so they can be passed to lowerForSeqConsume,
+    -- which may use them inside the inline per-iteration statements it builds.
     shp <- freshCVar "coo_shp"
     outRows <- freshCVar "coo_rows"
     outCols <- freshCVar "coo_cols"
@@ -1077,10 +1076,15 @@ lowerExp expr = case expr of
     row <- freshCVar "coo_row"
     col <- freshCVar "coo_col"
     val <- freshCVar "coo_val"
+    -- Inline EMap inputs directly into the dedup loop; avoids materialising
+    -- sorted_rows / sorted_cols / sorted_vals as separate intermediate arrays.
+    (srRows, rowSrcAtom, rowIterStmts) <- lowerForSeqConsume rowsExp i row
+    (srCols, _,          colIterStmts) <- lowerForSeqConsume colsExp i col
+    (srVals, _,          valIterStmts) <- lowerForSeqConsume valsExp i val
     lastIdx <- freshCVar "coo_last"
     prevRow <- freshCVar "coo_prev_row"
     prevCol <- freshCVar "coo_prev_col"
-    oldVal <- freshCVar "coo_old_val"
+    prevVal <- freshCVar "coo_prev_val"
     mergedVal <- freshCVar "coo_merged_val"
     hasPrev <- freshCVar "coo_has_prev"
     sameRow <- freshCVar "coo_same_row"
@@ -1099,43 +1103,54 @@ lowerExp expr = case expr of
     registerCType outCols (CTArray CTInt64)
     registerCType outVals (CTArray CTInt64)
     registerCType outNnz CTInt64
+    registerCType prevRow CTInt64
+    registerCType prevCol CTInt64
+    registerCType prevVal CTInt64
     registerCType result cooTy
     pure
       ( srNRows ++ srNCols ++ srNnz ++ srRows ++ srCols ++ srVals
-          ++ [ SAssign shp (RArrayShape arRows)
+          ++ [ SAssign shp (RArrayShape rowSrcAtom)
              , SAssign outRows (RArrayAlloc (AVar shp))
              , SAssign outCols (RArrayAlloc (AVar shp))
              , SAssign outVals (RArrayAlloc (AVar shp))
              , SAssign outNnz (RAtom (AInt 0))
+             -- Loop-carried scalars cache the last written row/col/val, eliminating
+             -- array reads per iteration from the dedup loop.
+             , SAssign prevRow (RAtom (AInt 0))
+             , SAssign prevCol (RAtom (AInt 0))
+             , SAssign prevVal (RAtom (AInt 0))
              , SLoop (LoopSpec [i] [atomToIndexExpr arNnz] Serial Nothing LoopPlain)
-                 [ SAssign row (RArrayLoad arRows (AVar i))
-                 , SAssign col (RArrayLoad arCols (AVar i))
-                 , SAssign val (RArrayLoad arVals (AVar i))
-                 , SAssign hasPrev (RBinOp CGt (AVar outNnz) (AInt 0))
+                 ( rowIterStmts ++ colIterStmts ++ valIterStmts ++
+                 [ SAssign hasPrev (RBinOp CGt (AVar outNnz) (AInt 0))
                  , SIf (AVar hasPrev)
-                     [ SAssign lastIdx (RBinOp CSub (AVar outNnz) (AInt 1))
-                     , SAssign prevRow (RArrayLoad (AVar outRows) (AVar lastIdx))
-                     , SAssign prevCol (RArrayLoad (AVar outCols) (AVar lastIdx))
-                     , SAssign sameRow (RBinOp CEq (AVar row) (AVar prevRow))
+                     [ SAssign sameRow (RBinOp CEq (AVar row) (AVar prevRow))
                      , SAssign sameCol (RBinOp CEq (AVar col) (AVar prevCol))
                      , SAssign sameEntry (RBinOp CAnd (AVar sameRow) (AVar sameCol))
                      , SIf (AVar sameEntry)
-                         [ SAssign oldVal (RArrayLoad (AVar outVals) (AVar lastIdx))
-                         , SAssign mergedVal (RBinOp CAdd (AVar oldVal) (AVar val))
+                         -- Merge: update prevVal in-register, write back once
+                         [ SAssign mergedVal (RBinOp CAdd (AVar prevVal) (AVar val))
+                         , SAssign prevVal (RAtom (AVar mergedVal))
+                         , SAssign lastIdx (RBinOp CSub (AVar outNnz) (AInt 1))
                          , SArrayWrite (AVar outVals) (AVar lastIdx) (AVar mergedVal)
                          ]
                          [ SArrayWrite (AVar outRows) (AVar outNnz) (AVar row)
                          , SArrayWrite (AVar outCols) (AVar outNnz) (AVar col)
                          , SArrayWrite (AVar outVals) (AVar outNnz) (AVar val)
+                         , SAssign prevRow (RAtom (AVar row))
+                         , SAssign prevCol (RAtom (AVar col))
+                         , SAssign prevVal (RAtom (AVar val))
                          , SAssign outNnz (RBinOp CAdd (AVar outNnz) (AInt 1))
                          ]
                      ]
                      [ SArrayWrite (AVar outRows) (AVar outNnz) (AVar row)
                      , SArrayWrite (AVar outCols) (AVar outNnz) (AVar col)
                      , SArrayWrite (AVar outVals) (AVar outNnz) (AVar val)
+                     , SAssign prevRow (RAtom (AVar row))
+                     , SAssign prevCol (RAtom (AVar col))
+                     , SAssign prevVal (RAtom (AVar val))
                      , SAssign outNnz (RBinOp CAdd (AVar outNnz) (AInt 1))
                      ]
-                 ]
+                 ])
              , SAssign result
                  (RRecord
                    [ ("cols", AVar outCols)
@@ -2840,6 +2855,45 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
   _ -> do
     (sf, af) <- lowerExp fnExp
     pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
+
+-- | Lower an array expression for use as a sequential input to a consumer loop.
+--
+-- When the expression is @EMap fn src@ (possibly wrapped in @ELetIn@
+-- function-binding wrappers), the map result is *not* materialised.  Instead
+-- we lower @src@ once (as setup) and emit per-iteration statements that load
+-- @src[loopVar]@ and then inline @fn@ to produce @resultVar@.  This avoids
+-- allocating a temporary array and makes the dedup/scatter loops process
+-- their inputs without an extra pass.
+--
+-- For any other expression the array is materialised normally and each
+-- iteration does a plain @RArrayLoad@.
+--
+-- Returns @(setup_stmts, src_atom, per_iter_stmts)@ where
+--   * @setup_stmts@ run once before the consumer loop,
+--   * @src_atom@ is the underlying source array atom (useful for shape queries),
+--   * @per_iter_stmts@ produce @resultVar = expr[loopVar]@ each iteration.
+lowerForSeqConsume :: Exp Range -> CVar -> CVar -> LowerM ([Stmt], Atom, [Stmt])
+lowerForSeqConsume arrExp loopVar resultVar = case arrExp of
+  EMap _ fn src -> do
+    (ssrc, asrc) <- lowerExp src
+    elem' <- freshCVar "elem"
+    srcTy <- ctypeOfAtom asrc
+    case srcTy of
+      CTArray et -> registerCType elem' et
+      _          -> pure ()
+    bodyStmts <- inlineScalarFn fn elem' resultVar
+    let perIter = SAssign elem' (RArrayLoad asrc (AVar loopVar)) : bodyStmts
+    pure (ssrc, asrc, perIter)
+  ELetIn _ (Dec _ name pats _ _ body) rest
+    | not (null pats) -> do
+        registerFn name pats body
+        lowerForSeqConsume rest loopVar resultVar
+    | otherwise -> materialize
+  _ -> materialize
+  where
+    materialize = do
+      (sarr, aarr) <- lowerExp arrExp
+      pure (sarr, aarr, [SAssign resultVar (RArrayLoad aarr (AVar loopVar))])
 
 inlineBinaryFn :: Exp Range -> CVar -> CVar -> CVar -> LowerM [Stmt]
 inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of

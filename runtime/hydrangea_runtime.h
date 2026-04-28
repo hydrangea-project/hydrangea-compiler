@@ -375,14 +375,41 @@ typedef struct {
     int64_t idx;
 } hyd_sort_index_entry_t;
 
-static int hyd_sort_index_entry_cmp(const void* lhs, const void* rhs) {
-    const hyd_sort_index_entry_t* a = (const hyd_sort_index_entry_t*)lhs;
-    const hyd_sort_index_entry_t* b = (const hyd_sort_index_entry_t*)rhs;
-    if (a->key < b->key) return -1;
-    if (a->key > b->key) return 1;
-    if (a->idx < b->idx) return -1;
-    if (a->idx > b->idx) return 1;
-    return 0;
+/* LSD radix sort on hyd_sort_index_entry_t arrays by key, 8 bits per pass.
+   Determines the number of passes from the actual max key so short-key
+   workloads (e.g. packed row*ncols+col with nrows=ncols=4096) use only 3
+   passes instead of 8, cutting sort time roughly in half versus qsort. */
+static void hyd_radix_sort_entries(hyd_sort_index_entry_t* a,
+                                   hyd_sort_index_entry_t* b,
+                                   int64_t n) {
+    /* Find max key to determine number of 8-bit passes needed. */
+    int64_t max_key = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (a[i].key > max_key) max_key = a[i].key;
+    }
+    int passes = 0;
+    int64_t mk = max_key;
+    while (mk) { passes++; mk >>= 8; }
+    if (passes == 0) passes = 1;
+
+    hyd_sort_index_entry_t* src = a, *dst = b;
+    for (int p = 0; p < passes; p++) {
+        int shift = p * 8;
+        int64_t count[256];
+        memset(count, 0, sizeof(count));
+        for (int64_t i = 0; i < n; i++) count[(src[i].key >> shift) & 0xFF]++;
+        int64_t sum = 0;
+        for (int j = 0; j < 256; j++) { int64_t c = count[j]; count[j] = sum; sum += c; }
+        for (int64_t i = 0; i < n; i++) {
+            int64_t d = (src[i].key >> shift) & 0xFF;
+            dst[count[d]++] = src[i];
+        }
+        hyd_sort_index_entry_t* tmp = src; src = dst; dst = tmp;
+    }
+    /* After an odd number of passes the result lives in b; copy it back to a. */
+    if (passes % 2 == 1) {
+        memcpy(a, b, (size_t)n * sizeof(hyd_sort_index_entry_t));
+    }
 }
 
 static hyd_array_t* hyd_sort_indices(hyd_array_t* keys) {
@@ -396,7 +423,9 @@ static hyd_array_t* hyd_sort_indices(hyd_array_t* keys) {
     int64_t* out_data = (int64_t*)(void*)out->data;
     hyd_sort_index_entry_t* entries =
         (hyd_sort_index_entry_t*)malloc((size_t)n * sizeof(hyd_sort_index_entry_t));
-    if (entries == NULL) {
+    hyd_sort_index_entry_t* tmp =
+        (hyd_sort_index_entry_t*)malloc((size_t)n * sizeof(hyd_sort_index_entry_t));
+    if (entries == NULL || tmp == NULL) {
         fprintf(stderr, "hyd_sort_indices: allocation failed\n");
         exit(1);
     }
@@ -404,11 +433,12 @@ static hyd_array_t* hyd_sort_indices(hyd_array_t* keys) {
         entries[i].key = key_data[i];
         entries[i].idx = i;
     }
-    qsort(entries, (size_t)n, sizeof(hyd_sort_index_entry_t), hyd_sort_index_entry_cmp);
+    hyd_radix_sort_entries(entries, tmp, n);
     for (int64_t i = 0; i < n; i++) {
         out_data[i] = entries[i].idx;
     }
     free(entries);
+    free(tmp);
     return out;
 }
 
