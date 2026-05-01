@@ -634,6 +634,7 @@ spec = describe "Polyhedral" $ do
     polyhedralProgram2 (Program [proc]) `shouldBe` Program [proc]
   fusionSpec
   skewingSpec
+  temporalSkewingSpec
 
 loadPreparedMatmulBenchmarkDiagnostics :: IO [ScopDiagnostic]
 loadPreparedMatmulBenchmarkDiagnostics = do
@@ -936,3 +937,188 @@ skewingSpec = describe "skewing" $ do
         , pdrSrcIndex = []
         , pdrTgtIndex = []
         }
+
+-- ---------------------------------------------------------------------------
+-- Temporal skewing tests
+-- ---------------------------------------------------------------------------
+
+temporalSkewingSpec :: Spec
+temporalSkewingSpec = describe "temporal skewing" $ do
+  it "detectTemporalAlias finds the swap at the end of a LoopIterate body" $ do
+    let body =
+          [ SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+          , SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+          , SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap)
+              [ SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "i"))
+              , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+              ]
+          , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+          ]
+    detectTemporalAlias body `shouldBe` Just ("arr_cur", "arr_next")
+
+  it "detectTemporalAlias returns Nothing when there is no swap" $ do
+    let body =
+          [ SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "x")
+          ]
+    detectTemporalAlias body `shouldBe` Nothing
+
+  it "augmentWithTemporalDeps bumps iter_t distance from 0 to 1 for WAR deps with negative spatial distance" $ do
+    -- A WAR dep as produced by the extractor for a LoopIterate stencil:
+    -- iter_t carry is PolyCarryIndependent (0), i distance = -1.
+    -- After augmentation iter_t should become +1 so skewing can fire.
+    let iterateDep = PolyhedralDependenceRelation
+          { pdrKind = PolyDepWAR
+          , pdrArray = "arr_next"
+          , pdrSourceStmt = [0]
+          , pdrTargetStmt = [1]
+          , pdrDirection = PolyDepForward
+          , pdrIsLoopCarried = True
+          , pdrDistance = Just [0, -1]
+          , pdrCarryInfo =
+              [ PolyhedralCarryInfo "iter_t" PolyCarryIndependent
+              , PolyhedralCarryInfo "i" (PolyCarryDistance (-1))
+              ]
+          , pdrBandCarry =
+              [ PolyhedralBandCarry
+                  { pbcIters = ["iter_t"]
+                  , pbcRole = LoopIterate
+                  , pbcStatus = PolyBandIndependent
+                  , pbcCarryInfo = [PolyhedralCarryInfo "iter_t" PolyCarryIndependent]
+                  }
+              , PolyhedralBandCarry
+                  { pbcIters = ["i"]
+                  , pbcRole = LoopMap
+                  , pbcStatus = PolyBandBackward
+                  , pbcCarryInfo = [PolyhedralCarryInfo "i" (PolyCarryDistance (-1))]
+                  }
+              ]
+          , pdrClassification = PolyDepClassRegular
+          , pdrIsBlocking = True
+          , pdrSrcIndex = []
+          , pdrTgtIndex = []
+          }
+        augmented = augmentWithTemporalDeps "iter_t" [iterateDep]
+    case augmented of
+      [rel] -> do
+        -- iter_t distance should now be +1, i distance still -1
+        pdrDistance rel `shouldBe` Just [1, -1]
+        -- First carryInfo entry should be iter_t: +1
+        case pdrCarryInfo rel of
+          (ci : _) -> do
+            pciIter ci `shouldBe` "iter_t"
+            pciStatus ci `shouldBe` PolyCarryDistance 1
+          [] -> expectationFailure "expected non-empty carryInfo"
+        -- The LoopIterate band carry should now be forward
+        case pdrBandCarry rel of
+          (bc : _) -> do
+            pbcRole bc `shouldBe` LoopIterate
+            pbcStatus bc `shouldBe` PolyBandForward
+          [] -> expectationFailure "expected non-empty bandCarry"
+        -- After augmentation the dep should be non-blocking (outer is forward)
+        pdrIsBlocking rel `shouldBe` False
+      other -> expectationFailure ("expected one dep, got: " <> show (length other))
+
+  it "augmentWithTemporalDeps leaves forward-only deps unchanged" $ do
+    let fwdDep = PolyhedralDependenceRelation
+          { pdrKind = PolyDepRAW
+          , pdrArray = "arr"
+          , pdrSourceStmt = [0]
+          , pdrTargetStmt = [1]
+          , pdrDirection = PolyDepForward
+          , pdrIsLoopCarried = True
+          , pdrDistance = Just [1]
+          , pdrCarryInfo = [PolyhedralCarryInfo "i" (PolyCarryDistance 1)]
+          , pdrBandCarry =
+              [ PolyhedralBandCarry
+                  { pbcIters = ["i"]
+                  , pbcRole = LoopMap
+                  , pbcStatus = PolyBandForward
+                  , pbcCarryInfo = [PolyhedralCarryInfo "i" (PolyCarryDistance 1)]
+                  }
+              ]
+          , pdrClassification = PolyDepClassRegular
+          , pdrIsBlocking = False
+          , pdrSrcIndex = []
+          , pdrTgtIndex = []
+          }
+        augmented = augmentWithTemporalDeps "iter_t" [fwdDep]
+    augmented `shouldBe` [fwdDep]
+
+  it "suggestBandSkew2 is triggered for the augmented temporal stencil dep" $ do
+    -- Simulate the dep produced by augmentWithTemporalDeps for a 1D stencil:
+    -- outer band (iter_t: LoopIterate), inner band (i: LoopMap)
+    -- distance: [+1, -1]  → outerDist(iter_t)=+1, innerDist(i)=-1
+    let dims = [ScheduleDim "iter_t" (IVar "T"), ScheduleDim "i" (IVar "n")]
+        rel = PolyhedralDependenceRelation
+          { pdrKind = PolyDepWAR
+          , pdrArray = "arr_next"
+          , pdrSourceStmt = [0]
+          , pdrTargetStmt = [1]
+          , pdrDirection = PolyDepForward
+          , pdrIsLoopCarried = True
+          , pdrDistance = Just [1, -1]
+          , pdrCarryInfo =
+              [ PolyhedralCarryInfo "iter_t" (PolyCarryDistance 1)
+              , PolyhedralCarryInfo "i" (PolyCarryDistance (-1))
+              ]
+          , pdrBandCarry =
+              [ PolyhedralBandCarry
+                  { pbcIters = ["iter_t", "i"]
+                  , pbcRole = LoopIterate
+                  , pbcStatus = PolyBandForward
+                  , pbcCarryInfo =
+                      [ PolyhedralCarryInfo "iter_t" (PolyCarryDistance 1)
+                      , PolyhedralCarryInfo "i" (PolyCarryDistance (-1))
+                      ]
+                  }
+              ]
+          , pdrClassification = PolyDepClassRegular
+          , pdrIsBlocking = False
+          , pdrSrcIndex = []
+          , pdrTgtIndex = []
+          }
+    case suggestBandSkew2 0 dims [rel] of
+      Nothing -> expectationFailure "expected a skew suggestion for temporal stencil dep"
+      Just skew -> do
+        skewTarget skew `shouldBe` "i"
+        skewSource skew `shouldBe` "iter_t"
+        skewCoeff skew `shouldSatisfy` (>= 1)
+
+  it "LoopIterate scop with stencil pattern extracts and produces a dep suitable for skewing" $ do
+    -- Build a synthetic 1D iterate loop body:
+    --   iter_t ∈ [0, T):
+    --     arr_next = alloc(shp)
+    --     shp = shape(arr_cur)
+    --     i ∈ [0, n):
+    --       x = load arr_cur[i+1]   ← reads from i+1 (will be substituted → arr_next)
+    --       write arr_next[i] x
+    --     arr_cur = arr_next         ← temporal swap
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap)
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        iterateBody =
+          [ SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+          , SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+          , innerLoop
+          , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+          ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate) iterateBody
+        proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
+    case extractProcScops2 proc of
+      [scop] -> do
+        let deps = collectScopDependenceRelations2 scop
+        -- There should be at least one dep involving arr_next (or arr_cur substituted)
+        -- that has a negative inner distance augmented with iter_t: +1
+        let temporalDeps =
+              [ rel
+              | rel <- deps
+              , case pdrDistance rel of
+                  Just (d0 : d1 : _) -> d0 > 0 && d1 < 0
+                  _ -> False
+              ]
+        length temporalDeps `shouldSatisfy` (>= 1)
+      other -> expectationFailure ("expected one extracted scop, got: " <> show (length other))

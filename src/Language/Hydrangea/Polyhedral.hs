@@ -58,6 +58,8 @@ module Language.Hydrangea.Polyhedral
   , tileIdentityScop2
   , tileScop2
   , tryFuseBands2
+  , detectTemporalAlias
+  , augmentWithTemporalDeps
   ) where
 
 import Control.Applicative ((<|>))
@@ -784,17 +786,23 @@ collectScopDependences2 =
 
 collectScopDependenceRelations2 :: Scop -> [PolyhedralDependenceRelation]
 collectScopDependenceRelations2 scop =
-  [ mkRelation srcStmt tgtStmt srcAccess tgtAccess depKind accessAnalysis
-  | (srcPos, srcStmt) <- orderedStmts
-  , (tgtPos, tgtStmt) <- orderedStmts
-  , srcPos < tgtPos
-  , srcAccess <- psReads srcStmt ++ psWrites srcStmt
-  , tgtAccess <- psReads tgtStmt ++ psWrites tgtStmt
-  , paArray srcAccess == paArray tgtAccess
-  , Just depKind <- [dependenceKindFromAccesses srcAccess tgtAccess]
-  , let accessAnalysis =
-          analyzeAccessDistance2 (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
-  ]
+  let baseDeps =
+        [ mkRelation srcStmt tgtStmt srcAccess tgtAccess depKind accessAnalysis
+        | (srcPos, srcStmt) <- orderedStmts
+        , (tgtPos, tgtStmt) <- orderedStmts
+        , srcPos < tgtPos
+        , srcAccess <- psReads srcStmt ++ psWrites srcStmt
+        , tgtAccess <- psReads tgtStmt ++ psWrites tgtStmt
+        , paArray srcAccess == paArray tgtAccess
+        , Just depKind <- [dependenceKindFromAccesses srcAccess tgtAccess]
+        , let accessAnalysis =
+                analyzeAccessDistance2 (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
+        ]
+  in  case outerIterateInfo (scSchedule scop) of
+        Just (iterT, _arrNext) ->
+          augmentWithTemporalDeps iterT baseDeps
+        Nothing ->
+          baseDeps
   where
     stmtMap = M.fromList [(psPath stmt, stmt) | stmt <- scStatements scop]
     orderedStmts =
@@ -825,6 +833,112 @@ collectScopDependenceRelations2 scop =
             , pdrSrcIndex = paIndex srcAccess
             , pdrTgtIndex = paIndex tgtAccess
             }
+
+-- | Detect if the outermost schedule band is a LoopIterate and return its
+-- iterator variable.  Returns @Just (iterT, "")@ when found; the second
+-- component is unused but kept for symmetry with 'detectTemporalAlias'.
+outerIterateInfo :: ScheduleTree -> Maybe (CVar, CVar)
+outerIterateInfo sched = case sched of
+  ScheduleLoopBand band
+    | lbRole band == LoopIterate
+    , (iterT : _) <- lbIters band ->
+        Just (iterT, "")
+  _ -> Nothing
+
+-- | Detect temporal alias: look for @SAssign cur (RAtom (AVar next))@ at the end of stmts.
+detectTemporalAlias :: [Stmt] -> Maybe (CVar, CVar)
+detectTemporalAlias stmts = case reverse stmts of
+  (SAssign cur (RAtom (AVar next)) : _) -> Just (cur, next)
+  _ -> Nothing
+
+-- | Augment dependence relations from a LoopIterate scop with the temporal
+-- dimension.  For every dep that is carried purely within spatial (non-iterate)
+-- bands, prepend an outer LoopIterate band carry of distance +1.  This makes
+-- the WAR deps from stencil reads visible to @suggestBandSkew2@.
+--
+-- In a @LoopIterate@ body the polyhedral analysis treats reads and writes as
+-- occurring in the *same* temporal iteration (iter_t distance = 0).  But the
+-- actual semantics is that the array read at the start of body[iter_t] was
+-- written at body[iter_t-1].  For a WAR dep (read-before-write, same array)
+-- with zero iter_t distance and at least one negative spatial distance, we
+-- bump the iter_t component from 0 to +1 to expose the true cross-iteration
+-- nature of the dependence so that @suggestBandSkew2@ can fire.
+augmentWithTemporalDeps
+  :: CVar                          -- ^ iter_t: the LoopIterate iterator
+  -> [PolyhedralDependenceRelation]
+  -> [PolyhedralDependenceRelation]
+augmentWithTemporalDeps iterT = map augmentOne
+  where
+    augmentOne rel =
+      if needsTemporalAugment rel
+        then bumpIterTDistance rel
+        else rel
+
+    -- A dep needs augmentation when:
+    --   1. It is a WAR dep (read before write in static order, same array)
+    --   2. The iter_t carry distance is currently 0 (both read and write are
+    --      modelled in the same temporal iteration)
+    --   3. There is at least one negative spatial distance (backward spatial dep)
+    needsTemporalAugment rel =
+      pdrKind rel == PolyDepWAR
+      && case iterTCarryDistance rel of
+           Just 0 -> True
+           _ -> False
+      && case pdrDistance rel of
+           Just ds -> any (< 0) ds
+           Nothing -> False
+
+    -- Extract the effective carry distance for iter_t from the flat carry info list.
+    -- PolyCarryIndependent means distance = 0 in this context.
+    iterTCarryDistance rel =
+      case [pciStatus ci | ci <- pdrCarryInfo rel, pciIter ci == iterT] of
+        [PolyCarryDistance d] -> Just d
+        [PolyCarryIndependent] -> Just 0
+        _ -> Nothing
+
+    -- Bump iter_t carry distance from 0 to +1 throughout the relation.
+    bumpIterTDistance rel =
+      let newCarryInfo = map bumpCI (pdrCarryInfo rel)
+          newBandCarry = map bumpBC (pdrBandCarry rel)
+          -- The iter_t dimension in pdrDistance corresponds to its position
+          -- in pdrCarryInfo; bump just that slot from 0 to 1.
+          iters = map pciIter (pdrCarryInfo rel)
+          iterTIdx = length (takeWhile (/= iterT) iters)
+          newDistance = case pdrDistance rel of
+            Nothing -> Nothing
+            Just ds ->
+              Just [if idx == iterTIdx then 1 else d | (idx, d) <- zip [0 ..] ds]
+      in rel
+           { pdrCarryInfo = newCarryInfo
+           , pdrBandCarry = newBandCarry
+           , pdrDistance = newDistance
+           , pdrIsLoopCarried = True
+           , pdrDirection = PolyDepForward
+           , pdrIsBlocking = False
+           }
+
+    bumpCI ci
+      | pciIter ci == iterT
+      , pciStatus ci == PolyCarryDistance 0 || pciStatus ci == PolyCarryIndependent =
+          ci { pciStatus = PolyCarryDistance 1 }
+      | otherwise = ci
+
+    bumpBC bc =
+      bc
+        { pbcCarryInfo = map bumpCI (pbcCarryInfo bc)
+        , pbcStatus = recomputeBandStatus (map bumpCI (pbcCarryInfo bc))
+        }
+
+    recomputeBandStatus carryInfo =
+      case traverse carryDistance2 carryInfo of
+        Just distances
+          | all (== 0) distances -> PolyBandIndependent
+          | otherwise ->
+              case classifyDistance distances of
+                PolyDepForward -> PolyBandForward
+                PolyDepBackward -> PolyBandBackward
+                PolyDepUnknown -> PolyBandUnknown
+        Nothing -> PolyBandUnknown
 
 relationToLegacyDependence2 :: PolyhedralDependenceRelation -> PolyhedralDependence
 relationToLegacyDependence2 relation =
@@ -1200,6 +1314,16 @@ collectScheduleNames sched = case sched of
             ]
         ]
 
+-- | True for execution policies that polyhedral extraction can handle.
+-- Serial and Parallel are both fine: Parallel means "no loop-carried deps,"
+-- which is exactly what polyhedral dep analysis will verify.  Vector loops
+-- are not supported because they operate on SIMD sub-words.
+isPolyhedralCompatibleExec :: ExecPolicy -> Bool
+isPolyhedralCompatibleExec Serial = True
+isPolyhedralCompatibleExec (Parallel {}) = True
+isPolyhedralCompatibleExec _ = False
+
+-- | Top-level entry point for loop extraction (no inherited alias map).
 extractLoop
   :: [Int]
   -> [AffineConstraint]
@@ -1207,8 +1331,21 @@ extractLoop
   -> LoopSpec
   -> [Stmt]
   -> Either ScopRejectReason ([PolyhedralStmt], ScheduleTree)
-extractLoop loopPath domain env spec body
-  | lsExec spec /= Serial = Left (RejectNonSerialExec (lsExec spec))
+extractLoop = extractLoopWithAlias M.empty
+
+-- | Core loop extraction.  The @inheritedAlias@ is the temporal alias map
+-- propagated down from an enclosing @LoopIterate@.  When this loop is itself
+-- a @LoopIterate@, a new alias is detected from the body and used instead.
+extractLoopWithAlias
+  :: Map CVar CVar
+  -> [Int]
+  -> [AffineConstraint]
+  -> AffineEnv
+  -> LoopSpec
+  -> [Stmt]
+  -> Either ScopRejectReason ([PolyhedralStmt], ScheduleTree)
+extractLoopWithAlias inheritedAlias loopPath domain env spec body
+  | not (isPolyhedralCompatibleExec (lsExec spec)) = Left (RejectNonSerialExec (lsExec spec))
   | otherwise = do
       bounds <- case mapM supportedBoundExprFromIndexExpr2 (lsBounds spec) of
         Just ok -> Right ok
@@ -1216,7 +1353,16 @@ extractLoop loopPath domain env spec body
           Just bad -> Left (RejectUnsupportedBound bad)
           Nothing -> Left (RejectUnsupportedStmt (SLoop spec body))
       let domain' = domain ++ loopDomainConstraints spec bounds
-      (stmts, bodySchedule, _) <- extractStmtList loopPath domain' env body
+          -- For LoopIterate bodies, detect a new temporal alias; otherwise
+          -- inherit the alias from the enclosing scope so that nested inner
+          -- loops (e.g. LoopMap inside LoopIterate) still substitute reads.
+          aliasMap = case lsRole spec of
+            LoopIterate ->
+              case detectTemporalAlias body of
+                Just (arrCur, arrNext) -> M.singleton arrCur arrNext
+                Nothing -> inheritedAlias
+            _ -> inheritedAlias
+      (stmts, bodySchedule, _) <- extractStmtListWithAlias aliasMap loopPath domain' env body
       pure
         ( stmts
         , ScheduleLoopBand
@@ -1230,20 +1376,21 @@ extractLoop loopPath domain env spec body
               , lbSkew = []
               }
         )
-extractStmtList
-  :: [Int]
+extractStmtListWithAlias
+  :: Map CVar CVar
+  -> [Int]
   -> [AffineConstraint]
   -> AffineEnv
   -> [Stmt]
   -> Either ScopRejectReason ([PolyhedralStmt], ScheduleTree, AffineEnv)
-extractStmtList basePath domain env stmts = go env [] [] (zip [0 ..] stmts)
+extractStmtListWithAlias aliasMap basePath domain env stmts = go env [] [] (zip [0 ..] stmts)
   where
     go envNow accStmts accSched [] =
       Right (reverse accStmts, ScheduleSequence (reverse accSched), envNow)
     go envNow accStmts accSched ((i, stmt) : rest) =
       case stmt of
         SAssign v rhs -> do
-          readAccesses <- rhsReadAccesses envNow rhs
+          readAccesses <- rhsReadAccessesWithAlias aliasMap envNow rhs
           if not (rhsSupportedInScop rhs)
             then Left (RejectUnsupportedRHS rhs)
             else
@@ -1264,19 +1411,23 @@ extractStmtList basePath domain env stmts = go env [] [] (zip [0 ..] stmts)
             Nothing -> Left (RejectUnsupportedArrayRef stmt)
             Just affineIdx ->
               let stmtPath = basePath ++ [i]
+                  -- Also substitute array name on writes for consistency
+                  arr' = M.findWithDefault arr arr aliasMap
                   polyStmt = PolyhedralStmt
                     { psPath = stmtPath
                     , psDomain = domain
                     , psReads = []
-                    , psWrites = [PolyhedralAccess PolyWrite arr affineIdx]
+                    , psWrites = [PolyhedralAccess PolyWrite arr' affineIdx]
                     , psStmt = SArrayWrite (AVar arr) idx val
                     }
               in go envNow (polyStmt : accStmts) (ScheduleStmtRef stmtPath : accSched) rest
         SArrayWrite {} ->
           Left (RejectUnsupportedArrayRef stmt)
-        SLoop spec body -> do
+        SLoop innerSpec innerBody -> do
           let stmtPath = basePath ++ [i]
-          (nestedStmts, nestedSchedule) <- extractLoop stmtPath domain envNow spec body
+          -- Propagate the alias map into nested loops.
+          (nestedStmts, nestedSchedule) <-
+            extractLoopWithAlias aliasMap stmtPath domain envNow innerSpec innerBody
           go envNow (reverse nestedStmts ++ accStmts) (nestedSchedule : accSched) rest
         SIf {} ->
           Left (RejectUnsupportedStmt stmt)
@@ -1321,19 +1472,30 @@ rhsIsAffineScopCore rhs = case rhs of
 -- These are accepted inside a SCoP so extraction can keep shape normalization
 -- and index conversion around an affine kernel without admitting general
 -- effectful or non-affine operations.
+-- RArrayAlloc and RShapeSize are permitted so that the preamble of a
+-- LoopIterate body (buffer allocation, shape extraction) does not block
+-- scop extraction.
 rhsIsSupportedScopPrelude :: RHS -> Bool
 rhsIsSupportedScopPrelude rhs = case rhs of
   RCall _ [] -> True
   RArrayShape {} -> True
   RFlatToNd {} -> True
   RNdToFlat {} -> True
+  RArrayAlloc {} -> True
+  RShapeSize {} -> True
   _ -> False
 
-rhsReadAccesses :: AffineEnv -> RHS -> Either ScopRejectReason [PolyhedralAccess]
-rhsReadAccesses env rhs = case rhs of
+-- | Like 'rhsReadAccesses' (= 'rhsReadAccessesWithAlias' with empty alias map)
+-- but substitutes array names via the alias map.
+-- This is used for LoopIterate bodies where @arr_cur@ is aliased to @arr_next@
+-- so that dep analysis sees both reads and writes on the same array.
+rhsReadAccessesWithAlias :: Map CVar CVar -> AffineEnv -> RHS -> Either ScopRejectReason [PolyhedralAccess]
+rhsReadAccessesWithAlias aliasMap env rhs = case rhs of
   RArrayLoad (AVar arr) idx ->
     case affineIndexFromAtom env idx of
-      Just affineIdx -> Right [PolyhedralAccess PolyRead arr affineIdx]
+      Just affineIdx ->
+        let arr' = M.findWithDefault arr arr aliasMap
+        in Right [PolyhedralAccess PolyRead arr' affineIdx]
       Nothing -> Left (RejectUnsupportedArrayRef (SAssign "scop_tmp" rhs))
   RArrayLoad {} ->
     Left (RejectUnsupportedArrayRef (SAssign "scop_tmp" rhs))

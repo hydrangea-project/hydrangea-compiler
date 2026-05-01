@@ -1,0 +1,16 @@
+let h       = get_env_int "JACOBI_H"
+let w       = get_env_int "JACOBI_W"
+let n_iters = get_env_int "JACOBI_ITERS"
+let initial = generate [h, w] (fn [i, j] => 1.0)
+let step    = fn arr =>
+  generate [h-2, w-2]
+    (let f [i, j] =
+      let ii = i+1 in
+      let jj = j+1 in
+      (index [ii-1, jj] arr +.
+       index [ii+1, jj] arr +.
+       index [ii, jj-1] arr +.
+       index [ii, jj+1] arr) /. 4.0
+    in f)
+let result  = iterate n_iters initial step
+let main    = write_array_float result "jacobi_out.csv"
