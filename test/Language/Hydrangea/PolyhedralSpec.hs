@@ -354,6 +354,14 @@ spec = describe "Polyhedral" $ do
                   ]
               , pdrClassification = PolyDepClassRegular
               , pdrIsBlocking = False
+              , pdrSrcIndex =
+                  [ AffineExpr (Map.fromList [("i", 1)]) 0
+                  , AffineExpr (Map.fromList [("j", 1)]) 0
+                  ]
+              , pdrTgtIndex =
+                  [ AffineExpr (Map.fromList [("i", 1)]) 1
+                  , AffineExpr (Map.fromList [("j", 1)]) (-1)
+                  ]
               }
           ]
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -391,6 +399,8 @@ spec = describe "Polyhedral" $ do
                   ]
               , pdrClassification = PolyDepClassReductionLike
               , pdrIsBlocking = False
+              , pdrSrcIndex = [AffineExpr (Map.fromList [("k", 1)]) 0]
+              , pdrTgtIndex = [AffineExpr (Map.fromList [("k", 1)]) (-1)]
               }
           ]
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -446,6 +456,14 @@ spec = describe "Polyhedral" $ do
                   ]
               , pdrClassification = PolyDepClassReductionLike
               , pdrIsBlocking = False
+              , pdrSrcIndex =
+                  [ AffineExpr (Map.fromList [("j", 1)]) 0
+                  , AffineExpr (Map.fromList [("k", 1)]) 0
+                  ]
+              , pdrTgtIndex =
+                  [ AffineExpr (Map.fromList [("j", 1)]) 0
+                  , AffineExpr (Map.fromList [("k", 1)]) (-1)
+                  ]
               }
           ]
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -483,6 +501,8 @@ spec = describe "Polyhedral" $ do
                   ]
               , pdrClassification = PolyDepClassRegular
               , pdrIsBlocking = False
+              , pdrSrcIndex = [AffineExpr (Map.fromList [("i", 1)]) 0]
+              , pdrTgtIndex = [AffineExpr (Map.fromList [("i", 1)]) 1]
               }
           ]
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -607,6 +627,8 @@ spec = describe "Polyhedral" $ do
             ]
         proc = mkProc "p" ["n", "m", "arr", "out"] [outer]
     polyhedralProgram2 (Program [proc]) `shouldBe` Program [proc]
+  fusionSpec
+  skewingSpec
 
 loadPreparedMatmulBenchmarkDiagnostics :: IO [ScopDiagnostic]
 loadPreparedMatmulBenchmarkDiagnostics = do
@@ -699,3 +721,213 @@ hasMapUpdateLoop = any go
     writeCount =
       length
         . filter (\stmt -> case stmt of SArrayWrite {} -> True; _ -> False)
+
+-- ---------------------------------------------------------------------------
+-- Fusion tests
+-- ---------------------------------------------------------------------------
+
+-- | Count bands at the current level of a schedule sequence.
+-- Used to check that fusion produced a smaller number of bands.
+sequenceBandCount :: AffineScheduleTree -> Int
+sequenceBandCount tree = case tree of
+  AffineScheduleSequence xs -> sum (map sequenceBandCount xs)
+  AffineScheduleLoopBand {} -> 1
+  AffineScheduleStmtRef {} -> 0
+
+-- | Given an outer loop containing two inner loops, extract one SCoP and
+-- synthesize a schedule; return the affine schedule root.
+fuseSiblingBands :: Stmt -> AffineScheduleTree
+fuseSiblingBands outer =
+  case extractProcScops2 (mkProc "p" ["n", "m", "a", "b"] [outer]) of
+    (scop : _) -> asRoot (ssAffineSchedule (synthesizeScopSchedule2 scop))
+    [] -> error "expected at least one scop"
+
+-- | Count inner loop bands inside the body of the outermost band.
+innerBandCount :: AffineScheduleTree -> Int
+innerBandCount tree = case tree of
+  AffineScheduleLoopBand band -> sequenceBandCount (albBody band)
+  AffineScheduleSequence xs -> case filter isLoopBand xs of
+    (t : _) -> innerBandCount t
+    [] -> 0
+  _ -> 0
+  where
+    isLoopBand (AffineScheduleLoopBand {}) = True
+    isLoopBand _ = False
+
+-- | Count inner loop stmts (SLoop) in the reified output.
+reifiedInnerLoopCount :: Maybe [Stmt] -> Int
+reifiedInnerLoopCount Nothing = -1
+reifiedInnerLoopCount (Just stmts) =
+  sum [length [() | SLoop {} <- body] | SLoop _ body <- stmts]
+
+fusionSpec :: Spec
+fusionSpec = describe "fusion" $ do
+  it "two independent map bands with the same bound are structurally compatible" $ do
+    bandsStructurallyCompatible2 (mkMapBand "i") (mkMapBand "j") `shouldBe` True
+  it "two sibling inner loops with the same bound and no cross-deps fuse" $ do
+    -- outer loop containing two independent inner loops
+    let outer =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+                [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+                [SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "i")]
+            ]
+    innerBandCount (fuseSiblingBands outer) `shouldBe` 1
+  it "fused sibling loops reify to a single inner loop with both writes" $ do
+    let outer =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+                [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+                [SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "i")]
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "a", "b"] [outer]) of
+      (scop : _) -> do
+        let scheduled = synthesizeScopSchedule2 scop
+        case reifyScheduledScop2 scheduled of
+          Just [SLoop _ [SLoop _ innerBody]] -> do
+            let writes = [() | SArrayWrite {} <- innerBody]
+            length writes `shouldBe` 2
+          Just other ->
+            expectationFailure ("expected outer->single inner loop, got: " <> show other)
+          Nothing ->
+            expectationFailure "reification failed"
+      other ->
+        expectationFailure ("expected scops, got: " <> show other)
+  it "sibling loops with backward cross-dep do not fuse" $ do
+    -- inner1 writes a[j], inner2 reads a[j+1] — backward dep blocks fusion
+    let outer =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+                [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+                [ SAssign "nextK" (C.RBinOp C.CAdd (C.AVar "k") (C.AInt 1))
+                , SAssign "x" (C.RArrayLoad (C.AVar "a") (C.AVar "nextK"))
+                , SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "x")
+                ]
+            ]
+    innerBandCount (fuseSiblingBands outer) `shouldBe` 2
+  it "sibling loops with forward cross-dep (a[j-1]) do fuse" $ do
+    -- inner1 writes a[j], inner2 reads a[j-1] — forward dep allows fusion
+    let outer =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+                [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+                [ SAssign "prevK" (C.RBinOp C.CSub (C.AVar "k") (C.AInt 1))
+                , SAssign "x" (C.RArrayLoad (C.AVar "a") (C.AVar "prevK"))
+                , SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "x")
+                ]
+            ]
+    innerBandCount (fuseSiblingBands outer) `shouldBe` 1
+  it "tryFuseBands2 returns Nothing for bands with mismatched bounds" $ do
+    let b2 = (mkMapBand "j") { albDims = [ScheduleDim "j" (IVar "m")] }
+    tryFuseBands2 0 [] (AffineScheduleLoopBand (mkMapBand "i")) (AffineScheduleLoopBand b2)
+      `shouldBe` Nothing
+  where
+    mkMapBand iter =
+      AffineLoopBand
+        { albDims = [ScheduleDim iter (IVar "n")]
+        , albExec = Serial
+        , albReduction = Nothing
+        , albRole = LoopMap
+        , albSkew = []
+        , albBody = AffineScheduleStmtRef [0]
+        }
+
+-- ---------------------------------------------------------------------------
+-- Skewing tests
+-- ---------------------------------------------------------------------------
+
+skewingSpec :: Spec
+skewingSpec = describe "skewing" $ do
+  it "suggestBandSkew2 returns Nothing for a loop with no backward deps" $ do
+    let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
+        relations = []
+    suggestBandSkew2 0 dims relations `shouldBe` Nothing
+  it "suggestBandSkew2 returns Nothing for a single-dim band" $ do
+    let dims = [ScheduleDim "i" (IVar "n")]
+        rel = forwardRel "i" 1
+    suggestBandSkew2 0 dims [rel] `shouldBe` Nothing
+  it "suggestBandSkew2 suggests a skew when inner dim has backward dep and outer has forward dep" $ do
+    let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
+        rel = backwardInnerRel "i" "j" 1 (-1)
+    case suggestBandSkew2 0 dims [rel] of
+      Nothing -> expectationFailure "expected a skew suggestion"
+      Just skew -> do
+        skewTarget skew `shouldBe` "j"
+        skewSource skew `shouldBe` "i"
+        skewCoeff skew `shouldSatisfy` (>= 1)
+  it "skewCoeff >= ceil(innerDist / outerDist) ensures new inner dist is non-negative" $ do
+    let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
+        rel = backwardInnerRel "i" "j" 2 (-3)
+    case suggestBandSkew2 0 dims [rel] of
+      Nothing -> expectationFailure "expected a skew suggestion"
+      Just skew -> do
+        let newInnerDist = (-3) + skewCoeff skew * 2
+        newInnerDist `shouldSatisfy` (>= 0)
+  it "suggestBandSkew2 takes the maximum coefficient when multiple deps require skewing" $ do
+    let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
+        rel1 = backwardInnerRel "i" "j" 1 (-1)
+        rel2 = backwardInnerRel "i" "j" 1 (-3)
+    case suggestBandSkew2 0 dims [rel1, rel2] of
+      Nothing -> expectationFailure "expected a skew suggestion"
+      Just skew -> do
+        let newInnerDist1 = (-1) + skewCoeff skew * 1
+            newInnerDist2 = (-3) + skewCoeff skew * 1
+        newInnerDist1 `shouldSatisfy` (>= 0)
+        newInnerDist2 `shouldSatisfy` (>= 0)
+  where
+    forwardRel iter dist =
+      PolyhedralDependenceRelation
+        { pdrKind = PolyDepRAW
+        , pdrArray = "a"
+        , pdrSourceStmt = [0]
+        , pdrTargetStmt = [0]
+        , pdrDirection = PolyDepForward
+        , pdrIsLoopCarried = True
+        , pdrDistance = Just [dist]
+        , pdrCarryInfo = [PolyhedralCarryInfo iter (PolyCarryDistance dist)]
+        , pdrBandCarry =
+            [ PolyhedralBandCarry
+                { pbcIters = [iter]
+                , pbcRole = LoopMap
+                , pbcStatus = if dist > 0 then PolyBandForward else PolyBandIndependent
+                , pbcCarryInfo = [PolyhedralCarryInfo iter (PolyCarryDistance dist)]
+                }
+            ]
+        , pdrClassification = PolyDepClassRegular
+        , pdrIsBlocking = False
+        , pdrSrcIndex = []
+        , pdrTgtIndex = []
+        }
+    backwardInnerRel outerIter innerIter outerDist innerDist =
+      PolyhedralDependenceRelation
+        { pdrKind = PolyDepRAW
+        , pdrArray = "a"
+        , pdrSourceStmt = [0]
+        , pdrTargetStmt = [0]
+        , pdrDirection = PolyDepForward
+        , pdrIsLoopCarried = True
+        , pdrDistance = Just [outerDist, innerDist]
+        , pdrCarryInfo =
+            [ PolyhedralCarryInfo outerIter (PolyCarryDistance outerDist)
+            , PolyhedralCarryInfo innerIter (PolyCarryDistance innerDist)
+            ]
+        , pdrBandCarry =
+            [ PolyhedralBandCarry
+                { pbcIters = [outerIter, innerIter]
+                , pbcRole = LoopMap
+                , pbcStatus = PolyBandForward
+                , pbcCarryInfo =
+                    [ PolyhedralCarryInfo outerIter (PolyCarryDistance outerDist)
+                    , PolyhedralCarryInfo innerIter (PolyCarryDistance innerDist)
+                    ]
+                }
+            ]
+        , pdrClassification = PolyDepClassRegular
+        , pdrIsBlocking = True
+        , pdrSrcIndex = []
+        , pdrTgtIndex = []
+        }

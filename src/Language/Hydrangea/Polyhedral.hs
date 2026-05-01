@@ -30,6 +30,7 @@ module Language.Hydrangea.Polyhedral
   , LoopBand(..)
   , ScheduleTree(..)
   , ScheduleDim(..)
+  , SkewSpec(..)
   , AffineLoopBand(..)
   , AffineScheduleTree(..)
   , AffineSchedule(..)
@@ -38,6 +39,7 @@ module Language.Hydrangea.Polyhedral
   , ScopRejectReason(..)
   , ScopDiagnostic(..)
   , affineExprFromIndexExpr2
+  , bandsStructurallyCompatible2
   , buildIdentitySchedule2
   , collectProcScopDiagnostics2
   , collectProgramScopDiagnostics2
@@ -46,23 +48,26 @@ module Language.Hydrangea.Polyhedral
   , collectScopDependenceRelations2
   , extractProcScops2
   , extractProgramScops2
+  , fusionLegalAtDepth2
   , polyhedralProgram2
   , polyhedralIdentityTileProgram2
   , polyhedralTileProgram2
   , reifyScheduledScop2
+  , suggestBandSkew2
   , synthesizeScopSchedule2
   , tileIdentityScop2
   , tileScop2
+  , tryFuseBands2
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad.State.Strict (State, evalState, state)
+import Control.Monad.State.Strict (State, evalState, modify, runState, state)
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (find, nub, permutations, sort, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG
@@ -165,6 +170,8 @@ data PolyhedralDependenceRelation = PolyhedralDependenceRelation
   , pdrBandCarry :: [PolyhedralBandCarry]
   , pdrClassification :: PolyhedralDependenceClass
   , pdrIsBlocking :: Bool
+  , pdrSrcIndex :: [AffineExpr]
+  , pdrTgtIndex :: [AffineExpr]
   }
   deriving (Eq, Show)
 
@@ -222,11 +229,19 @@ data ScheduleDim = ScheduleDim
   }
   deriving (Eq, Show)
 
+data SkewSpec = SkewSpec
+  { skewTarget :: CVar
+  , skewSource :: CVar
+  , skewCoeff  :: Integer
+  }
+  deriving (Eq, Show)
+
 data AffineLoopBand = AffineLoopBand
   { albDims :: [ScheduleDim]
   , albExec :: ExecPolicy
   , albReduction :: Maybe ReductionSpec
   , albRole :: LoopRole
+  , albSkew :: [SkewSpec]
   , albBody :: AffineScheduleTree
   }
   deriving (Eq, Show)
@@ -340,8 +355,18 @@ buildIdentitySchedule2 scop =
 
 synthesizeScopSchedule2 :: Scop -> ScheduledScop
 synthesizeScopSchedule2 scop =
-  let affineSchedule = synthesizeAffineSchedule2 scop
-  in  buildScheduledScop2 scop affineSchedule (scheduleTreeFromAffineSchedule2 affineSchedule)
+  let (affineSchedule, fusionRenames) = synthesizeAffineSchedule2 scop
+      renamedScop
+        | M.null fusionRenames = scop
+        | otherwise =
+            let substEnv = M.map AVar fusionRenames
+            in  scop
+                  { scStatements =
+                      map
+                        (\ps -> ps { psStmt = case substStmts2 substEnv [psStmt ps] of { s : _ -> s; [] -> psStmt ps } })
+                        (scStatements scop)
+                  }
+  in  buildScheduledScop2 renamedScop affineSchedule (scheduleTreeFromAffineSchedule2 affineSchedule)
 
 tileScop2 :: Scop -> ScheduledScop
 tileScop2 =
@@ -391,6 +416,7 @@ affineScheduleFromScheduleTree2 scheduleTree =
             , albExec = lbExec band
             , albReduction = lbReduction band
             , albRole = lbRole band
+            , albSkew = []
             , albBody = go (lbBody band)
             }
       ScheduleStripMine band _ ->
@@ -417,32 +443,41 @@ scheduleTreeFromAffineSchedule2 = go . asRoot
       AffineScheduleStmtRef stmtId ->
         ScheduleStmtRef stmtId
 
-synthesizeAffineSchedule2 :: Scop -> AffineSchedule
+synthesizeAffineSchedule2 :: Scop -> (AffineSchedule, Map CVar CVar)
 synthesizeAffineSchedule2 scop =
   let relations = collectScopDependenceRelations2 scop
-      root' = synthesizeAffineScheduleTree2 0 relations (asRoot (scAffineSchedule scop))
-  in  AffineSchedule
-        { asRoot = root'
-        , asStmtOrder = affineScheduleStmtOrder2 root'
-        }
+      (root', fusionRenames) =
+        runState
+          (synthesizeAffineScheduleTree2 0 relations (asRoot (scAffineSchedule scop)))
+          M.empty
+      schedule =
+        AffineSchedule
+          { asRoot = root'
+          , asStmtOrder = affineScheduleStmtOrder2 root'
+          }
+  in  (schedule, fusionRenames)
 
 synthesizeAffineScheduleTree2
   :: Int
   -> [PolyhedralDependenceRelation]
   -> AffineScheduleTree
-  -> AffineScheduleTree
+  -> FusionM AffineScheduleTree
 synthesizeAffineScheduleTree2 bandDepth relations sched = case sched of
-  AffineScheduleSequence xs ->
-    AffineScheduleSequence (map (synthesizeAffineScheduleTree2 bandDepth relations) xs)
+  AffineScheduleSequence xs -> do
+    synthesized <- mapM (synthesizeAffineScheduleTree2 bandDepth relations) xs
+    fused <- greedyFuse2M bandDepth relations synthesized
+    pure (AffineScheduleSequence fused)
   AffineScheduleStmtRef stmtId ->
-    AffineScheduleStmtRef stmtId
-  AffineScheduleLoopBand band ->
+    pure (AffineScheduleStmtRef stmtId)
+  AffineScheduleLoopBand band -> do
     let dims' = applyPermutation (chooseBandPermutation2 bandDepth (albDims band) relations) (albDims band)
-    in  AffineScheduleLoopBand
-          band
-            { albDims = dims'
-            , albBody = synthesizeAffineScheduleTree2 (bandDepth + 1) relations (albBody band)
-            }
+        skews = maybe [] pure (suggestBandSkew2 bandDepth dims' relations)
+    body' <- synthesizeAffineScheduleTree2 (bandDepth + 1) relations (albBody band)
+    pure $ AffineScheduleLoopBand band
+      { albDims = dims'
+      , albSkew = skews
+      , albBody = body'
+      }
 
 chooseBandPermutation2
   :: Int
@@ -558,6 +593,159 @@ affineScheduleStmtOrder2 sched = case sched of
   AffineScheduleLoopBand band -> affineScheduleStmtOrder2 (albBody band)
   AffineScheduleStmtRef stmtId -> [stmtId]
 
+-- ---------------------------------------------------------------------------
+-- Fusion helpers
+-- ---------------------------------------------------------------------------
+
+bandsStructurallyCompatible2 :: AffineLoopBand -> AffineLoopBand -> Bool
+bandsStructurallyCompatible2 b1 b2 =
+  length (albDims b1) == length (albDims b2)
+    && albRole b1 == albRole b2
+    && map sdBound (albDims b1) == map sdBound (albDims b2)
+    && albExec b1 == albExec b2
+    && albReduction b1 == albReduction b2
+
+-- | Rename variable references in an affine expression using a substitution map.
+renameAffineExpr :: Map CVar CVar -> AffineExpr -> AffineExpr
+renameAffineExpr renaming ae =
+  ae { aeTerms = M.mapKeys (\v -> M.findWithDefault v v renaming) (aeTerms ae) }
+
+-- | For a cross-sibling dependence whose band carry is unknown due to different
+-- iterator names, apply the iter renaming (B2 iters → B1 iters) to the target
+-- access index and re-analyze.  Returns True (safe) iff the effective distance
+-- is ≤ 0 (reads from the past or same iteration in the fused loop).
+crossSiblingDepSafe2 :: Map CVar CVar -> PolyhedralDependenceRelation -> Bool
+crossSiblingDepSafe2 renaming rel =
+  let renamedTgt = map (renameAffineExpr renaming) (pdrTgtIndex rel)
+      allIters = M.keys (M.unions (map aeTerms (pdrSrcIndex rel) ++ map aeTerms renamedTgt))
+      analysis = analyzeAccessDistance2 allIters (pdrSrcIndex rel) renamedTgt
+  in not (any positiveCarry (adaCarryInfo analysis))
+  where
+    positiveCarry info = case pciStatus info of
+      PolyCarryDistance d -> d > 0
+      PolyCarryUnknown -> True
+      PolyCarryIndependent -> False
+
+-- | True when this dependence does not block fusion of the two adjacent bands
+-- at the given depth.  @renaming@ maps B2 iterator names to B1 iterator names
+-- and is used when the standard band-carry analysis cannot determine the carry
+-- (because the two bands use different iterator variable names).
+fusionLegalAtDepth2
+  :: Int
+  -> Set StmtId
+  -> Set StmtId
+  -> Map CVar CVar
+  -> PolyhedralDependenceRelation
+  -> Bool
+fusionLegalAtDepth2 bandDepth stmtsA stmtsB renaming rel
+  | pdrClassification rel == PolyDepClassReductionLike = True
+  | not crossBands = True
+  | otherwise = case currentBandCarryForDepth2 bandDepth rel of
+      Nothing -> crossSiblingDepSafe2 renaming rel
+      Just bc -> pbcStatus bc /= PolyBandBackward && pbcStatus bc /= PolyBandUnknown
+  where
+    srcA = pdrSourceStmt rel `S.member` stmtsA
+    tgtB = pdrTargetStmt rel `S.member` stmtsB
+    srcB = pdrSourceStmt rel `S.member` stmtsB
+    tgtA = pdrTargetStmt rel `S.member` stmtsA
+    crossBands = (srcA && tgtB) || (srcB && tgtA)
+
+-- | Pure check: are two bands compatible for fusion?  Returns the fused tree
+-- (using b1's iterator names) without accumulating any renaming.  Exported
+-- for unit tests.
+tryFuseBands2
+  :: Int
+  -> [PolyhedralDependenceRelation]
+  -> AffineScheduleTree
+  -> AffineScheduleTree
+  -> Maybe AffineScheduleTree
+tryFuseBands2 bandDepth relations t1 t2 =
+  fst <$> tryFuseBands2Internal bandDepth relations t1 t2
+
+tryFuseBands2Internal
+  :: Int
+  -> [PolyhedralDependenceRelation]
+  -> AffineScheduleTree
+  -> AffineScheduleTree
+  -> Maybe (AffineScheduleTree, Map CVar CVar)
+tryFuseBands2Internal bandDepth relations (AffineScheduleLoopBand b1) (AffineScheduleLoopBand b2)
+  | bandsStructurallyCompatible2 b1 b2
+  , all (fusionLegalAtDepth2 bandDepth stmts1 stmts2 renaming) relations =
+      Just
+        ( AffineScheduleLoopBand b1
+            { albBody =
+                AffineScheduleSequence
+                  [ albBody b1
+                  , albBody b2
+                  ]
+            }
+        , renaming
+        )
+  where
+    renaming = M.fromList (zip (map sdIter (albDims b2)) (map sdIter (albDims b1)))
+    stmts1 = S.fromList (affineScheduleStmtOrder2 (AffineScheduleLoopBand b1))
+    stmts2 = S.fromList (affineScheduleStmtOrder2 (AffineScheduleLoopBand b2))
+tryFuseBands2Internal _ _ _ _ = Nothing
+
+type FusionM = State (Map CVar CVar)
+
+greedyFuse2M
+  :: Int
+  -> [PolyhedralDependenceRelation]
+  -> [AffineScheduleTree]
+  -> FusionM [AffineScheduleTree]
+greedyFuse2M _ _ [] = pure []
+greedyFuse2M _ _ [x] = pure [x]
+greedyFuse2M bandDepth relations (x : y : rest) =
+  case tryFuseBands2Internal bandDepth relations x y of
+    Just (fused, renaming) -> do
+      modify (M.union renaming)
+      greedyFuse2M bandDepth relations (fused : rest)
+    Nothing -> (x :) <$> greedyFuse2M bandDepth relations (y : rest)
+
+-- ---------------------------------------------------------------------------
+-- Skewing helpers
+-- ---------------------------------------------------------------------------
+
+suggestBandSkew2
+  :: Int
+  -> [ScheduleDim]
+  -> [PolyhedralDependenceRelation]
+  -> Maybe SkewSpec
+suggestBandSkew2 bandDepth dims relations
+  | length dims < 2 = Nothing
+  | otherwise = listToMaybe
+      [ SkewSpec
+          { skewTarget = sdIter innerDim
+          , skewSource = sdIter outerDim
+          , skewCoeff = coeff
+          }
+      | (outerDim, innerDim) <- zip dims (drop 1 dims)
+      , let outerIter = sdIter outerDim
+            innerIter = sdIter innerDim
+      , coeff <- maybeToList (skewCoeffForBand2 bandDepth outerIter innerIter relations)
+      ]
+
+skewCoeffForBand2
+  :: Int
+  -> CVar
+  -> CVar
+  -> [PolyhedralDependenceRelation]
+  -> Maybe Integer
+skewCoeffForBand2 bandDepth outerIter innerIter relations =
+  case
+    [ coeff
+    | rel <- relations
+    , Just innerDist <- [currentBandDistanceForIter2 bandDepth rel innerIter]
+    , Just outerDist <- [currentBandDistanceForIter2 bandDepth rel outerIter]
+    , innerDist < 0
+    , outerDist > 0
+    , let coeff = ((-innerDist) + outerDist - 1) `div` outerDist
+    ]
+  of
+    [] -> Nothing
+    coeffs -> Just (maximum coeffs)
+
 extractProgramScops2 :: Program -> [Scop]
 extractProgramScops2 (Program procs) = foldMap extractProcScops2 procs
 
@@ -594,7 +782,7 @@ collectScopDependences2 =
 
 collectScopDependenceRelations2 :: Scop -> [PolyhedralDependenceRelation]
 collectScopDependenceRelations2 scop =
-  [ mkRelation srcStmt tgtStmt srcAccess depKind accessAnalysis
+  [ mkRelation srcStmt tgtStmt srcAccess tgtAccess depKind accessAnalysis
   | (srcPos, srcStmt) <- orderedStmts
   , (tgtPos, tgtStmt) <- orderedStmts
   , srcPos < tgtPos
@@ -613,7 +801,7 @@ collectScopDependenceRelations2 scop =
        , Just stmt <- [M.lookup stmtId stmtMap]
        ]
     stmtContexts = stmtLoopContexts2 (scSchedule scop)
-    mkRelation srcStmt tgtStmt srcAccess depKind accessAnalysis =
+    mkRelation srcStmt tgtStmt srcAccess tgtAccess depKind accessAnalysis =
       let srcCtx = M.findWithDefault [] (psPath srcStmt) stmtContexts
           tgtCtx = M.findWithDefault [] (psPath tgtStmt) stmtContexts
           bandCarry = dependenceBandCarry2 srcCtx tgtCtx accessAnalysis
@@ -632,6 +820,8 @@ collectScopDependenceRelations2 scop =
             , pdrBandCarry = bandCarry
             , pdrClassification = depClass
             , pdrIsBlocking = isBlocking
+            , pdrSrcIndex = paIndex srcAccess
+            , pdrTgtIndex = paIndex tgtAccess
             }
 
 relationToLegacyDependence2 :: PolyhedralDependenceRelation -> PolyhedralDependence
