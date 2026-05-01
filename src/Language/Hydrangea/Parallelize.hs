@@ -503,6 +503,7 @@ shouldParallelizeLoop :: Bool -> LoopSpec -> Bool
 shouldParallelizeLoop insideLoop spec = case lsRole spec of
   LoopReductionWrapper -> False
   LoopFold             -> False  -- foldl/scan loops carry an accumulator; never parallelizable
+  LoopIterate          -> False  -- iterate temporal loop carries array state; never parallelizable
   _                    -> not insideLoop
 
 -- | Returns 'True' when any statement in the list (or in nested conditionals,

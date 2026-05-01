@@ -980,6 +980,7 @@ genLoop2 env declared spec body =
         C2.LoopReductionWrapper -> text "reduction wrapper loop"
         C2.LoopReduction -> text "reduction loop"
         C2.LoopMapReduction -> text "map-reduction outer loop"
+        C2.LoopIterate -> text "iterate temporal loop"
       defaultSimdLen = case C2.lsExec spec of
         C2.Vector v -> C2.vsWidth v
         _ -> 1

@@ -169,6 +169,7 @@ normExp expr = case expr of
   EZipWith a f a1 a2 -> EZipWith a <$> normExp f <*> normExp a1 <*> normExp a2
   EReduce a f z arr -> EReduce a <$> normExp f <*> normExp z <*> normExp arr
   EReduceGenerate a f z sz g -> EReduceGenerate a <$> normExp f <*> normExp z <*> normExp sz <*> normExp g
+  EIterate a n initArr f -> EIterate a <$> normExp n <*> normExp initArr <*> normExp f
   EFoldl a f z arr -> EFoldl a <$> normExp f <*> normExp z <*> normExp arr
   EFoldlWhile a p f z arr -> EFoldlWhile a <$> normExp p <*> normExp f <*> normExp z <*> normExp arr
   EScan a f z arr -> EScan a <$> normExp f <*> normExp z <*> normExp arr

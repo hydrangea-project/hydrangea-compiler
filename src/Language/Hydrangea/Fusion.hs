@@ -97,6 +97,7 @@ collectVarsExp expr =
     EZipWith _ f a b -> collectVarsExp f `S.union` collectVarsExp a `S.union` collectVarsExp b
     EReduce _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EReduceGenerate _ f z shape gen -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp shape `S.union` collectVarsExp gen
+    EIterate _ n initArr f -> collectVarsExp n `S.union` collectVarsExp initArr `S.union` collectVarsExp f
     EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
@@ -207,6 +208,7 @@ freeVarsExp expr =
     EZipWith _ f a b -> freeVarsExp f `S.union` freeVarsExp a `S.union` freeVarsExp b
     EReduce _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EReduceGenerate _ f z shape gen -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp shape `S.union` freeVarsExp gen
+    EIterate _ n initArr f -> freeVarsExp n `S.union` freeVarsExp initArr `S.union` freeVarsExp f
     EFoldl _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EFoldlWhile _ p f z arr -> freeVarsExp p `S.union` freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
     EScan _ f z arr -> freeVarsExp f `S.union` freeVarsExp z `S.union` freeVarsExp arr
@@ -297,6 +299,7 @@ boundVarsExp expr =
     EZipWith _ f a b -> boundVarsExp f `S.union` boundVarsExp a `S.union` boundVarsExp b
     EReduce _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EReduceGenerate _ f z shape gen -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp shape `S.union` boundVarsExp gen
+    EIterate _ n initArr f -> boundVarsExp n `S.union` boundVarsExp initArr `S.union` boundVarsExp f
     EFoldl _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EFoldlWhile _ p f z arr -> boundVarsExp p `S.union` boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
     EScan _ f z arr -> boundVarsExp f `S.union` boundVarsExp z `S.union` boundVarsExp arr
@@ -391,6 +394,7 @@ countVarExp v expr =
     EZipWith _ f a b -> countVarExp v f + countVarExp v a + countVarExp v b
     EReduce _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
     EReduceGenerate _ f z shape gen -> countVarExp v f + countVarExp v z + countVarExp v shape + countVarExp v gen
+    EIterate _ n initArr f -> countVarExp v n + countVarExp v initArr + countVarExp v f
     EFoldl _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
     EFoldlWhile _ p f z arr -> countVarExp v p + countVarExp v f + countVarExp v z + countVarExp v arr
     EScan _ f z arr -> countVarExp v f + countVarExp v z + countVarExp v arr
@@ -483,6 +487,7 @@ substExp v replacement expr =
     EZipWith a f a1 a2 -> EZipWith a (substExp v replacement f) (substExp v replacement a1) (substExp v replacement a2)
     EReduce a f z arr -> EReduce a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EReduceGenerate a f z shape gen -> EReduceGenerate a (substExp v replacement f) (substExp v replacement z) (substExp v replacement shape) (substExp v replacement gen)
+    EIterate a n initArr f -> EIterate a (substExp v replacement n) (substExp v replacement initArr) (substExp v replacement f)
     EFoldl a f z arr -> EFoldl a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EFoldlWhile a p f z arr -> EFoldlWhile a (substExp v replacement p) (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
     EScan a f z arr -> EScan a (substExp v replacement f) (substExp v replacement z) (substExp v replacement arr)
@@ -606,6 +611,7 @@ isArrayExp expr =
     EZipWith {} -> True
     EReduce {} -> True
     EReduceGenerate {} -> True
+    EIterate {} -> False
     EFoldl {} -> False
     EFoldlWhile {} -> False
     EScan {} -> True
@@ -1100,6 +1106,7 @@ normExp expr =
     EZipWith a f x y -> EZipWith a <$> normExp f <*> normExp x <*> normExp y
     EReduce a f z arr -> EReduce a <$> normExp f <*> normExp z <*> normExp arr
     EReduceGenerate a f z s g -> EReduceGenerate a <$> normExp f <*> normExp z <*> normExp s <*> normExp g
+    EIterate a n initArr f -> EIterate a <$> normExp n <*> normExp initArr <*> normExp f
     EFoldl a f z arr -> EFoldl a <$> normExp f <*> normExp z <*> normExp arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> normExp p <*> normExp f <*> normExp z <*> normExp arr
     EScan a f z arr -> EScan a <$> normExp f <*> normExp z <*> normExp arr
@@ -1325,6 +1332,7 @@ fuseOnce expr =
       fuseReduce a f' z' arr'
     EReduceGenerate a f z shape gen ->
       EReduceGenerate a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce shape <*> fuseOnce gen
+    EIterate a n initArr f -> EIterate a <$> fuseOnce n <*> fuseOnce initArr <*> fuseOnce f
     EFoldl a f z arr -> EFoldl a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> fuseOnce p <*> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EScan a f z arr -> EScan a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr

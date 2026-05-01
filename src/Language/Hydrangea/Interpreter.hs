@@ -267,6 +267,13 @@ evalExp expr env = case expr of
                 vals
         outVals <- mapM reduceGeneratedAtPrefix prefixIndices
         pure $ VArray outShape outVals
+  EIterate _ numExpr initExpr stepFnExpr -> do
+    vNum  <- evalExp numExpr env
+    vInit <- evalExp initExpr env
+    vFn   <- evalExp stepFnExpr env
+    case vNum of
+      VInt n -> foldM (\arr _ -> evalApp vFn arr env) vInit [0 .. n - 1]
+      _ -> throwError $ TypeError "iterate: first argument must be an integer"
   EFoldl _ fnExpr initExpr arrExpr -> do
     vFn   <- evalExp fnExpr env
     vInit <- evalExp initExpr env

@@ -1502,6 +1502,13 @@ infer (EFoldl _ fn initExp arrExp) = do
   when (rank /= 1) $ throwError $ MiscError (Just (firstParam arrExp))
   _ <- wrange (firstParam fn) $ fty =:= UTyFun initTy (UTyFun eTy initTy)
   return initTy
+infer (EIterate _ numExp initExp stepFnExp) = do
+  numTy  <- infer numExp
+  initTy <- infer initExp
+  stepTy <- infer stepFnExp
+  _ <- wrange (firstParam numExp)    $ numTy  =:= UTyInt
+  _ <- wrange (firstParam stepFnExp) $ stepTy =:= UTyFun initTy initTy
+  return initTy
 infer (EFoldlWhile _ predExp fn initExp arrExp) = do
   arrTy  <- infer arrExp
   initTy <- infer initExp

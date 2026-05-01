@@ -216,6 +216,7 @@ data ReductionSpec = ReductionSpec
 -- * 'LoopReductionWrapper' — scalar wrapper around a reduction, usually from a 0-D source reduction.
 -- * 'LoopReduction' — the loop that performs the reduction.
 -- * 'LoopMapReduction' — outer map whose body contains a per-element reduction.
+-- * 'LoopIterate' — outer temporal loop from an @iterate@ primitive; carries the array state across iterations.
 data LoopRole
   = LoopPlain
   | LoopFold
@@ -223,6 +224,7 @@ data LoopRole
   | LoopReductionWrapper
   | LoopReduction
   | LoopMapReduction
+  | LoopIterate
   deriving (Eq, Show)
 
 -- | Execution policy for a loop.

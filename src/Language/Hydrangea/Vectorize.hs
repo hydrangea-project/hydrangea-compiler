@@ -162,6 +162,7 @@ vectorCandidate w ctx spec body
         LoopMap -> True
         LoopMapReduction -> False
         LoopReductionWrapper -> False
+        LoopIterate -> False
 
 hasExplicitVectorOps :: [Stmt] -> Bool
 hasExplicitVectorOps = any go

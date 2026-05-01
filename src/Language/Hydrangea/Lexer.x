@@ -89,6 +89,7 @@ tokens :-
 <0> scatter  { tok Scatter }
 <0> scatter_guarded { tok ScatterGuarded }
 <0> gather   { tok Gather }
+<0> iterate  { tok Iterate }
 <0> stencil  { tok Stencil }
 <0> clamp    { tok Clamp }
 <0> wrap     { tok Wrap }
@@ -334,6 +335,7 @@ data Token
   | Scatter
   | ScatterGuarded
   | Gather
+  | Iterate
   | Stencil
   | Clamp
   | Wrap

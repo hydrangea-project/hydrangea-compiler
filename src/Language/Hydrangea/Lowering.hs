@@ -743,6 +743,25 @@ lowerExp expr = case expr of
          , AVar acc
          )
 
+  EIterate _ numExp initExp stepFnExp -> do
+    (sn, an)  <- lowerExp numExp
+    (si, ai)  <- lowerExp initExp
+    arr_cur   <- freshCVar "iter_cur"
+    arr_next  <- freshCVar "iter_next"
+    t         <- freshIterVar "iter_t"
+    curTy     <- ctypeOfAtom ai
+    when (curTy /= CTUnknown) $ registerCType arr_cur curTy
+    stepStmts <- inlineScalarFn stepFnExp arr_cur arr_next
+    pure ( sn ++ si
+         ++ [ SAssign arr_cur (RAtom ai)
+            , SLoop (LoopSpec [t] [atomToIndexExpr an] Serial Nothing LoopIterate)
+                ( stepStmts
+                  ++ [SAssign arr_cur (RAtom (AVar arr_next))]
+                )
+            ]
+         , AVar arr_cur
+         )
+
   EFoldl _ fnExp initExp arrExp -> do
     (si, ai) <- lowerExp initExp
     (sa, aa) <- lowerExp arrExp

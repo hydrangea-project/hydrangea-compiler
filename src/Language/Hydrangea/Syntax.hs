@@ -355,6 +355,10 @@ data Exp a
     -- @current_index + offset@ subject to the boundary condition.
     -- stencil : Boundary -> ((Int -> a) -> b) -> Array[sh, a] -> Array[sh, b]
     EStencil a (BoundaryCondition a) (Exp a) (Exp a)
+  | -- | Iterate a function over an array-valued state for a fixed number of steps.
+    -- @iterate : Int -> Array[sh, a] -> (Array[sh, a] -> Array[sh, a]) -> Array[sh, a]@
+    -- @iterate n init step@ applies @step@ to @init@ exactly @n@ times and returns the result.
+    EIterate a (Exp a) (Exp a) (Exp a)
   | -- | Bound-annotated let-in: @let x bound E = rhs in body@.
     -- Asserts (and if possible verifies statically) that @rhs@ evaluates to a
     -- value in @[0, E)@, then binds @x@ with that value-bound annotation for

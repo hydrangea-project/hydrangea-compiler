@@ -94,6 +94,7 @@ uniqExp expr =
     EZipWith a f a1 a2 -> EZipWith a <$> uniqExp f <*> uniqExp a1 <*> uniqExp a2
     EReduce a f z arr -> EReduce a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     EReduceGenerate a f z shape gen -> EReduceGenerate a <$> uniqExp f <*> uniqExp z <*> uniqExp shape <*> uniqExp gen
+    EIterate a n initArr f -> EIterate a <$> uniqExp n <*> uniqExp initArr <*> uniqExp f
     EFoldl a f z arr -> EFoldl a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> uniqExp p <*> uniqExp f <*> uniqExp z <*> uniqExp arr
     EScan a f z arr -> EScan a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
@@ -249,6 +250,7 @@ collectVarsExp expr =
     EZipWith _ f a b -> collectVarsExp f `S.union` collectVarsExp a `S.union` collectVarsExp b
     EReduce _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EReduceGenerate _ f z shape gen -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp shape `S.union` collectVarsExp gen
+    EIterate _ n initArr f -> collectVarsExp n `S.union` collectVarsExp initArr `S.union` collectVarsExp f
     EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
     EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr

@@ -1759,6 +1759,7 @@ tiledLoopRole role = case role of
   LoopReductionWrapper -> LoopMap
   LoopReduction -> LoopMap
   LoopMapReduction -> LoopMap
+  LoopIterate -> LoopIterate
 
 minLenSetup :: StripMinedDim -> [Stmt]
 minLenSetup td =

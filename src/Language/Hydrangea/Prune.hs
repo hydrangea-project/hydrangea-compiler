@@ -52,6 +52,7 @@ collectTopLevelRefs topNames expr bound =
     EZipWith _ f a1 a2 -> go f bound `S.union` go a1 bound `S.union` go a2 bound
     EReduce _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
     EReduceGenerate _ f z s g -> go f bound `S.union` go z bound `S.union` go s bound `S.union` go g bound
+    EIterate _ n initArr f -> go n bound `S.union` go initArr bound `S.union` go f bound
     EFoldl _ f z a -> go f bound `S.union` go z bound `S.union` go a bound
     EFoldlWhile _ p f z a -> go p bound `S.union` go f bound `S.union` go z bound `S.union` go a bound
     EScan _ f z a -> go f bound `S.union` go z bound `S.union` go a bound

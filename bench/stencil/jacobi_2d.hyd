@@ -1,0 +1,7 @@
+let h       = get_env_int "JACOBI_H"
+let w       = get_env_int "JACOBI_W"
+let n_iters = get_env_int "JACOBI_ITERS"
+let initial = generate [h, w] (fn [i, j] => 1.0)
+let step    = fn arr => stencil clamp (fn acc => (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1) /. 4.0) arr
+let result  = iterate n_iters initial step
+let main    = write_array_float result "jacobi_out.csv"

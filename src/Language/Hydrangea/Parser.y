@@ -76,6 +76,7 @@ import Language.Hydrangea.Syntax
   scatter    { L.RangedToken L.Scatter _ }
   scatter_guarded { L.RangedToken L.ScatterGuarded _ }
   gather     { L.RangedToken L.Gather _ }
+  iterate    { L.RangedToken L.Iterate _ }
   stencil    { L.RangedToken L.Stencil _ }
   clamp      { L.RangedToken L.Clamp _ }
   wrap       { L.RangedToken L.Wrap _ }
@@ -329,6 +330,7 @@ expspecial :: { Exp L.Range }
   | write_array_float atom atom { EWriteArrayFloat (L.rtRange $1 <-> info $3) $2 $3 }
   | get_env_int atom           { EGetEnvInt (L.rtRange $1 <-> info $2) $2 }
   | get_env_string atom        { EGetEnvString (L.rtRange $1 <-> info $2) $2 }
+  | iterate atom atom atom     { EIterate (L.rtRange $1 <-> info $4) $2 $3 $4 }
   | stencil boundary atom atom { EStencil (L.rtRange $1 <-> info $4) $2 $3 $4 }
 
 boundary :: { BoundaryCondition L.Range }
