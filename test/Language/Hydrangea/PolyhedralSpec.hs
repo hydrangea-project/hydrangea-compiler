@@ -588,8 +588,13 @@ spec = describe "Polyhedral" $ do
           other ->
             expectationFailure ("unexpected affine schedule: " <> show other)
         case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
-          Just [SLoop loopSpec _] ->
-            lsIters loopSpec `shouldBe` ["j", "i"]
+          Just [SLoop loopSpec body] -> do
+            -- After interchange, j is outer; i is renamed to i__s by skewing
+            -- (skew makes i-dep independent: i_dist + 1*j_dist = -1+1 = 0)
+            lsIters loopSpec `shouldBe` ["j", "i__s"]
+            -- The skew prelude assigns i = i__s - coeff*j
+            let preludes = [v | SAssign v _ <- body]
+            preludes `shouldSatisfy` elem "i"
           other ->
             expectationFailure ("unexpected reified schedule: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)

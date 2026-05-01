@@ -1,0 +1,27 @@
+(* 2D 5-point Laplacian stencil — interior-only variant.
+   Uses generate+index to produce a clean 2D nested loop (no SIf for
+   boundary clamping).  Computes only the interior (h-2)x(w-2) elements;
+   boundary handling is omitted.
+
+   Environment variables:
+     STENCIL_H  -- grid height (rows)
+     STENCIL_W  -- grid width  (cols) *)
+
+let h = get_env_int "STENCIL_H"
+let w = get_env_int "STENCIL_W"
+
+let input = read_array_float [h, w] "bench/stencil/input.csv"
+
+(* Iterate over i in [0, h-2), j in [0, w-2).
+   Map: i -> i+1, j -> j+1 so actual grid indices are [1..h-2] x [1..w-2]. *)
+let laplacian =
+  generate [h-2, w-2]
+    (let f [i, j] =
+      (index [i+1-1, j+1] input) +.
+      (index [i+1+1, j+1] input) +.
+      (index [i+1, j+1-1] input) +.
+      (index [i+1, j+1+1] input) +.
+      ((index [i+1, j+1] input) *. (-4.0))
+    in f)
+
+let main = write_array_float laplacian "bench/stencil/out_interior.csv"

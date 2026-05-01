@@ -182,6 +182,7 @@ data LoopBand = LoopBand
   , lbReduction :: Maybe ReductionSpec
   , lbRole :: LoopRole
   , lbBody :: ScheduleTree
+  , lbSkew :: [SkewSpec]
   }
   deriving (Eq, Show)
 
@@ -439,6 +440,7 @@ scheduleTreeFromAffineSchedule2 = go . asRoot
             , lbReduction = albReduction band
             , lbRole = albRole band
             , lbBody = go (albBody band)
+            , lbSkew = albSkew band
             }
       AffineScheduleStmtRef stmtId ->
         ScheduleStmtRef stmtId
@@ -1225,6 +1227,7 @@ extractLoop loopPath domain env spec body
               , lbReduction = lsRed spec
               , lbRole = lsRole spec
               , lbBody = bodySchedule
+              , lbSkew = []
               }
         )
 extractStmtList
@@ -1670,6 +1673,24 @@ reifyScheduledScop2 scheduled =
         | stmt <- scStatements (ssOriginal scheduled)
         ]
 
+-- | For a loop band with skew specs, rename the target iterators to skewed
+-- names and produce prelude assignments that recover the original iterator
+-- value: @orig = skewed - coeff * source@.
+applyBandSkew2 :: [CVar] -> [SkewSpec] -> ([CVar], [Stmt])
+applyBandSkew2 iters skews =
+  let skewMap = M.fromList [(skewTarget s, s) | s <- skews]
+      renameIter iter = case M.lookup iter skewMap of
+        Just _ -> iter <> "__s"
+        Nothing -> iter
+      iters' = map renameIter iters
+      preludes = concatMap mkPrelude skews
+      mkPrelude s =
+        let mulVar = skewTarget s <> "__s__mul"
+        in  [ SAssign mulVar (RBinOp CMul (AInt (skewCoeff s)) (AVar (skewSource s)))
+            , SAssign (skewTarget s) (RBinOp CSub (AVar (skewTarget s <> "__s")) (AVar mulVar))
+            ]
+  in  (iters', preludes)
+
 reifyScheduleTree :: Map StmtId Stmt -> ScheduleTree -> Maybe [Stmt]
 reifyScheduleTree stmtMap sched = case sched of
   ScheduleSequence xs ->
@@ -1705,18 +1726,18 @@ reifyScheduleTree stmtMap sched = case sched of
         StripKeep _ bound -> bound
         StripTile td -> IVar (smdTileLen td)
   ScheduleLoopBand band -> do
-    bounds <- pure (lbBounds band)
     body <- reifyScheduleTree stmtMap (lbBody band)
+    let (iters', skewPreludes) = applyBandSkew2 (lbIters band) (lbSkew band)
     pure
       [ SLoop
           LoopSpec
-            { lsIters = lbIters band
-            , lsBounds = bounds
+            { lsIters = iters'
+            , lsBounds = lbBounds band
             , lsExec = lbExec band
             , lsRed = lbReduction band
             , lsRole = lbRole band
             }
-          body
+          (skewPreludes ++ body)
       ]
   ScheduleStmtRef stmtId ->
     pure . pure =<< M.lookup stmtId stmtMap

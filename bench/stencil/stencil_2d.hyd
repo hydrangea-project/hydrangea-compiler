@@ -1,0 +1,24 @@
+(* 2D 5-point Laplacian stencil benchmark.
+   Reads a height x width float array from CSV, applies one sweep of
+   the discrete Laplacian (with clamped boundary), writes result to CSV.
+
+   Environment variables:
+     STENCIL_H  -- grid height (rows)
+     STENCIL_W  -- grid width  (cols) *)
+
+let h = get_env_int "STENCIL_H"
+let w = get_env_int "STENCIL_W"
+
+let input = read_array_float [h, w] "bench/stencil/input.csv"
+
+let sh = shape_of input
+let height = proj 0 sh
+let width  = proj 1 sh
+
+let laplacian =
+  stencil clamp
+    (fn acc =>
+      acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1 +. (acc 0 0 *. (-4.0)))
+    input
+
+let main = write_array_float laplacian "bench/stencil/out.csv"
