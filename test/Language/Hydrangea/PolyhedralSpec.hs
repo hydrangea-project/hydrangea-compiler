@@ -75,6 +75,38 @@ spec = describe "Polyhedral" $ do
           other -> expectationFailure ("unexpected schedule tree: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
+  it "profitability prefers row-major loop order for legal tuple-indexed map nests" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j", "i"] [IVar "m", IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ix" (C.RTuple [C.AVar "i", C.AVar "j"])
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
+            , SArrayWrite (C.AVar "out") (C.AVar "ix") (C.AVar "x")
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+      [scop] ->
+        case ssSchedule (synthesizeScopSchedule2 scop) of
+          ScheduleLoopBand band -> lbIters band `shouldBe` ["i", "j"]
+          other -> expectationFailure ("unexpected schedule tree: " <> show other)
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "profitability sees lowered RNdToFlat accesses as row-major-friendly" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j", "i"] [IVar "m", IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "shape" (C.RTuple [C.AVar "n", C.AVar "m"])
+            , SAssign "ix" (C.RTuple [C.AVar "i", C.AVar "j"])
+            , SAssign "flat" (C.RNdToFlat (C.AVar "ix") (C.AVar "shape"))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "flat"))
+            , SArrayWrite (C.AVar "out") (C.AVar "flat") (C.AVar "x")
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+      [scop] ->
+        case ssSchedule (synthesizeScopSchedule2 scop) of
+          ScheduleLoopBand band -> lbIters band `shouldBe` ["i", "j"]
+          other -> expectationFailure ("unexpected schedule tree: " <> show other)
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
   it "extracts a map-reduction nest that matches today's tiling target" $ do
     let inner =
           SLoop

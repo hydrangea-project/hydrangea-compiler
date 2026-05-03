@@ -120,6 +120,27 @@ spec = describe "CFGPipeline" $ do
       [SLoop loopSpec _] -> lsIters loopSpec `shouldBe` ["j", "i"]
       other -> expectationFailure ("unexpected pipeline result: " <> show other)
 
+  it "prefers row-major-friendly legal loop orders in the untiled polyhedral path" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j", "i"] [IVar "m", IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ix" (RTuple [AVar "i", AVar "j"])
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "ix"))
+            , SArrayWrite (AVar "out") (AVar "ix") (AVar "x")
+            ]
+        prog = Program [mkProc "p" ["n", "m", "arr", "out"] [loop]]
+        opts =
+          defaultPipelineOptions
+            { poEnableTiling = False
+            , poEnablePolyhedral = True
+            , poEnableExplicitVectorization = False
+            , poEnableParallelization = False
+            }
+        Program [polyProc] = pipelineWithOptions opts prog
+    case procBody polyProc of
+      [SLoop loopSpec _] -> lsIters loopSpec `shouldBe` ["i", "j"]
+      other -> expectationFailure ("unexpected pipeline result: " <> show other)
+
   it "routes tiling through polyhedral scheduling when enabled" $ do
     let loop =
           SLoop

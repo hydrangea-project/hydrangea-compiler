@@ -332,8 +332,14 @@ data AffineValue
   | AffineFlatIndex [AffineExpr]
   | AffineRowOffset AffineExpr AffineExpr
 
+data IteratorProfitability = IteratorProfitability
+  { ipAccessDimHits :: Map Int Int
+  , ipUnitStrideLastHits :: Int
+  }
+
 type AffineEnv = Map CVar AffineValue
 type TileM = State (Set CVar, Int)
+type ProfitabilityFacts = Map CVar IteratorProfitability
 
 polyhedralProgram2 :: Program -> Program
 polyhedralProgram2 = scheduleProgram2 synthesizeScopSchedule2
@@ -457,9 +463,10 @@ scheduleTreeFromAffineSchedule2 = go . asRoot
 synthesizeAffineSchedule2 :: Scop -> (AffineSchedule, Map CVar CVar)
 synthesizeAffineSchedule2 scop =
   let relations = collectScopDependenceRelations2 scop
+      profitability = collectScopProfitabilityFacts2 scop
       (root', fusionRenames) =
         runState
-          (synthesizeAffineScheduleTree2 0 relations (asRoot (scAffineSchedule scop)))
+          (synthesizeAffineScheduleTree2 profitability 0 relations (asRoot (scAffineSchedule scop)))
           M.empty
       schedule =
         AffineSchedule
@@ -468,21 +475,65 @@ synthesizeAffineSchedule2 scop =
           }
   in  (schedule, fusionRenames)
 
+emptyIteratorProfitability :: IteratorProfitability
+emptyIteratorProfitability =
+  IteratorProfitability
+    { ipAccessDimHits = M.empty
+    , ipUnitStrideLastHits = 0
+    }
+
+mergeIteratorProfitability :: IteratorProfitability -> IteratorProfitability -> IteratorProfitability
+mergeIteratorProfitability lhs rhs =
+  IteratorProfitability
+    { ipAccessDimHits = M.unionWith (+) (ipAccessDimHits lhs) (ipAccessDimHits rhs)
+    , ipUnitStrideLastHits = ipUnitStrideLastHits lhs + ipUnitStrideLastHits rhs
+    }
+
+collectScopProfitabilityFacts2 :: Scop -> ProfitabilityFacts
+collectScopProfitabilityFacts2 scop =
+  foldl' collectStmt M.empty (scStatements scop)
+  where
+    collectStmt facts stmt =
+      foldl' collectAccess facts (psReads stmt ++ psWrites stmt)
+
+    collectAccess facts access =
+      let rank = length (paIndex access)
+      in foldl' (collectIndexExpr rank) facts (zip [0 :: Int ..] (paIndex access))
+
+    collectIndexExpr rank facts (dimPos, expr) =
+      foldl' (collectTerm rank dimPos) facts (M.toList (aeTerms expr))
+
+    collectTerm rank dimPos facts (iter, coeff)
+      | iter `elem` scIterators scop =
+          let contribution =
+                IteratorProfitability
+                  { ipAccessDimHits = M.singleton dimPos 1
+                  , ipUnitStrideLastHits =
+                      if dimPos == rank - 1 && abs coeff == 1 then 1 else 0
+                  }
+          in M.insertWith mergeIteratorProfitability iter contribution facts
+      | otherwise =
+          facts
+
 synthesizeAffineScheduleTree2
-  :: Int
+  :: ProfitabilityFacts
+  -> Int
   -> [PolyhedralDependenceRelation]
   -> AffineScheduleTree
   -> FusionM AffineScheduleTree
-synthesizeAffineScheduleTree2 bandDepth relations sched = case sched of
+synthesizeAffineScheduleTree2 profitability bandDepth relations sched = case sched of
   AffineScheduleSequence xs -> do
-    synthesized <- mapM (synthesizeAffineScheduleTree2 bandDepth relations) xs
+    synthesized <- mapM (synthesizeAffineScheduleTree2 profitability bandDepth relations) xs
     fused <- greedyFuse2M bandDepth relations synthesized
     pure (AffineScheduleSequence fused)
   AffineScheduleStmtRef stmtId ->
     pure (AffineScheduleStmtRef stmtId)
   AffineScheduleLoopBand band -> do
-    let dims' = applyPermutation (chooseBandPermutation2 bandDepth (albDims band) relations) (albDims band)
-    body' <- synthesizeAffineScheduleTree2 (bandDepth + 1) relations (albBody band)
+    let dims' =
+          applyPermutation
+            (chooseBandPermutation2 profitability bandDepth (albDims band) relations)
+            (albDims band)
+    body' <- synthesizeAffineScheduleTree2 profitability (bandDepth + 1) relations (albBody band)
     let body'' = case albRole band of
           LoopIterate ->
             case body' of
@@ -500,13 +551,14 @@ synthesizeAffineScheduleTree2 bandDepth relations sched = case sched of
       }
 
 chooseBandPermutation2
-  :: Int
+  :: ProfitabilityFacts
+  -> Int
   -> [ScheduleDim]
   -> [PolyhedralDependenceRelation]
   -> [Int]
-chooseBandPermutation2 _ dims _
+chooseBandPermutation2 _ _ dims _
   | length dims <= 1 = [0 .. length dims - 1]
-chooseBandPermutation2 bandDepth dims relations =
+chooseBandPermutation2 profitability bandDepth dims relations =
   fromMaybe identityPermutation (listToMaybe orderedPermutations)
   where
     identityPermutation = [0 .. length dims - 1]
@@ -516,7 +568,7 @@ chooseBandPermutation2 bandDepth dims relations =
       filter
         (\perm -> perm == identityPermutation || all (relationAllowsPermutation2 bandDepth bandIters perm) relations)
         allPermutations
-    orderedPermutations = sortOn (permutationScore2 bandDepth dims relations) legalPermutations
+    orderedPermutations = sortOn (permutationScore2 profitability bandDepth dims relations) legalPermutations
 
 relationAllowsPermutation2 :: Int -> [CVar] -> [Int] -> PolyhedralDependenceRelation -> Bool
 relationAllowsPermutation2 bandDepth bandIters permutation relation =
@@ -551,15 +603,17 @@ prefixBandStatus2 bandDepth relation =
       PolyBandUnknown -> PrefixUnknown
 
 permutationScore2
-  :: Int
+  :: ProfitabilityFacts
+  -> Int
   -> [ScheduleDim]
   -> [PolyhedralDependenceRelation]
   -> [Int]
-  -> [(Int, Int, Int, Int, Int)]
-permutationScore2 bandDepth dims relations permutation =
+  -> [(Int, Int, Int, Int, Int, Int, Int)]
+permutationScore2 profitability bandDepth dims relations permutation =
   map scoreDim (zip [0 :: Int ..] permutedDims)
   where
     permutedDims = applyPermutation permutation dims
+    innermostPos = length dims - 1
     scoringRelations =
       [ relation
       | relation <- relations
@@ -570,6 +624,8 @@ permutationScore2 bandDepth dims relations permutation =
       ( negativeCount dim
       , carriedCount dim
       , unknownCount dim
+      , accessPositionPenalty position dim
+      , if position == innermostPos then negate (unitStrideLastHits dim) else 0
       , negate (independentCount dim)
       , position
       )
@@ -599,6 +655,15 @@ permutationScore2 bandDepth dims relations permutation =
         | relation <- scoringRelations
         , Just 0 <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
         ]
+    accessPositionPenalty position dim =
+      let targetHits =
+            ipAccessDimHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
+      in sum
+           [ hits * abs (min accessPos innermostPos - position)
+           | (accessPos, hits) <- M.toList targetHits
+           ]
+    unitStrideLastHits dim =
+      ipUnitStrideLastHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
 
 applyPermutation :: [Int] -> [a] -> [a]
 applyPermutation permutation xs =
