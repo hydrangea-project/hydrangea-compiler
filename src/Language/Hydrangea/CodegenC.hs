@@ -868,6 +868,7 @@ genStmts2 env declared liveAfter stmts =
           doc = genStmt2 env declared stmtLiveAfter stmt
           declared' = case stmt of
             C2.SAssign _ (RVecStore _ _ _) -> declared
+            C2.SAssign _ (RArrayFree _) -> declared
             C2.SAssign v _ -> S.insert v declared
             C2.SLoop spec body ->
               let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars (ceRetKinds env) (ceRetTypes env) body
@@ -882,6 +883,7 @@ genStmts2 env declared liveAfter stmts =
 
 genStmt2 :: CodegenEnv -> Set CVar -> Set CVar -> C2.Stmt -> Doc
 genStmt2 env declared liveAfter stmt = case stmt of
+  C2.SAssign _ (RArrayFree a) -> text "hyd_array_free(" <> genAtom a <> text ");"
   C2.SAssign _ rhs@(RVecStore _ _ val) ->
     let mw = case val of
           AVecVar vv -> Map.lookup vv (ceVecVars env)
@@ -2064,6 +2066,7 @@ varDecl env v rhs
         Just (KPair ct1 ct2) -> text (pairStructName ct1 ct2)
         Just (KRecord fields) -> text (recordStructName fields)
         _ -> text "int64_t"
+      RArrayFree{} -> text "void"
       RPairMake ct1 ct2 _ _ -> text (pairStructName ct1 ct2)
       RPairFst ct _ -> text (celemTypeCType' (ceOpts env) ct)
       RPairSnd ct _ -> text (celemTypeCType' (ceOpts env) ct)
@@ -2185,6 +2188,7 @@ genRHS _ _ _ _ (RPairMake _ _ a1 a2) =
   text "{.fst =" <+> genAtom a1 <> text ", .snd =" <+> genAtom a2 <> text "}"
 genRHS _ _ _ _ (RPairFst _ a) = genAtom a <> text ".fst"
 genRHS _ _ _ _ (RPairSnd _ a) = genAtom a <> text ".snd"
+genRHS _ _ _ _ (RArrayFree a) = text "hyd_array_free(" <> genAtom a <> text ")"
 
 genArrayAllocExpr :: Map CVar CType -> CVar -> Atom -> Doc
 genArrayAllocExpr arrayElemTypes arrVar shp =

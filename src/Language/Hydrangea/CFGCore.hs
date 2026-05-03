@@ -110,6 +110,7 @@ data RHS
   | RVecUnOp UnOp Atom
   | RVecSplat Atom
   | RVecReduce BinOp Atom
+  | RArrayFree Atom
   deriving (Eq, Show)
 
 -- | Reduction operators used by @ReductionSpec@ in CFG.

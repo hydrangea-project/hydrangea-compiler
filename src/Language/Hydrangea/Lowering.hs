@@ -2610,6 +2610,7 @@ renameVarInRHS old new rhs =
     RPairMake ct1 ct2 a b -> RPairMake ct1 ct2 (renameVarInAtom old new a) (renameVarInAtom old new b)
     RPairFst ct a -> RPairFst ct (renameVarInAtom old new a)
     RPairSnd ct a -> RPairSnd ct (renameVarInAtom old new a)
+    RArrayFree a -> RArrayFree (renameVarInAtom old new a)
 
 renameVarInReductionSpec :: CVar -> CVar -> ReductionSpec -> ReductionSpec
 renameVarInReductionSpec old new (ReductionSpec acc initE redop) =

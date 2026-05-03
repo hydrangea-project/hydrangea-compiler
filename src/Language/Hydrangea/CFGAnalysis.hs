@@ -206,6 +206,7 @@ usedVarsRHS2 rhs = case rhs of
   RPairMake _ _ a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
   RPairFst _ a -> usedVarsAtom2 a
   RPairSnd _ a -> usedVarsAtom2 a
+  RArrayFree a -> usedVarsAtom2 a
 
 -- | Collect variables referenced by an 'IndexExpr'
 usedVarsIndexExpr :: IndexExpr -> Set ByteString

@@ -250,6 +250,7 @@ substScalarRHS iter base rhs = case rhs of
   C.RVecBinOp op a b -> C.RVecBinOp op (substScalarAtom iter base a) (substScalarAtom iter base b)
   C.RVecSplat a -> C.RVecSplat (substScalarAtom iter base a)
   C.RVecReduce op a -> C.RVecReduce op (substScalarAtom iter base a)
+  C.RArrayFree a -> C.RArrayFree (substScalarAtom iter base a)
 
 rhsRefsVector :: VecEnv -> C.RHS -> Bool
 rhsRefsVector env rhs = case rhs of
@@ -279,6 +280,7 @@ rhsRefsVector env rhs = case rhs of
   C.RVecUnOp _ a -> atomRefsVector env a
   C.RVecSplat a -> atomRefsVector env a
   C.RVecReduce _ a -> atomRefsVector env a
+  C.RArrayFree a -> atomRefsVector env a
 
 supportedVecBinOp :: BinOp -> Bool
 supportedVecBinOp op = op `elem` [CAddF, CSubF, CMulF, CDivF]

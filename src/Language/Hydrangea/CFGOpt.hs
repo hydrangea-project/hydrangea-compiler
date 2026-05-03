@@ -86,6 +86,7 @@ rhsIsPure2 rhs = case rhs of
   RPairMake{}   -> True
   RPairFst{}    -> True
   RPairSnd{}    -> True
+  RArrayFree{}  -> False     -- side effect: frees heap memory
   _             -> False
 
 ------------------------------------------------------------------------
@@ -133,6 +134,7 @@ substRHS2 env rhs =
     RPairMake ct1 ct2 a1 a2 -> RPairMake ct1 ct2 (sub a1) (sub a2)
     RPairFst ct a           -> RPairFst ct (sub a)
     RPairSnd ct a           -> RPairSnd ct (sub a)
+    RArrayFree a            -> RArrayFree (sub a)
     _                       -> rhs
 
 -- | Apply a variable-to-atom substitution map throughout a list of
@@ -557,7 +559,7 @@ hoistIterateAllocs2 = go
     go (SLoop spec body : rest)
       | lsRole spec == LoopIterate =
           case restructureIterateBody spec body of
-            Just (hoisted, newLoop) -> hoisted ++ newLoop : go rest
+            Just replacement -> replacement ++ go rest
             Nothing -> SLoop spec (hoistIterateAllocs2 body) : go rest
       | otherwise = SLoop spec (hoistIterateAllocs2 body) : go rest
     go (SIf c t e : rest) =
@@ -566,7 +568,9 @@ hoistIterateAllocs2 = go
 
 -- | Given a @LoopIterate@ body, try to hoist the initial @alloc+shape@
 -- out and replace the epilogue swap with a ping-pong three-way swap.
--- Returns @(pre_loop_stmts, new_loop_stmt)@ on success.
+-- Also emits a post-loop conditional free of the init buffer to avoid
+-- use-after-free (the returned variable may alias the init buffer on even
+-- iteration counts). Returns the full replacement statement list.
 --
 -- The expected body ends with a swap:
 --
@@ -575,7 +579,7 @@ hoistIterateAllocs2 = go
 --
 -- And contains at most one @RArrayAlloc@ and one @RArrayShape@ whose
 -- variables match the swap.  Those two stmts are hoisted before the loop.
-restructureIterateBody :: LoopSpec -> [Stmt] -> Maybe ([Stmt], Stmt)
+restructureIterateBody :: LoopSpec -> [Stmt] -> Maybe [Stmt]
 restructureIterateBody spec body = do
   guard (length body >= 2)
   -- The last stmt must be the swap: SAssign cur (RAtom (AVar next))
@@ -597,15 +601,22 @@ restructureIterateBody spec body = do
   let mkResult skip hoistedExtra =
         let computeBody = [s | (i, s) <- zip [0..] prefix, i `S.notMember` skip]
             tmpVar = nextVar <> "__iter_tmp"
+            initTrackerVar = curVar <> "__iter_init_track"
+            condFreeVar = curVar <> "__iter_cond"
             initSave = SAssign tmpVar (RAtom (AVar curVar))
+            initTracker = SAssign initTrackerVar (RAtom (AVar curVar))
             pingSwap =
               [ SAssign curVar (RAtom (AVar nextVar))
               , SAssign nextVar (RAtom (AVar tmpVar))
               , SAssign tmpVar (RAtom (AVar curVar))
               ]
+            condFree =
+              [ SAssign condFreeVar (RBinOp CNeq (AVar curVar) (AVar initTrackerVar))
+              , SIf (AVar condFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar initTrackerVar))] []
+              ]
             newBody = computeBody ++ pingSwap
             newLoop = SLoop spec newBody
-        in Just (hoistedExtra ++ [initSave], newLoop)
+        in Just (hoistedExtra ++ [initSave, initTracker, newLoop] ++ condFree)
 
   -- Need at least one of shape or alloc to match the swap variables
   case (listToMaybe shapeCandidates, listToMaybe allocCandidates) of
