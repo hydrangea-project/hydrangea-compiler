@@ -20,7 +20,7 @@ module Language.Hydrangea.Lowering
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (when, zipWithM)
+import Control.Monad (foldM, when, zipWithM)
 import Control.Monad.State
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
@@ -1855,42 +1855,416 @@ lowerExp expr = case expr of
     (bodyExp', accCalls) <- substituteAccCalls accVar rank bodyExp
     shp    <- freshCVar "shp"
     outArr <- freshCVar "arr"
-    n      <- freshCVar "n"
-    i      <- freshIterVar "i"
-    (preLoopStmts, idxVars, dimVars) <- case rank of
-      2 -> do
-        n0   <- freshCVar "n0"
-        n1   <- freshCVar "n1"
-        i0   <- freshCVar "i0"
-        i1   <- freshCVar "i1"
-        itmp <- freshCVar "itmp"
-        let stmts = [ SAssign n0   (RProj 0 (AVar shp))
-                    , SAssign n1   (RProj 1 (AVar shp))
-                    , SAssign i0   (RBinOp CDiv (AVar i) (AVar n1))
-                    , SAssign itmp (RBinOp CMul (AVar i0) (AVar n1))
-                    , SAssign i1   (RBinOp CSub (AVar i) (AVar itmp))
-                    ]
-        pure (stmts, [i0, i1], [n0, n1])
-      _ -> pure ([], [i], [n])
-    bndStmtss <- mapM
-      (genBndStmts aa (map AVar idxVars) (map AVar dimVars) bnd maDef)
-      accCalls
-    (sb, ab) <- lowerExp bodyExp'
-    let loopBody = preLoopStmts
-                ++ concat bndStmtss
-                ++ sb
-                ++ [SArrayWrite (AVar outArr) (AVar i) ab]
-    pure ( sa ++ sDef
-        ++ [ SAssign shp    (RArrayShape aa)
-           , SAssign outArr (RArrayAlloc (AVar shp))
-           , SAssign n      (RShapeSize (AVar shp))
-           , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain []) loopBody
-           ]
-         , AVar outArr
-         )
+    let mConstAccesses =
+          if canSplitStencilBoundary bnd
+            then traverse constStencilAccess accCalls
+            else Nothing
+    case (rank, mConstAccesses) of
+      (1, Just constAccesses) -> do
+        n <- freshCVar "n"
+        splitLoops <-
+          lowerSplitStencil1D
+            aa
+            (AVar shp)
+            (AVar outArr)
+            (AVar n)
+            bnd
+            maDef
+            bodyExp'
+            accCalls
+            constAccesses
+        pure
+          ( sa ++ sDef
+          ++ [ SAssign shp    (RArrayShape aa)
+             , SAssign outArr (RArrayAlloc (AVar shp))
+             , SAssign n      (RShapeSize (AVar shp))
+             ]
+          ++ splitLoops
+          , AVar outArr
+          )
+      (2, Just constAccesses) -> do
+        n0 <- freshCVar "n0"
+        n1 <- freshCVar "n1"
+        splitLoops <-
+          lowerSplitStencil2D
+            aa
+            (AVar shp)
+            (AVar outArr)
+            (AVar n0)
+            (AVar n1)
+            bnd
+            maDef
+            bodyExp'
+            accCalls
+            constAccesses
+        pure
+          ( sa ++ sDef
+          ++ [ SAssign shp    (RArrayShape aa)
+             , SAssign outArr (RArrayAlloc (AVar shp))
+             , SAssign n0     (RProj 0 (AVar shp))
+             , SAssign n1     (RProj 1 (AVar shp))
+             ]
+          ++ splitLoops
+          , AVar outArr
+          )
+      _ -> do
+        n <- freshCVar "n"
+        i <- freshIterVar "i"
+        (preLoopStmts, idxVars, dimVars) <- case rank of
+          2 -> do
+            n0   <- freshCVar "n0"
+            n1   <- freshCVar "n1"
+            i0   <- freshCVar "i0"
+            i1   <- freshCVar "i1"
+            itmp <- freshCVar "itmp"
+            let stmts = [ SAssign n0   (RProj 0 (AVar shp))
+                        , SAssign n1   (RProj 1 (AVar shp))
+                        , SAssign i0   (RBinOp CDiv (AVar i) (AVar n1))
+                        , SAssign itmp (RBinOp CMul (AVar i0) (AVar n1))
+                        , SAssign i1   (RBinOp CSub (AVar i) (AVar itmp))
+                        ]
+            pure (stmts, [i0, i1], [n0, n1])
+          _ -> pure ([], [i], [n])
+        bndStmtss <- mapM
+          (genBndStmts aa (map AVar idxVars) (map AVar dimVars) bnd maDef)
+          accCalls
+        (sb, ab) <- lowerExp bodyExp'
+        let loopBody = preLoopStmts
+                    ++ concat bndStmtss
+                    ++ sb
+                    ++ [SArrayWrite (AVar outArr) (AVar i) ab]
+        pure ( sa ++ sDef
+            ++ [ SAssign shp    (RArrayShape aa)
+               , SAssign outArr (RArrayAlloc (AVar shp))
+               , SAssign n      (RShapeSize (AVar shp))
+               , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain []) loopBody
+               ]
+             , AVar outArr
+             )
 
 -- | Extract the accessor variable name and body from a stencil function expression.
 -- Handles both inline lambdas and named functions registered in the environment.
+type StencilConstAccess = ([Integer], CVar)
+
+canSplitStencilBoundary :: BoundaryCondition a -> Bool
+canSplitStencilBoundary bnd = case bnd of
+  BClamp   -> True
+  BConst _ -> True
+  _        -> False
+
+constStencilAccess :: ([Exp Range], CVar) -> Maybe StencilConstAccess
+constStencilAccess (offsetExprs, resultVar) = do
+  offsets <- mapM staticIntExp offsetExprs
+  pure (offsets, resultVar)
+
+staticIntExp :: Exp Range -> Maybe Integer
+staticIntExp expr = case expr of
+  EInt _ n -> Just n
+  ENeg _ e -> negate <$> staticIntExp e
+  EBinOp _ lhs op rhs -> do
+    x <- staticIntExp lhs
+    y <- staticIntExp rhs
+    case op of
+      Plus _   -> Just (x + y)
+      Minus _  -> Just (x - y)
+      Times _  -> Just (x * y)
+      Divide _ | y /= 0 -> Just (x `div` y)
+      Mod _    | y /= 0 -> Just (x `mod` y)
+      _ -> Nothing
+  _ ->
+    Nothing
+
+stencilFootprint :: Int -> [StencilConstAccess] -> Maybe [(Integer, Integer)]
+stencilFootprint rank accesses
+  | all (\(offsets, _) -> length offsets == rank) accesses =
+      Just [footprintForDim dim | dim <- [0 .. rank - 1]]
+  | otherwise =
+      Nothing
+  where
+    footprintForDim dim =
+      let dimOffsets = [offsets !! dim | (offsets, _) <- accesses]
+          lo = minimum (0 : dimOffsets)
+          hi = maximum (0 : dimOffsets)
+      in (max 0 (negate lo), max 0 hi)
+
+shiftIndexAtom :: Atom -> Atom -> LowerM ([Stmt], Atom)
+shiftIndexAtom base (AInt 0) = pure ([], base)
+shiftIndexAtom base off = do
+  shifted <- freshCVar "idx"
+  pure ([SAssign shifted (RBinOp CAdd base off)], AVar shifted)
+
+combineOrAtoms :: [Atom] -> LowerM ([Stmt], Atom)
+combineOrAtoms [] = pure ([], ABool False)
+combineOrAtoms (firstCond : rest) = foldM step ([], firstCond) rest
+  where
+    step (stmts, acc) next = do
+      tmp <- freshCVar "or"
+      pure (stmts ++ [SAssign tmp (RBinOp COr acc next)], AVar tmp)
+
+mkStencilLoop1D :: IndexExpr -> Atom -> (Atom -> LowerM [Stmt]) -> LowerM Stmt
+mkStencilLoop1D bound offset buildBody = do
+  i <- freshIterVar "i"
+  (shiftStmts, idxAtom) <- shiftIndexAtom (AVar i) offset
+  body <- buildBody idxAtom
+  pure $ SLoop (LoopSpec [i] [bound] Serial Nothing LoopMap []) (shiftStmts ++ body)
+
+mkStencilLoop2D
+  :: IndexExpr
+  -> IndexExpr
+  -> Atom
+  -> Atom
+  -> (Atom -> Atom -> LowerM [Stmt])
+  -> LowerM Stmt
+mkStencilLoop2D rowBound colBound rowOffset colOffset buildBody = do
+  i <- freshIterVar "i"
+  j <- freshIterVar "j"
+  (rowShiftStmts, rowAtom) <- shiftIndexAtom (AVar i) rowOffset
+  (colShiftStmts, colAtom) <- shiftIndexAtom (AVar j) colOffset
+  body <- buildBody rowAtom colAtom
+  pure $
+    SLoop
+      (LoopSpec [i, j] [rowBound, colBound] Serial Nothing LoopMap [])
+      (rowShiftStmts ++ colShiftStmts ++ body)
+
+buildFlatIndex2D :: Atom -> Atom -> Atom -> LowerM ([Stmt], Atom)
+buildFlatIndex2D shapeAtom rowAtom colAtom = do
+  idx <- freshCVar "idx"
+  flat <- freshCVar "flat"
+  registerCType idx CTTuple
+  pure
+    ( [ SAssign idx (RTuple [rowAtom, colAtom])
+      , SAssign flat (RNdToFlat (AVar idx) shapeAtom)
+      ]
+    , AVar flat
+    )
+
+genDirectStencilLoad1D :: Atom -> Atom -> StencilConstAccess -> LowerM [Stmt]
+genDirectStencilLoad1D arrAtom idxAtom ([offset], resultVar) = do
+  (shiftStmts, loadIdx) <- shiftIndexAtom idxAtom (AInt offset)
+  pure $ shiftStmts ++ [SAssign resultVar (RArrayLoad arrAtom loadIdx)]
+genDirectStencilLoad1D _ _ _ =
+  error "genDirectStencilLoad1D: expected rank-1 constant offsets"
+
+genDirectStencilLoad2D :: Atom -> Atom -> Atom -> Atom -> StencilConstAccess -> LowerM [Stmt]
+genDirectStencilLoad2D arrAtom shapeAtom rowAtom colAtom ([rowOff, colOff], resultVar) = do
+  (rowShiftStmts, rowIdx) <- shiftIndexAtom rowAtom (AInt rowOff)
+  (colShiftStmts, colIdx) <- shiftIndexAtom colAtom (AInt colOff)
+  (flatStmts, flatIdx) <- buildFlatIndex2D shapeAtom rowIdx colIdx
+  pure $ rowShiftStmts ++ colShiftStmts ++ flatStmts ++ [SAssign resultVar (RArrayLoad arrAtom flatIdx)]
+genDirectStencilLoad2D _ _ _ _ _ =
+  error "genDirectStencilLoad2D: expected rank-2 constant offsets"
+
+buildStencilDirectBody1D :: Atom -> Atom -> Atom -> Exp Range -> [StencilConstAccess] -> LowerM [Stmt]
+buildStencilDirectBody1D arrAtom outAtom idxAtom bodyExp constAccesses = do
+  directLoads <- mapM (genDirectStencilLoad1D arrAtom idxAtom) constAccesses
+  (bodyStmts, resultAtom) <- lowerExp bodyExp
+  pure $ concat directLoads ++ bodyStmts ++ [SArrayWrite outAtom idxAtom resultAtom]
+
+buildStencilBoundaryBody1D
+  :: Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> BoundaryCondition Range
+  -> Maybe Atom
+  -> Exp Range
+  -> [([Exp Range], CVar)]
+  -> LowerM [Stmt]
+buildStencilBoundaryBody1D arrAtom outAtom idxAtom dimAtom bnd maDef bodyExp accCalls = do
+  bndStmtss <- mapM (genBndStmts arrAtom [idxAtom] [dimAtom] bnd maDef) accCalls
+  (bodyStmts, resultAtom) <- lowerExp bodyExp
+  pure $ concat bndStmtss ++ bodyStmts ++ [SArrayWrite outAtom idxAtom resultAtom]
+
+buildStencilDirectBody2D
+  :: Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> Exp Range
+  -> [StencilConstAccess]
+  -> LowerM [Stmt]
+buildStencilDirectBody2D arrAtom shapeAtom outAtom rowAtom colAtom bodyExp constAccesses = do
+  directLoads <- mapM (genDirectStencilLoad2D arrAtom shapeAtom rowAtom colAtom) constAccesses
+  (bodyStmts, resultAtom) <- lowerExp bodyExp
+  (flatStmts, flatIdx) <- buildFlatIndex2D shapeAtom rowAtom colAtom
+  pure $ concat directLoads ++ bodyStmts ++ flatStmts ++ [SArrayWrite outAtom flatIdx resultAtom]
+
+buildStencilBoundaryBody2D
+  :: Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> BoundaryCondition Range
+  -> Maybe Atom
+  -> Exp Range
+  -> [([Exp Range], CVar)]
+  -> LowerM [Stmt]
+buildStencilBoundaryBody2D arrAtom shapeAtom outAtom rowAtom colAtom n0Atom n1Atom bnd maDef bodyExp accCalls = do
+  bndStmtss <- mapM (genBndStmts arrAtom [rowAtom, colAtom] [n0Atom, n1Atom] bnd maDef) accCalls
+  (bodyStmts, resultAtom) <- lowerExp bodyExp
+  (flatStmts, flatIdx) <- buildFlatIndex2D shapeAtom rowAtom colAtom
+  pure $ concat bndStmtss ++ bodyStmts ++ flatStmts ++ [SArrayWrite outAtom flatIdx resultAtom]
+
+buildBoundaryGuard1D :: Atom -> Integer -> Maybe Atom -> LowerM ([Stmt], Atom)
+buildBoundaryGuard1D idxAtom leftPad mRightStart = do
+  leftGuard <- if leftPad > 0
+    then do
+      leftVar <- freshCVar "bd_left"
+      pure [([SAssign leftVar (RBinOp CLt idxAtom (AInt leftPad))], AVar leftVar)]
+    else pure []
+  rightGuard <- case mRightStart of
+    Just rightStart -> do
+      rightVar <- freshCVar "bd_right"
+      pure [([SAssign rightVar (RBinOp CGe idxAtom rightStart)], AVar rightVar)]
+    Nothing ->
+      pure []
+  let guards = leftGuard ++ rightGuard
+  case guards of
+    [] ->
+      pure ([], ABool False)
+    _ -> do
+      let (stmtss, atoms) = unzip guards
+      (orStmts, guardAtom) <- combineOrAtoms atoms
+      pure (concat stmtss ++ orStmts, guardAtom)
+
+buildBoundaryGuard2D
+  :: Atom
+  -> Atom
+  -> Integer
+  -> Maybe Atom
+  -> Integer
+  -> Maybe Atom
+  -> LowerM ([Stmt], Atom)
+buildBoundaryGuard2D rowAtom colAtom topPad mBottomStart leftPad mRightStart = do
+  topGuard <- if topPad > 0
+    then do
+      topVar <- freshCVar "bd_top"
+      pure [([SAssign topVar (RBinOp CLt rowAtom (AInt topPad))], AVar topVar)]
+    else pure []
+  bottomGuard <- case mBottomStart of
+    Just bottomStart -> do
+      bottomVar <- freshCVar "bd_bottom"
+      pure [([SAssign bottomVar (RBinOp CGe rowAtom bottomStart)], AVar bottomVar)]
+    Nothing ->
+      pure []
+  leftGuard <- if leftPad > 0
+    then do
+      leftVar <- freshCVar "bd_left"
+      pure [([SAssign leftVar (RBinOp CLt colAtom (AInt leftPad))], AVar leftVar)]
+    else pure []
+  rightGuard <- case mRightStart of
+    Just rightStart -> do
+      rightVar <- freshCVar "bd_right"
+      pure [([SAssign rightVar (RBinOp CGe colAtom rightStart)], AVar rightVar)]
+    Nothing ->
+      pure []
+  let guards = topGuard ++ bottomGuard ++ leftGuard ++ rightGuard
+  case guards of
+    [] ->
+      pure ([], ABool False)
+    _ -> do
+      let (stmtss, atoms) = unzip guards
+      (orStmts, guardAtom) <- combineOrAtoms atoms
+      pure (concat stmtss ++ orStmts, guardAtom)
+
+lowerSplitStencil1D
+  :: Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> BoundaryCondition Range
+  -> Maybe Atom
+  -> Exp Range
+  -> [([Exp Range], CVar)]
+  -> [StencilConstAccess]
+  -> LowerM [Stmt]
+lowerSplitStencil1D arrAtom _shapeAtom outAtom nAtom bnd maDef bodyExp accCalls constAccesses =
+  case stencilFootprint 1 constAccesses of
+    Just [(leftPad, rightPad)] -> do
+      let interiorBound = IAdd (atomToIndexExpr nAtom) (IConst (negate (leftPad + rightPad)))
+      interiorLoop <-
+        mkStencilLoop1D interiorBound (AInt leftPad) $
+          \idxAtom -> buildStencilDirectBody1D arrAtom outAtom idxAtom bodyExp constAccesses
+      if leftPad == 0 && rightPad == 0
+        then pure [interiorLoop]
+        else do
+          (boundarySetup, mRightStart) <- if rightPad > 0
+            then do
+              rightStart <- freshCVar "bd_start"
+              pure ([SAssign rightStart (RBinOp CSub nAtom (AInt rightPad))], Just (AVar rightStart))
+            else pure ([], Nothing)
+          boundaryLoop <-
+            mkStencilLoop1D (atomToIndexExpr nAtom) (AInt 0) $ \idxAtom -> do
+              (guardStmts, guardAtom) <- buildBoundaryGuard1D idxAtom leftPad mRightStart
+              boundaryBody <- buildStencilBoundaryBody1D arrAtom outAtom idxAtom nAtom bnd maDef bodyExp accCalls
+              pure (guardStmts ++ [SIf guardAtom boundaryBody []])
+          pure $ [interiorLoop] ++ boundarySetup ++ [boundaryLoop]
+    _ ->
+      error "lowerSplitStencil1D: expected rank-1 constant-access footprint"
+
+lowerSplitStencil2D
+  :: Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> Atom
+  -> BoundaryCondition Range
+  -> Maybe Atom
+  -> Exp Range
+  -> [([Exp Range], CVar)]
+  -> [StencilConstAccess]
+  -> LowerM [Stmt]
+lowerSplitStencil2D arrAtom shapeAtom outAtom n0Atom n1Atom bnd maDef bodyExp accCalls constAccesses =
+  case stencilFootprint 2 constAccesses of
+    Just [(topPad, bottomPad), (leftPad, rightPad)] -> do
+      let interiorRowBound = IAdd (atomToIndexExpr n0Atom) (IConst (negate (topPad + bottomPad)))
+          interiorColBound = IAdd (atomToIndexExpr n1Atom) (IConst (negate (leftPad + rightPad)))
+      interiorLoop <-
+        mkStencilLoop2D interiorRowBound interiorColBound (AInt topPad) (AInt leftPad) $
+          \rowAtom colAtom ->
+            buildStencilDirectBody2D arrAtom shapeAtom outAtom rowAtom colAtom bodyExp constAccesses
+      if topPad == 0 && bottomPad == 0 && leftPad == 0 && rightPad == 0
+        then pure [interiorLoop]
+        else do
+          (boundarySetup, mBottomStart, mRightStart) <- do
+            (bottomSetup, bottomStart) <- if bottomPad > 0
+              then do
+                start <- freshCVar "bd_row_start"
+                pure ([SAssign start (RBinOp CSub n0Atom (AInt bottomPad))], Just (AVar start))
+              else pure ([], Nothing)
+            (rightSetup, rightStart) <- if rightPad > 0
+              then do
+                start <- freshCVar "bd_col_start"
+                pure ([SAssign start (RBinOp CSub n1Atom (AInt rightPad))], Just (AVar start))
+              else pure ([], Nothing)
+            pure (bottomSetup ++ rightSetup, bottomStart, rightStart)
+          boundaryLoop <-
+            mkStencilLoop2D (atomToIndexExpr n0Atom) (atomToIndexExpr n1Atom) (AInt 0) (AInt 0) $
+              \rowAtom colAtom -> do
+                (guardStmts, guardAtom) <-
+                  buildBoundaryGuard2D rowAtom colAtom topPad mBottomStart leftPad mRightStart
+                boundaryBody <-
+                  buildStencilBoundaryBody2D
+                    arrAtom
+                    shapeAtom
+                    outAtom
+                    rowAtom
+                    colAtom
+                    n0Atom
+                    n1Atom
+                    bnd
+                    maDef
+                    bodyExp
+                    accCalls
+                pure (guardStmts ++ [SIf guardAtom boundaryBody []])
+          pure $ [interiorLoop] ++ boundarySetup ++ [boundaryLoop]
+    _ ->
+      error "lowerSplitStencil2D: expected rank-2 constant-access footprint"
+
 extractStencilFn :: Exp Range -> LowerM (Maybe (Var, Exp Range))
 extractStencilFn (ELetIn _ (Dec _ _name [PVar _ accVar] _ _ body) _) =
   pure $ Just (accVar, body)

@@ -282,6 +282,22 @@ spec = do
           , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
           ])
 
+    it "compiles and runs polyhedral constant-boundary stencil kernels and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = False
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let input = generate [8] (let f [i] = i + 1 in f)"
+          , "let result = stencil (constant 0)"
+          , "  (fn acc => acc (-1) + acc 0 + acc 1)"
+          , "  input"
+          ])
+
     it "emits skewed tiled jacobi interior C and matches the untiled polyhedral path" $ withCC $
       withSystemTempDirectory "hydrangea-jacobi" $ \tmp -> do
         src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"

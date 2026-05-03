@@ -216,6 +216,36 @@ spec = do
       let Program procs = prog
       length procs `shouldBe` 2
 
+  describe "Lowering - Stencil" $ do
+    it "splits clamp stencils into affine interior and guarded boundary loops" $ do
+      prog <- lowerFromSource $
+        BS.pack $
+          unlines
+            [ "let result arr = stencil clamp"
+            , "  (fn acc => acc (-1) + acc 0 + acc 1)"
+            , "  arr"
+            ]
+      let Program procs = prog
+          Proc { procBody = stmts } = head [proc | proc@Proc { procName = name } <- procs, name == "result"]
+          loops = collectLoopsWithBodies stmts
+      length loops `shouldBe` 2
+      any (\(_, body) -> anyArrayLoad body && not (containsSIf body)) loops `shouldBe` True
+      any (\(_, body) -> containsSIf body) loops `shouldBe` True
+
+    it "lowers 2D clamp stencils with a dedicated interior loop nest" $ do
+      prog <- lowerFromSource $
+        BS.pack $
+          unlines
+            [ "let result arr = stencil clamp"
+            , "  (fn acc => acc (-1) 0 + acc 1 0 + acc 0 (-1) + acc 0 1)"
+            , "  arr"
+            ]
+      let Program procs = prog
+          Proc { procBody = stmts } = head [proc | proc@Proc { procName = name } <- procs, name == "result"]
+          loops = collectLoopsWithBodies stmts
+      any (\(spec, body) -> length (lsIters spec) == 2 && anyArrayLoad body && not (containsSIf body)) loops `shouldBe` True
+      any (\(_, body) -> containsSIf body) loops `shouldBe` True
+
   describe "Lowering - Tuples" $ do
     it "lowers tuple construction" $ do
       prog <- lowerFromSource "let t = [1, 2, 3]"
@@ -420,6 +450,13 @@ anyArrayLoad = any checkStmt
     checkStmt (SIf _ thn els)              = anyArrayLoad thn || anyArrayLoad els
     checkStmt _                            = False
 
+containsSIf :: [Stmt] -> Bool
+containsSIf = any checkStmt
+  where
+    checkStmt (SIf _ _ _)    = True
+    checkStmt (SLoop _ body) = containsSIf body
+    checkStmt _              = False
+
 loopRoles :: [Stmt] -> [LoopRole]
 loopRoles = concatMap go
   where
@@ -434,4 +471,12 @@ collectLoopSpecs = concatMap go
     go stmt = case stmt of
       SLoop loopSpec body -> loopSpec : collectLoopSpecs body
       SIf _ thn els -> collectLoopSpecs thn ++ collectLoopSpecs els
+      _ -> []
+
+collectLoopsWithBodies :: [Stmt] -> [(LoopSpec, [Stmt])]
+collectLoopsWithBodies = concatMap go
+  where
+    go stmt = case stmt of
+      SLoop loopSpec body -> (loopSpec, body) : collectLoopsWithBodies body
+      SIf _ thn els -> collectLoopsWithBodies thn ++ collectLoopsWithBodies els
       _ -> []

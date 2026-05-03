@@ -180,6 +180,32 @@ spec = describe "Polyhedral" $ do
         other -> expectationFailure ("unexpected diagnostic: " <> show other)
       other -> expectationFailure ("expected one diagnostic, got: " <> show other)
 
+  it "extracts the affine interior of clamp stencils while leaving the boundary fallback rejected" $ do
+    diagnostics <-
+      loadPreparedDiagnosticsFromSource $
+        BS.pack $
+          unlines
+            [ "let input = generate [8] (let f [i] = i + 1 in f)"
+            , "let result = stencil clamp"
+            , "  (fn acc => acc (-1) + acc 0 + acc 1)"
+            , "  input"
+            ]
+    extractedProcNames diagnostics `shouldSatisfy` elem "result"
+    rejectedProcNames diagnostics `shouldSatisfy` elem "result"
+
+  it "extracts the affine interior of constant-boundary stencils too" $ do
+    diagnostics <-
+      loadPreparedDiagnosticsFromSource $
+        BS.pack $
+          unlines
+            [ "let input = generate [6] (let f [i] = i + 1 in f)"
+            , "let result = stencil (constant 0)"
+            , "  (fn acc => acc (-1) + acc 0 + acc 1)"
+            , "  input"
+            ]
+    extractedProcNames diagnostics `shouldSatisfy` elem "result"
+    rejectedProcNames diagnostics `shouldSatisfy` elem "result"
+
   it "extracts and reifies tile-count style ceil-div bounds" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
         loop =
@@ -705,6 +731,21 @@ loadPreparedMatmulBenchmarkDiagnostics = do
               { poEnableTiling = True
               , poEnablePolyhedral = True
               , poEnableParallelization = True
+              }
+      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
+      pure (collectProgramScopDiagnostics2 (preparePolyhedralProgramWithOptions pipelineOpts prog))
+
+loadPreparedDiagnosticsFromSource :: BS.ByteString -> IO [ScopDiagnostic]
+loadPreparedDiagnosticsFromSource src =
+  case readDecs src of
+    Left perr ->
+      expectationFailure ("Parse error: " ++ perr) >> pure []
+    Right decs -> do
+      let pipelineOpts =
+            defaultPipelineOptions
+              { poEnableTiling = True
+              , poEnablePolyhedral = True
+              , poEnableParallelization = False
               }
       prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
       pure (collectProgramScopDiagnostics2 (preparePolyhedralProgramWithOptions pipelineOpts prog))
