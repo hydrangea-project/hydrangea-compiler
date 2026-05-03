@@ -691,6 +691,7 @@ spec = describe "Polyhedral" $ do
   fusionSpec
   skewingSpec
   temporalSkewingSpec
+  wavefrontCollapseSpec
 
 loadPreparedMatmulBenchmarkDiagnostics :: IO [ScopDiagnostic]
 loadPreparedMatmulBenchmarkDiagnostics = do
@@ -1327,3 +1328,74 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
             expectationFailure ("expected strip-mined schedule, got: " <> show other)
       other ->
         expectationFailure ("expected one scop, got: " <> show (length other))
+
+wavefrontCollapseSpec :: Spec
+wavefrontCollapseSpec = describe "wavefront collapse" $ do
+  it "collapses constant-trip iterate/map kernels into a ring-buffer wavefront on the polyhedral path" $ do
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IConst 2] Serial Nothing LoopIterate [])
+            [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+            , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+            , innerLoop
+            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+            ]
+        proc = mkProc "p" ["n", "arr_cur"] [outerLoop]
+    case polyhedralProgram2 (Program [proc]) of
+      Program [rewritten] -> do
+        loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
+        hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
+        length [() | SAssign "__hyd_discard" (C.RArrayFree _) <- procBody rewritten] `shouldSatisfy` (>= 1)
+      other ->
+        expectationFailure ("expected one proc, got: " <> show other)
+
+  it "collapses dynamic-trip iterate/map kernels into a ring-buffer wavefront too" $ do
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate [])
+            [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+            , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+            , innerLoop
+            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+            ]
+        proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
+    case polyhedralProgram2 (Program [proc]) of
+      Program [rewritten] -> do
+        loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
+        hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
+      other ->
+        expectationFailure ("expected one proc, got: " <> show other)
+
+loopRolesInStmts :: [Stmt] -> [LoopRole]
+loopRolesInStmts = concatMap go
+  where
+    go stmt = case stmt of
+      SLoop spec body ->
+        lsRole spec : loopRolesInStmts body
+      SIf _ thn els ->
+        loopRolesInStmts thn ++ loopRolesInStmts els
+      _ ->
+        []
+
+hasParallelLoopInStmts :: [Stmt] -> Bool
+hasParallelLoopInStmts = any go
+  where
+    go stmt = case stmt of
+      SLoop spec body ->
+        case lsExec spec of
+          Parallel {} -> True
+          _ -> hasParallelLoopInStmts body
+      SIf _ thn els ->
+        hasParallelLoopInStmts thn || hasParallelLoopInStmts els
+      _ ->
+        False
