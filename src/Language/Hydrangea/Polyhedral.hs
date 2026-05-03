@@ -1090,6 +1090,7 @@ collectProcScopDiagnostics2 proc = go [] (procBody proc)
       SLoop spec body ->
         case buildScop (procName proc) path spec body of
           Right scop -> [ScopExtracted scop]
+          Left RejectNoMemoryAccess -> go path body
           Left reason -> ScopRejected (procName proc) path reason : go path body
       SIf _ thn els ->
         go (path ++ [0]) thn ++ go (path ++ [1]) els

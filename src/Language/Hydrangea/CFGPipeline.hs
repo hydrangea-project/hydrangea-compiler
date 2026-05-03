@@ -52,6 +52,79 @@ defaultPipelineOptions = PipelineOptions
 fixpointOpt :: [Stmt] -> [Stmt]
 fixpointOpt = optimizeStmts2
 
+-- | After iterate-allocation hoisting, run only the structurally safe cleanup
+-- passes that expose invariant case splits without touching the ping-pong
+-- swap sequence.
+postHoistIterateFixpoint :: [Stmt] -> [Stmt]
+postHoistIterateFixpoint = go 20
+  where
+    go :: Int -> [Stmt] -> [Stmt]
+    go 0 stmts = stmts
+    go n stmts =
+      let stmts' = unswitchLoopInvariantIf2 stmts
+      in if stmts' == stmts then stmts else go (n - 1) stmts'
+
+-- | Normalize iterate bodies before downstream scheduling/vectorization.
+-- Hoisting the ping-pong allocs can expose additional invariant shape-case
+-- branching, so run the scalar cleanup pass again afterwards.
+normalizeIterateBodies :: [Stmt] -> [Stmt]
+normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs2 . fixpointOpt
+
+stmtsNeedIterateNormalization :: [Stmt] -> Bool
+stmtsNeedIterateNormalization = any stmtNeedsIterateNormalization
+  where
+    stmtNeedsIterateNormalization :: Stmt -> Bool
+    stmtNeedsIterateNormalization stmt = case stmt of
+      SLoop spec body ->
+        (lsRole spec == LoopIterate && stmtsContainIf body)
+          || stmtsNeedIterateNormalization body
+      SIf _ thn els ->
+        stmtsNeedIterateNormalization thn || stmtsNeedIterateNormalization els
+      _ ->
+        False
+
+    stmtsContainIf :: [Stmt] -> Bool
+    stmtsContainIf = any containsIf
+
+    containsIf :: Stmt -> Bool
+    containsIf stmt = case stmt of
+      SIf _ thn els -> True || stmtsContainIf thn || stmtsContainIf els
+      SLoop _ body -> stmtsContainIf body
+      _ -> False
+
+programHasConditionalIterates :: Program -> Bool
+programHasConditionalIterates (Program procs) = any (stmtsHaveConditionalIterate . procBody) procs
+  where
+    stmtsHaveConditionalIterate :: [Stmt] -> Bool
+    stmtsHaveConditionalIterate = any stmtHasConditionalIterate
+
+    stmtHasConditionalIterate :: Stmt -> Bool
+    stmtHasConditionalIterate stmt = case stmt of
+      SLoop _ body ->
+        stmtsHaveConditionalIterate body
+      SIf _ thn els ->
+        branchHasIterate thn
+          || branchHasIterate els
+          || stmtsHaveConditionalIterate thn
+          || stmtsHaveConditionalIterate els
+      _ ->
+        False
+
+    branchHasIterate :: [Stmt] -> Bool
+    branchHasIterate = any containsIterate
+
+    containsIterate :: Stmt -> Bool
+    containsIterate stmt = case stmt of
+      SLoop spec body ->
+        lsRole spec == LoopIterate || stmtsContainIterate body
+      SIf _ thn els ->
+        stmtsContainIterate thn || stmtsContainIterate els
+      _ ->
+        False
+
+    stmtsContainIterate :: [Stmt] -> Bool
+    stmtsContainIterate = any containsIterate
+
 cleanupProgram :: Program -> Program
 cleanupProgram (Program procs) =
   Program
@@ -75,9 +148,15 @@ optimizePipelineWithTiling enableTiling stmts =
 -- | Run the CFG cleanup steps that prepare loop nests for polyhedral
 -- extraction or scheduling.
 preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
-preparePolyhedralProgramWithOptions opts (Program procs) =
+preparePolyhedralProgramWithOptions _opts (Program procs) =
   Program
-    [ proc { procBody = optimizePipelineWithTiling False (procBody proc) }
+    [ proc
+        { procBody =
+            let body' = optimizePipelineWithTiling False (procBody proc)
+            in if stmtsNeedIterateNormalization body'
+                 then normalizeIterateBodies body'
+                 else body'
+        }
     | proc <- procs
     ]
 
@@ -85,10 +164,15 @@ preparePolyhedralProgramWithOptions opts (Program procs) =
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
 vectorizePipelineWithOptions opts prog =
   let prepared = preparePolyhedralProgramWithOptions opts prog
+      cleanupPolyhedral scheduled
+        | programHasConditionalIterates scheduled = scheduled
+        | otherwise = cleanupProgram scheduled
       optimized
-        | poEnablePolyhedral opts && poEnableTiling opts = cleanupProgram (polyhedralTileProgram2 prepared)
+        | poEnablePolyhedral opts && poEnableTiling opts =
+            cleanupPolyhedral (polyhedralTileProgram2 prepared)
         | poEnableTiling opts = cleanupProgram (polyhedralIdentityTileProgram2 prepared)
-        | poEnablePolyhedral opts = cleanupProgram (polyhedralProgram2 prepared)
+        | poEnablePolyhedral opts =
+            cleanupPolyhedral (polyhedralProgram2 prepared)
         | otherwise = applyHoist prepared
       applyHoist (Program procs) =
         Program [proc { procBody = hoistIterateAllocs2 (procBody proc) } | proc <- procs]

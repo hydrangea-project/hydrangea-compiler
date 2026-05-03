@@ -180,7 +180,7 @@ spec = describe "Polyhedral" $ do
         other -> expectationFailure ("unexpected diagnostic: " <> show other)
       other -> expectationFailure ("expected one diagnostic, got: " <> show other)
 
-  it "extracts the affine interior of clamp stencils while leaving the boundary fallback rejected" $ do
+  it "extracts full clamp stencil kernels without fallback rejections" $ do
     diagnostics <-
       loadPreparedDiagnosticsFromSource $
         BS.pack $
@@ -191,9 +191,9 @@ spec = describe "Polyhedral" $ do
             , "  input"
             ]
     extractedProcNames diagnostics `shouldSatisfy` elem "result"
-    rejectedProcNames diagnostics `shouldSatisfy` elem "result"
+    rejectedProcNames diagnostics `shouldNotContain` ["result"]
 
-  it "extracts the affine interior of constant-boundary stencils too" $ do
+  it "extracts full constant-boundary stencil kernels too" $ do
     diagnostics <-
       loadPreparedDiagnosticsFromSource $
         BS.pack $
@@ -204,7 +204,21 @@ spec = describe "Polyhedral" $ do
             , "  input"
             ]
     extractedProcNames diagnostics `shouldSatisfy` elem "result"
-    rejectedProcNames diagnostics `shouldSatisfy` elem "result"
+    rejectedProcNames diagnostics `shouldNotContain` ["result"]
+
+  it "extracts iterate-wrapped clamp stencil kernels without outer rejection" $ do
+    diagnostics <-
+      loadPreparedDiagnosticsFromSource $
+        BS.pack $
+          unlines
+            [ "let init = generate [5] (fn [i] => 1.0)"
+            , "let step = fn arr => stencil clamp"
+            , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
+            , "  arr"
+            , "let result = iterate 3 init step"
+            ]
+    extractedProcNames diagnostics `shouldSatisfy` elem "result"
+    rejectedProcNames diagnostics `shouldNotContain` ["result"]
 
   it "extracts and reifies tile-count style ceil-div bounds" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)

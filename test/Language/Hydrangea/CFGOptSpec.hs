@@ -159,6 +159,34 @@ spec = do
             _ -> expectationFailure "Expected conditional in loop body"
         _ -> expectationFailure "Expected shared assignment hoisted before loop"
 
+  describe "CFGOpt - Loop Unswitching" $ do
+    it "hoists loop-invariant conditionals out of LoopIterate bodies" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 4] Serial Nothing LoopIterate []
+          isIf stmt = case stmt of
+            SIf {} -> True
+            _ -> False
+          loopBody =
+            [ SAssign "n" (RAtom (AInt 5))
+            , SAssign "is_small" (RBinOp CLe (AVar "n") (AInt 1))
+            , SIf (AVar "is_small")
+                [SAssign "x" (RAtom (AInt 0))]
+                [SAssign "x" (RAtom (AInt 1))]
+            , SArrayWrite (AVar "out") (AVar "iter_t") (AVar "x")
+            , SAssign "cur" (RAtom (AVar "next"))
+            ]
+          result = unswitchLoopInvariantIf2 [SLoop loopSpec loopBody]
+      case result of
+        [ SAssign "n" (RAtom (AInt 5))
+          , SAssign "is_small" (RBinOp CLe (AVar "n") (AInt 1))
+          , SIf (AVar "is_small") [SLoop specThn bodyThn] [SLoop specEls bodyEls]
+          ] -> do
+              specThn `shouldBe` loopSpec
+              specEls `shouldBe` loopSpec
+              any isIf bodyThn `shouldBe` False
+              any isIf bodyEls `shouldBe` False
+        other ->
+          expectationFailure ("Expected iterate loop to be unswitched, got: " <> show other)
+
   describe "CFGOpt - Combined Optimization" $ do
     it "scalarizes temporary 0-D array write/load roundtrips" $ do
       let stmts =

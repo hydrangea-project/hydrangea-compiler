@@ -27,6 +27,8 @@ module Language.Hydrangea.CFGOpt
   , copyProp2
   , deadAssignElim2
   , loopInvariantCodeMotion2
+  , unswitchLoopInvariantIf2
+  , removeNoOps2
   , hoistIterateAllocs2
     -- * Atom/statement substitution utilities
   , substAtom2
@@ -217,92 +219,122 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
     go env tupEnv callEnv shapeEnv flatToNdEnv (stmt : rest) = case stmt of
       SAssign x (RAtom a) ->
         let a' = substAtom2 env a
-        in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+            (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+            env1
+              | introducesCopyCycle x a' env0 = env0
+              | otherwise = M.insert x a' env0
+        in  SAssign x (RAtom a') : go env1 tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Track RTuple assignments for downstream shape-folding.
       SAssign x (RTuple atoms) ->
         let atoms' = map (substAtom2 env) atoms
-        in  SAssign x (RTuple atoms') : go env (M.insert x atoms' tupEnv) callEnv shapeEnv flatToNdEnv rest
+            (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+        in  SAssign x (RTuple atoms')
+              : go env0 (M.insert x atoms' tupEnv0) callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Fold RShapeInit on a statically-known tuple: drop the last element.
       SAssign x (RShapeInit (AVar v))
         | Just atoms <- M.lookup v tupEnv
         , not (null atoms) ->
             let atoms' = init atoms
-            in  SAssign x (RTuple atoms') : go env (M.insert x atoms' tupEnv) callEnv shapeEnv flatToNdEnv rest
+                (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+                  killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+            in  SAssign x (RTuple atoms')
+                  : go env0 (M.insert x atoms' tupEnv0) callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Fold RShapeLast on a statically-known tuple: extract the last element.
       SAssign x (RShapeLast (AVar v))
         | Just atoms <- M.lookup v tupEnv
         , not (null atoms) ->
             let a' = last atoms
-            in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+                (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+                  killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+            in  SAssign x (RAtom a')
+                  : go (M.insert x a' env0) tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Fold RShapeSize on a statically-known tuple: compute the product.
       SAssign x (RShapeSize (AVar v))
         | Just atoms <- M.lookup v tupEnv
         , Just ns    <- mapM atomToInt atoms ->
             let a' = AInt (product ns)
-            in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+                (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+                  killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+            in  SAssign x (RAtom a')
+                  : go (M.insert x a' env0) tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Fold RProj on a statically-known tuple: extract the i-th element.
       SAssign x (RProj i (AVar v))
         | Just atoms <- M.lookup v tupEnv
         , fromIntegral i < length atoms ->
             let a' = atoms !! fromIntegral i
-            in  SAssign x (RAtom a') : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+                (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+                  killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+            in  SAssign x (RAtom a')
+                  : go (M.insert x a' env0) tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Call CSE: zero-argument value procs are idempotent (cached).
       -- Replace a second call to the same proc with a copy of the first result.
       SAssign x (RCall proc []) ->
-        case M.lookup proc callEnv of
+        let (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+        in case M.lookup proc callEnv0 of
           Just prevVar ->
-            let a' = AVar prevVar
-            in  SAssign x (RAtom a')
-                  : go (M.insert x a' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+             let a' = AVar prevVar
+             in  SAssign x (RAtom a')
+                  : go (M.insert x a' env0) tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
           Nothing ->
-            SAssign x (RCall proc [])
-              : go env tupEnv (M.insert proc x callEnv) shapeEnv flatToNdEnv rest
+             SAssign x (RCall proc [])
+              : go env0 tupEnv0 (M.insert proc x callEnv0) shapeEnv0 flatToNdEnv0 rest
 
       -- Shape CSE: deduplicate arr->shape reads for the same array pointer.
       SAssign x (RArrayShape a) ->
         let a' = substAtom2 env a
+            (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  case a' of
               AVar v -> case M.lookup v shapeEnv of
                 Just prevShp ->
                   let atom' = AVar prevShp
                   in  SAssign x (RAtom atom')
-                        : go (M.insert x atom' env) tupEnv callEnv shapeEnv flatToNdEnv rest
+                        : go (M.insert x atom' env0) tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
                 Nothing ->
                   SAssign x (RArrayShape a')
-                    : go env tupEnv callEnv (M.insert v x shapeEnv) flatToNdEnv rest
+                    : go env0 tupEnv0 callEnv0 (M.insert v x shapeEnv0) flatToNdEnv0 rest
               _ -> SAssign x (RArrayShape a')
-                     : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+                     : go env0 tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       -- Track flat→nd conversions for roundtrip elimination below.
       SAssign x (RFlatToNd ka sa) ->
         let ka' = substAtom2 env ka
             sa' = substAtom2 env sa
+            (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  SAssign x (RFlatToNd ka' sa')
-              : go env tupEnv callEnv shapeEnv (M.insert x (ka', sa') flatToNdEnv) rest
+              : go env0 tupEnv0 callEnv0 shapeEnv0 (M.insert x (ka', sa') flatToNdEnv0) rest
 
       -- Roundtrip elimination: nd_to_flat(flat_to_nd(k, s), s) == k.
       SAssign x (RNdToFlat a sa) ->
         let a'  = substAtom2 env a
             sa' = substAtom2 env sa
+            (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  case a' of
               AVar ndVar | Just (kAtom, s1) <- M.lookup ndVar flatToNdEnv
                          , s1 == sa' ->
                 -- The nd-index was produced by flat_to_nd with the same shape:
                 -- skip the round-trip and use the original flat index directly.
                 SAssign x (RAtom kAtom)
-                  : go (M.insert x kAtom env) tupEnv callEnv shapeEnv flatToNdEnv rest
+                  : go (M.insert x kAtom env0) tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
               _ ->
                 SAssign x (RNdToFlat a' sa')
-                  : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+                  : go env0 tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
 
       SAssign x rhs ->
-        SAssign x (substRHS2 env rhs) : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+        let (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
+              killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
+        in  SAssign x (substRHS2 env rhs) : go env0 tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
       SArrayWrite a1 a2 a3 ->
         SArrayWrite (substAtom2 env a1) (substAtom2 env a2) (substAtom2 env a3)
           : go env tupEnv callEnv shapeEnv flatToNdEnv rest
@@ -357,6 +389,39 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
     atomToInt :: Atom -> Maybe Integer
     atomToInt (AInt n) = Just n
     atomToInt _        = Nothing
+
+    killAssignedVar
+      :: ByteString
+      -> Map ByteString Atom
+      -> Map ByteString [Atom]
+      -> Map ByteString ByteString
+      -> Map ByteString ByteString
+      -> Map ByteString (Atom, Atom)
+      -> ( Map ByteString Atom
+         , Map ByteString [Atom]
+         , Map ByteString ByteString
+         , Map ByteString ByteString
+         , Map ByteString (Atom, Atom)
+         )
+    killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv =
+      ( M.delete x env
+      , M.delete x tupEnv
+      , M.filter (/= x) callEnv
+      , M.filter (/= x) shapeEnv
+      , M.delete x flatToNdEnv
+      )
+
+    introducesCopyCycle :: ByteString -> Atom -> Map ByteString Atom -> Bool
+    introducesCopyCycle x atom env = case atom of
+      AVar y -> followsTo x S.empty y
+      _ -> False
+      where
+        followsTo target seen v
+          | v == target = True
+          | v `S.member` seen = False
+          | otherwise = case M.lookup v env of
+              Just (AVar v') -> followsTo target (S.insert v seen) v'
+              _ -> False
 
 ------------------------------------------------------------------------
 -- Dead assignment elimination
@@ -524,6 +589,126 @@ loopInvariantCodeMotion2 = concatMap goStmt
           SLoop _ body -> foldr go acc body
           SIf _ thn els -> foldr go (foldr go acc thn) els
           _ -> acc
+
+------------------------------------------------------------------------
+-- Loop-invariant conditional unswitching
+------------------------------------------------------------------------
+
+-- | Hoist top-level loop-invariant conditionals out of @LoopIterate@ bodies.
+--
+-- This targets temporal kernels whose loop body starts with shape-derived
+-- case splits. When the setup assignments and conditional depend only on
+-- loop-invariant values, the pass hoists the setup and duplicates the
+-- iterate loop per branch so later passes can see branch-free loop bodies.
+-- Nested case chains are handled by the surrounding optimize-to-fixpoint
+-- driver, which can expose and hoist the next conditional on a later pass.
+unswitchLoopInvariantIf2 :: [Stmt] -> [Stmt]
+unswitchLoopInvariantIf2 = concatMap goStmt
+  where
+    goStmt :: Stmt -> [Stmt]
+    goStmt (SLoop spec body) =
+      let body' = unswitchLoopInvariantIf2 body
+      in case unswitchIterateInvariantIf spec body' of
+           Just replacement -> replacement
+           Nothing -> [SLoop spec body']
+    goStmt (SIf cond thn els) =
+      [SIf cond (unswitchLoopInvariantIf2 thn) (unswitchLoopInvariantIf2 els)]
+    goStmt stmt = [stmt]
+
+    unswitchIterateInvariantIf :: LoopSpec -> [Stmt] -> Maybe [Stmt]
+    unswitchIterateInvariantIf spec body = do
+      guard (lsRole spec == LoopIterate)
+      (prefix, cond, thn, els, suffix) <- splitInvariantIf spec body
+      let mkBranch branch = [SLoop spec (branch ++ suffix)]
+      pure (prefix ++ [SIf cond (mkBranch thn) (mkBranch els)])
+
+    splitInvariantIf :: LoopSpec -> [Stmt] -> Maybe ([Stmt], Atom, [Stmt], [Stmt], [Stmt])
+    splitInvariantIf spec body = go [] S.empty body
+      where
+        iterDefs = S.fromList (lsIters spec)
+        bodyDefs = definedVarsStmts2 body
+        defCounts = countAssignedVars body
+
+        go :: [Stmt] -> Set ByteString -> [Stmt] -> Maybe ([Stmt], Atom, [Stmt], [Stmt], [Stmt])
+        go prefix hoistedDefs stmts = case stmts of
+          [] ->
+            Nothing
+          SIf cond thn els : suffix
+            | invariantCond hoistedDefs cond ->
+                Just (reverse prefix, cond, thn, els, suffix)
+            | otherwise ->
+                Nothing
+          stmt : rest
+            | invariantPrefixStmt hoistedDefs stmt ->
+                let hoistedDefs' = hoistedDefs `S.union` definedVarsStmt stmt
+                in go (stmt : prefix) hoistedDefs' rest
+            | otherwise ->
+                Nothing
+
+        invariantPrefixStmt :: Set ByteString -> Stmt -> Bool
+        invariantPrefixStmt hoistedDefs stmt = case stmt of
+          SAssign x rhs ->
+            not (x `S.member` iterDefs)
+              && M.findWithDefault 0 x defCounts == 1
+              && (rhsIsPure2 rhs || isZeroArgCall rhs)
+              && S.null (usedVarsRHS2 rhs `S.intersection` disallowed hoistedDefs)
+          _ ->
+            False
+
+        invariantCond :: Set ByteString -> Atom -> Bool
+        invariantCond hoistedDefs cond =
+          S.null (usedVarsAtom2 cond `S.intersection` disallowed hoistedDefs)
+
+        disallowed :: Set ByteString -> Set ByteString
+        disallowed hoistedDefs =
+          iterDefs `S.union` (bodyDefs `S.difference` hoistedDefs)
+
+        definedVarsStmt :: Stmt -> Set ByteString
+        definedVarsStmt stmt = case stmt of
+          SAssign x _ -> S.singleton x
+          _ -> S.empty
+
+        countAssignedVars :: [Stmt] -> Map ByteString Int
+        countAssignedVars = foldr goCount M.empty
+          where
+            goCount stmt acc = case stmt of
+              SAssign x _ -> M.insertWith (+) x 1 acc
+              SLoop _ innerBody -> foldr goCount acc innerBody
+              SIf _ thn els -> foldr goCount (foldr goCount acc thn) els
+              _ -> acc
+
+        isZeroArgCall :: RHS -> Bool
+        isZeroArgCall (RCall _ []) = True
+        isZeroArgCall _ = False
+
+------------------------------------------------------------------------
+-- No-op cleanup
+------------------------------------------------------------------------
+
+-- | Remove trivial no-op statements introduced by other rewrites:
+--
+-- * self-assignments like @x = x@
+-- * loops whose body becomes empty
+-- * conditionals whose branches both become empty
+removeNoOps2 :: [Stmt] -> [Stmt]
+removeNoOps2 = concatMap goStmt
+  where
+    goStmt :: Stmt -> [Stmt]
+    goStmt stmt = case stmt of
+      SAssign x (RAtom (AVar y))
+        | x == y ->
+            []
+      SLoop spec body ->
+        let body' = removeNoOps2 body
+        in if null body' then [] else [SLoop spec body']
+      SIf cond thn els ->
+        let thn' = removeNoOps2 thn
+            els' = removeNoOps2 els
+        in if null thn' && null els'
+             then []
+             else [SIf cond thn' els']
+      _ ->
+        [stmt]
 
 ------------------------------------------------------------------------
 -- Iterate-loop allocation hoisting

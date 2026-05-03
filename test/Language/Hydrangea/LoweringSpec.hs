@@ -217,7 +217,7 @@ spec = do
       length procs `shouldBe` 2
 
   describe "Lowering - Stencil" $ do
-    it "splits clamp stencils into affine interior and guarded boundary loops" $ do
+    it "lowers 1D clamp stencils into SIf-free affine loop regions" $ do
       prog <- lowerFromSource $
         BS.pack $
           unlines
@@ -228,11 +228,10 @@ spec = do
       let Program procs = prog
           Proc { procBody = stmts } = head [proc | proc@Proc { procName = name } <- procs, name == "result"]
           loops = collectLoopsWithBodies stmts
-      length loops `shouldBe` 2
-      any (\(_, body) -> anyArrayLoad body && not (containsSIf body)) loops `shouldBe` True
-      any (\(_, body) -> containsSIf body) loops `shouldBe` True
+      length loops `shouldSatisfy` (> 1)
+      all (\(_, body) -> not (containsSIf body)) loops `shouldBe` True
 
-    it "lowers 2D clamp stencils with a dedicated interior loop nest" $ do
+    it "lowers 2D clamp stencils into SIf-free affine loop regions" $ do
       prog <- lowerFromSource $
         BS.pack $
           unlines
@@ -243,8 +242,8 @@ spec = do
       let Program procs = prog
           Proc { procBody = stmts } = head [proc | proc@Proc { procName = name } <- procs, name == "result"]
           loops = collectLoopsWithBodies stmts
-      any (\(spec, body) -> length (lsIters spec) == 2 && anyArrayLoad body && not (containsSIf body)) loops `shouldBe` True
-      any (\(_, body) -> containsSIf body) loops `shouldBe` True
+      any (\(spec, body) -> length (lsIters spec) == 2 && anyArrayLoad body) loops `shouldBe` True
+      all (\(_, body) -> not (containsSIf body)) loops `shouldBe` True
 
   describe "Lowering - Tuples" $ do
     it "lowers tuple construction" $ do
