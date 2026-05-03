@@ -329,6 +329,8 @@ data ScopDiagnostic
 data AffineValue
   = AffineScalar AffineExpr
   | AffineTuple [AffineExpr]
+  | AffineFlatIndex [AffineExpr]
+  | AffineRowOffset AffineExpr AffineExpr
 
 type AffineEnv = Map CVar AffineValue
 type TileM = State (Set CVar, Int)
@@ -778,15 +780,17 @@ suggestCrossBandSkew2
 suggestCrossBandSkew2 outerDepth outerIters innerIters relations
   | null outerIters || null innerIters = []
   | otherwise =
-      [ SkewSpec
-          { skewTarget = innerIter
-          , skewSource = outerIter
-          , skewCoeff  = coeff
-          }
-      | outerIter <- outerIters
-      , innerIter <- innerIters
-      , coeff <- maybeToList (crossSkewCoeff2 outerDepth outerIter innerIter relations)
-      ]
+      maybeToList $
+        listToMaybe
+          [ SkewSpec
+              { skewTarget = innerIter
+              , skewSource = outerIter
+              , skewCoeff  = coeff
+              }
+          | innerIter <- innerIters
+          , outerIter <- outerIters
+          , coeff <- maybeToList (crossSkewCoeff2 outerDepth outerIter innerIter relations)
+          ]
 
 -- | Compute the required skew coefficient for a cross-band dependence where
 -- the outer iterator has positive distance and the inner iterator has
@@ -1619,17 +1623,18 @@ affineCoreValueFromRHS :: AffineEnv -> RHS -> Maybe AffineValue
 affineCoreValueFromRHS env rhs = case rhs of
   RAtom atom ->
     affineValueFromAtom env atom
-  RBinOp op a b -> do
-    lhs <- affineScalarFromAtom env a
-    rhs' <- affineScalarFromAtom env b
-    case op of
-      CAdd -> Just (AffineScalar (addAffineExpr lhs rhs'))
-      CSub -> Just (AffineScalar (subAffineExpr lhs rhs'))
-      CMul ->
-        AffineScalar <$> affineMul lhs rhs'
-      CDiv ->
-        AffineScalar <$> affineDiv lhs rhs'
-      _ -> Nothing
+  RBinOp op a b ->
+    affineSpecialValueFromBinOp env op a b <|> do
+      lhs <- affineScalarFromAtom env a
+      rhs' <- affineScalarFromAtom env b
+      case op of
+        CAdd -> Just (AffineScalar (addAffineExpr lhs rhs'))
+        CSub -> Just (AffineScalar (subAffineExpr lhs rhs'))
+        CMul ->
+          AffineScalar <$> affineMul lhs rhs'
+        CDiv ->
+          AffineScalar <$> affineDiv lhs rhs'
+        _ -> Nothing
   RTuple atoms ->
     AffineTuple <$> mapM (affineScalarFromAtom env) atoms
   RProj i atom -> do
@@ -1649,9 +1654,11 @@ affinePreludeValueFromRHS env rhs = case rhs of
       [_] -> Just (AffineTuple [flatExpr])
       _ -> Nothing
   RNdToFlat idx shape -> do
-    AffineTuple idxExprs <- affineValueFromAtom env idx
+    idxExprs <- affineTupleLikeFromAtom env idx
     shapeExprs <- arrayShapeTupleFromAtom env shape (length idxExprs)
-    AffineScalar <$> affineNdToFlat idxExprs shapeExprs
+    case affineNdToFlat idxExprs shapeExprs of
+      Just expr -> Just (AffineScalar expr)
+      Nothing -> Just (AffineFlatIndex idxExprs)
   _ ->
     Nothing
 
@@ -1667,6 +1674,8 @@ affineScalarFromAtom env atom = do
   case value of
     AffineScalar expr -> Just expr
     AffineTuple {} -> Nothing
+    AffineFlatIndex {} -> Nothing
+    AffineRowOffset {} -> Nothing
 
 affineIndexFromAtom :: AffineEnv -> Atom -> Maybe [AffineExpr]
 affineIndexFromAtom env atom = do
@@ -1674,6 +1683,43 @@ affineIndexFromAtom env atom = do
   case value of
     AffineScalar expr -> Just [expr]
     AffineTuple exprs -> Just exprs
+    AffineFlatIndex exprs -> Just exprs
+    AffineRowOffset {} -> Nothing
+
+affineTupleLikeFromAtom :: AffineEnv -> Atom -> Maybe [AffineExpr]
+affineTupleLikeFromAtom env atom = do
+  value <- affineValueFromAtom env atom
+  case value of
+    AffineTuple exprs -> Just exprs
+    AffineFlatIndex exprs -> Just exprs
+    _ -> Nothing
+
+affineSpecialValueFromBinOp :: AffineEnv -> BinOp -> Atom -> Atom -> Maybe AffineValue
+affineSpecialValueFromBinOp env op a b = case op of
+  CMul ->
+    affineRowOffsetFromMul env a b <|> affineRowOffsetFromMul env b a
+  CAdd ->
+    affineFlatIndexFromAdd env a b <|> affineFlatIndexFromAdd env b a
+  _ ->
+    Nothing
+
+affineRowOffsetFromMul :: AffineEnv -> Atom -> Atom -> Maybe AffineValue
+affineRowOffsetFromMul env rowAtom widthAtom = do
+  rowExpr <- affineScalarFromAtom env rowAtom
+  widthExpr <- affineScalarFromAtom env widthAtom
+  if isJust (isConstAffine widthExpr)
+    then Nothing
+    else Just (AffineRowOffset rowExpr widthExpr)
+
+affineFlatIndexFromAdd :: AffineEnv -> Atom -> Atom -> Maybe AffineValue
+affineFlatIndexFromAdd env rowOffsetAtom colAtom = do
+  rowOffset <- affineValueFromAtom env rowOffsetAtom
+  colExpr <- affineScalarFromAtom env colAtom
+  case rowOffset of
+    AffineRowOffset rowExpr _ ->
+      Just (AffineFlatIndex [rowExpr, colExpr])
+    _ ->
+      Nothing
 
 supportedBoundExprFromIndexExpr2 :: IndexExpr -> Maybe IndexExpr
 supportedBoundExprFromIndexExpr2 expr
@@ -1767,6 +1813,8 @@ arrayShapeTupleFromAtom env atom fallbackRank = case atom of
   AVar v -> case M.lookup v env of
     Just (AffineTuple exprs) -> Just exprs
     Just (AffineScalar _) -> Nothing
+    Just (AffineFlatIndex _) -> Nothing
+    Just (AffineRowOffset _ _) -> Nothing
     Nothing ->
       Just [affineVar (v <> "_dim" <> BS.pack (show i)) | i <- [0 .. fallbackRank - 1]]
   _ -> do
@@ -1958,9 +2006,64 @@ applyBandSkew2 iters skews =
       mkPrelude s =
         let mulVar = skewTarget s <> "__s__mul"
         in  [ SAssign mulVar (RBinOp CMul (AInt (skewCoeff s)) (AVar (skewSource s)))
-            , SAssign (skewTarget s) (RBinOp CSub (AVar (skewTarget s <> "__s")) (AVar mulVar))
-            ]
+             , SAssign (skewTarget s) (RBinOp CSub (AVar (skewTarget s <> "__s")) (AVar mulVar))
+             ]
   in  (iters', preludes)
+
+-- | Preserve skewed iterator semantics when a band is reified through
+-- strip-mining. Kept dimensions inherit their original origins directly on the
+-- local loop, while tiled skewed dimensions recover the logical iterator from
+-- a skewed position inside the local-loop setup.
+applyBandSkewToStripMine
+  :: LoopBand
+  -> [StripMinePlan]
+  -> ([CVar], [IndexExpr], [Stmt], [Stmt])
+applyBandSkewToStripMine band plans =
+  let skews = lbSkew band
+      skewMap = M.fromList [(skewTarget s, s) | s <- skews]
+      originMap = M.fromList (zip (lbIters band) (lbOrigins band ++ repeat (IConst 0)))
+      skewOriginVar s = skewTarget s <> "__skew_origin"
+      skewPrelude =
+        [ SAssign (skewOriginVar s) (RBinOp CMul (AInt (skewCoeff s)) (AVar (skewSource s)))
+        | s <- skews
+        ]
+      localIterFor plan = case plan of
+        StripKeep iter _ ->
+          case M.lookup iter skewMap of
+            Just _ -> iter <> "__s"
+            Nothing -> iter
+        StripTile td ->
+          smdLocalIter td
+      localOriginFor plan = case plan of
+        StripKeep iter _ ->
+          M.findWithDefault (IConst 0) iter originMap
+        StripTile {} ->
+          IConst 0
+      localOrigins =
+        let origins = map localOriginFor plans
+        in if all (== IConst 0) origins then [] else origins
+      innerSetup = concatMap setupPlan plans
+      setupPlan plan = case plan of
+        StripKeep iter _ ->
+          case M.lookup iter skewMap of
+            Just s ->
+              [ SAssign iter (RBinOp CSub (AVar (iter <> "__s")) (AVar (skewOriginVar s)))
+              ]
+            Nothing ->
+              []
+        StripTile td ->
+          case M.lookup (smdOrigIter td) skewMap of
+            Just s ->
+              let orig = smdOrigIter td
+                  skewed = orig <> "__s"
+              in
+                [ assignOrigIter td
+                , SAssign skewed (RBinOp CAdd (AVar orig) (AVar (skewOriginVar s)))
+                , SAssign orig (RBinOp CSub (AVar skewed) (AVar (skewOriginVar s)))
+                ]
+            Nothing ->
+              [assignOrigIter td]
+  in  (map localIterFor plans, localOrigins, skewPrelude, innerSetup)
 
 reifyScheduleTree :: Map StmtId Stmt -> ScheduleTree -> Maybe [Stmt]
 reifyScheduleTree stmtMap sched = case sched of
@@ -1970,6 +2073,8 @@ reifyScheduleTree stmtMap sched = case sched of
     body <- reifyScheduleTree stmtMap (lbBody band)
     let tiledDims = [td | StripTile td <- plans]
         tilePrelude = concatMap smdBoundPrelude tiledDims
+        (localIters, localOrigins, skewPrelude, innerSetup) =
+          applyBandSkewToStripMine band plans
         outerTileSpec = LoopSpec
           { lsIters = map smdTileIter tiledDims
           , lsBounds = map (\td -> tileCountExpr (smdOrigBound td) (smdTileSize td)) tiledDims
@@ -1979,22 +2084,17 @@ reifyScheduleTree stmtMap sched = case sched of
           , lsRole = tiledLoopRole (lbRole band)
           }
         innerLocalSpec = LoopSpec
-          { lsIters = map localIter plans
+          { lsIters = localIters
           , lsBounds = map localBound plans
-          , lsOrigins = []
+          , lsOrigins = localOrigins
           , lsExec = lbExec band
           , lsRed = lbReduction band
           , lsRole = lbRole band
           }
         outerSetup = concatMap setupStripDim tiledDims
-        innerSetup = map assignOrigIter tiledDims
         innerLocalLoop = SLoop innerLocalSpec (innerSetup ++ body)
-    pure (tilePrelude ++ [SLoop outerTileSpec (outerSetup ++ [innerLocalLoop])])
+    pure (skewPrelude ++ tilePrelude ++ [SLoop outerTileSpec (outerSetup ++ [innerLocalLoop])])
     where
-      localIter plan = case plan of
-        StripKeep iter _ -> iter
-        StripTile td -> smdLocalIter td
-
       localBound plan = case plan of
         StripKeep _ bound -> bound
         StripTile td -> IVar (smdTileLen td)

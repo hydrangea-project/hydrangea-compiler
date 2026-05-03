@@ -3,8 +3,17 @@
 module Language.Hydrangea.EndToEndSpec (spec) where
 
 import Test.Hspec
-import System.Directory (copyFile, findExecutable)
-import System.Process (readProcessWithExitCode, createProcess, proc, waitForProcess, callProcess)
+import System.Directory (copyFile, createDirectoryIfMissing, findExecutable)
+import System.Environment (getEnvironment)
+import System.Process
+  ( CreateProcess(cwd, env, std_err, std_out)
+  , StdStream(NoStream)
+  , readProcessWithExitCode
+  , createProcess
+  , proc
+  , waitForProcess
+  , callProcess
+  )
 import System.Exit (ExitCode(..))
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Text.Printf (printf)
@@ -55,6 +64,40 @@ compileAndRunC src keepC compileOnly isParallel =
           else do
             (_, _, _, ph) <- createProcess (proc exe [])
             waitForProcess ph
+
+compileCToExecutable :: FilePath -> String -> Bool -> IO FilePath
+compileCToExecutable dir src isParallel = do
+  let cpath = dir </> "out.c"
+      exe = dir </> "hydrangea_out"
+      cc = "cc"
+      ompFlags = if isParallel then ["-fopenmp"] else []
+      flags = ["-O2", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
+  writeFile cpath src
+  (cExit, _cout, cerr) <- readProcessWithExitCode cc flags ""
+  case cExit of
+    ExitFailure {} -> do
+      putStrLn "C compilation failed:"
+      putStrLn cerr
+      expectationFailure "C compilation failed"
+      pure exe
+    ExitSuccess ->
+      pure exe
+
+runExecutableInDir :: FilePath -> FilePath -> [(String, String)] -> IO ExitCode
+runExecutableInDir dir exe extraEnv = do
+  baseEnv <- getEnvironment
+  let overrideKeys = map fst extraEnv
+      mergedEnv = extraEnv ++ filter (\(k, _) -> k `notElem` overrideKeys) baseEnv
+  (_, _, _, ph) <-
+    createProcess
+      ( (proc exe [])
+          { cwd = Just dir
+          , env = Just mergedEnv
+          , std_out = NoStream
+          , std_err = NoStream
+          }
+      )
+  waitForProcess ph
 
 -- | Skip test if 'cc' is not available.
 withCC :: IO () -> IO ()
@@ -238,6 +281,54 @@ spec = do
           , "  arr"
           , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
           ])
+
+    it "emits skewed tiled jacobi interior C and matches the untiled polyhedral path" $ withCC $
+      withSystemTempDirectory "hydrangea-jacobi" $ \tmp -> do
+        src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"
+        case readDecs src of
+          Left perr -> expectationFailure $ "Parse error: " ++ perr
+          Right decs -> do
+            let polyOpts =
+                  defaultPipelineOptions
+                    { poEnableTiling = True
+                    , poEnablePolyhedral = True
+                    , poEnableExplicitVectorization = False
+                    , poEnableParallelization = False
+                    }
+                untiledOpts = polyOpts { poEnableTiling = False }
+                jacobiEnv =
+                  [ ("JACOBI_H", "10")
+                  , ("JACOBI_W", "10")
+                  , ("JACOBI_ITERS", "4")
+                  ]
+                tiledDir = tmp </> "tiled"
+                untiledDir = tmp </> "untiled"
+            tiledC <-
+              compileToCOptIOWithPipelineOptionsAndCodegenOptions
+                defaultInferOptions
+                polyOpts
+                defaultCodegenOptions
+                False
+                decs
+            untiledC <-
+              compileToCOptIOWithPipelineOptionsAndCodegenOptions
+                defaultInferOptions
+                untiledOpts
+                defaultCodegenOptions
+                False
+                decs
+            tiledC `shouldSatisfy` isInfixOf "__skew_origin"
+            createDirectoryIfMissing True tiledDir
+            createDirectoryIfMissing True untiledDir
+            tiledExe <- compileCToExecutable tiledDir tiledC False
+            untiledExe <- compileCToExecutable untiledDir untiledC False
+            tiledExit <- runExecutableInDir tiledDir tiledExe jacobiEnv
+            untiledExit <- runExecutableInDir untiledDir untiledExe jacobiEnv
+            tiledExit `shouldBe` ExitSuccess
+            untiledExit `shouldBe` ExitSuccess
+            tiledOut <- readFile (tiledDir </> "jacobi_out.csv")
+            untiledOut <- readFile (untiledDir </> "jacobi_out.csv")
+            tiledOut `shouldBe` untiledOut
 
     it "compiles a 1D index through a function parameter (Issue 3 fix)" $ withCC $
       checkInlineSrc $ BS.pack $ unlines

@@ -1217,3 +1217,46 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
           _ -> expectationFailure "expected ScheduleLoopBand"
       other -> expectationFailure ("expected one scop, got: " <> show (length other))
 
+  it "reifyScheduledScop2 preserves skew through ScheduleStripMine" $ do
+    let tupleStmt = SAssign "ij" (C.RTuple [C.AVar "i", C.AVar "j"])
+        stmt = SArrayWrite (C.AVar "out") (C.AVar "ij") (C.AVar "i")
+        loop =
+          SLoop (LoopSpec ["i", "j"] [IVar "n", IConst 16] Serial Nothing LoopMap [])
+            [tupleStmt, stmt]
+        proc = mkProc "p" ["t", "n", "out"] [loop]
+    case extractProcScops2 proc of
+      [scop] ->
+        case ssSchedule (tileScop2 scop) of
+          ScheduleStripMine band plans ->
+            let scheduled =
+                  (tileScop2 scop)
+                    { ssSchedule =
+                        ScheduleStripMine
+                          band
+                            { lbOrigins = [IMul (IConst 1) (IVar "t")]
+                            , lbSkew = [SkewSpec "i" "t" 1]
+                            }
+                          plans
+                    }
+            in
+              case reifyScheduledScop2 scheduled of
+                Just
+                  [ SAssign skewOrigin (C.RBinOp C.CMul (C.AInt 1) (C.AVar "t"))
+                  , SLoop _ outerBody
+                  ] -> do
+                    skewOrigin `shouldBe` "i__skew_origin"
+                    case reverse outerBody of
+                      (SLoop _ innerBody : _) -> do
+                        innerBody `shouldContain`
+                          [ SAssign "i__s" (C.RBinOp C.CAdd (C.AVar "i") (C.AVar "i__skew_origin"))
+                          , SAssign "i" (C.RBinOp C.CSub (C.AVar "i__s") (C.AVar "i__skew_origin"))
+                          ]
+                        innerBody `shouldContain` [tupleStmt, stmt]
+                      _ ->
+                        expectationFailure ("expected inner local loop, got: " <> show outerBody)
+                other ->
+                  expectationFailure ("unexpected reified strip-mined skew tree: " <> show other)
+          other ->
+            expectationFailure ("expected strip-mined schedule, got: " <> show other)
+      other ->
+        expectationFailure ("expected one scop, got: " <> show (length other))
