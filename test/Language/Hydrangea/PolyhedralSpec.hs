@@ -129,8 +129,8 @@ spec = describe "Polyhedral" $ do
           ]
         facts =
           Map.fromList
-            [ ("j", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipInvariantReadHits = 3 })
-            , ("i", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipInvariantReadHits = 0 })
+            [ ("j", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipReadTouchHits = 0, ipInvariantReadHits = 3 })
+            , ("i", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipReadTouchHits = 0, ipInvariantReadHits = 0 })
             ]
     chooseBandPermutation2 facts 0 dims [] `shouldBe` [1, 0]
 
@@ -1278,11 +1278,18 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
 
   it "reifyScheduledScop2 preserves skew through ScheduleStripMine" $ do
     let tupleStmt = SAssign "ij" (C.RTuple [C.AVar "i", C.AVar "j"])
+        i1Stmt = SAssign "i1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+        j1Stmt = SAssign "j1" (C.RBinOp C.CAdd (C.AVar "j") (C.AInt 1))
+        downStmt = SAssign "ij_down" (C.RTuple [C.AVar "i1", C.AVar "j"])
+        rightStmt = SAssign "ij_right" (C.RTuple [C.AVar "i", C.AVar "j1"])
+        readStmt = SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ij"))
+        readDownStmt = SAssign "y" (C.RArrayLoad (C.AVar "arr") (C.AVar "ij_down"))
+        readRightStmt = SAssign "z" (C.RArrayLoad (C.AVar "arr") (C.AVar "ij_right"))
         stmt = SArrayWrite (C.AVar "out") (C.AVar "ij") (C.AVar "i")
         loop =
           SLoop (LoopSpec ["i", "j"] [IVar "n", IConst 16] Serial Nothing LoopMap [])
-            [tupleStmt, stmt]
-        proc = mkProc "p" ["t", "n", "out"] [loop]
+            [tupleStmt, i1Stmt, j1Stmt, downStmt, rightStmt, readStmt, readDownStmt, readRightStmt, stmt]
+        proc = mkProc "p" ["t", "n", "arr", "out"] [loop]
     case extractProcScops2 proc of
       [scop] ->
         case ssSchedule (tileScop2 scop) of
@@ -1310,7 +1317,8 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
                           [ SAssign "i__s" (C.RBinOp C.CAdd (C.AVar "i") (C.AVar "i__skew_origin"))
                           , SAssign "i" (C.RBinOp C.CSub (C.AVar "i__s") (C.AVar "i__skew_origin"))
                           ]
-                        innerBody `shouldContain` [tupleStmt, stmt]
+                        innerBody `shouldContain`
+                          [tupleStmt, i1Stmt, j1Stmt, downStmt, rightStmt, readStmt, readDownStmt, readRightStmt, stmt]
                       _ ->
                         expectationFailure ("expected inner local loop, got: " <> show outerBody)
                 other ->

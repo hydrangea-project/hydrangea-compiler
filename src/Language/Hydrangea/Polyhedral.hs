@@ -339,6 +339,7 @@ data AffineValue
 data IteratorProfitability = IteratorProfitability
   { ipAccessDimHits :: Map Int Int
   , ipUnitStrideLastHits :: Int
+  , ipReadTouchHits :: Int
   , ipInvariantReadHits :: Int
   }
 
@@ -400,10 +401,14 @@ tileScheduledScop2 scheduled =
   fromMaybe generic (buildBlockedMapReductionScop2 generic)
   where
     scop = ssOriginal scheduled
+    profitability = collectScopProfitabilityFacts2 scop
+    relations = collectScopDependenceRelations2 scop
     generic =
       scheduled
         { ssSchedule =
-            evalState (tileScheduleTree2 0 (ssSchedule scheduled)) (collectScopNames scop, 0)
+            evalState
+              (tileScheduleTree2 profitability relations 0 (ssSchedule scheduled))
+              (collectScopNames scop, 0)
         }
 
 buildScheduledScop2 :: Scop -> AffineSchedule -> ScheduleTree -> ScheduledScop
@@ -485,6 +490,7 @@ emptyIteratorProfitability =
   IteratorProfitability
     { ipAccessDimHits = M.empty
     , ipUnitStrideLastHits = 0
+    , ipReadTouchHits = 0
     , ipInvariantReadHits = 0
     }
 
@@ -493,6 +499,7 @@ mergeIteratorProfitability lhs rhs =
   IteratorProfitability
     { ipAccessDimHits = M.unionWith (+) (ipAccessDimHits lhs) (ipAccessDimHits rhs)
     , ipUnitStrideLastHits = ipUnitStrideLastHits lhs + ipUnitStrideLastHits rhs
+    , ipReadTouchHits = ipReadTouchHits lhs + ipReadTouchHits rhs
     , ipInvariantReadHits = ipInvariantReadHits lhs + ipInvariantReadHits rhs
     }
 
@@ -504,7 +511,7 @@ collectScopProfitabilityFacts2 scop =
       foldl' collectWriteAccess (foldl' collectReadAccess facts (psReads stmt)) (psWrites stmt)
 
     collectReadAccess facts access =
-      collectInvariantReads access (collectAccessTerms facts access)
+      collectInvariantReads access (collectReadTouches access (collectAccessTerms facts access))
 
     collectWriteAccess facts access =
       collectAccessTerms facts access
@@ -512,6 +519,22 @@ collectScopProfitabilityFacts2 scop =
     collectAccessTerms facts access =
       let rank = length (paIndex access)
       in foldl' (collectIndexExpr rank) facts (zip [0 :: Int ..] (paIndex access))
+
+    collectReadTouches access facts =
+      foldl' collectReadExpr facts (paIndex access)
+
+    collectReadExpr facts expr =
+      foldl' collectReadTerm facts (M.toList (aeTerms expr))
+
+    collectReadTerm facts (iter, _)
+      | iter `elem` scIterators scop =
+          M.insertWith
+            mergeIteratorProfitability
+            iter
+            emptyIteratorProfitability { ipReadTouchHits = 1 }
+            facts
+      | otherwise =
+          facts
 
     collectInvariantReads access facts =
       foldl'
@@ -547,6 +570,7 @@ collectScopProfitabilityFacts2 scop =
                   { ipAccessDimHits = M.singleton dimPos 1
                   , ipUnitStrideLastHits =
                       if dimPos == rank - 1 && abs coeff == 1 then 1 else 0
+                  , ipReadTouchHits = 0
                   , ipInvariantReadHits = 0
                   }
           in M.insertWith mergeIteratorProfitability iter contribution facts
@@ -704,16 +728,22 @@ permutationScore2 profitability bandDepth dims relations permutation =
            ]
     unitStrideLastHits dim =
       ipUnitStrideLastHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
-    invariantReadHits dim =
-      ipInvariantReadHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
     reuseInnerPenalty position dim =
-      invariantReadHits dim * (innermostPos - position)
+      iteratorReuseSignal2 (iteratorProfitabilityFor2 profitability (sdIter dim)) * (innermostPos - position)
     parallelOuterReward position dim =
       negate (parallelFreedom dim * outerParallelWeight position * constantTripCountScore (sdBound dim))
     parallelFreedom dim
       | null scoringRelations = 1
       | otherwise = independentCount dim
     outerParallelWeight position = innermostPos - position + 1
+
+iteratorProfitabilityFor2 :: ProfitabilityFacts -> CVar -> IteratorProfitability
+iteratorProfitabilityFor2 profitability iter =
+  M.findWithDefault emptyIteratorProfitability iter profitability
+
+iteratorReuseSignal2 :: IteratorProfitability -> Int
+iteratorReuseSignal2 info =
+  ipInvariantReadHits info + max 0 (ipReadTouchHits info - 1)
 
 constantTripCountScore :: IndexExpr -> Int
 constantTripCountScore expr = case simplifyIndexExpr expr of
@@ -1378,22 +1408,22 @@ scheduleStmtOrder sched = case sched of
   ScheduleStripMine band _ -> scheduleStmtOrder (lbBody band)
   ScheduleStmtRef stmtId -> [stmtId]
 
-tileScheduleTree2 :: Int -> ScheduleTree -> TileM ScheduleTree
-tileScheduleTree2 depth sched = case sched of
+tileScheduleTree2 :: ProfitabilityFacts -> [PolyhedralDependenceRelation] -> Int -> ScheduleTree -> TileM ScheduleTree
+tileScheduleTree2 profitability relations depth sched = case sched of
   ScheduleSequence xs ->
-    ScheduleSequence <$> mapM (tileScheduleTree2 depth) xs
+    ScheduleSequence <$> mapM (tileScheduleTree2 profitability relations depth) xs
   ScheduleStmtRef stmtId ->
     pure (ScheduleStmtRef stmtId)
   ScheduleStripMine band plans -> do
-    body' <- tileScheduleTree2 (depth + 1) (lbBody band)
+    body' <- tileScheduleTree2 profitability relations (depth + 1) (lbBody band)
     pure (ScheduleStripMine band { lbBody = body' } plans)
   ScheduleLoopBand band -> do
-    body' <- tileScheduleTree2 (depth + 1) (lbBody band)
+    body' <- tileScheduleTree2 profitability relations (depth + 1) (lbBody band)
     let band' = band { lbBody = body' }
     if not (shouldTileBand depth band')
       then pure (ScheduleLoopBand band')
       else do
-        plans <- buildStripMinePlans defaultTileConfig band'
+        plans <- buildStripMinePlans defaultTileConfig profitability relations depth band'
         if any isStripTiled plans
           then pure (ScheduleStripMine band' plans)
           else pure (ScheduleLoopBand band')
@@ -1432,10 +1462,28 @@ isStripTiled :: StripMinePlan -> Bool
 isStripTiled StripKeep {} = False
 isStripTiled StripTile {} = True
 
-buildStripMinePlans :: TileConfig -> LoopBand -> TileM [StripMinePlan]
-buildStripMinePlans cfg band = mapM buildOne (zip (lbIters band) (lbBounds band))
+buildStripMinePlans
+  :: TileConfig
+  -> ProfitabilityFacts
+  -> [PolyhedralDependenceRelation]
+  -> Int
+  -> LoopBand
+  -> TileM [StripMinePlan]
+buildStripMinePlans cfg profitability relations depth band
+  | shouldSkipBandTilingForProfitability2 profitability relations depth band =
+      pure [StripKeep iter bound | (iter, bound) <- zip (lbIters band) (lbBounds band)]
+  | otherwise =
+      mapM buildOne (zip3 [0 :: Int ..] (lbIters band) (lbBounds band))
   where
-    buildOne (iter, bound) =
+    innermostPos = length (lbIters band) - 1
+
+    buildOne (position, iter, bound)
+      | shouldKeepDimUntiledForProfitability2 profitability band innermostPos position iter =
+          pure (StripKeep iter bound)
+      | otherwise =
+          buildTiledPlan iter bound
+
+    buildTiledPlan iter bound =
       case chooseTileSize cfg band bound of
         Nothing -> pure (StripKeep iter bound)
         Just tileSize -> do
@@ -1459,6 +1507,50 @@ buildStripMinePlans cfg band = mapM buildOne (zip (lbIters band) (lbBounds band)
             , smdBoundPrelude = prelude
             , smdBoundAtom = boundAtom
             })
+
+shouldSkipBandTilingForProfitability2
+  :: ProfitabilityFacts
+  -> [PolyhedralDependenceRelation]
+  -> Int
+  -> LoopBand
+  -> Bool
+shouldSkipBandTilingForProfitability2 profitability relations depth band =
+  bandRoleUsesReuseHeuristics2 band
+    && bandFullyIndependent2 depth relations
+    && all ((== 0) . iteratorReuseSignal2 . iteratorProfitabilityFor2 profitability) (lbIters band)
+
+shouldKeepDimUntiledForProfitability2
+  :: ProfitabilityFacts
+  -> LoopBand
+  -> Int
+  -> Int
+  -> CVar
+  -> Bool
+shouldKeepDimUntiledForProfitability2 profitability band innermostPos position iter =
+  bandRoleUsesReuseHeuristics2 band
+    && position == innermostPos
+    && ipUnitStrideLastHits info > 0
+    && iteratorReuseSignal2 info == 0
+  where
+    info = iteratorProfitabilityFor2 profitability iter
+
+bandRoleUsesReuseHeuristics2 :: LoopBand -> Bool
+bandRoleUsesReuseHeuristics2 band =
+  lbRole band == LoopPlain || lbRole band == LoopMap
+
+bandFullyIndependent2 :: Int -> [PolyhedralDependenceRelation] -> Bool
+bandFullyIndependent2 depth relations =
+  all relationIndependent relevantRelations
+  where
+    relevantRelations =
+      [ relation
+      | relation <- relations
+      , prefixBandStatus2 depth relation /= PrefixUnknown
+      , hasCurrentBandCarry2 depth relation
+      ]
+    relationIndependent relation = case currentBandCarryForDepth2 depth relation of
+      Nothing -> True
+      Just bandCarry -> pbcStatus bandCarry == PolyBandIndependent
 
 chooseTileSize :: TileConfig -> LoopBand -> IndexExpr -> Maybe Integer
 chooseTileSize cfg band bound

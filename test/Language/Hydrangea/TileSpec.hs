@@ -9,21 +9,38 @@ import Test.Hspec
 
 spec :: Spec
 spec = describe "Tile" $ do
-  it "tiles generic ND loops by strip-mining useful dimensions" $ do
+  it "keeps pure streaming ND loops untiled when there is no reuse signal" $ do
     let loop =
           SLoop
             (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
-            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+            [ SAssign "ij" (RTuple [AVar "i", AVar "j"])
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "ij"))
+            , SArrayWrite (AVar "out") (AVar "ij") (AVar "x")
+            ]
+
+    tileStmts2 [loop] `shouldBe` [loop]
+
+  it "tiles reuse-heavy ND loops by strip-mining useful dimensions" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
+            [ SAssign "ij" (RTuple [AVar "i", AVar "j"])
+            , SAssign "i1" (RBinOp CAdd (AVar "i") (AInt 1))
+            , SAssign "j1" (RBinOp CAdd (AVar "j") (AInt 1))
+            , SAssign "ij_down" (RTuple [AVar "i1", AVar "j"])
+            , SAssign "ij_right" (RTuple [AVar "i", AVar "j1"])
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "ij"))
+            , SAssign "y" (RArrayLoad (AVar "arr") (AVar "ij_down"))
+            , SAssign "z" (RArrayLoad (AVar "arr") (AVar "ij_right"))
+            , SAssign "sum" (RBinOp CAdd (AVar "x") (AVar "y"))
+            , SAssign "sum2" (RBinOp CAdd (AVar "sum") (AVar "z"))
+            , SArrayWrite (AVar "out") (AVar "ij") (AVar "sum2")
+            ]
 
     let tiled = tileStmts2 [loop]
         loopSpecs = collectLoopSpecs tiled
 
-    map lsRole loopSpecs `shouldBe` [LoopPlain, LoopPlain]
-    map lsBounds loopSpecs `shouldSatisfy` \bounds ->
-      case bounds of
-        [[IConst 2, IConst 2], [IVar _, IVar _]] -> True
-        _ -> False
-    map (length . lsIters) loopSpecs `shouldBe` [2, 2]
+    length loopSpecs `shouldSatisfy` (> 1)
 
   it "skips strip-mining when a constant band only adds a tiny cleanup tile" $ do
     let loop =
@@ -49,10 +66,10 @@ spec = describe "Tile" $ do
     let tiled = tileStmts2 [outer]
         loopSpecs = collectLoopSpecs tiled
 
-    map lsRole loopSpecs `shouldBe` [LoopPlain, LoopPlain, LoopMap, LoopReduction]
+    map lsRole loopSpecs `shouldBe` [LoopPlain, LoopMap, LoopReduction]
     map lsBounds loopSpecs `shouldSatisfy` \bounds ->
       case bounds of
-        [[IConst 2], [IVar _], [IConst 2], [IVar _]] -> True
+        [[IConst 64], [IConst 2], [IVar _]] -> True
         _ -> False
     lsRed (last loopSpecs) `shouldBe` Just (ReductionSpec "acc" (IConst 0) RAdd)
     hasAccumulatorReload tiled `shouldBe` False

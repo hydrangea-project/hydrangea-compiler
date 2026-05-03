@@ -21,7 +21,18 @@ spec = describe "CFGPipeline" $ do
     let loop =
           SLoop
             (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
-            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+            [ SAssign "ij" (RTuple [AVar "i", AVar "j"])
+            , SAssign "i1" (RBinOp CAdd (AVar "i") (AInt 1))
+            , SAssign "j1" (RBinOp CAdd (AVar "j") (AInt 1))
+            , SAssign "ijDown" (RTuple [AVar "i1", AVar "j"])
+            , SAssign "ijRight" (RTuple [AVar "i", AVar "j1"])
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "ij"))
+            , SAssign "y" (RArrayLoad (AVar "arr") (AVar "ijDown"))
+            , SAssign "z" (RArrayLoad (AVar "arr") (AVar "ijRight"))
+            , SAssign "sum" (RBinOp CAdd (AVar "x") (AVar "y"))
+            , SAssign "sum2" (RBinOp CAdd (AVar "sum") (AVar "z"))
+            , SArrayWrite (AVar "out") (AVar "ij") (AVar "sum2")
+            ]
         prog = Program [mkProc "p" [] [loop]]
         optsNoTiling =
           defaultPipelineOptions
@@ -36,6 +47,23 @@ spec = describe "CFGPipeline" $ do
         Program [tileProc] = pipelineWithOptions optsWithTiling prog
     countLoops (procBody noTileProc) `shouldBe` 1
     countLoops (procBody tileProc) `shouldSatisfy` (> 1)
+
+  it "keeps pure streaming nests untiled even when tiling is enabled" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
+            [ SAssign "ij" (RTuple [AVar "i", AVar "j"])
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "ij"))
+            , SArrayWrite (AVar "out") (AVar "ij") (AVar "x")
+            ]
+        prog = Program [mkProc "p" ["arr", "out"] [loop]]
+        opts =
+          defaultPipelineOptions
+            { poEnableTiling = True
+            , poEnableParallelization = False
+            }
+        Program [tileProc] = pipelineWithOptions opts prog
+    procBody tileProc `shouldBe` [loop]
 
   it "skips marginal cleanup-tail tiling even when tiling is enabled" $ do
     let loop =
@@ -88,7 +116,18 @@ spec = describe "CFGPipeline" $ do
     let loop =
           SLoop
             (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
-            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+            [ SAssign "ij" (RTuple [AVar "i", AVar "j"])
+            , SAssign "i1" (RBinOp CAdd (AVar "i") (AInt 1))
+            , SAssign "j1" (RBinOp CAdd (AVar "j") (AInt 1))
+            , SAssign "ijDown" (RTuple [AVar "i1", AVar "j"])
+            , SAssign "ijRight" (RTuple [AVar "i", AVar "j1"])
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "ij"))
+            , SAssign "y" (RArrayLoad (AVar "arr") (AVar "ijDown"))
+            , SAssign "z" (RArrayLoad (AVar "arr") (AVar "ijRight"))
+            , SAssign "sum" (RBinOp CAdd (AVar "x") (AVar "y"))
+            , SAssign "sum2" (RBinOp CAdd (AVar "sum") (AVar "z"))
+            , SArrayWrite (AVar "out") (AVar "ij") (AVar "sum2")
+            ]
         prog = Program [mkProc "p" [] [loop]]
         Program [noTileProc] = metalPipelineWithTiling False prog
         Program [tileProc] = metalPipelineWithTiling True prog
@@ -227,6 +266,10 @@ spec = describe "CFGPipeline" $ do
     case (procBody legacyTileProc, procBody polyTileProc) of
       ([SLoop legacySpec _], [SLoop polySpec _]) -> do
         case (lsIters legacySpec, lsIters polySpec) of
+          ([legacyOuter0], [polyOuter0, polyOuter1]) -> do
+            legacyOuter0 `shouldSatisfy` BS.isPrefixOf "i_tile"
+            polyOuter0 `shouldSatisfy` BS.isPrefixOf "j_tile"
+            polyOuter1 `shouldSatisfy` BS.isPrefixOf "i_tile"
           ([legacyOuter0, legacyOuter1], [polyOuter0, polyOuter1]) -> do
             legacyOuter0 `shouldSatisfy` BS.isPrefixOf "i_tile"
             legacyOuter1 `shouldSatisfy` BS.isPrefixOf "j_tile"
