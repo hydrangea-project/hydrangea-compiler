@@ -155,7 +155,7 @@ spec = do
       any (\s -> case s of { SAssign _ (RArrayAlloc _) -> True; _ -> False }) stmts `shouldBe` True
       any (\s -> case s of { SLoop _ _ -> True; _ -> False }) stmts `shouldBe` True
       loopRoles stmts `shouldBe` [LoopMap]
-      let mapBounds = [b | LoopSpec _ [b] _ _ LoopMap <- collectLoopSpecs stmts]
+      let mapBounds = [b | LoopSpec _ [b] _ _ LoopMap _ <- collectLoopSpecs stmts]
       mapBounds `shouldContain` [IConst 3]
 
     it "lowers generate array" $ do
@@ -192,7 +192,7 @@ spec = do
       prog <- lowerFromSource "let main = foldl (fn acc _ => acc + 1) 0 (fill [4] 0)"
       let Program procs = prog
       let Proc { procBody = stmts } = head procs
-      let foldBounds = [b | LoopSpec _ [b] _ _ LoopFold <- collectLoopSpecs stmts]
+      let foldBounds = [b | LoopSpec _ [b] _ _ LoopFold _ <- collectLoopSpecs stmts]
       foldBounds `shouldContain` [IConst 4]
 
     it "lowers gather as a map-style output loop" $ do

@@ -894,13 +894,17 @@ inferVecElemBounds _ = return Nothing
 -- | Count the number of dimensions in a shape type after normalization.
 shapeArityFromType :: Range -> UType -> Infer Int
 shapeArityFromType r ty = do
-  ty' <- normalizeShapeToTupleOf r UTyInt ty
-  let go t =
-        case stripRefineTop t of
-          UTyUnit -> return 0
-          UTyCons _ rest -> (1 +) <$> go rest
-          _ -> throwError $ MiscError (Just r)
-  go ty'
+  ty' <- applyBindings ty
+  case stripRefineTop ty' of
+    UVar _ -> return 0         -- fresh shape variable, rank unknown yet
+    _ -> do
+      ty'' <- normalizeShapeToTupleOf r UTyInt ty
+      let go t =
+            case stripRefineTop t of
+              UTyUnit -> return 0
+              UTyCons _ rest -> (1 +) <$> go rest
+              _ -> throwError $ MiscError (Just r)
+      go ty''
 
 -- | Count the number of consecutive Int-argument layers at the front of a
 -- (possibly refined) function type.  Used to determine the rank of a stencil
@@ -1827,8 +1831,14 @@ infer (EIndex _ idx arrExp) = do
   arrTy <- infer arrExp
   (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
   sTy' <- applyBindings sTy
+  -- Normalize a concrete 1D shape (Int) to cons-list (Int,) so it unifies
+  -- with the index type.  Fresh shape variables are left alone — they will
+  -- be driven by the index type later.
+  sTy'' <- case stripRefineTop sTy' of
+    UTyInt -> normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy'
+    _ -> pure sTy'
   idxTy' <- applyBindings idxTy
-  _ <- wrange (firstParam idx) $ idxTy' =:= sTy'
+  _ <- wrange (firstParam idx) $ idxTy' =:= sTy''
   pairs  <- termsAndExpsFromIndex idx
   arrVar <- maybe freshPredVar return mArrVar
   forM_ (zip [0 ..] pairs) $ \(i, (t, mExp)) -> do
@@ -1852,10 +1862,13 @@ infer (ECheckIndex _ idx defVal arrExp) = do
   arrTy <- infer arrExp
   (_mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
   sTy' <- applyBindings sTy
+  sTy'' <- case stripRefineTop sTy' of
+    UTyInt -> normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy'
+    _ -> pure sTy'
   idxTy' <- applyBindings idxTy
   eTy' <- applyBindings eTy
   defValTy' <- applyBindings defValTy
-  _ <- wrange (firstParam idx)    $ idxTy'    =:= sTy'
+  _ <- wrange (firstParam idx)    $ idxTy'    =:= sTy''
   _ <- wrange (firstParam defVal) $ defValTy' =:= eTy'
   return eTy'
 infer (EStencil _ bnd fnExp arrExp) = do

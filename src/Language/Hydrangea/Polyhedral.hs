@@ -54,6 +54,7 @@ module Language.Hydrangea.Polyhedral
   , polyhedralTileProgram2
   , reifyScheduledScop2
   , suggestBandSkew2
+  , suggestCrossBandSkew2
   , synthesizeScopSchedule2
   , tileIdentityScop2
   , tileScop2
@@ -180,6 +181,7 @@ data PolyhedralDependenceRelation = PolyhedralDependenceRelation
 data LoopBand = LoopBand
   { lbIters :: [CVar]
   , lbBounds :: [IndexExpr]
+  , lbOrigins :: [IndexExpr]
   , lbExec :: ExecPolicy
   , lbReduction :: Maybe ReductionSpec
   , lbRole :: LoopRole
@@ -241,6 +243,7 @@ data SkewSpec = SkewSpec
 
 data AffineLoopBand = AffineLoopBand
   { albDims :: [ScheduleDim]
+  , albOrigins :: [IndexExpr]
   , albExec :: ExecPolicy
   , albReduction :: Maybe ReductionSpec
   , albRole :: LoopRole
@@ -416,6 +419,7 @@ affineScheduleFromScheduleTree2 scheduleTree =
         AffineScheduleLoopBand
           AffineLoopBand
             { albDims = zipWith ScheduleDim (lbIters band) (lbBounds band)
+            , albOrigins = lbOrigins band
             , albExec = lbExec band
             , albReduction = lbReduction band
             , albRole = lbRole band
@@ -438,6 +442,7 @@ scheduleTreeFromAffineSchedule2 = go . asRoot
           LoopBand
             { lbIters = map sdIter (albDims band)
             , lbBounds = map sdBound (albDims band)
+            , lbOrigins = albOrigins band
             , lbExec = albExec band
             , lbReduction = albReduction band
             , lbRole = albRole band
@@ -475,12 +480,21 @@ synthesizeAffineScheduleTree2 bandDepth relations sched = case sched of
     pure (AffineScheduleStmtRef stmtId)
   AffineScheduleLoopBand band -> do
     let dims' = applyPermutation (chooseBandPermutation2 bandDepth (albDims band) relations) (albDims band)
-        skews = maybe [] pure (suggestBandSkew2 bandDepth dims' relations)
     body' <- synthesizeAffineScheduleTree2 (bandDepth + 1) relations (albBody band)
+    let body'' = case albRole band of
+          LoopIterate ->
+            case body' of
+              AffineScheduleLoopBand inner
+                | albRole inner == LoopMap ->
+                    applyCrossBandSkewToInner bandDepth (map sdIter dims') inner relations
+              AffineScheduleSequence xs ->
+                applyCrossBandSkewToSeq bandDepth (map sdIter dims') xs relations
+              _ -> body'
+          _ -> body'
     pure $ AffineScheduleLoopBand band
       { albDims = dims'
-      , albSkew = skews
-      , albBody = body'
+      , albSkew = []
+      , albBody = body''
       }
 
 chooseBandPermutation2
@@ -749,6 +763,99 @@ skewCoeffForBand2 bandDepth outerIter innerIter relations =
   of
     [] -> Nothing
     coeffs -> Just (maximum coeffs)
+
+-- | Suggest cross-band skews between an outer band's iterators and all inner
+-- band iterators (e.g., wavefront skew of @i@ and @j@ by @iter_t@).  Each
+-- skew target is an inner iterator; the source is an outer iterator.  This
+-- differs from 'suggestBandSkew2' which operates on adjacents dims /within/
+-- a single band.
+suggestCrossBandSkew2
+  :: Int              -- ^ outer band depth
+  -> [CVar]           -- ^ outer band iterators
+  -> [CVar]           -- ^ inner band iterators
+  -> [PolyhedralDependenceRelation]
+  -> [SkewSpec]
+suggestCrossBandSkew2 outerDepth outerIters innerIters relations
+  | null outerIters || null innerIters = []
+  | otherwise =
+      [ SkewSpec
+          { skewTarget = innerIter
+          , skewSource = outerIter
+          , skewCoeff  = coeff
+          }
+      | outerIter <- outerIters
+      , innerIter <- innerIters
+      , coeff <- maybeToList (crossSkewCoeff2 outerDepth outerIter innerIter relations)
+      ]
+
+-- | Compute the required skew coefficient for a cross-band dependence where
+-- the outer iterator has positive distance and the inner iterator has
+-- negative distance.  Returns @ceil(-innerDist \/ outerDist)@.
+crossSkewCoeff2
+  :: Int
+  -> CVar
+  -> CVar
+  -> [PolyhedralDependenceRelation]
+  -> Maybe Integer
+crossSkewCoeff2 outerDepth outerIter innerIter relations =
+  case [ coeff
+       | rel <- relations
+       , Just innerDist <- [currentBandDistanceForIter2 (outerDepth + 1) rel innerIter]
+       , Just outerDist <- [currentBandDistanceForIter2 outerDepth rel outerIter]
+       , innerDist < 0
+       , outerDist > 0
+       , let coeff = ((-innerDist) + outerDist - 1) `div` outerDist
+       ] of
+    [] -> Nothing
+    coeffs -> Just (maximum coeffs)
+
+-- | Compute the per-dimension origin list for a set of cross-band skews.
+-- Each skewed dimension gets @coeff * sourceIter@; unskewed dims get @IConst 0@.
+crossBandOrigins :: [SkewSpec] -> AffineLoopBand -> [IndexExpr]
+crossBandOrigins skews inner =
+  let iterToOrigin = M.fromList
+        [ (skewTarget s, IMul (IConst (skewCoeff s)) (IVar (skewSource s)))
+        | s <- skews
+        ]
+  in [M.findWithDefault (IConst 0) dimIter iterToOrigin | ScheduleDim dimIter _ <- albDims inner]
+
+-- | Apply cross-band skew to all eligible dimensions of an inner 'LoopMap'
+-- band.  Each inner dimension with a backward spatial dep gets an origin of
+-- @coeff * outerIter@ and a SkewSpec is recorded.
+applyCrossBandSkewToInner
+  :: Int              -- ^ outer band depth
+  -> [CVar]           -- ^ outer band iterators
+  -> AffineLoopBand   -- ^ the inner LoopMap band
+  -> [PolyhedralDependenceRelation]
+  -> AffineScheduleTree
+applyCrossBandSkewToInner outerDepth outerIters inner relations =
+  let skews = suggestCrossBandSkew2 outerDepth outerIters (map sdIter (albDims inner)) relations
+  in case skews of
+    [] -> AffineScheduleLoopBand inner
+    _ ->
+      let inner' = inner { albSkew = skews ++ albSkew inner, albOrigins = crossBandOrigins skews inner }
+      in AffineScheduleLoopBand inner'
+
+-- | Walk a sequence of 'AffineScheduleTree' children and apply cross-band
+-- skew to the first child whose role is 'LoopMap'.
+applyCrossBandSkewToSeq
+  :: Int
+  -> [CVar]
+  -> [AffineScheduleTree]
+  -> [PolyhedralDependenceRelation]
+  -> AffineScheduleTree
+applyCrossBandSkewToSeq outerDepth outerIters xs relations =
+  case span (not . isLoopMapBand) xs of
+    (before, AffineScheduleLoopBand inner : after) ->
+      let skews = suggestCrossBandSkew2 outerDepth outerIters (map sdIter (albDims inner)) relations
+          inner' = case skews of
+            [] -> inner
+            _  -> inner { albSkew = skews ++ albSkew inner, albOrigins = crossBandOrigins skews inner }
+      in AffineScheduleSequence (before ++ AffineScheduleLoopBand inner' : after)
+    _ -> AffineScheduleSequence xs
+  where
+    isLoopMapBand (AffineScheduleLoopBand b) = albRole b == LoopMap
+    isLoopMapBand _ = False
 
 extractProgramScops2 :: Program -> [Scop]
 extractProgramScops2 (Program procs) = foldMap extractProcScops2 procs
@@ -1170,6 +1277,7 @@ shouldTileBand depth band =
   lbExec band == Serial
     && lbRole band /= LoopReductionWrapper
     && lbRole band /= LoopFold
+    && lbRole band /= LoopIterate
     && loopRoleSupportsTiling2 band
     && boundsAreIteratorIndependent band
     && all (supportsAtomBound . simplifyIndexExpr) (lbBounds band)
@@ -1369,6 +1477,7 @@ extractLoopWithAlias inheritedAlias loopPath domain env spec body
             LoopBand
               { lbIters = lsIters spec
               , lbBounds = bounds
+              , lbOrigins = lsOrigins spec
               , lbExec = lsExec spec
               , lbReduction = lsRed spec
               , lbRole = lsRole spec
@@ -1864,6 +1973,7 @@ reifyScheduleTree stmtMap sched = case sched of
         outerTileSpec = LoopSpec
           { lsIters = map smdTileIter tiledDims
           , lsBounds = map (\td -> tileCountExpr (smdOrigBound td) (smdTileSize td)) tiledDims
+          , lsOrigins = []
           , lsExec = Serial
           , lsRed = Nothing
           , lsRole = tiledLoopRole (lbRole band)
@@ -1871,6 +1981,7 @@ reifyScheduleTree stmtMap sched = case sched of
         innerLocalSpec = LoopSpec
           { lsIters = map localIter plans
           , lsBounds = map localBound plans
+          , lsOrigins = []
           , lsExec = lbExec band
           , lsRed = lbReduction band
           , lsRole = lbRole band
@@ -1895,6 +2006,7 @@ reifyScheduleTree stmtMap sched = case sched of
           LoopSpec
             { lsIters = iters'
             , lsBounds = lbBounds band
+            , lsOrigins = lbOrigins band
             , lsExec = lbExec band
             , lsRed = lbReduction band
             , lsRole = lbRole band
@@ -2116,6 +2228,7 @@ buildBlockedMapReductionBody2 kernel = do
           LoopSpec
             { lsIters = [bmrWrapperIter kernel]
             , lsBounds = [IConst 1]
+            , lsOrigins = []
             , lsExec = Serial
             , lsRed = Nothing
             , lsRole = LoopReductionWrapper
@@ -2162,27 +2275,29 @@ buildForcedStripDim2 iter bound tileSize = do
 
 tileLoop2 :: StripMinedDim -> LoopRole -> [Stmt] -> Stmt
 tileLoop2 td role body =
-  SLoop
-    LoopSpec
-      { lsIters = [smdTileIter td]
-      , lsBounds = [tileCountExpr (smdOrigBound td) (smdTileSize td)]
-      , lsExec = Serial
-      , lsRed = Nothing
-      , lsRole = role
-      }
-    (setupStripDim td ++ body)
+    SLoop
+     LoopSpec
+       { lsIters = [smdTileIter td]
+       , lsBounds = [tileCountExpr (smdOrigBound td) (smdTileSize td)]
+       , lsOrigins = []
+       , lsExec = Serial
+       , lsRed = Nothing
+       , lsRole = role
+       }
+     (setupStripDim td ++ body)
 
 localLoop2 :: StripMinedDim -> LoopRole -> [Stmt] -> Stmt
 localLoop2 td role body =
-  SLoop
-    LoopSpec
-      { lsIters = [smdLocalIter td]
-      , lsBounds = [IVar (smdTileLen td)]
-      , lsExec = Serial
-      , lsRed = Nothing
-      , lsRole = role
-      }
-    (assignOrigIter td : body)
+    SLoop
+     LoopSpec
+       { lsIters = [smdLocalIter td]
+       , lsBounds = [IVar (smdTileLen td)]
+       , lsOrigins = []
+       , lsExec = Serial
+       , lsRed = Nothing
+       , lsRole = role
+       }
+     (assignOrigIter td : body)
 
 unsnoc2 :: [a] -> Maybe ([a], a)
 unsnoc2 xs = case reverse xs of

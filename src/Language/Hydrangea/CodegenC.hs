@@ -728,10 +728,21 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
             _ -> S.empty
           _ -> S.empty
       cleanupDoc retAtom =
-        let varsToFree =
+        let returnedVars = returnedArrayVars retAtom
+            aliasedToReturn = case retAtom of
+              AVar retVar -> S.fromList
+                [ src
+                | C2.SAssign tgt (RAtom (AVar src)) <- bodyWithoutReturn
+                , tgt == retVar
+                , case Map.lookup src typeEnv of
+                    Just (CTArray _) -> True
+                    _ -> False
+                ]
+              _ -> S.empty
+            varsToFree =
               case procRetKind of
-                KArray -> localArrayVars `S.difference` returnedArrayVars retAtom
-                KFloatArray -> localArrayVars `S.difference` returnedArrayVars retAtom
+                KArray -> localArrayVars `S.difference` returnedVars `S.difference` aliasedToReturn
+                KFloatArray -> localArrayVars `S.difference` returnedVars `S.difference` aliasedToReturn
                 KPair _ _ -> S.empty
                 KRecord _ -> S.empty
                 _ -> localArrayVars
@@ -964,9 +975,16 @@ genLoop2 env declared spec body =
                 C2.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
            in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (C2.psPolicy p)
         _ -> empty
+      origins = C2.lsOrigins spec
       collapseClause
         | length iters > 1 = space <> text "collapse(" <> int (length iters) <> text ")"
         | otherwise = empty
+      originFor i = case drop i (origins ++ repeat (C2.IConst 0)) of
+        (o : _) -> o
+        [] -> C2.IConst 0
+      originDoc i = case originFor i of
+        C2.IConst 0 -> text "0"
+        o           -> genIndexExpr o
       parallelPragma extraClauses =
         let simdClause = case C2.lsExec spec of
               C2.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
@@ -1073,7 +1091,7 @@ genLoop2 env declared spec body =
                         $$ text "#pragma omp for"
                         $$ text "for (int64_t"
                         <+> text ci
-                        <+> text "= 0;"
+                        <+> text "=" <+> originDoc 0 <> text ";"
                         <+> text ci
                         <+> text "<"
                         <+> genIndexExpr bound
@@ -1090,10 +1108,10 @@ genLoop2 env declared spec body =
                         $$ text "{"
                         $$ nest
                           4
-                          ( text "for (int64_t"
-                              <+> mergeIx
-                              <+> text "= 0;"
-                              <+> mergeIx
+                           ( text "for (int64_t"
+                               <+> mergeIx
+                               <+> text "= 0;"
+                               <+> mergeIx
                               <+> text "<"
                               <+> sizeVar
                               <> text ";"
@@ -1115,7 +1133,7 @@ genLoop2 env declared spec body =
               $$ parallelPragma empty
               $$ text "for (int64_t"
               <+> text (sanitize iter)
-              <+> text "= 0;"
+              <+> text "=" <+> originDoc 0 <> text ";"
               <+> text (sanitize iter)
               <+> text "<"
               <+> genIndexExpr bound
@@ -1138,7 +1156,7 @@ genLoop2 env declared spec body =
            in accInit
                 $$ text "for (int64_t"
                 <+> text ci
-                <+> text "= 0;"
+                <+> text "=" <+> originDoc 0 <> text ";"
                 <+> text ci
                 <+> text "<"
                 <+> genIndexExpr b
@@ -1164,7 +1182,7 @@ genLoop2 env declared spec body =
                 $$ parallelPragma (space <> redClause)
                 $$ text "for (int64_t"
                 <+> text ci
-                <+> text "= 0;"
+                <+> text "=" <+> originDoc 0 <> text ";"
                 <+> text ci
                 <+> text "<"
                 <+> genIndexExpr b
@@ -1187,7 +1205,7 @@ genLoop2 env declared spec body =
                   else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
            in accInit
                 $$ parallelPragma (space <> redClause)
-                $$ genNestedLoops iters bounds (bodyDoc declared')
+                 $$ genNestedLoops iters bounds origins (bodyDoc declared')
         (C2.Vector v, Just r, [i], [b]) ->
           let ci = sanitize i
               cacc = sanitize (C2.rsAccVar r)
@@ -1210,7 +1228,7 @@ genLoop2 env declared spec body =
                     $$ simdPragma redClause
                     $$ text "for (int64_t"
                     <+> text ci
-                    <+> text "= 0;"
+                    <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
                     <+> genIndexExpr b
@@ -1224,7 +1242,7 @@ genLoop2 env declared spec body =
                     $$ text "/* short vector reduction loop; simd pragma omitted */"
                     $$ text "for (int64_t"
                     <+> text ci
-                    <+> text "= 0;"
+                    <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
                     <+> genIndexExpr b
@@ -1244,7 +1262,7 @@ genLoop2 env declared spec body =
                     $$ simdPragma empty
                     $$ text "for (int64_t"
                     <+> text ci
-                    <+> text "= 0;"
+                    <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
                     <+> genIndexExpr b
@@ -1257,7 +1275,7 @@ genLoop2 env declared spec body =
                   text "/* short vector loop; simd pragma omitted */"
                     $$ text "for (int64_t"
                     <+> text ci
-                    <+> text "= 0;"
+                    <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
                     <+> genIndexExpr b
@@ -1277,7 +1295,7 @@ genLoop2 env declared spec body =
                 $$ parallelPragma empty
                 $$ text "for (int64_t"
                 <+> text ci
-                <+> text "= 0;"
+                <+> text "=" <+> originDoc 0 <> text ";"
                 <+> text ci
                 <+> text "<"
                 <+> genIndexExpr b
@@ -1300,12 +1318,13 @@ genLoop2 env declared spec body =
             $$ genNestedLoops
               iters
               bounds
+              origins
               ( case C2.lsExec spec of
                   C2.Parallel p
                     | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
                   _ -> bodyDoc declaredWithHoisted
               )
-        (_, _, _, _) -> genNestedLoops iters bounds (bodyDoc declaredWithHoisted)
+        (_, _, _, _) -> genNestedLoops iters bounds origins (bodyDoc declaredWithHoisted)
 
 hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> Map CVar CType -> [C2.Stmt] -> ([C2.Stmt], [C2.Stmt])
 hoistMemoizedZeroArgArrayCalls retKinds retTypes = go
@@ -1346,17 +1365,22 @@ isMemoizedZeroArgArrayCall retKinds retTypes stmt = case stmt of
 isZeroArgCallArgs :: [Atom] -> Bool
 isZeroArgCallArgs args = null args || all (== AUnit) args
 
-genNestedLoops :: [CVar] -> [C2.IndexExpr] -> Doc -> Doc
-genNestedLoops iters bounds body =
-  foldr mk body (zip (map sanitize iters) bounds)
+genNestedLoops :: [CVar] -> [C2.IndexExpr] -> [C2.IndexExpr] -> Doc -> Doc
+genNestedLoops iters bounds origins body =
+  foldr mk body (zip3 (map sanitize iters) bounds (origins ++ repeat (C2.IConst 0)))
   where
-    mk (ci, b) inner =
-      text "for (int64_t"
+    mk (ci, b, o) inner =
+      let startDoc = case o of
+            C2.IConst _ -> text "0"
+            _           -> genIndexExpr o
+      in text "for (int64_t"
         <+> text ci
-        <+> text "= 0;"
+        <+> text "="
+        <+> startDoc
+        <> text ";"
         <+> text ci
         <+> text "<"
-        <+> genIndexExpr b
+        <+> genIndexExpr (C2.simplifyIndexExpr (C2.IAdd o b))
         <> text ";"
         <+> text ci
         <> text "++) {"

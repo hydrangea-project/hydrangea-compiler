@@ -237,13 +237,15 @@ data ExecPolicy
 -- | Descriptor for an n-dimensional loop nest.
 --
 -- 'lsIters' and 'lsBounds' have the same length; each bound is the trip count
--- for the corresponding iterator.
+-- for the corresponding iterator.  'lsOrigins' (default @IConst 0@) gives the
+-- per-dimension /start/ value — loops iterate from @origin@ to @origin + bound@.
 data LoopSpec = LoopSpec
-  { lsIters  :: [CVar]            -- ^ iterator variable names
-  , lsBounds :: [IndexExpr]       -- ^ per-dimension trip counts
-  , lsExec   :: ExecPolicy        -- ^ execution policy (serial\/parallel\/vector)
-  , lsRed    :: Maybe ReductionSpec  -- ^ optional loop-carried reduction
-  , lsRole   :: LoopRole          -- ^ semantic role from lowering
+  { lsIters   :: [CVar]            -- ^ iterator variable names
+  , lsBounds  :: [IndexExpr]       -- ^ per-dimension trip counts
+  , lsExec    :: ExecPolicy        -- ^ execution policy (serial\/parallel\/vector)
+  , lsRed     :: Maybe ReductionSpec  -- ^ optional loop-carried reduction
+  , lsRole    :: LoopRole          -- ^ semantic role from lowering
+  , lsOrigins :: [IndexExpr]       -- ^ per-dimension start offsets (default: all IConst 0)
   }
   deriving (Eq, Show)
 

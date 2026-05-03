@@ -54,7 +54,12 @@ fixpointOpt = optimizeStmts2
 
 cleanupProgram :: Program -> Program
 cleanupProgram (Program procs) =
-  Program [proc { procBody = fixpointOpt (procBody proc) } | proc <- procs]
+  Program
+    [ proc
+        { procBody = hoistIterateAllocs2 (fixpointOpt (procBody proc))
+        }
+    | proc <- procs
+    ]
 
 -- | Optimization-only pipeline.
 optimizePipeline2 :: [Stmt] -> [Stmt]
@@ -84,7 +89,9 @@ vectorizePipelineWithOptions opts prog =
         | poEnablePolyhedral opts && poEnableTiling opts = cleanupProgram (polyhedralTileProgram2 prepared)
         | poEnableTiling opts = cleanupProgram (polyhedralIdentityTileProgram2 prepared)
         | poEnablePolyhedral opts = cleanupProgram (polyhedralProgram2 prepared)
-        | otherwise = prepared
+        | otherwise = applyHoist prepared
+      applyHoist (Program procs) =
+        Program [proc { procBody = hoistIterateAllocs2 (procBody proc) } | proc <- procs]
   in  vectorizeProgram2WithWidthAndExplicit
         (poVectorWidth opts)
         (poEnableExplicitVectorization opts)

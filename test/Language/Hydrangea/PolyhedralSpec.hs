@@ -34,7 +34,7 @@ spec = describe "Polyhedral" $ do
   it "extracts a single affine scop from a simple map loop" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
             [ SAssign "ix" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
             , SAssign "y" (C.RBinOp C.CAddF (C.AVar "x") (C.AFloat 1.0))
@@ -57,7 +57,7 @@ spec = describe "Polyhedral" $ do
   it "extracts and reifies a tile-friendly ND loop band" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IAdd (IVar "m") (IConst 4)] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IAdd (IVar "m") (IConst 4)] Serial Nothing LoopPlain [])
             [ SAssign "ij" (C.RTuple [C.AVar "i", C.AVar "j"])
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ij"))
             , SArrayWrite (C.AVar "out") (C.AVar "ij") (C.AVar "x")
@@ -78,13 +78,13 @@ spec = describe "Polyhedral" $ do
   it "extracts a map-reduction nest that matches today's tiling target" $ do
     let inner =
           SLoop
-            (LoopSpec ["k"] [IVar "m"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            (LoopSpec ["k"] [IVar "m"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "k"))
             , SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AVar "x"))
             ]
         outer =
           SLoop
-            (LoopSpec ["j"] [IVar "n"] Serial Nothing LoopMapReduction)
+            (LoopSpec ["j"] [IVar "n"] Serial Nothing LoopMapReduction [])
             [ SAssign "acc" (C.RAtom (C.AInt 0))
             , inner
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
@@ -111,7 +111,7 @@ spec = describe "Polyhedral" $ do
   it "reports unsupported calls as rejection diagnostics" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [SAssign "x" (C.RCall "opaque" [C.AVar "i"])]
     case collectProcScopDiagnostics2 (mkProc "p" ["n"] [loop]) of
       [diag] -> case diag of
@@ -125,7 +125,7 @@ spec = describe "Polyhedral" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
         loop =
           SLoop
-            (LoopSpec ["i"] [tileCountBound] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [tileCountBound] Serial Nothing LoopPlain [])
             [SArrayWrite (C.AVar "out") (C.AVar "i") (C.AInt 0)]
     case extractProcScops2 (mkProc "p" ["n", "out"] [loop]) of
       [scop] -> do
@@ -139,7 +139,7 @@ spec = describe "Polyhedral" $ do
   it "reifies strip-mined ND schedules like the legacy tiler" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
             [SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "j")]
     case extractProcScops2 (mkProc "p" ["out"] [loop]) of
       [scop] ->
@@ -149,11 +149,11 @@ spec = describe "Polyhedral" $ do
   it "reifies strip-mined map-reduction schedules like the legacy tiler" $ do
     let inner =
           SLoop
-            (LoopSpec ["k"] [IConst 96] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            (LoopSpec ["k"] [IConst 96] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction [])
             [SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AInt 1))]
         outer =
           SLoop
-            (LoopSpec ["j"] [IConst 128] Serial Nothing LoopMapReduction)
+            (LoopSpec ["j"] [IConst 128] Serial Nothing LoopMapReduction [])
             [ SAssign "acc" (C.RAtom (C.AInt 0))
             , inner
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
@@ -196,13 +196,13 @@ spec = describe "Polyhedral" $ do
   it "falls back to nested loop roots when an outer loop is not a scop" $ do
     let inner =
           SLoop
-            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "j"))
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "x")
             ]
         outer =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [ SAssign "opaque" (C.RCall "f" [C.AVar "i"])
             , inner
             ]
@@ -219,7 +219,7 @@ spec = describe "Polyhedral" $ do
   it "collects simple affine RAW dependences inside a scop" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [ SAssign "ix" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
@@ -242,7 +242,7 @@ spec = describe "Polyhedral" $ do
   it "keeps consistent repeated iterator shifts across multiple dimensions" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "i"])
             , SAssign "dst0" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "dstIx" (C.RTuple [C.AVar "dst0", C.AVar "dst0"])
@@ -267,7 +267,7 @@ spec = describe "Polyhedral" $ do
   it "classifies lexicographically forward mixed-sign distances as forward" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
             , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "prevJ" (C.RBinOp C.CSub (C.AVar "j") (C.AInt 1))
@@ -294,7 +294,7 @@ spec = describe "Polyhedral" $ do
   it "surfaces backward loop-carried dependences as blocking" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [ SAssign "prev" (C.RBinOp C.CSub (C.AVar "i") (C.AInt 1))
             , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "prev"))
@@ -318,7 +318,7 @@ spec = describe "Polyhedral" $ do
   it "records carried-band metadata for mixed-sign dependences" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
             , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "prevJ" (C.RBinOp C.CSub (C.AVar "j") (C.AInt 1))
@@ -369,7 +369,7 @@ spec = describe "Polyhedral" $ do
   it "classifies reduction-carried dependences separately from blocking ones" $ do
     let loop =
           SLoop
-            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction [])
             [ SAssign "prev" (C.RBinOp C.CSub (C.AVar "k") (C.AInt 1))
             , SArrayWrite (C.AVar "arr") (C.AVar "k") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "prev"))
@@ -408,7 +408,7 @@ spec = describe "Polyhedral" $ do
   it "tracks carried-vs-independent bands across nested reduction contexts" $ do
     let inner =
           SLoop
-            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "j", C.AVar "k"])
             , SAssign "prev" (C.RBinOp C.CSub (C.AVar "k") (C.AInt 1))
             , SAssign "dstIx" (C.RTuple [C.AVar "j", C.AVar "prev"])
@@ -418,7 +418,7 @@ spec = describe "Polyhedral" $ do
             ]
         outer =
           SLoop
-            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMapReduction)
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMapReduction [])
             [ SAssign "acc" (C.RAtom (C.AInt 0))
             , inner
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
@@ -472,7 +472,7 @@ spec = describe "Polyhedral" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
         loop =
           SLoop
-            (LoopSpec ["i"] [tileCountBound] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [tileCountBound] Serial Nothing LoopPlain [])
             [ SAssign "ix" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
@@ -510,7 +510,7 @@ spec = describe "Polyhedral" $ do
   it "synthesizes a legal band interchange when an outer dimension is independent" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
             , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "dstIx" (C.RTuple [C.AVar "nextI", C.AVar "j"])
@@ -534,7 +534,7 @@ spec = describe "Polyhedral" $ do
   it "reorders a nested inner band even when an outer band already carries the dependence" $ do
     let inner =
           SLoop
-            (LoopSpec ["j", "k"] [IVar "m", IVar "p"] Serial Nothing LoopPlain)
+            (LoopSpec ["j", "k"] [IVar "m", IVar "p"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j", C.AVar "k"])
             , SAssign "nextI" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "nextJ" (C.RBinOp C.CAdd (C.AVar "j") (C.AInt 1))
@@ -544,7 +544,7 @@ spec = describe "Polyhedral" $ do
             ]
         outer =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [inner]
     case extractProcScops2 (mkProc "p" ["n", "m", "p", "arr"] [outer]) of
       [scop] -> do
@@ -571,7 +571,7 @@ spec = describe "Polyhedral" $ do
   it "uses band interchange to turn a blocking dependence into a forward schedule" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (C.RTuple [C.AVar "i", C.AVar "j"])
             , SAssign "prevI" (C.RBinOp C.CSub (C.AVar "i") (C.AInt 1))
             , SAssign "nextJ" (C.RBinOp C.CAdd (C.AVar "j") (C.AInt 1))
@@ -588,13 +588,10 @@ spec = describe "Polyhedral" $ do
           other ->
             expectationFailure ("unexpected affine schedule: " <> show other)
         case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
-          Just [SLoop loopSpec body] -> do
-            -- After interchange, j is outer; i is renamed to i__s by skewing
-            -- (skew makes i-dep independent: i_dist + 1*j_dist = -1+1 = 0)
-            lsIters loopSpec `shouldBe` ["j", "i__s"]
-            -- The skew prelude assigns i = i__s - coeff*j
-            let preludes = [v | SAssign v _ <- body]
-            preludes `shouldSatisfy` elem "i"
+          Just [SLoop loopSpec _] -> do
+            -- After interchange, j is outer; i is inner (within-band skew
+            -- is deferred; band permutation alone makes the schedule legal)
+            lsIters loopSpec `shouldBe` ["j", "i"]
           other ->
             expectationFailure ("unexpected reified schedule: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -602,13 +599,13 @@ spec = describe "Polyhedral" $ do
   it "reifies an identity schedule back into the original loop nest" $ do
     let inner =
           SLoop
-            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "j"))
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "x")
             ]
         loop =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [ SAssign "base" (C.RAtom (C.AVar "i"))
             , inner
             ]
@@ -620,13 +617,13 @@ spec = describe "Polyhedral" $ do
   it "rewrites nested scop roots without changing surrounding CFG" $ do
     let inner =
           SLoop
-            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+            (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "j"))
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "x")
             ]
         outer =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [ SAssign "opaque" (C.RCall "f" [C.AVar "i"])
             , inner
             ]
@@ -773,19 +770,19 @@ fusionSpec = describe "fusion" $ do
   it "two sibling inner loops with the same bound and no cross-deps fuse" $ do
     -- outer loop containing two independent inner loops
     let outer =
-          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
-            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
-            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "i")]
             ]
     innerBandCount (fuseSiblingBands outer) `shouldBe` 1
   it "fused sibling loops reify to a single inner loop with both writes" $ do
     let outer =
-          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
-            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
-            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "i")]
             ]
     case extractProcScops2 (mkProc "p" ["n", "m", "a", "b"] [outer]) of
@@ -804,10 +801,10 @@ fusionSpec = describe "fusion" $ do
   it "sibling loops with backward cross-dep do not fuse" $ do
     -- inner1 writes a[j], inner2 reads a[j+1] — backward dep blocks fusion
     let outer =
-          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
-            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
-            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap [])
                 [ SAssign "nextK" (C.RBinOp C.CAdd (C.AVar "k") (C.AInt 1))
                 , SAssign "x" (C.RArrayLoad (C.AVar "a") (C.AVar "nextK"))
                 , SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "x")
@@ -817,10 +814,10 @@ fusionSpec = describe "fusion" $ do
   it "sibling loops with forward cross-dep (a[j-1]) do fuse" $ do
     -- inner1 writes a[j], inner2 reads a[j-1] — forward dep allows fusion
     let outer =
-          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
-            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap)
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
+            [ SLoop (LoopSpec ["j"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "a") (C.AVar "j") (C.AVar "i")]
-            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap)
+            , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap [])
                 [ SAssign "prevK" (C.RBinOp C.CSub (C.AVar "k") (C.AInt 1))
                 , SAssign "x" (C.RArrayLoad (C.AVar "a") (C.AVar "prevK"))
                 , SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "x")
@@ -948,7 +945,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
     let body =
           [ SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
           , SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
-          , SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap)
+          , SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
               [ SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "i"))
               , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
               ]
@@ -1046,7 +1043,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
 
   it "suggestBandSkew2 is triggered for the augmented temporal stencil dep" $ do
     -- Simulate the dep produced by augmentWithTemporalDeps for a 1D stencil:
-    -- outer band (iter_t: LoopIterate), inner band (i: LoopMap)
+    -- outer band (iter_t: LoopIterate []), inner band (i: LoopMap [])
     -- distance: [+1, -1]  → outerDist(iter_t)=+1, innerDist(i)=-1
     let dims = [ScheduleDim "iter_t" (IVar "T"), ScheduleDim "i" (IVar "n")]
         rel = PolyhedralDependenceRelation
@@ -1094,7 +1091,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
     --       write arr_next[i] x
     --     arr_cur = arr_next         ← temporal swap
     let innerLoop =
-          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap)
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
             [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
             , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
             , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
@@ -1106,7 +1103,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
           , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
           ]
         outerLoop =
-          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate) iterateBody
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate []) iterateBody
         proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
     case extractProcScops2 proc of
       [scop] -> do
@@ -1122,3 +1119,101 @@ temporalSkewingSpec = describe "temporal skewing" $ do
               ]
         length temporalDeps `shouldSatisfy` (>= 1)
       other -> expectationFailure ("expected one extracted scop, got: " <> show (length other))
+
+  wavefrontSkewingSpec
+
+wavefrontSkewingSpec :: Spec
+wavefrontSkewingSpec = describe "wavefront skewing" $ do
+  it "suggestCrossBandSkew2 detects temporal stencil pattern" $ do
+    -- Augmented dep from the stencil: iter_t=+1, i=-1
+    let rel = PolyhedralDependenceRelation
+          { pdrKind = PolyDepWAR
+          , pdrArray = "arr"
+          , pdrSourceStmt = [0]
+          , pdrTargetStmt = [1]
+          , pdrDirection = PolyDepForward
+          , pdrIsLoopCarried = True
+          , pdrDistance = Just [1, -1]
+          , pdrCarryInfo =
+              [ PolyhedralCarryInfo "iter_t" (PolyCarryDistance 1)
+              , PolyhedralCarryInfo "i" (PolyCarryDistance (-1))
+              ]
+          , pdrBandCarry =
+              [ PolyhedralBandCarry
+                  { pbcIters = ["iter_t"]
+                  , pbcRole = LoopIterate
+                  , pbcStatus = PolyBandForward
+                  , pbcCarryInfo = [PolyhedralCarryInfo "iter_t" (PolyCarryDistance 1)]
+                  }
+              , PolyhedralBandCarry
+                  { pbcIters = ["i"]
+                  , pbcRole = LoopMap
+                  , pbcStatus = PolyBandBackward
+                  , pbcCarryInfo = [PolyhedralCarryInfo "i" (PolyCarryDistance (-1))]
+                  }
+              ]
+          , pdrClassification = PolyDepClassRegular
+          , pdrIsBlocking = False
+          , pdrSrcIndex = []
+          , pdrTgtIndex = []
+          }
+    case suggestCrossBandSkew2 0 ["iter_t"] ["i"] [rel] of
+      [] -> expectationFailure "expected wavefront skew for (+1, -1) dep"
+      skew : _ -> do
+        skewTarget skew `shouldBe` "i"
+        skewSource skew `shouldBe` "iter_t"
+        skewCoeff skew `shouldBe` 1
+
+  it "synthesizeScopSchedule2 applies cross-band skew to LoopIterate+LoopMap" $ do
+    -- Build a 1D iterate loop similar to the stencil pattern
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        iterateBody =
+          [ SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+          , SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+          , innerLoop
+          , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+          ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate []) iterateBody
+        proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
+    case extractProcScops2 proc of
+      [scop] -> do
+        let scheduled = synthesizeScopSchedule2 scop
+            sched = ssSchedule scheduled
+        -- Walk the schedule tree to find the inner LoopMap band.
+        -- After synthesis the body may be a sequence (prelude + inner band + epilogue)
+        -- or directly the inner band if prelude/epilogue were absorbed.
+        let findInner :: [ScheduleTree] -> Maybe LoopBand
+            findInner candidates = case candidates of
+              [ScheduleLoopBand inner]
+                | lbRole inner == LoopMap -> Just inner
+              [ScheduleSequence xs] ->
+                foldl (\acc x -> acc <|> findInner [x]) Nothing xs
+              _ -> Nothing
+        case sched of
+          ScheduleLoopBand outer
+            | lbRole outer == LoopIterate ->
+                case findInner [lbBody outer] of
+                  Just inner -> do
+                    length (lbSkew inner) `shouldSatisfy` (>= 1)
+                    let firstSkew = head (lbSkew inner)
+                    skewTarget firstSkew `shouldBe` "i"
+                    skewSource firstSkew `shouldBe` "iter_t"
+                    skewCoeff firstSkew `shouldBe` 1
+                    length (lbOrigins inner) `shouldSatisfy` (>= 1)
+                    case head (lbOrigins inner) of
+                      IMul (IConst c) (IVar s) -> do
+                        c `shouldBe` 1
+                        s `shouldBe` "iter_t"
+                      other ->
+                        expectationFailure ("unexpected origin: " ++ show other)
+                  Nothing -> expectationFailure "could not find inner LoopMap band"
+            | otherwise -> expectationFailure "outer band is not LoopIterate"
+          _ -> expectationFailure "expected ScheduleLoopBand"
+      other -> expectationFailure ("expected one scop, got: " <> show (length other))
+

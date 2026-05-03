@@ -223,6 +223,37 @@ spec = do
           , "let result = generate [M, N] matElem"
           ])
 
+    it "compiles and runs polyhedral tiled iterate stencil and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = False
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let step arr = stencil clamp"
+          , "  (let acc_fn acc = (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1) /. 4.0 in acc_fn)"
+          , "  arr"
+          , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
+          ])
+
+    it "compiles a 1D index through a function parameter (Issue 3 fix)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let f arr = index [0] arr + index [1] arr"
+        , "let main = 0"
+        ]
+
+    it "compiles a function calling map with an array parameter (Issue 4 fix)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let inc x = x + 1"
+        , "let step arr = map inc arr"
+        , "let arr = fill [4] 1"
+        , "let a = step arr"
+        , "let main = a"
+        ]
+
     it "matmul benchmark uses blocked generic tiling and explicit-vector polyhedral codegen" $ do
       src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"
       case readDecs src of

@@ -27,17 +27,20 @@ module Language.Hydrangea.CFGOpt
   , copyProp2
   , deadAssignElim2
   , loopInvariantCodeMotion2
+  , hoistIterateAllocs2
     -- * Atom/statement substitution utilities
   , substAtom2
   , substRHS2
   , substStmts2
   ) where
 
+import Control.Monad (guard)
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (partition)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..))
@@ -519,6 +522,108 @@ loopInvariantCodeMotion2 = concatMap goStmt
           SLoop _ body -> foldr go acc body
           SIf _ thn els -> foldr go (foldr go acc thn) els
           _ -> acc
+
+------------------------------------------------------------------------
+-- Iterate-loop allocation hoisting
+------------------------------------------------------------------------
+
+-- | Hoist @RArrayAlloc@ out of @LoopIterate@ bodies, replacing the
+-- allocate-each-iteration pattern with a pre-allocated ping-pong between
+-- two buffers.  The pattern detected is:
+--
+-- > for iter_t:
+-- >   arr_next = alloc(shp)
+-- >   shp = shape(arr_cur)
+-- >   ...compute...
+-- >   arr_cur = arr_next
+--
+-- which is rewritten to:
+--
+-- > shp = shape(arr_cur)
+-- > arr_next = alloc(shp)
+-- > tmp = arr_cur
+-- > for iter_t:
+-- >   ...compute...
+-- >   arr_cur = arr_next
+-- >   arr_next = tmp
+-- >   tmp = arr_cur
+--
+-- This avoids re-allocating every temporal iteration.
+hoistIterateAllocs2 :: [Stmt] -> [Stmt]
+hoistIterateAllocs2 = go
+  where
+    go :: [Stmt] -> [Stmt]
+    go [] = []
+    go (SLoop spec body : rest)
+      | lsRole spec == LoopIterate =
+          case restructureIterateBody spec body of
+            Just (hoisted, newLoop) -> hoisted ++ newLoop : go rest
+            Nothing -> SLoop spec (hoistIterateAllocs2 body) : go rest
+      | otherwise = SLoop spec (hoistIterateAllocs2 body) : go rest
+    go (SIf c t e : rest) =
+      SIf c (hoistIterateAllocs2 t) (hoistIterateAllocs2 e) : go rest
+    go (s : rest) = s : go rest
+
+-- | Given a @LoopIterate@ body, try to hoist the initial @alloc+shape@
+-- out and replace the epilogue swap with a ping-pong three-way swap.
+-- Returns @(pre_loop_stmts, new_loop_stmt)@ on success.
+--
+-- The expected body ends with a swap:
+--
+-- > ...compute...
+-- > SAssign cur (RAtom (AVar next))
+--
+-- And contains at most one @RArrayAlloc@ and one @RArrayShape@ whose
+-- variables match the swap.  Those two stmts are hoisted before the loop.
+restructureIterateBody :: LoopSpec -> [Stmt] -> Maybe ([Stmt], Stmt)
+restructureIterateBody spec body = do
+  guard (length body >= 2)
+  -- The last stmt must be the swap: SAssign cur (RAtom (AVar next))
+  let swapStmt = last body
+  (curVar, nextVar) <- case swapStmt of
+    SAssign cur (RAtom (AVar next)) -> Just (cur, next)
+    _ -> Nothing
+
+  -- Collect the stmts that precede the swap
+  let prefix = init body
+
+  -- Find the shape stmt in the prefix
+  let shapeCandidates = [(i, sv, av) | (i, SAssign sv (RArrayShape (AVar av))) <- zip [0..] prefix]
+      allocCandidates = [(i, av) | (i, SAssign av (RArrayAlloc _)) <- zip [0..] prefix]
+
+  -- Shared helper: given a set of stmt indices to skip (alloc + optionally
+  -- shape) and a list of stmts to hoist before the loop, build the
+  -- restructured program.
+  let mkResult skip hoistedExtra =
+        let computeBody = [s | (i, s) <- zip [0..] prefix, i `S.notMember` skip]
+            tmpVar = nextVar <> "__iter_tmp"
+            initSave = SAssign tmpVar (RAtom (AVar curVar))
+            pingSwap =
+              [ SAssign curVar (RAtom (AVar nextVar))
+              , SAssign nextVar (RAtom (AVar tmpVar))
+              , SAssign tmpVar (RAtom (AVar curVar))
+              ]
+            newBody = computeBody ++ pingSwap
+            newLoop = SLoop spec newBody
+        in Just (hoistedExtra ++ [initSave], newLoop)
+
+  -- Need at least one of shape or alloc to match the swap variables
+  case (listToMaybe shapeCandidates, listToMaybe allocCandidates) of
+    (Just (shapeIdx, shpVar, shapeArrVar), Just (allocIdx, allocVar)) -> do
+      guard (shapeArrVar == curVar)   -- shape reads from the cur variable
+      guard (allocVar == nextVar)     -- alloc writes to the next variable
+      let shapeStmt = SAssign shpVar (RArrayShape (AVar curVar))
+          allocStmt = SAssign nextVar (RArrayAlloc (AVar shpVar))
+          skip = S.fromList [shapeIdx, allocIdx]
+      mkResult skip [shapeStmt, allocStmt]
+
+    -- Fallback: only the alloc matches (shape is pre-computed outside loop).
+    -- Hoist just the alloc; the shape stmt stays in the loop body.
+    (_, Just (allocIdx, allocVar))
+      | allocVar == nextVar ->
+          mkResult (S.singleton allocIdx) [prefix !! allocIdx]
+
+    _ -> Nothing
 
 ------------------------------------------------------------------------
 -- Common subexpression elimination (CSE)

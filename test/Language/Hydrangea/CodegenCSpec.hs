@@ -23,7 +23,7 @@ spec = describe "CodegenC" $ do
   it "emits parallel pragma from Parallel ExecPolicy" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain []) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -33,7 +33,7 @@ spec = describe "CodegenC" $ do
   it "emits omp simd from Vector ExecPolicy" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 8] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain []) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -43,7 +43,7 @@ spec = describe "CodegenC" $ do
   it "omits omp simd for very short vector loops" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 3] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 3] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain []) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -53,27 +53,27 @@ spec = describe "CodegenC" $ do
   it "emits parallel reduction clause from ReductionSpec" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AInt 1))]
         spec' = LoopSpec ["i"] [IConst 16] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing))
-                  (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction
+                  (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "reduction(+:acc)"
 
   it "emits collapse for ND parallel loops" $ do
     let spec' = LoopSpec ["i", "j", "k"] [IConst 2, IConst 3, IConst 4]
-                  (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain
+                  (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for collapse(3)"
 
   it "emits policy clauses carried by ParallelSpec" $ do
     let spec' = LoopSpec ["i"] [IConst 8]
-                  (Parallel (ParallelSpec ParallelGeneric (Just "schedule(static)") Nothing)) Nothing LoopPlain
+                  (Parallel (ParallelSpec ParallelGeneric (Just "schedule(static)") Nothing)) Nothing LoopPlain []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for schedule(static)"
 
   it "emits role-aware comments for outer map-reduction loops" $ do
-    let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopMapReduction
+    let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopMapReduction []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "map-reduction outer loop"
@@ -82,7 +82,7 @@ spec = describe "CodegenC" $ do
     let body = [SAssign "acc" (C.RBinOp C.CMul (C.AVar "acc") (C.AInt 2))]
         spec' = LoopSpec ["i", "j"] [IConst 3, IConst 4]
                   (Parallel (ParallelSpec ParallelGeneric Nothing Nothing))
-                  (Just (ReductionSpec "acc" (IConst 1) C.RMul)) LoopReduction
+                  (Just (ReductionSpec "acc" (IConst 1) C.RMul)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AVar "acc")]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for collapse(2) reduction(*:acc)"
@@ -90,7 +90,7 @@ spec = describe "CodegenC" $ do
   it "emits strategy comments for direct scatter parallel loops" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)) Nothing LoopPlain []) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -108,7 +108,7 @@ spec = describe "CodegenC" $ do
         prog = Program
           [ (mkProc "p" []
               [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
-              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)) Nothing LoopPlain []) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
@@ -130,7 +130,7 @@ spec = describe "CodegenC" $ do
           [ (mkProc "p" []
               [ SAssign "shp" (C.RTuple [C.AInt 8])
               , SAssign "out" (C.RArrayAlloc (C.AVar "shp"))
-              , SLoop (LoopSpec ["i"] [IConst 64] (Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 64] (Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)) Nothing LoopPlain []) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64), ("routes", C.CTArray C.CTInt64), ("vals", C.CTArray C.CTInt64)] }
@@ -156,7 +156,7 @@ spec = describe "CodegenC" $ do
         prog = Program
           [ (mkProc "p" []
               [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
-              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)) Nothing LoopPlain []) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
@@ -177,7 +177,7 @@ spec = describe "CodegenC" $ do
         prog = Program
           [ (mkProc "p" []
               [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
-              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing Nothing)) Nothing LoopPlain) loopBody
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing Nothing)) Nothing LoopPlain []) loopBody
               , SReturn (C.AInt 0)
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTDouble)] }
@@ -190,7 +190,7 @@ spec = describe "CodegenC" $ do
   it "emits serial 1D loop with correct bounds" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain)
+              [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain [])
                   [ SReturn (C.AInt 0) ]
               ]
           ]
@@ -201,7 +201,7 @@ spec = describe "CodegenC" $ do
   it "emits 2D nested loops from multiple iterators" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i","j"] [IConst 3, IConst 4] Serial Nothing LoopPlain)
+              [ SLoop (LoopSpec ["i","j"] [IConst 3, IConst 4] Serial Nothing LoopPlain [])
                   [ SReturn (C.AInt 0) ]
               ]
           ]
@@ -213,7 +213,7 @@ spec = describe "CodegenC" $ do
     let prog = Program
           [ mkProc "p" []
               [ SAssign "arr" (C.RArrayAlloc (C.AInt 100))
-              , SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain)
+              , SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain [])
                   [ SArrayWrite (AVar "arr") (AVar "i") (AInt 42) ]
               , SReturn (AInt 0)
               ]
@@ -270,7 +270,7 @@ spec = describe "CodegenC" $ do
   it "emits serial reduction from ReductionSpec" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AInt 1))]
         spec' = LoopSpec ["i"] [IConst 16] Serial
-                  (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction
+                  (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AVar "acc")]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "int64_t acc = 0LL;"
@@ -279,7 +279,7 @@ spec = describe "CodegenC" $ do
   it "emits variable-bound loop from IVar" $ do
     let prog = Program
           [ mkProc "p" ["n"]
-              [ SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain)
+              [ SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
                   [ SReturn (C.AInt 0) ]
               ]
           ]
@@ -289,7 +289,7 @@ spec = describe "CodegenC" $ do
   it "emits vector loop without remainder when TailNone" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Vector (VectorSpec 4 TailNone)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 8] (Vector (VectorSpec 4 TailNone)) Nothing LoopPlain []) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -300,7 +300,7 @@ spec = describe "CodegenC" $ do
   it "emits vector loop with remainder when TailRemainder" $ do
     let prog = Program
           [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 6] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain) []
+              [ SLoop (LoopSpec ["i"] [IConst 6] (Vector (VectorSpec 4 TailRemainder)) Nothing LoopPlain []) []
               , SReturn (C.AInt 0)
               ]
           ]
@@ -311,7 +311,7 @@ spec = describe "CodegenC" $ do
   it "emits simd reduction clauses for vectorized reduction loops" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAddF (C.AVar "acc") (C.AVar "x"))]
         spec' = LoopSpec ["i"] [IConst 16] (Vector (VectorSpec 2 TailNone))
-                  (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction
+                  (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SAssign "x" (C.RAtom (C.AFloat 1.0)), SLoop spec' body, SReturn (C.AVar "acc")]]
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(2) reduction(+:acc)"
@@ -324,7 +324,7 @@ spec = describe "CodegenC" $ do
               , SAssign "out" (C.RArrayAlloc (C.AVar "shape"))
               , SAssign "n" (C.RAtom (C.AInt 8))
               , SAssign "i__vec_trips" (C.RBinOp C.CDiv (C.AVar "n") (C.AInt 4))
-              , SLoop (LoopSpec ["i__vec_i"] [IVar "i__vec_trips"] Serial Nothing LoopPlain)
+              , SLoop (LoopSpec ["i__vec_i"] [IVar "i__vec_trips"] Serial Nothing LoopPlain [])
                   [ SAssign "i__vec_base" (C.RBinOp C.CMul (C.AVar "i__vec_i") (C.AInt 4))
                   , SAssign "x__vec" (C.RVecLoad (C.AVar "arr") (C.AVar "i__vec_base"))
                   , SAssign "bias__vec" (C.RVecSplat (C.AFloat 1.0))

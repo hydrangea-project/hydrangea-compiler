@@ -20,7 +20,7 @@ spec = describe "CFGPipeline" $ do
   it "keeps tiling disabled unless opted in" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
             [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
         prog = Program [mkProc "p" [] [loop]]
         optsNoTiling =
@@ -48,7 +48,7 @@ spec = describe "CFGPipeline" $ do
             [ SAssign "shape" (RTuple [AInt 8])
             , SAssign "arr" (RArrayAlloc (AVar "shape"))
             , SAssign "out" (RArrayAlloc (AVar "shape"))
-            , SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap) body
+            , SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap []) body
             , SReturn (AInt 0)
             ])
             { procTypeEnv =
@@ -73,7 +73,7 @@ spec = describe "CFGPipeline" $ do
   it "applies tiling policy consistently for metal pipeline" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
             [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
         prog = Program [mkProc "p" [] [loop]]
         Program [noTileProc] = metalPipelineWithTiling False prog
@@ -84,7 +84,7 @@ spec = describe "CFGPipeline" $ do
   it "keeps polyhedral preparation on untiled canonical loops" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
             [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
         prog = Program [mkProc "p" [] [loop]]
         opts =
@@ -99,7 +99,7 @@ spec = describe "CFGPipeline" $ do
   it "routes untiled polyhedral scheduling through legal band interchange" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (RTuple [AVar "i", AVar "j"])
             , SAssign "nextI" (RBinOp CAdd (AVar "i") (AInt 1))
             , SAssign "dstIx" (RTuple [AVar "nextI", AVar "j"])
@@ -123,7 +123,7 @@ spec = describe "CFGPipeline" $ do
   it "routes tiling through polyhedral scheduling when enabled" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
             [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
         prog = Program [mkProc "p" [] [loop]]
         optsNoPoly =
@@ -144,7 +144,7 @@ spec = describe "CFGPipeline" $ do
   it "tiles along the synthesized polyhedral loop order" $ do
     let loop =
           SLoop
-            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain)
+            (LoopSpec ["i", "j"] [IVar "n", IVar "m"] Serial Nothing LoopPlain [])
             [ SAssign "srcIx" (RTuple [AVar "i", AVar "j"])
             , SAssign "prevI" (RBinOp CSub (AVar "i") (AInt 1))
             , SAssign "nextJ" (RBinOp CAdd (AVar "j") (AInt 1))

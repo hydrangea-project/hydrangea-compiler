@@ -11,7 +11,7 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Parallelize" $ do
   it "preserves lowering-provided reduction metadata" $ do
-    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 1) RMul)) LoopReduction)
+    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 1) RMul)) LoopReduction [])
                   [SAssign "acc" (RBinOp CMul (AVar "acc") (AInt 2))]
     case parallelizeStmts2 [inner] of
       [SLoop spec' _] -> do
@@ -20,14 +20,14 @@ spec = describe "Parallelize" $ do
       _ -> expectationFailure "Expected a single parallelized loop"
 
   it "parallelizes simple single-level map loops without nested-loop heuristics" $ do
-    let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+    let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
                  [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
     case parallelizeStmts2 [loop] of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized loop"
 
   it "parallelizes simple LoopMap kernels at top level" $ do
-    let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+    let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
                  [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
     case parallelizeStmts2 [loop] of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
@@ -41,7 +41,7 @@ spec = describe "Parallelize" $ do
     -- handle loops where the fallback would block on a true write hazard.
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "left" (RArrayLoad (AVar "src") (AVar "leftIx"))
             , SAssign "right" (RArrayLoad (AVar "src") (AVar "rightIx"))
             , SArrayWrite (AVar "out") (AVar "dstIx") (AInt 1)
@@ -64,7 +64,7 @@ spec = describe "Parallelize" $ do
   it "does not use procArrayFacts to justify read-write updates of the same array" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "x" (RArrayLoad (AVar "out") (AVar "readIx"))
             , SArrayWrite (AVar "out") (AVar "writeIx") (AVar "x")
             ]
@@ -81,7 +81,7 @@ spec = describe "Parallelize" $ do
   it "keeps fallback parallelization off colliding scatter-style updates" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
             , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
             , SAssign "old" (RArrayLoad (AVar "out") (AVar "idx"))
@@ -95,7 +95,7 @@ spec = describe "Parallelize" $ do
   it "parallelizes injective scatter kernels when route analysis proves unique writes" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "nd" (RFlatToNd (AVar "i") (AVar "shp"))
             , SAssign "idx" (RProj 0 (AVar "nd"))
             , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
@@ -118,7 +118,7 @@ spec = describe "Parallelize" $ do
   it "keeps non-injective scatter kernels serial even with fresh destinations" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
             , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
             , SAssign "old" (RArrayLoad (AVar "out") (AVar "idx"))
@@ -149,7 +149,7 @@ spec = describe "Parallelize" $ do
   it "keeps unsupported colliding scatter combines serial" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
             , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
             , SAssign "old" (RArrayLoad (AVar "out") (AVar "idx"))
@@ -180,7 +180,7 @@ spec = describe "Parallelize" $ do
   it "uses atomic scatter for guarded colliding integer add kernels" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "guard" (RArrayLoad (AVar "guards") (AVar "i"))
             , SIf (AVar "guard")
                 [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
@@ -216,7 +216,7 @@ spec = describe "Parallelize" $ do
   it "uses atomic scatter for colliding floating-point add kernels" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
             , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
             , SAssign "old" (RArrayLoad (AVar "out") (AVar "idx"))
@@ -247,7 +247,7 @@ spec = describe "Parallelize" $ do
   it "uses privatized scatter for dense colliding integer add kernels with enough work" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 64] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 64] Serial Nothing LoopPlain [])
             [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
             , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
             , SAssign "old" (RArrayLoad (AVar "out") (AVar "idx"))
@@ -276,9 +276,9 @@ spec = describe "Parallelize" $ do
       _ -> expectationFailure "Expected dense colliding scatter loop to use privatized strategy"
 
   it "keeps inner reduction loops serial under a map-reduction outer loop" $ do
-    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction)
+    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
                   [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
-        outer = SLoop (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMapReduction)
+        outer = SLoop (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMapReduction [])
                   [SAssign "acc" (RAtom (AInt 0)), inner]
     case parallelizeStmts2 [outer] of
       [SLoop outerSpec [_, SLoop innerSpec _]] -> do
@@ -287,9 +287,9 @@ spec = describe "Parallelize" $ do
       _ -> expectationFailure "Expected nested map-reduction structure"
 
   it "does not parallelize scalar reduction wrapper loops" $ do
-    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction)
+    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
                   [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
-        wrapper = SLoop (LoopSpec ["j"] [IVar "one"] Serial Nothing LoopReductionWrapper)
+        wrapper = SLoop (LoopSpec ["j"] [IVar "one"] Serial Nothing LoopReductionWrapper [])
                     [SAssign "acc" (RAtom (AInt 0)), inner]
     case parallelizeStmts2 [wrapper] of
       [SLoop wrapperSpec [_, SLoop innerSpec _]] -> do
@@ -298,9 +298,9 @@ spec = describe "Parallelize" $ do
       _ -> expectationFailure "Expected scalar reduction wrapper structure"
 
   it "keeps nested reduction loops serial under an outer plain parallel loop" $ do
-    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction)
+    let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
                   [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
-        outer = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+        outer = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
                   [SAssign "acc" (RAtom (AInt 0)), inner]
     case parallelizeStmts2 [outer] of
       [SLoop outerSpec [_, SLoop innerSpec _]] -> do

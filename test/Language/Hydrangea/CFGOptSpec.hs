@@ -32,7 +32,7 @@ spec = do
       length result `shouldSatisfy` (>= 0)
 
     it "does not propagate across loop boundaries" $ do
-      let loop = SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain)
+      let loop = SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain [])
                    [SAssign "y" (RAtom (AVar "x"))]
           stmts = [ SAssign "x" (RAtom (AInt 5))
                   , loop
@@ -42,7 +42,7 @@ spec = do
       length result `shouldSatisfy` (>= 0)
 
     it "propagates integer constants into loop bounds" $ do
-      let loop = SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopFold)
+      let loop = SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopFold [])
                    [SAssign "acc" (RAtom (AVar "i"))]
           stmts = [ SAssign "n" (RAtom (AInt 4))
                   , loop
@@ -121,7 +121,7 @@ spec = do
       let loopBody = [ SAssign "y" (RAtom (AInt 5))  -- invariant
                      , SArrayWrite (AVar "arr") (AVar "i") (AVar "y")
                      ]
-          stmts = [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain) loopBody ]
+          stmts = [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain []) loopBody ]
           result = loopInvariantCodeMotion2 stmts
       -- y should be hoisted before the loop
       -- For now, just verify it produces a valid result
@@ -131,7 +131,7 @@ spec = do
       let loopBody = [ SAssign "y" (RBinOp CAdd (AVar "i") (AInt 1))
                      , SArrayWrite (AVar "arr") (AVar "i") (AVar "y")
                      ]
-          stmts = [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain) loopBody ]
+          stmts = [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain []) loopBody ]
           result = loopInvariantCodeMotion2 stmts
       -- y depends on i, so should stay in loop
       length result `shouldBe` 1
@@ -148,7 +148,7 @@ spec = do
                 ]
             , SArrayWrite (AVar "arr") (AVar "i") (AVar "x")
             ]
-          stmts = [SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain) loopBody]
+          stmts = [SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain []) loopBody]
           result = loopInvariantCodeMotion2 stmts
       case result of
         (SAssign "c" _ : SLoop _ body' : _) ->
@@ -165,7 +165,7 @@ spec = do
             [ SAssign "out_shp" (RTuple [])
             , SAssign "out_arr" (RArrayAlloc (AVar "out_shp"))
             , SAssign "acc" (RAtom (AInt 0))
-            , SLoop (LoopSpec ["k"] [IConst 4] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction)
+            , SLoop (LoopSpec ["k"] [IConst 4] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
                 [ SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))
                 ]
             , SArrayWrite (AVar "out_arr") (AInt 0) (AVar "acc")
@@ -233,7 +233,7 @@ spec = do
 
     it "optimizes nested loops with invariant code" $ do
       let stmts = [ SAssign "inv" (RAtom (AInt 10))
-                  , SLoop (LoopSpec ["i"] [IConst 5] Serial Nothing LoopPlain)
+                  , SLoop (LoopSpec ["i"] [IConst 5] Serial Nothing LoopPlain [])
                       [ SArrayWrite (AVar "arr") (AVar "i") (AVar "inv")
                       ]
                   , SReturn (AVar "arr")
@@ -276,8 +276,8 @@ spec = do
   describe "CFGOpt - Nested Loop Optimization" $ do
     it "optimizes nested loops with invariant outer variables" $ do
       let stmts = [ SAssign "outer" (RAtom (AInt 100))
-                  , SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain)
-                      [ SLoop (LoopSpec ["j"] [IConst 5] Serial Nothing LoopPlain)
+                  , SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain [])
+                      [ SLoop (LoopSpec ["j"] [IConst 5] Serial Nothing LoopPlain [])
                           [ SArrayWrite (AVar "arr") (AVar "i") (AVar "outer")
                           ]
                       ]
@@ -289,7 +289,7 @@ spec = do
 
     it "handles loop-carried dependencies correctly" $ do
       let stmts = [ SAssign "acc" (RAtom (AInt 0))
-                  , SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain)
+                  , SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain [])
                       [ SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))
                       , SArrayWrite (AVar "arr") (AVar "i") (AVar "acc")
                       ]
@@ -300,7 +300,7 @@ spec = do
       length result `shouldBe` 3
 
     it "eliminates dead code in nested loops" $ do
-      let stmts = [ SLoop (LoopSpec ["i"] [IConst 5] Serial Nothing LoopPlain)
+      let stmts = [ SLoop (LoopSpec ["i"] [IConst 5] Serial Nothing LoopPlain [])
                       [ SAssign "dead" (RAtom (AInt 42))
                       , SArrayWrite (AVar "arr") (AVar "i") (AInt 0)
                       ]
@@ -314,7 +314,7 @@ spec = do
     it "preserves vectorized loops during optimization" $ do
       let vectorSpec = Vector (VectorSpec 4 TailNone)
           stmts = [ SAssign "inv" (RAtom (AInt 10))
-                  , SLoop (LoopSpec ["i"] [IConst 16] vectorSpec Nothing LoopPlain)
+                  , SLoop (LoopSpec ["i"] [IConst 16] vectorSpec Nothing LoopPlain [])
                       [ SArrayWrite (AVar "arr") (AVar "i") (AVar "inv")
                       ]
                   , SReturn (AVar "arr")
@@ -476,7 +476,7 @@ simpleArrayProg :: Gen SimpleStmts
 simpleArrayProg = do
   size <- choose (1, 5)
   pure [ SAssign "arr" (RArrayAlloc (AInt size))
-       , SLoop (LoopSpec ["i"] [IConst size] Serial Nothing LoopPlain)
+       , SLoop (LoopSpec ["i"] [IConst size] Serial Nothing LoopPlain [])
            [SArrayWrite (AVar "arr") (AVar "i") (AInt 0)]
        , SReturn (AVar "arr")
        ]

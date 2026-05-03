@@ -57,7 +57,7 @@ spec = describe "Vectorize" $ do
   it "lowers simple floating reduction loops to explicit vector IR when types are available" $ do
     let loop =
           SLoop
-            (LoopSpec ["j"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction)
+            (LoopSpec ["j"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "j"))
             , SAssign "acc" (C.RBinOp C.CAddF (C.AVar "acc") (C.AVar "x"))
             ]
@@ -76,7 +76,7 @@ spec = describe "Vectorize" $ do
   it "keeps reduction wrapper loops scalar" $ do
     let wrapper =
           SLoop
-            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopReductionWrapper)
+            (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopReductionWrapper [])
             [SAssign "x" (C.RAtom (C.AFloat 1.0))]
     case vectorizeStmts2 [wrapper] of
       [SLoop wrapperSpec _] -> lsExec wrapperSpec `shouldBe` Serial
@@ -85,14 +85,14 @@ spec = describe "Vectorize" $ do
   it "explicitly vectorizes nested unary float loops when lowering is supported" $ do
     let innerLoop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "i"))
             , SAssign "y" (C.RUnOp C.CSqrt (C.AVar "x"))
             , SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "y")
             ]
         outerLoop =
           SLoop
-            (LoopSpec ["j"] [IConst 4] Serial Nothing LoopPlain)
+            (LoopSpec ["j"] [IConst 4] Serial Nothing LoopPlain [])
             [innerLoop]
         lowered =
           vectorizeWithTypes
@@ -113,7 +113,7 @@ spec = describe "Vectorize" $ do
   it "explicitly vectorizes top-level unary float LoopMap kernels when lowering is supported" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "i"))
             , SAssign "y" (C.RUnOp C.CSqrt (C.AVar "x"))
             , SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "y")
@@ -138,7 +138,7 @@ spec = describe "Vectorize" $ do
   it "explicitly vectorizes top-level LoopMap kernels when types prove float arrays" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "i"))
             , SAssign "y" (C.RBinOp C.CAddF (C.AVar "x") (C.AFloat 1.0))
             , SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "y")
@@ -160,7 +160,7 @@ spec = describe "Vectorize" $ do
   it "uses lowering-provided dense index aliases to broaden explicit vectorization" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "off" (C.RAtom (C.AVar "idx"))
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "off"))
             , SAssign "y" (C.RBinOp C.CAddF (C.AVar "x") (C.AFloat 1.0))
@@ -193,7 +193,7 @@ spec = describe "Vectorize" $ do
   it "keeps row-base dense aliases as explicit vector indices" $ do
     let loop =
           SLoop
-            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "flat" (C.RBinOp C.CAdd (C.AVar "row_base") (C.AVar "j"))
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "flat"))
             , SAssign "y" (C.RBinOp C.CAddF (C.AVar "x") (C.AFloat 1.0))
@@ -218,7 +218,7 @@ spec = describe "Vectorize" $ do
   it "keeps non-contiguous scalar loads on the explicit path when vector ops still apply" $ do
     let loop =
           SLoop
-            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "offA" (C.RBinOp C.CAdd (C.AVar "row_base_a") (C.AVar "k"))
             , SAssign "a" (C.RArrayLoad (C.AVar "matA") (C.AVar "offA"))
             , SAssign "offB" (C.RBinOp C.CAdd (C.AVar "row_base_b") (C.AVar "j"))
@@ -258,7 +258,7 @@ spec = describe "Vectorize" $ do
   it "keeps indirect-access kernels off the explicit vector path even with dense index aliases" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "src") (C.AVar "off"))
             , SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "x")
             ]
@@ -283,7 +283,7 @@ spec = describe "Vectorize" $ do
   it "keeps integer LoopMap kernels on the hint-only path" $ do
     let loop =
           SLoop
-            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap)
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
             [ SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "i"))
             , SAssign "y" (C.RBinOp C.CAdd (C.AVar "x") (C.AInt 1))
             , SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "y")

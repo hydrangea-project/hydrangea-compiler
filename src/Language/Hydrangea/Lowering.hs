@@ -414,7 +414,7 @@ lowerExp expr = case expr of
         pure ( [ SAssign arr (RArrayAlloc as')
                , SAssign n   (RShapeSize as')
                ]
-             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                  (bodyStmts ++ [SArrayWrite (AVar arr) (AVar i) (AVar _val)])
              )
       -- 2D: nested (i, j) loops; avoids the flat→ND→flat roundtrip.
@@ -441,7 +441,7 @@ lowerExp expr = case expr of
                ]
              , SLoop (LoopSpec [i, j]
                                [atomToIndexExpr (AVar dim0), atomToIndexExpr (AVar dim1)]
-                               Serial Nothing LoopMap)
+                               Serial Nothing LoopMap [])
                  ( SAssign idx (RTuple [AVar i, AVar j])
                    : bodyStmts
                    ++ [ SAssign mul  (RBinOp CMul (AVar i) (AVar dim1))
@@ -464,7 +464,7 @@ lowerExp expr = case expr of
         pure ( [ SAssign arr (RArrayAlloc as')
                , SAssign n   (RShapeSize as')
                ]
-             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                  ( SAssign idx (RFlatToNd (AVar i) as')
                    : bodyStmts
                    ++ [SArrayWrite (AVar arr) (AVar i) (AVar _val)]
@@ -488,7 +488,7 @@ lowerExp expr = case expr of
         pure ( sl ++ sv
              ++ [ SAssign shp (RTuple [alen])
                 , SAssign arr (RArrayAlloc (AVar shp))
-                , SLoop (LoopSpec [i] [atomToIndexExpr alen] Serial Nothing LoopMap)
+                , SLoop (LoopSpec [i] [atomToIndexExpr alen] Serial Nothing LoopMap [])
                     [SArrayWrite (AVar arr) (AVar i) av]
                  ]
               , AVar arr
@@ -499,7 +499,7 @@ lowerExp expr = case expr of
         pure ( ss ++ sv
              ++ [ SAssign arr (RArrayAlloc as')
                 , SAssign n (RShapeSize as')
-                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                     [SArrayWrite (AVar arr) (AVar i) av]
                  ]
               , AVar arr
@@ -531,7 +531,7 @@ lowerExp expr = case expr of
          ++ [ SAssign shp (RArrayShape aa)
             , SAssign arr (RArrayAlloc (AVar shp))
             , SAssign n (RShapeSize (AVar shp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                 ( [SAssign elem' (RArrayLoad aa (AVar i))]
                    ++ bodyStmts
                    ++ [SArrayWrite (AVar arr) (AVar i) (AVar val)]
@@ -563,7 +563,7 @@ lowerExp expr = case expr of
          ++ [ SAssign shp (RArrayShape a1)
             , SAssign arr (RArrayAlloc (AVar shp))
             , SAssign n (RShapeSize (AVar shp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                 ( [ SAssign e1 (RArrayLoad a1 (AVar i))
                   , SAssign e2 (RArrayLoad a2 (AVar i))
                   ]
@@ -596,10 +596,10 @@ lowerExp expr = case expr of
             , SAssign redDim (RShapeLast (AVar shp))
             , SAssign outN (RShapeSize (AVar outShp))
              , SAssign outArr (RArrayAlloc (AVar outShp))
-             , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction)
+             , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction [])
                   ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
                       , SAssign acc (RAtom ai)
-                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
                           ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
                            , SAssign elem' (RArrayLoad aa (AVar flatIn))
                            ]
@@ -638,7 +638,7 @@ lowerExp expr = case expr of
                 , SAssign redDim (RShapeLast as')
                 , SAssign outArr (RArrayAlloc (AVar outShp))
                 , SAssign acc (RAtom ai)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
                     ( genStmts
                       ++ bodyStmts
                     )
@@ -670,11 +670,11 @@ lowerExp expr = case expr of
                 , SAssign redDim (RShapeLast as')
                 , SAssign outN (RShapeSize (AVar outShp))
                 , SAssign outArr (RArrayAlloc (AVar outShp))
-                , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction)
+                , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction [])
                     ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
                       -- Initialize the accumulator for this output element.
                       , SAssign acc (RAtom ai)
-                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
                           ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
                             , SAssign idx (RFlatToNd (AVar flatIn) as')
                             ]
@@ -704,7 +704,7 @@ lowerExp expr = case expr of
         pure ( si ++ sl ++ sv
              ++ [ SAssign acc   (RAtom ai)
                 , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr alen] Serial Nothing LoopFold)
+                , SLoop (LoopSpec [k] [atomToIndexExpr alen] Serial Nothing LoopFold [])
                     bodyStmts
                 ]
              , AVar acc
@@ -716,7 +716,7 @@ lowerExp expr = case expr of
              ++ [ SAssign n     (RShapeSize as')
                 , SAssign acc   (RAtom ai)
                 , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                     bodyStmts
                 ]
              , AVar acc
@@ -737,7 +737,7 @@ lowerExp expr = case expr of
     pure ( si ++ ss
          ++ [ SAssign n   (RShapeSize as')
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( genStmts ++ bodyStmts )
             ]
          , AVar acc
@@ -754,7 +754,7 @@ lowerExp expr = case expr of
     stepStmts <- inlineScalarFn stepFnExp arr_cur arr_next
     pure ( sn ++ si
          ++ [ SAssign arr_cur (RAtom ai)
-            , SLoop (LoopSpec [t] [atomToIndexExpr an] Serial Nothing LoopIterate)
+            , SLoop (LoopSpec [t] [atomToIndexExpr an] Serial Nothing LoopIterate [])
                 ( stepStmts
                   ++ [SAssign arr_cur (RAtom (AVar arr_next))]
                 )
@@ -776,7 +776,7 @@ lowerExp expr = case expr of
          ++ [ SAssign shp (RArrayShape aa)
             , SAssign n (RShapeLast (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( [ SAssign elem' (RArrayLoad aa (AVar k))
                   ]
                   ++ bodyStmts
@@ -802,7 +802,7 @@ lowerExp expr = case expr of
         pure ( si ++ sl ++ sv
              ++ [ SAssign acc   (RAtom ai)
                 , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr alen] Serial Nothing LoopFold)
+                , SLoop (LoopSpec [k] [atomToIndexExpr alen] Serial Nothing LoopFold [])
                     ( predStmts
                       ++ [SIf (AVar predV) [] [SBreak]]
                       ++ bodyStmts
@@ -817,7 +817,7 @@ lowerExp expr = case expr of
              ++ [ SAssign n     (RShapeSize as')
                 , SAssign acc   (RAtom ai)
                 , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                     ( predStmts
                       ++ [SIf (AVar predV) [] [SBreak]]
                       ++ bodyStmts
@@ -841,7 +841,7 @@ lowerExp expr = case expr of
     pure ( si ++ ss
          ++ [ SAssign n   (RShapeSize as')
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( predStmts
                   ++ [SIf (AVar predV) [] [SBreak]]
                   ++ genStmts
@@ -867,7 +867,7 @@ lowerExp expr = case expr of
          ++ [ SAssign shp (RArrayShape aa)
             , SAssign n (RShapeLast (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( predStmts
                   ++ [SIf (AVar predV) [] [SBreak]]
                   ++ [SAssign elem' (RArrayLoad aa (AVar k))]
@@ -898,7 +898,7 @@ lowerExp expr = case expr of
             , SAssign n (RShapeLast (AVar shp))
             , SAssign outArr (RArrayAlloc (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( [ SAssign elem' (RArrayLoad aa (AVar k))
                   , SArrayWrite (AVar outArr) (AVar k) (AVar acc)
                   ]
@@ -928,7 +928,7 @@ lowerExp expr = case expr of
             , SAssign n (RShapeLast (AVar shp))
             , SAssign outArr (RArrayAlloc (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( [ SAssign elem' (RArrayLoad aa (AVar k)) ]
                   ++ bodyStmts
                   ++ [SArrayWrite (AVar outArr) (AVar k) (AVar acc)]
@@ -960,7 +960,7 @@ lowerExp expr = case expr of
             , SAssign n1 (RBinOp CSub (AVar n) (AInt 1))
             , SAssign outArr (RArrayAlloc (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( [ SAssign ix (RBinOp CSub (AVar n1) (AVar k))
                   , SAssign elem' (RArrayLoad aa (AVar ix))
                   , SArrayWrite (AVar outArr) (AVar ix) (AVar acc)
@@ -994,7 +994,7 @@ lowerExp expr = case expr of
             , SAssign n1 (RBinOp CSub (AVar n) (AInt 1))
             , SAssign outArr (RArrayAlloc (AVar shp))
             , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold)
+            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
                 ( [ SAssign ix (RBinOp CSub (AVar n1) (AVar k))
                   , SAssign elem' (RArrayLoad aa (AVar ix))
                   ]
@@ -1036,13 +1036,13 @@ lowerExp expr = case expr of
              , SAssign outN (RBinOp CSub (AVar offsetsN) (AInt 1))
              , SAssign outShp (RTuple [AVar outN])
              , SAssign outArr (RArrayAlloc (AVar outShp))
-             , SLoop (LoopSpec [seg] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain)
+             , SLoop (LoopSpec [seg] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain [])
                  [ SAssign start (RArrayLoad ao (AVar seg))
                  , SAssign nextSeg (RBinOp CAdd (AVar seg) (AInt 1))
                  , SAssign stop (RArrayLoad ao (AVar nextSeg))
                  , SAssign segLen (RBinOp CSub (AVar stop) (AVar start))
                  , SAssign acc (RAtom ai)
-                 , SLoop (LoopSpec [k] [atomToIndexExpr (AVar segLen)] Serial Nothing LoopReduction)
+                 , SLoop (LoopSpec [k] [atomToIndexExpr (AVar segLen)] Serial Nothing LoopReduction [])
                      ( [ SAssign elemIx (RBinOp CAdd (AVar start) (AVar k))
                        , SAssign elem' (RArrayLoad av (AVar elemIx))
                        ]
@@ -1067,7 +1067,7 @@ lowerExp expr = case expr of
          ++ [ SAssign shp (RTuple [an])
             , SAssign arr (RArrayAlloc (AVar shp))
             , SAssign n   (RShapeSize  (AVar shp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                 [SArrayWrite (AVar arr) (AVar i) (AVar i)]
             ]
          , AVar arr
@@ -1138,7 +1138,7 @@ lowerExp expr = case expr of
              , SAssign prevRow (RAtom (AInt 0))
              , SAssign prevCol (RAtom (AInt 0))
              , SAssign prevVal (RAtom (AInt 0))
-             , SLoop (LoopSpec [i] [atomToIndexExpr arNnz] Serial Nothing LoopPlain)
+             , SLoop (LoopSpec [i] [atomToIndexExpr arNnz] Serial Nothing LoopPlain [])
                  ( rowIterStmts ++ colIterStmts ++ valIterStmts ++
                  [ SAssign hasPrev (RBinOp CGt (AVar outNnz) (AInt 0))
                  , SIf (AVar hasPrev)
@@ -1230,10 +1230,10 @@ lowerExp expr = case expr of
              , SAssign rowPtr (RArrayAlloc (AVar rowPtrShp))
              , SAssign outCols (RArrayAlloc (AVar shp))
              , SAssign outVals (RArrayAlloc (AVar shp))
-             , SLoop (LoopSpec [i] [atomToIndexExpr arNRows] Serial Nothing LoopPlain)
+             , SLoop (LoopSpec [i] [atomToIndexExpr arNRows] Serial Nothing LoopPlain [])
                  [ SArrayWrite (AVar counts) (AVar i) (AInt 0)
                  ]
-             , SLoop (LoopSpec [i] [atomToIndexExpr arNnz] Serial Nothing LoopPlain)
+             , SLoop (LoopSpec [i] [atomToIndexExpr arNnz] Serial Nothing LoopPlain [])
                  [ SAssign row (RArrayLoad arRows (AVar i))
                  , SAssign oldCount (RArrayLoad (AVar counts) (AVar row))
                  , SAssign newCount (RBinOp CAdd (AVar oldCount) (AInt 1))
@@ -1244,7 +1244,7 @@ lowerExp expr = case expr of
                  , SArrayWrite (AVar outVals) (AVar i) (AVar val)
                  ]
              , SAssign acc (RAtom (AInt 0))
-             , SLoop (LoopSpec [i] [atomToIndexExpr arNRows] Serial Nothing LoopPlain)
+             , SLoop (LoopSpec [i] [atomToIndexExpr arNRows] Serial Nothing LoopPlain [])
                  [ SArrayWrite (AVar rowPtr) (AVar i) (AVar acc)
                  , SAssign cnt (RArrayLoad (AVar counts) (AVar i))
                  , SAssign acc (RBinOp CAdd (AVar acc) (AVar cnt))
@@ -1289,8 +1289,8 @@ lowerExp expr = case expr of
             pure ( si ++ ss
                  ++ [ SAssign redDim (RShapeLast as')
                     , SAssign acc (RAtom ai)
-                    , SLoop (LoopSpec [j] [IConst 1] Serial Nothing LoopReductionWrapper)
-                        [ SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                    , SLoop (LoopSpec [j] [IConst 1] Serial Nothing LoopReductionWrapper [])
+                        [ SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
                             ( genStmts ++ bodyStmts )
                         ]
                     , SAssign val (RAtom (AVar acc))
@@ -1321,9 +1321,9 @@ lowerExp expr = case expr of
                     , SAssign redDim (RShapeLast as')
                     , SAssign outN (RShapeSize (AVar outShp))
                     , SAssign acc (RAtom ai)
-                    , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopReductionWrapper)
+                    , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopReductionWrapper [])
                         ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
-                          , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction)
+                          , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
                               ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
                                 , SAssign idx (RFlatToNd (AVar flatIn) as')
                                 ]
@@ -1431,7 +1431,7 @@ lowerExp expr = case expr of
             , SAssign outN (RShapeSize (AVar outShp))
             , SAssign outArr (RArrayAlloc (AVar outShp))
             , SAssign outN (RShapeSize (AVar outShp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain [])
                 ( [SAssign outIdx (RNdToFlat (AVar i) (AVar outShp))]
                   ++ dimStmts
                   ++ [ SAssign srcTuple (RTuple (map AVar dimVars))
@@ -1478,7 +1478,7 @@ lowerExp expr = case expr of
             , SAssign outShp (RCall "__replicate_shape" [AVar shpSrc])
             , SAssign arr (RArrayAlloc (AVar outShp))
             , SAssign n (RShapeSize (AVar outShp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                 ( projAssigns
                   ++ [ SAssign srcTuple (RTuple (map AVar projVars))
                      , SAssign flatSrc (RNdToFlat (AVar srcTuple) aa)
@@ -1511,11 +1511,11 @@ lowerExp expr = case expr of
          ++ [ SAssign shpDst (RArrayShape ad)
             , SAssign out (RArrayAlloc (AVar shpDst))
             , SAssign nDst (RShapeSize (AVar shpDst))
-            , SLoop (LoopSpec [j] [atomToIndexExpr (AVar nDst)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [j] [atomToIndexExpr (AVar nDst)] Serial Nothing LoopPlain [])
                 [SAssign elemD (RArrayLoad ad (AVar j)), SArrayWrite (AVar out) (AVar j) (AVar elemD)]
             , SAssign shpSrc (RArrayShape as')
             , SAssign nSrc (RShapeSize (AVar shpSrc))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar nSrc)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar nSrc)] Serial Nothing LoopPlain [])
                 ( [ SAssign srcElem (RArrayLoad as' (AVar i))
                   , SAssign idx (RFlatToNd (AVar i) (AVar shpSrc))
                   , SArrayWrite (AVar out) (AVar permIdx) (AVar srcElem)
@@ -1540,7 +1540,7 @@ lowerExp expr = case expr of
     pure ( sd ++ si ++ sv
          ++ [ SAssign shp (RArrayShape ai)
             , SAssign n (RShapeSize (AVar shp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                 ( [ SAssign idx (RArrayLoad ai (AVar i))
                   , SAssign val (RArrayLoad av (AVar i))
                   , SAssign oldVal (RArrayLoad ad (AVar idx))
@@ -1575,7 +1575,7 @@ lowerExp expr = case expr of
             pure ( sd ++ sshp
                  ++ hoistedCalls
                  ++ [ SAssign n (RShapeSize ashp)
-                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( kernelStmts ++
                           [ SIf (AVar guardVal)
                               ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
@@ -1601,7 +1601,7 @@ lowerExp expr = case expr of
             pure ( sd ++ sshp
                  ++ hoistedCalls
                  ++ [ SAssign n (RShapeSize ashp)
-                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
                           ] ++ kernelStmts ++
                           [ SIf (AVar guardVal)
@@ -1633,7 +1633,7 @@ lowerExp expr = case expr of
         pure ( sd ++ si ++ sv ++ sg
              ++ [ SAssign shp (RArrayShape ai)
                 , SAssign n (RShapeSize (AVar shp))
-                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                     ( [ SAssign guardVal (RArrayLoad ag (AVar i)) ]
                    ++ [ SIf (AVar guardVal)
                         ( [ SAssign idx (RArrayLoad ai (AVar i))
@@ -1670,7 +1670,7 @@ lowerExp expr = case expr of
             pure ( sd ++ sshp
                  ++ hoistedCalls
                  ++ [ SAssign n (RShapeSize ashp)
-                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( kernelStmts ++
                           [ SAssign oldVal (RArrayLoad ad (AVar idx))
                           ] ++ combStmts ++
@@ -1690,7 +1690,7 @@ lowerExp expr = case expr of
             pure ( sd ++ sshp
                  ++ hoistedCalls
                  ++ [ SAssign n (RShapeSize ashp)
-                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                    , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
                           ] ++ kernelStmts ++
                           [ SAssign oldVal (RArrayLoad ad (AVar idx))
@@ -1725,7 +1725,7 @@ lowerExp expr = case expr of
              ++ hoistedCalls
              ++ [ SAssign shp (RArrayShape asrc)
                 , SAssign n (RShapeSize (AVar shp))
-                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                     ( [ SAssign ndIdx (RFlatToNd (AVar i) (AVar shp))
                       , SAssign elem' (RArrayLoad asrc (AVar i))
                       ] ++ kernelStmts ++
@@ -1757,7 +1757,7 @@ lowerExp expr = case expr of
              ++ hoistedCalls
              ++ [ SAssign shp (RArrayShape ai)
                 , SAssign n (RShapeSize (AVar shp))
-                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain)
+                , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                     ( [ SAssign ndIdx (RFlatToNd (AVar i) (AVar shp))
                       , SAssign idx (RArrayLoad ai (AVar i))
                       ] ++ kernelStmts ++
@@ -1797,7 +1797,7 @@ lowerExp expr = case expr of
             , SAssign srcShp (RArrayShape asrc)
             , SAssign arr    (RArrayAlloc (AVar idxShp))
             , SAssign n      (RShapeSize (AVar idxShp))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap)
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopMap [])
                 ( [ SAssign ndIdx (RArrayLoad aidx (AVar i)) ]
                   ++ (if scalarRoutes
                         then [SAssign flat (RAtom (AVar ndIdx))]
@@ -1884,7 +1884,7 @@ lowerExp expr = case expr of
         ++ [ SAssign shp    (RArrayShape aa)
            , SAssign outArr (RArrayAlloc (AVar shp))
            , SAssign n      (RShapeSize (AVar shp))
-           , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain) loopBody
+           , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain []) loopBody
            ]
          , AVar outArr
          )
@@ -2618,11 +2618,12 @@ renameVarInReductionSpec old new (ReductionSpec acc initE redop) =
   in ReductionSpec acc' initE' redop
 
 renameLoopSpec :: CVar -> CVar -> LoopSpec -> LoopSpec
-renameLoopSpec old new (LoopSpec its bounds exec red role) =
+renameLoopSpec old new (LoopSpec its bounds exec red role origins) =
   let its' = map (\t -> if t == old then new else t) its
       bounds' = map (renameVarInIndexExpr old new) bounds
       red' = fmap (renameVarInReductionSpec old new) red
-  in LoopSpec its' bounds' exec red' role
+      origins' = map (renameVarInIndexExpr old new) origins
+  in LoopSpec its' bounds' exec red' role origins'
 
 renameVarInStmt :: CVar -> CVar -> Stmt -> Stmt
 renameVarInStmt old new stmt =
