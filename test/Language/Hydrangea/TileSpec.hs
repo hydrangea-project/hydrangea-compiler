@@ -25,6 +25,14 @@ spec = describe "Tile" $ do
         _ -> False
     map (length . lsIters) loopSpecs `shouldBe` [2, 2]
 
+  it "skips strip-mining when a constant band only adds a tiny cleanup tile" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IConst 33, IConst 40] Serial Nothing LoopPlain [])
+            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+
+    tileStmts2 [loop] `shouldBe` [loop]
+
   it "tiles nested reduction loops without program-specific accumulator reloads" $ do
     let inner =
           SLoop

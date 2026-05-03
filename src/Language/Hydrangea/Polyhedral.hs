@@ -31,6 +31,8 @@ module Language.Hydrangea.Polyhedral
   , ScheduleTree(..)
   , ScheduleDim(..)
   , SkewSpec(..)
+  , IteratorProfitability(..)
+  , ProfitabilityFacts
   , AffineLoopBand(..)
   , AffineScheduleTree(..)
   , AffineSchedule(..)
@@ -46,6 +48,8 @@ module Language.Hydrangea.Polyhedral
   , blockingScopDependences2
   , collectScopDependences2
   , collectScopDependenceRelations2
+  , collectScopProfitabilityFacts2
+  , chooseBandPermutation2
   , extractProcScops2
   , extractProgramScops2
   , fusionLegalAtDepth2
@@ -335,6 +339,7 @@ data AffineValue
 data IteratorProfitability = IteratorProfitability
   { ipAccessDimHits :: Map Int Int
   , ipUnitStrideLastHits :: Int
+  , ipInvariantReadHits :: Int
   }
 
 type AffineEnv = Map CVar AffineValue
@@ -480,6 +485,7 @@ emptyIteratorProfitability =
   IteratorProfitability
     { ipAccessDimHits = M.empty
     , ipUnitStrideLastHits = 0
+    , ipInvariantReadHits = 0
     }
 
 mergeIteratorProfitability :: IteratorProfitability -> IteratorProfitability -> IteratorProfitability
@@ -487,6 +493,7 @@ mergeIteratorProfitability lhs rhs =
   IteratorProfitability
     { ipAccessDimHits = M.unionWith (+) (ipAccessDimHits lhs) (ipAccessDimHits rhs)
     , ipUnitStrideLastHits = ipUnitStrideLastHits lhs + ipUnitStrideLastHits rhs
+    , ipInvariantReadHits = ipInvariantReadHits lhs + ipInvariantReadHits rhs
     }
 
 collectScopProfitabilityFacts2 :: Scop -> ProfitabilityFacts
@@ -494,11 +501,41 @@ collectScopProfitabilityFacts2 scop =
   foldl' collectStmt M.empty (scStatements scop)
   where
     collectStmt facts stmt =
-      foldl' collectAccess facts (psReads stmt ++ psWrites stmt)
+      foldl' collectWriteAccess (foldl' collectReadAccess facts (psReads stmt)) (psWrites stmt)
 
-    collectAccess facts access =
+    collectReadAccess facts access =
+      collectInvariantReads access (collectAccessTerms facts access)
+
+    collectWriteAccess facts access =
+      collectAccessTerms facts access
+
+    collectAccessTerms facts access =
       let rank = length (paIndex access)
       in foldl' (collectIndexExpr rank) facts (zip [0 :: Int ..] (paIndex access))
+
+    collectInvariantReads access facts =
+      foldl'
+        (\acc iter ->
+          M.insertWith
+            mergeIteratorProfitability
+            iter
+            emptyIteratorProfitability { ipInvariantReadHits = 1 }
+            acc
+        )
+        facts
+        invariantIters
+      where
+        accessIters =
+          S.fromList
+            [ iter
+            | expr <- paIndex access
+            , (iter, _) <- M.toList (aeTerms expr)
+            ]
+        invariantIters =
+          [ iter
+          | iter <- scIterators scop
+          , iter `S.notMember` accessIters
+          ]
 
     collectIndexExpr rank facts (dimPos, expr) =
       foldl' (collectTerm rank dimPos) facts (M.toList (aeTerms expr))
@@ -510,6 +547,7 @@ collectScopProfitabilityFacts2 scop =
                   { ipAccessDimHits = M.singleton dimPos 1
                   , ipUnitStrideLastHits =
                       if dimPos == rank - 1 && abs coeff == 1 then 1 else 0
+                  , ipInvariantReadHits = 0
                   }
           in M.insertWith mergeIteratorProfitability iter contribution facts
       | otherwise =
@@ -608,7 +646,7 @@ permutationScore2
   -> [ScheduleDim]
   -> [PolyhedralDependenceRelation]
   -> [Int]
-  -> [(Int, Int, Int, Int, Int, Int, Int)]
+  -> [(Int, Int, Int, Int, Int, Int, Int, Int, Int)]
 permutationScore2 profitability bandDepth dims relations permutation =
   map scoreDim (zip [0 :: Int ..] permutedDims)
   where
@@ -626,6 +664,8 @@ permutationScore2 profitability bandDepth dims relations permutation =
       , unknownCount dim
       , accessPositionPenalty position dim
       , if position == innermostPos then negate (unitStrideLastHits dim) else 0
+      , reuseInnerPenalty position dim
+      , parallelOuterReward position dim
       , negate (independentCount dim)
       , position
       )
@@ -664,6 +704,23 @@ permutationScore2 profitability bandDepth dims relations permutation =
            ]
     unitStrideLastHits dim =
       ipUnitStrideLastHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
+    invariantReadHits dim =
+      ipInvariantReadHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
+    reuseInnerPenalty position dim =
+      invariantReadHits dim * (innermostPos - position)
+    parallelOuterReward position dim =
+      negate (parallelFreedom dim * outerParallelWeight position * constantTripCountScore (sdBound dim))
+    parallelFreedom dim
+      | null scoringRelations = 1
+      | otherwise = independentCount dim
+    outerParallelWeight position = innermostPos - position + 1
+
+constantTripCountScore :: IndexExpr -> Int
+constantTripCountScore expr = case simplifyIndexExpr expr of
+  IConst n ->
+    fromInteger (max 1 (min 1024 n))
+  _ ->
+    1
 
 applyPermutation :: [Int] -> [a] -> [a]
 applyPermutation permutation xs =
@@ -1405,15 +1462,28 @@ buildStripMinePlans cfg band = mapM buildOne (zip (lbIters band) (lbBounds band)
 
 chooseTileSize :: TileConfig -> LoopBand -> IndexExpr -> Maybe Integer
 chooseTileSize cfg band bound
-  | usefulBound tileSize (simplifyIndexExpr bound) = Just tileSize
+  | usefulBound tileSize simplifiedBound
+      && profitableTailShape tileSize simplifiedBound = Just tileSize
   | otherwise = Nothing
   where
+    simplifiedBound = simplifyIndexExpr bound
     tileSize = case lbRole band of
       LoopReduction -> tcReductionTile cfg
       _ -> tcDefaultTile cfg
 
     usefulBound n expr = case expr of
       IConst k -> k > n
+      _ -> True
+
+    -- Avoid strip-mining constant map-like bands when it would only create a
+    -- tiny cleanup tile. Larger tails, multiple full tiles, and reduction
+    -- bands still justify the extra loop/setup overhead.
+    profitableTailShape n expr = case expr of
+      IConst k
+        | lbRole band == LoopReduction -> True
+        | otherwise ->
+            let (fullTiles, remainder) = k `divMod` n
+            in  fullTiles >= 2 || remainder * 2 >= n
       _ -> True
 
 supportsAtomBound :: IndexExpr -> Bool

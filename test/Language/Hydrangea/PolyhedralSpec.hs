@@ -107,6 +107,33 @@ spec = describe "Polyhedral" $ do
           other -> expectationFailure ("unexpected schedule tree: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
+  it "profitability counts invariant reads for reuse" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j", "i"] [IVar "m", IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "flat" (C.RBinOp C.CAdd (C.AVar "i") (C.AVar "j"))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "i"))
+            , SArrayWrite (C.AVar "out") (C.AVar "flat") (C.AVar "x")
+            ]
+    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+      [scop] -> do
+        let facts = collectScopProfitabilityFacts2 scop
+        fmap ipInvariantReadHits (Map.lookup "j" facts) `shouldBe` Just 1
+        fmap ipInvariantReadHits (Map.lookup "i" facts) `shouldBe` Just 0
+      other -> expectationFailure ("expected one extracted scop, got: " <> show other)
+
+  it "profitability prefers inner placement for iterators with invariant-read reuse when locality ties" $ do
+    let dims =
+          [ ScheduleDim "j" (IConst 32)
+          , ScheduleDim "i" (IConst 32)
+          ]
+        facts =
+          Map.fromList
+            [ ("j", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipInvariantReadHits = 3 })
+            , ("i", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipInvariantReadHits = 0 })
+            ]
+    chooseBandPermutation2 facts 0 dims [] `shouldBe` [1, 0]
+
   it "extracts a map-reduction nest that matches today's tiling target" $ do
     let inner =
           SLoop

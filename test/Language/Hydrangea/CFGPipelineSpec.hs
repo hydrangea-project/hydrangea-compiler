@@ -37,6 +37,20 @@ spec = describe "CFGPipeline" $ do
     countLoops (procBody noTileProc) `shouldBe` 1
     countLoops (procBody tileProc) `shouldSatisfy` (> 1)
 
+  it "skips marginal cleanup-tail tiling even when tiling is enabled" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i", "j"] [IConst 33, IConst 40] Serial Nothing LoopPlain [])
+            [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
+        prog = Program [mkProc "p" [] [loop]]
+        opts =
+          defaultPipelineOptions
+            { poEnableTiling = True
+            , poEnableParallelization = False
+            }
+        Program [tileProc] = pipelineWithOptions opts prog
+    procBody tileProc `shouldBe` [loop]
+
   it "gates explicit vector lowering behind an opt-in" $ do
     let body =
           [ SAssign "x" (RArrayLoad (AVar "arr") (AVar "i"))
@@ -129,6 +143,27 @@ spec = describe "CFGPipeline" $ do
             , SArrayWrite (AVar "out") (AVar "ix") (AVar "x")
             ]
         prog = Program [mkProc "p" ["n", "m", "arr", "out"] [loop]]
+        opts =
+          defaultPipelineOptions
+            { poEnableTiling = False
+            , poEnablePolyhedral = True
+            , poEnableExplicitVectorization = False
+            , poEnableParallelization = False
+            }
+        Program [polyProc] = pipelineWithOptions opts prog
+    case procBody polyProc of
+      [SLoop loopSpec _] -> lsIters loopSpec `shouldBe` ["i", "j"]
+      other -> expectationFailure ("unexpected pipeline result: " <> show other)
+
+  it "prefers larger parallel outer trip counts when locality ties in the untiled polyhedral path" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["j", "i"] [IConst 16, IConst 64] Serial Nothing LoopMap [])
+            [ SAssign "flat" (RBinOp CAdd (AVar "i") (AVar "j"))
+            , SAssign "x" (RArrayLoad (AVar "arr") (AVar "flat"))
+            , SArrayWrite (AVar "out") (AVar "flat") (AVar "x")
+            ]
+        prog = Program [mkProc "p" ["arr", "out"] [loop]]
         opts =
           defaultPipelineOptions
             { poEnableTiling = False
