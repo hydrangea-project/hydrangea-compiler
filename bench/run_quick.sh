@@ -81,6 +81,8 @@ BENCH_CC="$(find_openmp_cc)"
 : "${GRAPH_NODES:=100000}" "${GRAPH_DEGREE:=16}"
 : "${VOX_POINTS:=1000000}" "${VOX_NX:=64}" "${VOX_NY:=64}" "${VOX_NZ:=64}" "${VOX_KEEP_PERIOD:=3}"
 : "${VSPLAT_POINTS:=1000000}" "${VSPLAT_NX:=64}" "${VSPLAT_NY:=64}" "${VSPLAT_NZ:=64}" "${VSPLAT_KEEP_PERIOD:=3}"
+: "${STENCIL_H:=512}" "${STENCIL_W:=512}"
+: "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
 
 export BS_N NBODY_N MAND_W MAND_H MAND_ITERS
 export SPMV_NROWS SPMV_NCOLS SPMV_NNZ MAT_M MAT_K MAT_N
@@ -89,6 +91,8 @@ export COO_NROWS COO_NCOLS COO_NNZ COO_DUP_PERIOD
 export GRAPH_NODES GRAPH_DEGREE
 export VOX_POINTS VOX_NX VOX_NY VOX_NZ VOX_KEEP_PERIOD
 export VSPLAT_POINTS VSPLAT_NX VSPLAT_NY VSPLAT_NZ VSPLAT_KEEP_PERIOD
+export STENCIL_H STENCIL_W
+export JACOBI_H JACOBI_W JACOBI_ITERS
 
 cd "$REPO_ROOT"
 
@@ -150,6 +154,9 @@ gen_inputs() {
           "$REPO_ROOT/bench/matmul/gen_mats.c"
       "$REPO_ROOT/bench/matmul/gen_mats" "$MAT_M" "$MAT_K" "$REPO_ROOT/bench/matmul/matA.csv"
       "$REPO_ROOT/bench/matmul/gen_mats" "$MAT_K" "$MAT_N" "$REPO_ROOT/bench/matmul/matB.csv" ;;
+    stencil_interior)
+      python3 "$REPO_ROOT/bench/stencil/gen_input.py" \
+        "$STENCIL_H" "$STENCIL_W" "$REPO_ROOT/bench/stencil/input.csv" >/dev/null ;;
   esac
 }
 
@@ -221,6 +228,7 @@ ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
+  stencil_interior jacobi_2d
 )
 
 for bname in "${ALL_BENCHMARKS[@]}"; do
@@ -248,6 +256,48 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
       run_bench voxel_rasterization voxel_rasterization.hyd main ;;
     voxel_trilinear_splat)
       run_bench voxel_trilinear_splat voxel_trilinear_splat.hyd main "--no-solver-check" ;;
+    stencil_interior)
+      gen_inputs "stencil_interior"
+      # C ref has a non-standard directory layout (lives under bench/stencil/)
+      _stencil_ref_bin="$REPO_ROOT/bench/stencil/stencil_interior_ref"
+      _stencil_ref_src="$REPO_ROOT/bench/stencil/stencil_interior_ref.c"
+      if [ ! -x "$_stencil_ref_bin" ] || [ "$_stencil_ref_src" -nt "$_stencil_ref_bin" ]; then
+        "$BENCH_CC" -O3 -march=native -fopenmp -std=c11 -lm \
+          -I "$REPO_ROOT/bench/c_bench" \
+          "$_stencil_ref_src" -o "$_stencil_ref_bin" 2>/dev/null || true
+      fi
+      _hyd=$(run_hydrangea stencil stencil_interior.hyd main)
+      _repa=$(run_repa stencil_interior)
+      _accel=$(run_accel stencil_interior)
+      if [ -x "$_stencil_ref_bin" ]; then
+        _c=$(BENCH_WARMUP="$WARMUP" BENCH_ITERS="$ITERS" \
+          "$_stencil_ref_bin" 2>/dev/null | parse_min_ms) || true
+        _c="${_c:-N/A}"
+      else
+        _c="N/A"
+      fi
+      printf "%-35s %15s %15s %15s %15s\n" "stencil_interior" "$_hyd" "$_repa" "$_accel" "$_c"
+      ;;
+    jacobi_2d)
+      _jacobi_ref_bin="$REPO_ROOT/bench/stencil/jacobi_2d_ref"
+      _jacobi_ref_src="$REPO_ROOT/bench/stencil/jacobi_2d_ref.c"
+      if [ ! -x "$_jacobi_ref_bin" ] || [ "$_jacobi_ref_src" -nt "$_jacobi_ref_bin" ]; then
+        "$BENCH_CC" -O3 -march=native -fopenmp -std=c11 -lm \
+          -I "$REPO_ROOT/bench/c_bench" \
+          "$_jacobi_ref_src" -o "$_jacobi_ref_bin" 2>/dev/null || true
+      fi
+      _hyd=$(run_hydrangea stencil jacobi_2d.hyd main)
+      _repa=$(run_repa jacobi_2d)
+      _accel=$(run_accel jacobi_2d)
+      if [ -x "$_jacobi_ref_bin" ]; then
+        _c=$(BENCH_WARMUP="$WARMUP" BENCH_ITERS="$ITERS" \
+          "$_jacobi_ref_bin" 2>/dev/null | parse_min_ms) || true
+        _c="${_c:-N/A}"
+      else
+        _c="N/A"
+      fi
+      printf "%-35s %15s %15s %15s %15s\n" "jacobi_2d(${JACOBI_ITERS}it)" "$_hyd" "$_repa" "$_accel" "$_c"
+      ;;
   esac
 done
 

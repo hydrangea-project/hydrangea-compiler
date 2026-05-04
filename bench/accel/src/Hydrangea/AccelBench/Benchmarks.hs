@@ -132,6 +132,8 @@ benchmarks =
   , Benchmark "voxel_trilinear_splat"      runVoxelTrilinearSplat
   , Benchmark "softmax"                    runSoftmax
   , Benchmark "coo_spmv"                   runCooSpmv
+  , Benchmark "stencil_interior"           runStencilInterior
+  , Benchmark "jacobi_2d"                  runJacobi2D
   ]
 
 runAllBenchmarks :: IO ()
@@ -351,6 +353,22 @@ voxelTrilinearSplatKernel n nx ny nz keepPeriod =
        (\(I1 i) -> A.cond (keep A.! I1 i) (Just_ (I1 (idxs A.! I1 i))) Nothing_)
        weights
 
+-- | 5-point Laplacian using Accelerate's native stencil combinator with
+-- clamped boundary.  Matches stencil_interior.hyd and stencil_2d.hyd.
+stencilInteriorKernel :: Acc (Matrix Double) -> Acc (Matrix Double)
+stencilInteriorKernel = A.stencil step A.clamp
+  where
+    step ((_, n, _), (w', c, e), (_, s, _)) =
+      n + s + w' + e + c * (-4.0 :: A.Exp Double)
+
+-- | Averaging Jacobi stencil using Accelerate's native stencil combinator with
+-- clamped boundary.  Matches jacobi_2d.hyd: output = avg of 4 neighbours.
+avgJacobiKernel :: Acc (Matrix Double) -> Acc (Matrix Double)
+avgJacobiKernel = A.stencil step A.clamp
+  where
+    step ((_, n, _), (w', _, e), (_, s, _)) =
+      (n + s + w' + e) * (0.25 :: A.Exp Double)
+
 -- | COO sparse matrix-vector multiply via A.permute scatter-add.
 cooSpmvKernel
   :: Int
@@ -483,6 +501,27 @@ runVoxelTrilinearSplat = do
   let result = CPU.run $ voxelTrilinearSplatKernel n nx ny nz keepPeriod
   print (Prelude.sum (A.toList result) :: Double)
 
+runStencilInterior :: IO ()
+runStencilInterior = do
+  h <- readEnvInt "STENCIL_H"
+  w <- readEnvInt "STENCIL_W"
+  input <- toAccelMat h w <$> readCSVDoubles "bench/stencil/input.csv"
+  let result = CPU.runN stencilInteriorKernel input
+  print (Prelude.sum (A.toList result) :: Double)
+
+runJacobi2D :: IO ()
+runJacobi2D = do
+  h      <- readEnvInt "JACOBI_H"
+  w      <- readEnvInt "JACOBI_W"
+  nIters <- readEnvInt "JACOBI_ITERS"
+  let step    = CPU.runN avgJacobiKernel
+      initial = A.fromList (Z :. h :. w) (Prelude.replicate (h * w) (1.0 :: Double))
+      result  = go step nIters initial
+  print (Prelude.sum (A.toList result) :: Double)
+  where
+    go _ 0 arr = arr
+    go step n arr = go step (n - 1) (step arr)
+
 -- ---------------------------------------------------------------------------
 -- Timed variants
 -- ---------------------------------------------------------------------------
@@ -501,6 +540,8 @@ runBenchmarkByNameTimed opts name = case name of
   "voxel_trilinear_splat"      -> timedVoxelTrilinearSplat opts
   "softmax"                    -> timedSoftmax opts
   "coo_spmv"                   -> timedCooSpmv opts
+  "stencil_interior"           -> timedStencilInterior opts
+  "jacobi_2d"                  -> timedJacobi2D opts
   _ -> die $ "no timed harness for benchmark: " ++ name
 
 timedBlackScholes :: TimingOptions -> IO ()
@@ -641,3 +682,29 @@ timedCooSpmv opts = runTimingHarness "main" opts load run sumAllDoubles
       pure (nrows, rowIdx, colIdx, values, x)
     run (nrows, rowIdx, colIdx, values, x) =
       CPU.run $ cooSpmvKernel nrows rowIdx colIdx values x
+
+timedStencilInterior :: TimingOptions -> IO ()
+timedStencilInterior opts = do
+  let step = CPU.runN stencilInteriorKernel
+  runTimingHarness "main" opts load (run step) sumAllDoubles2D
+  where
+    load = do
+      h     <- readEnvInt "STENCIL_H"
+      w     <- readEnvInt "STENCIL_W"
+      toAccelMat h w <$> readCSVDoubles "bench/stencil/input.csv"
+    run step input = step input
+
+timedJacobi2D :: TimingOptions -> IO ()
+timedJacobi2D opts = do
+  let step = CPU.runN avgJacobiKernel
+  runTimingHarness "main" opts load (run step) sumAllDoubles2D
+  where
+    load = do
+      h      <- readEnvInt "JACOBI_H"
+      w      <- readEnvInt "JACOBI_W"
+      nIters <- readEnvInt "JACOBI_ITERS"
+      let initial = A.fromList (Z :. h :. w) (Prelude.replicate (h * w) (1.0 :: Double))
+      pure (nIters, initial)
+    run step (nIters, initial) = go step nIters initial
+    go _ 0 arr = arr
+    go step n arr = go step (n - 1) (step arr)

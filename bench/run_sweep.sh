@@ -89,6 +89,20 @@ for bname in blackscholes nbody mandelbrot spmv matmul \
   [ -n "$BENCH_FILTER" ] && [ "$bname" != "$BENCH_FILTER" ] && continue
   build_c "$bname" 2>/dev/null || true
 done
+# stencil_interior C ref has non-standard directory layout
+for _stencil_variant in stencil_interior jacobi_2d; do
+  if [ -z "$BENCH_FILTER" ] || [ "$BENCH_FILTER" = "$_stencil_variant" ]; then
+    _sv_bin="$REPO_ROOT/bench/stencil/${_stencil_variant}_ref"
+    _sv_src="$REPO_ROOT/bench/stencil/${_stencil_variant}_ref.c"
+    if [ -f "$_sv_src" ] && ([ ! -x "$_sv_bin" ] || [ "$_sv_src" -nt "$_sv_bin" ]); then
+      echo "  Building C reference: $_stencil_variant" >&2
+      "$BENCH_CC" -O3 -march=native -fopenmp -std=c11 -lm \
+        -I "$REPO_ROOT/bench/c_bench" \
+        "$_sv_src" -o "$_sv_bin" 2>/dev/null || \
+        echo "  WARNING: C build failed for $_stencil_variant" >&2
+    fi
+  fi
+done
 
 # ---- Utility functions -----------------------------------------------------
 
@@ -113,6 +127,9 @@ gen_inputs() {
           "$REPO_ROOT/bench/matmul/gen_mats.c"
       "$REPO_ROOT/bench/matmul/gen_mats" "$MAT_M" "$MAT_K" "$REPO_ROOT/bench/matmul/matA.csv"
       "$REPO_ROOT/bench/matmul/gen_mats" "$MAT_K" "$MAT_N" "$REPO_ROOT/bench/matmul/matB.csv" ;;
+    stencil_interior)
+      python3 "$REPO_ROOT/bench/stencil/gen_input.py" \
+        "$STENCIL_H" "$STENCIL_W" "$REPO_ROOT/bench/stencil/input.csv" >/dev/null ;;
   esac
 }
 
@@ -304,12 +321,60 @@ sweep_voxel_trilinear_splat() {
   done
 }
 
+sweep_stencil_interior() {
+  local csv="$REPO_ROOT/bench/results/stencil_interior.csv"
+  echo "  stencil_interior → $csv" >&2
+  echo "size,hydrangea_ms,repa_ms,c_ms" > "$csv"
+  local stencil_ref_bin="$REPO_ROOT/bench/stencil/stencil_interior_ref"
+  for n in 64 128 256 384 512 768 1024 1536 2048 3072; do
+    export STENCIL_H=$n STENCIL_W=$n
+    python3 "$REPO_ROOT/bench/stencil/gen_input.py" \
+      "$n" "$n" "$REPO_ROOT/bench/stencil/input.csv" >/dev/null
+    local hyd repa c
+    hyd=$(run_hydrangea stencil stencil_interior.hyd main "")
+    repa=$(run_repa stencil_interior)
+    if [ -x "$stencil_ref_bin" ]; then
+      c=$(BENCH_WARMUP="$WARMUP" BENCH_ITERS="$ITERS" \
+        "$stencil_ref_bin" 2>/dev/null | parse_min_ms) || true
+      c="${c:-N/A}"
+    else
+      c="N/A"
+    fi
+    echo "$n,$hyd,$repa,$c" >> "$csv"
+    echo "    size=$n done" >&2
+  done
+}
+
+sweep_jacobi_2d() {
+  local csv="$REPO_ROOT/bench/results/jacobi_2d.csv"
+  echo "  jacobi_2d → $csv" >&2
+  echo "size,hydrangea_ms,repa_ms,c_ms" > "$csv"
+  local jacobi_ref_bin="$REPO_ROOT/bench/stencil/jacobi_2d_ref"
+  export JACOBI_ITERS=50
+  for n in 64 128 256 384 512 768 1024 1536 2048; do
+    export JACOBI_H=$n JACOBI_W=$n
+    local hyd repa c
+    hyd=$(run_hydrangea stencil jacobi_2d.hyd main "")
+    repa=$(run_repa jacobi_2d)
+    if [ -x "$jacobi_ref_bin" ]; then
+      c=$(BENCH_WARMUP="$WARMUP" BENCH_ITERS="$ITERS" \
+        "$jacobi_ref_bin" 2>/dev/null | parse_min_ms) || true
+      c="${c:-N/A}"
+    else
+      c="N/A"
+    fi
+    echo "$n,$hyd,$repa,$c" >> "$csv"
+    echo "    size=$n done" >&2
+  done
+}
+
 # ---- Dispatch --------------------------------------------------------------
 
 ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
+  stencil_interior jacobi_2d
 )
 
 echo "Running size sweep (results → bench/results/)..." >&2
@@ -328,6 +393,8 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
     graph_messages)           sweep_graph_messages ;;
     voxel_rasterization)      sweep_voxel_rasterization ;;
     voxel_trilinear_splat)    sweep_voxel_trilinear_splat ;;
+    stencil_interior)         sweep_stencil_interior ;;
+    jacobi_2d)                sweep_jacobi_2d ;;
   esac
 done
 

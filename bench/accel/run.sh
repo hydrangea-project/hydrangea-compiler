@@ -42,6 +42,7 @@ BENCHES=(
   voxel_trilinear_splat
   softmax
   coo_spmv
+  stencil_interior
 )
 
 csv_len() {
@@ -161,6 +162,13 @@ for bench in "${BENCHES[@]}"; do
     voxel_trilinear_splat)
       VSPLAT_POINTS="$VSPLAT_POINTS" VSPLAT_NX="$VSPLAT_NX" VSPLAT_NY="$VSPLAT_NY" \
       VSPLAT_NZ="$VSPLAT_NZ" VSPLAT_KEEP_PERIOD="$VSPLAT_KEEP_PERIOD" \
+        cabal run --project-file="$PROJECT" exe:accel-bench -- "$bench" ;;
+    stencil_interior)
+      STENCIL_H="${STENCIL_H:-512}" STENCIL_W="${STENCIL_W:-512}" \
+        cabal run --project-file="$PROJECT" exe:accel-bench -- "$bench" ;;
+    jacobi_2d)
+      JACOBI_H="${JACOBI_H:-256}" JACOBI_W="${JACOBI_W:-256}" \
+      JACOBI_ITERS="${JACOBI_ITERS:-50}" \
         cabal run --project-file="$PROJECT" exe:accel-bench -- "$bench" ;;
   esac
 done

@@ -25,6 +25,8 @@ import Hydrangea.RepaBench.Harness
 import Control.Monad (forM_, when)
 import Control.Monad.ST (runST)
 import Data.Array.Repa qualified as R
+import Data.Array.Repa.Stencil (makeStencil, Stencil, Boundary(..))
+import Data.Array.Repa.Stencil.Dim2 (mapStencil2)
 import Data.Function (on)
 import Data.List (groupBy, sortOn, zip4)
 import Data.Map.Strict qualified as M
@@ -73,6 +75,8 @@ benchmarks =
   , Benchmark "voxel_trilinear_splat" runVoxelTrilinearSplat
   , Benchmark "softmax" runSoftmax
   , Benchmark "coo_spmv" runCooSpmv
+  , Benchmark "stencil_interior" runStencilInterior
+  , Benchmark "jacobi_2d" runJacobi2D
   ]
 
 runAllBenchmarks :: IO ()
@@ -741,6 +745,42 @@ voxelTrilinearSplatKernelMut n nx ny nz keepPeriod =
     contribs = n * 8
     size = nx * ny * nz
 
+-- | 5-point Laplacian stencil using Repa's native mapStencil2 combinator with
+-- clamped boundary.  Matches stencil_interior.hyd and stencil_2d.hyd.
+laplacianSt :: Stencil R.DIM2 Double
+laplacianSt = makeStencil (R.Z R.:. 3 R.:. 3) $ \(R.Z R.:. i R.:. j) -> case (i, j) of
+  (-1,  0) -> Just   1.0
+  ( 1,  0) -> Just   1.0
+  ( 0, -1) -> Just   1.0
+  ( 0,  1) -> Just   1.0
+  ( 0,  0) -> Just (-4.0)
+  _        -> Nothing
+
+stencilInteriorKernel :: Int -> Int -> R.Array R.U R.DIM2 Double -> IO (R.Array R.U R.DIM2 Double)
+stencilInteriorKernel _ _ input =
+  R.computeUnboxedP $ mapStencil2 BoundClamp laplacianSt input
+
+-- | Averaging Jacobi stencil using Repa's native mapStencil2 combinator with
+-- clamped boundary.  Matches jacobi_2d.hyd: output = avg of 4 neighbours.
+avgJacobiSt :: Stencil R.DIM2 Double
+avgJacobiSt = makeStencil (R.Z R.:. 3 R.:. 3) $ \(R.Z R.:. i R.:. j) -> case (i, j) of
+  (-1,  0) -> Just 0.25
+  ( 1,  0) -> Just 0.25
+  ( 0, -1) -> Just 0.25
+  ( 0,  1) -> Just 0.25
+  _        -> Nothing
+
+jacobi2DKernel
+  :: Int -> Int -> Int
+  -> R.Array R.U R.DIM2 Double
+  -> IO (R.Array R.U R.DIM2 Double)
+jacobi2DKernel _ _ nIters initial = go nIters initial
+  where
+    go 0 arr = pure arr
+    go n arr = do
+      arr' <- R.computeUnboxedP $ mapStencil2 BoundClamp avgJacobiSt arr
+      go (n - 1) arr'
+
 runBlackScholes :: IO ()
 runBlackScholes = do
   n <- readEnvInt "BS_N"
@@ -869,6 +909,23 @@ runVoxelTrilinearSplat = do
   let result = voxelTrilinearSplatKernel n nx ny nz keepPeriod
   print (R.sumAllS result)
 
+runStencilInterior :: IO ()
+runStencilInterior = do
+  h <- readEnvInt "STENCIL_H"
+  w <- readEnvInt "STENCIL_W"
+  input <- matFromVector h w <$> readCSVDoubles "bench/stencil/input.csv"
+  result <- stencilInteriorKernel h w input
+  print (R.sumAllS result)
+
+runJacobi2D :: IO ()
+runJacobi2D = do
+  h      <- readEnvInt "JACOBI_H"
+  w      <- readEnvInt "JACOBI_W"
+  nIters <- readEnvInt "JACOBI_ITERS"
+  let initial = R.computeUnboxedS $ R.fromFunction (R.Z R.:. h R.:. w) (const 1.0)
+  result <- jacobi2DKernel h w nIters initial
+  print (R.sumAllS result)
+
 -- ---------------------------------------------------------------------------
 -- Timed variants: one per benchmark, using the timing harness
 -- ---------------------------------------------------------------------------
@@ -886,6 +943,8 @@ runBenchmarkByNameTimed opts name = case name of
   "graph_messages"             -> timedGraphMessages opts
   "voxel_rasterization"        -> timedVoxelRasterization opts
   "voxel_trilinear_splat"      -> timedVoxelTrilinearSplat opts
+  "stencil_interior"           -> timedStencilInterior opts
+  "jacobi_2d"                  -> timedJacobi2D opts
   _ -> die $ "no timed harness for benchmark: " ++ name
 
 timedBlackScholes :: TimingOptions -> IO ()
@@ -1006,3 +1065,24 @@ timedVoxelTrilinearSplat opts = runTimingHarness "main" opts load run R.sumAllS
       kp   <- readEnvInt "VSPLAT_KEEP_PERIOD"
       pure (n, nx, ny, nz, kp)
     run (n, nx, ny, nz, kp) = voxelTrilinearSplatKernel n nx ny nz kp
+
+timedStencilInterior :: TimingOptions -> IO ()
+timedStencilInterior opts = runTimingHarnessIO "main" opts load run R.sumAllS
+  where
+    load = do
+      h <- readEnvInt "STENCIL_H"
+      w <- readEnvInt "STENCIL_W"
+      input <- matFromVector h w <$> readCSVDoubles "bench/stencil/input.csv"
+      pure (h, w, input)
+    run (h, w, input) = stencilInteriorKernel h w input
+
+timedJacobi2D :: TimingOptions -> IO ()
+timedJacobi2D opts = runTimingHarnessIO "main" opts load run R.sumAllS
+  where
+    load = do
+      h      <- readEnvInt "JACOBI_H"
+      w      <- readEnvInt "JACOBI_W"
+      nIters <- readEnvInt "JACOBI_ITERS"
+      let initial = R.computeUnboxedS $ R.fromFunction (R.Z R.:. h R.:. w) (const 1.0)
+      pure (h, w, nIters, initial)
+    run (h, w, nIters, initial) = jacobi2DKernel h w nIters initial

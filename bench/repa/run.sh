@@ -19,6 +19,7 @@ BENCHES=(
   voxel_trilinear_splat
   softmax
   coo_spmv
+  stencil_interior
 )
 
 csv_len() {
@@ -115,5 +116,7 @@ for bench in "${BENCHES[@]}"; do
     graph_messages) GRAPH_NODES="$GRAPH_NODES" GRAPH_DEGREE="$GRAPH_DEGREE" cabal run --project-file="$PROJECT" exe:repa-bench -- "$bench" ;;
     voxel_rasterization) VOX_POINTS="$VOX_POINTS" VOX_NX="$VOX_NX" VOX_NY="$VOX_NY" VOX_NZ="$VOX_NZ" VOX_KEEP_PERIOD="$VOX_KEEP_PERIOD" cabal run --project-file="$PROJECT" exe:repa-bench -- "$bench" ;;
     voxel_trilinear_splat) VSPLAT_POINTS="$VSPLAT_POINTS" VSPLAT_NX="$VSPLAT_NX" VSPLAT_NY="$VSPLAT_NY" VSPLAT_NZ="$VSPLAT_NZ" VSPLAT_KEEP_PERIOD="$VSPLAT_KEEP_PERIOD" cabal run --project-file="$PROJECT" exe:repa-bench -- "$bench" ;;
+    stencil_interior) STENCIL_H="${STENCIL_H:-512}" STENCIL_W="${STENCIL_W:-512}" cabal run --project-file="$PROJECT" exe:repa-bench -- "$bench" ;;
+    jacobi_2d) JACOBI_H="${JACOBI_H:-256}" JACOBI_W="${JACOBI_W:-256}" JACOBI_ITERS="${JACOBI_ITERS:-50}" cabal run --project-file="$PROJECT" exe:repa-bench -- "$bench" ;;
   esac
 done
