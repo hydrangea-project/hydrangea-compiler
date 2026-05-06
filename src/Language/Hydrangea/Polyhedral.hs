@@ -326,6 +326,7 @@ data WavefrontKernel = WavefrontKernel
   , wfkNextArray :: CVar
   , wfkAllocShape :: Atom
   , wfkPreallocatedNext :: Bool
+  , wfkInitTracker :: Maybe CVar
   , wfkHoistedPrefix :: [Stmt]
   , wfkStageSuffix :: [Stmt]
   , wfkInnerSpec :: LoopSpec
@@ -2594,13 +2595,17 @@ matchWavefrontKernel2 scheduled = do
       { wfkIterT = iterT
       , wfkIterBound = outerBound
       , wfkCurArray = curVar
-      , wfkNextArray = nextVar
-      , wfkAllocShape = allocShape
-      , wfkPreallocatedNext = preallocatedNext
-      , wfkHoistedPrefix = prefixWithoutAlloc
-      , wfkStageSuffix = stageSuffix
-      , wfkInnerSpec = innerSpec
-      , wfkInnerBody = innerBody
+       , wfkNextArray = nextVar
+       , wfkAllocShape = allocShape
+       , wfkPreallocatedNext = preallocatedNext
+       , wfkInitTracker =
+           if preallocatedNext
+             then Just (curVar <> "__iter_init_track")
+             else Nothing
+       , wfkHoistedPrefix = prefixWithoutAlloc
+       , wfkStageSuffix = stageSuffix
+       , wfkInnerSpec = innerSpec
+       , wfkInnerBody = innerBody
       , wfkSkewCoeff = coeff
       , wfkStageWidth = stageWidth
       , wfkStageExec = stageExec
@@ -2693,6 +2698,7 @@ buildWavefrontBody2 kernel = do
       [2 .. wfkStageWidth kernel]
   let stageBuffers = [wfkCurArray kernel, wfkNextArray kernel] ++ extraBuffers
   rotations <- buildWavefrontRotation2 stageBuffers (smdTileLen timeBlock)
+  stageCases <- buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars
   extraShapeVar <- freshLike (wfkCurArray kernel) "__wf_shape"
   let (extraShapeSetup, allocTargets) =
         if wfkPreallocatedNext kernel
@@ -2727,7 +2733,7 @@ buildWavefrontBody2 kernel = do
             , lsRed = Nothing
             , lsRole = LoopMap
             }
-          (buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars)
+          stageCases
       diagLoop =
         SLoop
           LoopSpec
@@ -2754,11 +2760,31 @@ buildWavefrontBody2 kernel = do
               ++ [diagLoop]
               ++ rotations
           )
-      cleanup =
-        [ SAssign "__hyd_discard" (RArrayFree (AVar arr))
-        | arr <- drop 1 stageBuffers
-        ]
+      cleanupTargets =
+        if wfkPreallocatedNext kernel
+          then extraBuffers
+          else drop 1 stageBuffers
+  cleanup <- fmap concat (mapM (buildWavefrontCleanup2 kernel) cleanupTargets)
   pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
+
+buildWavefrontCleanup2 :: WavefrontKernel -> CVar -> TileM [Stmt]
+buildWavefrontCleanup2 kernel arr = do
+  notCurVar <- freshLike arr "__wf_free_not_cur"
+  case wfkInitTracker kernel of
+    Nothing ->
+      pure
+        [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
+        , SIf (AVar notCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
+        ]
+    Just initTrackerVar -> do
+      notInitVar <- freshLike arr "__wf_free_not_init"
+      freeVar <- freshLike arr "__wf_free"
+      pure
+        [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
+        , SAssign notInitVar (RBinOp CNeq (AVar arr) (AVar initTrackerVar))
+        , SAssign freeVar (RBinOp CAnd (AVar notCurVar) (AVar notInitVar))
+        , SIf (AVar freeVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
+        ]
 
 matchWavefrontTail2 :: [Stmt] -> Maybe ([Stmt], CVar, CVar, Bool)
 matchWavefrontTail2 suffix = case reverse suffix of
@@ -2790,32 +2816,55 @@ buildWavefrontStageCases2
   -> CVar
   -> [CVar]
   -> [CVar]
-  -> [Stmt]
+  -> TileM [Stmt]
 buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars =
-  concatMap buildOne (zip3 [0 :: Integer ..] stageBuffers stageTimeVars)
+  fmap concat (mapM buildOne (zip3 [0 :: Integer ..] stageBuffers stageTimeVars))
   where
     buildOne (slotIx, curBuf, timeVar) =
       case atMay stageBuffers (fromIntegral slotIx + 1) of
         Nothing ->
-          []
+          pure []
         Just nextBuf ->
-          let eqVar = stageIter <> "__eq_" <> BS.pack (show slotIx)
-              substEnv =
-                M.fromList
-                  [ (wfkCurArray kernel, AVar curBuf)
-                  , (wfkNextArray kernel, AVar nextBuf)
-                  , (wfkIterT kernel, AVar timeVar)
-                  ]
-              stageBody =
-                collapseWavefrontInnerLoop2
-                  diagIter
-                  (wfkInnerSpec kernel)
-                  (substStmts2 substEnv (wfkInnerBody kernel))
-                ++ substStmts2 substEnv (wfkStageSuffix kernel)
-           in
-             [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
-             , SIf (AVar eqVar) stageBody []
-             ]
+          do
+            let eqVar = stageIter <> "__eq_" <> BS.pack (show slotIx)
+                substEnv =
+                  M.fromList
+                    [ (wfkCurArray kernel, AVar curBuf)
+                    , (wfkNextArray kernel, AVar nextBuf)
+                    , (wfkIterT kernel, AVar timeVar)
+                    ]
+                innerBody =
+                  collapseWavefrontInnerLoop2
+                    diagIter
+                    (wfkInnerSpec kernel)
+                    (substStmts2 substEnv (wfkInnerBody kernel))
+                suffixBody = substStmts2 substEnv (wfkStageSuffix kernel)
+            guardedInner <- buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody
+            pure
+              [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
+              , SIf (AVar eqVar) (guardedInner ++ suffixBody) []
+              ]
+
+buildWavefrontInnerGuard2 :: WavefrontKernel -> CVar -> CVar -> [Stmt] -> TileM [Stmt]
+buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody = do
+  let originExpr =
+        simplifyIndexExpr $
+          IMul (IConst (wfkSkewCoeff kernel)) (IVar timeVar)
+      upperExpr = IAdd originExpr (wavefrontHeadBound2 (wfkInnerSpec kernel))
+  (lowerSetup, lowerAtom) <- indexExprToAtom originExpr
+  (upperSetup, upperAtom) <- indexExprToAtom upperExpr
+  geVar <- freshLike diagIter "__wf_valid_ge"
+  ltVar <- freshLike diagIter "__wf_valid_lt"
+  validVar <- freshLike diagIter "__wf_valid"
+  pure
+    ( lowerSetup
+        ++ upperSetup
+        ++ [ SAssign geVar (RBinOp CGe (AVar diagIter) lowerAtom)
+           , SAssign ltVar (RBinOp CLt (AVar diagIter) upperAtom)
+           , SAssign validVar (RBinOp CAnd (AVar geVar) (AVar ltVar))
+           , SIf (AVar validVar) innerBody []
+           ]
+    )
 
 buildWavefrontRotation2 :: [CVar] -> CVar -> TileM [Stmt]
 buildWavefrontRotation2 ringVars blockLenVar = do

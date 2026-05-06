@@ -282,6 +282,23 @@ spec = do
           , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
           ])
 
+    it "compiles and runs polyhedral 1D iterate stencil clamp and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = False
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let init = generate [5] (let f [i] = 1.0 in f)"
+          , "let step arr = stencil clamp"
+          , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
+          , "  arr"
+          , "let result = iterate 3 init step"
+          ])
+
     it "compiles and runs polyhedral constant-boundary stencil kernels and matches the interpreter" $ withCC $
       checkInlineSrcWithOptions
         defaultInferOptions

@@ -404,12 +404,28 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
          , Map ByteString (Atom, Atom)
          )
     killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv =
-      ( M.delete x env
+      ( M.filter (not . atomDependsOn env x) (M.delete x env)
       , M.delete x tupEnv
       , M.filter (/= x) callEnv
       , M.filter (/= x) shapeEnv
       , M.delete x flatToNdEnv
       )
+
+    atomDependsOn :: Map ByteString Atom -> ByteString -> Atom -> Bool
+    atomDependsOn env0 target = depends S.empty
+      where
+        depends seen atom@(AVar v)
+          | atomUsesTarget atom = True
+          | v `S.member` seen = False
+          | otherwise = case M.lookup v env0 of
+              Just nextAtom -> depends (S.insert v seen) nextAtom
+              Nothing -> False
+        depends _ atom = atomUsesTarget atom
+
+        atomUsesTarget :: Atom -> Bool
+        atomUsesTarget atom = case atom of
+          AVar v -> v == target
+          _ -> False
 
     introducesCopyCycle :: ByteString -> Atom -> Map ByteString Atom -> Bool
     introducesCopyCycle x atom env = case atom of
@@ -788,6 +804,9 @@ restructureIterateBody spec body = do
             tmpVar = nextVar <> "__iter_tmp"
             initTrackerVar = curVar <> "__iter_init_track"
             condFreeVar = curVar <> "__iter_cond"
+            nextNotCurVar = nextVar <> "__iter_cleanup_not_cur"
+            nextNotInitVar = nextVar <> "__iter_cleanup_not_init"
+            nextFreeVar = nextVar <> "__iter_cleanup_cond"
             initSave = SAssign tmpVar (RAtom (AVar curVar))
             initTracker = SAssign initTrackerVar (RAtom (AVar curVar))
             pingSwap =
@@ -798,6 +817,10 @@ restructureIterateBody spec body = do
             condFree =
               [ SAssign condFreeVar (RBinOp CNeq (AVar curVar) (AVar initTrackerVar))
               , SIf (AVar condFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar initTrackerVar))] []
+              , SAssign nextNotCurVar (RBinOp CNeq (AVar nextVar) (AVar curVar))
+              , SAssign nextNotInitVar (RBinOp CNeq (AVar nextVar) (AVar initTrackerVar))
+              , SAssign nextFreeVar (RBinOp CAnd (AVar nextNotCurVar) (AVar nextNotInitVar))
+              , SIf (AVar nextFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar nextVar))] []
               ]
             newBody = computeBody ++ pingSwap
             newLoop = SLoop spec newBody

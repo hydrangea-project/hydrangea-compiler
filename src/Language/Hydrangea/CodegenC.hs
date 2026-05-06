@@ -1492,7 +1492,7 @@ arrayVarsProc2 (C2.Proc {C2.procBody = body}) = arrayVarsStmts2 body
 
 localArrayVarsProc2 :: Map CVar CType -> C2.Proc -> Set CVar
 localArrayVarsProc2 typeEnv (C2.Proc {C2.procBody = body}) =
-  rawLocals `S.difference` consumedByArrayPair
+  rawLocals `S.difference` consumedByArrayPair `S.difference` explicitlyFreedLocals
   where
     rawLocals =
       S.fromList
@@ -1515,6 +1515,17 @@ localArrayVarsProc2 typeEnv (C2.Proc {C2.procBody = body}) =
           ct == CEArray,
           AVar v <- [a]
         ]
+    explicitlyFreedLocals =
+      rawLocals `S.intersection` explicitlyFreedArrayVarsStmts2 body
+
+explicitlyFreedArrayVarsStmts2 :: [C2.Stmt] -> Set CVar
+explicitlyFreedArrayVarsStmts2 = foldMap go
+  where
+    go stmt = case stmt of
+      C2.SAssign "__hyd_discard" (RArrayFree (AVar v)) -> S.singleton v
+      C2.SLoop _ inner -> explicitlyFreedArrayVarsStmts2 inner
+      C2.SIf _ thn els -> explicitlyFreedArrayVarsStmts2 thn `S.union` explicitlyFreedArrayVarsStmts2 els
+      _ -> S.empty
 
 -- | Emit frees for the non-returned array component(s) of any pair-of-arrays
 -- variable whose one component is the returned atom.  This handles the case

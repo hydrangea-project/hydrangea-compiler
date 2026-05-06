@@ -52,6 +52,18 @@ spec = do
         [_assignN, SLoop spec _] -> lsBounds spec `shouldBe` [IConst 4]
         _ -> expectationFailure "Expected loop after copy propagation"
 
+    it "invalidates stale aliases when a copied source is reassigned" $ do
+      let stmts =
+            [ SAssign "cur" (RAtom (AVar "next"))
+            , SAssign "next" (RAtom (AVar "tmp"))
+            , SAssign "tmp" (RAtom (AVar "cur"))
+            ]
+      copyProp2 stmts `shouldBe`
+        [ SAssign "cur" (RAtom (AVar "next"))
+        , SAssign "next" (RAtom (AVar "tmp"))
+        , SAssign "tmp" (RAtom (AVar "cur"))
+        ]
+
   describe "CFGOpt - Dead Assignment Elimination" $ do
     it "removes unused pure assignments" $ do
       let stmts = [ SAssign "x" (RAtom (AInt 5))
@@ -284,6 +296,27 @@ spec = do
           result = optimizeStmts2 stmts
       -- Should converge to minimal form (1-2 statements)
       length result `shouldSatisfy` (<= 2)
+
+    it "preserves hoisted iterate ping-pong swaps under optimization" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
+          stmts =
+            [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
+            , SAssign "arr_next" (RArrayAlloc (AVar "shp"))
+            , SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_cur"))
+            , SLoop loopSpec
+                [ SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+                , SAssign "arr_cur" (RAtom (AVar "arr_next"))
+                , SAssign "arr_next" (RAtom (AVar "arr_next__iter_tmp"))
+                , SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_cur"))
+                ]
+            ]
+          result = optimizeStmts2 stmts
+          hasBadSelfAssign stmt = case stmt of
+            SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_next__iter_tmp")) -> True
+            SLoop _ body -> any hasBadSelfAssign body
+            SIf _ thn els -> any hasBadSelfAssign thn || any hasBadSelfAssign els
+            _ -> False
+      any hasBadSelfAssign result `shouldBe` False
 
     it "eliminates duplicate pure math unary ops" $ do
       let stmts = [ SAssign "x" (RUnOp CSqrt (AVar "t"))

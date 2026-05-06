@@ -1443,7 +1443,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
         countWavefrontRingAllocsInStmts (procBody rewritten) `shouldBe` 1
-        length [() | SAssign "__hyd_discard" (C.RArrayFree _) <- procBody rewritten] `shouldSatisfy` (>= 1)
+        countArrayFreesInStmts (procBody rewritten) `shouldSatisfy` (>= 1)
       other ->
         expectationFailure ("expected one proc, got: " <> show other)
 
@@ -1502,7 +1502,8 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
-        length [() | SAssign "__hyd_discard" (C.RArrayFree _) <- procBody rewritten] `shouldSatisfy` (>= 1)
+        countArrayFreesInStmts (procBody rewritten) `shouldSatisfy` (>= 1)
+        countNamedArrayFreesInStmts "arr_next" (procBody rewritten) `shouldBe` 0
       other ->
         expectationFailure ("expected one proc, got: " <> show other)
 
@@ -1562,5 +1563,28 @@ countWavefrontRingAllocsInStmts = sum . map go
         countWavefrontRingAllocsInStmts body
       SIf _ thn els ->
         countWavefrontRingAllocsInStmts thn + countWavefrontRingAllocsInStmts els
+      _ ->
+        0
+
+countArrayFreesInStmts :: [Stmt] -> Int
+countArrayFreesInStmts = sum . map go
+  where
+    go stmt = case stmt of
+      SAssign "__hyd_discard" (C.RArrayFree _) -> 1
+      SLoop _ body -> countArrayFreesInStmts body
+      SIf _ thn els -> countArrayFreesInStmts thn + countArrayFreesInStmts els
+      _ -> 0
+
+countNamedArrayFreesInStmts :: C.CVar -> [Stmt] -> Int
+countNamedArrayFreesInStmts target = sum . map go
+  where
+    go stmt = case stmt of
+      SAssign "__hyd_discard" (C.RArrayFree (C.AVar v))
+        | v == target ->
+            1
+      SLoop _ body ->
+        countNamedArrayFreesInStmts target body
+      SIf _ thn els ->
+        countNamedArrayFreesInStmts target thn + countNamedArrayFreesInStmts target els
       _ ->
         0
