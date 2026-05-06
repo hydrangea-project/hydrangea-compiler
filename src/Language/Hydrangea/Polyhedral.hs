@@ -2577,7 +2577,6 @@ matchWavefrontKernel2 scheduled = do
     )
   guard (not (usesVar2 iterT prefixWithoutAlloc))
   guard (not (usesVar2 nextVar prefixWithoutAlloc))
-  guard (null stageSuffix || length (lsIters innerSpec) == 1)
   guard (all (\iter -> not (usesVar2 iter stageSuffix)) (lsIters innerSpec))
   stageWidth <- chooseWavefrontStageWidth2 outerBound innerSpec
   let headIter = wavefrontHeadIter2 innerSpec

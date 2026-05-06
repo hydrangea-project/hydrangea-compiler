@@ -230,9 +230,21 @@ spec = describe "Polyhedral" $ do
           , "let step = fn arr => stencil clamp"
           , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
           , "  arr"
-          , "let result = iterate 3 init step"
-          ])
+           , "let result = iterate 3 init step"
+           ])
     hasParallelLoopInStmts body `shouldBe` True
+
+  it "collapses source-level 2D clamp iterate kernels into the wavefront path" $ do
+    body <-
+      loadPolyhedralProcBodyFromSource
+        "result"
+        (BS.pack $ unlines
+          [ "let step arr = stencil clamp"
+          , "  (let acc_fn acc = (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1) /. 4.0 in acc_fn)"
+          , "  arr"
+          , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
+          ])
+    countWavefrontRingAllocsInStmts body `shouldSatisfy` (> 0)
 
   it "extracts and reifies tile-count style ceil-div bounds" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
