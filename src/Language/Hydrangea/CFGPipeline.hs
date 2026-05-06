@@ -134,6 +134,24 @@ cleanupProgram (Program procs) =
     | proc <- procs
     ]
 
+serializeParallelStmts :: [Stmt] -> [Stmt]
+serializeParallelStmts = map go
+  where
+    go stmt = case stmt of
+      SLoop spec body ->
+        let exec' = case lsExec spec of
+              Parallel {} -> Serial
+              other -> other
+        in SLoop spec { lsExec = exec' } (serializeParallelStmts body)
+      SIf cond thn els ->
+        SIf cond (serializeParallelStmts thn) (serializeParallelStmts els)
+      other ->
+        other
+
+serializeParallelProgram :: Program -> Program
+serializeParallelProgram (Program procs) =
+  Program [proc { procBody = serializeParallelStmts (procBody proc) } | proc <- procs]
+
 -- | Optimization-only pipeline.
 optimizePipeline2 :: [Stmt] -> [Stmt]
 optimizePipeline2 = optimizePipelineWithTiling True
@@ -176,10 +194,13 @@ vectorizePipelineWithOptions opts prog =
         | otherwise = applyHoist prepared
       applyHoist (Program procs) =
         Program [proc { procBody = hoistIterateAllocs2 (procBody proc) } | proc <- procs]
+      optimizedNoParallel
+        | poEnableParallelization opts = optimized
+        | otherwise = serializeParallelProgram optimized
   in  vectorizeProgram2WithWidthAndExplicit
         (poVectorWidth opts)
         (poEnableExplicitVectorization opts)
-        optimized
+        optimizedNoParallel
 
 -- | Run optimization followed by vectorization using the given SIMD lane width.
 vectorizePipelineWithWidth :: Int -> Program -> Program

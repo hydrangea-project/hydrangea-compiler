@@ -4,6 +4,7 @@ module Language.Hydrangea.PolyhedralSpec (spec) where
 
 import Control.Applicative ((<|>))
 import Data.ByteString.Lazy.Char8 qualified as BS
+import Data.List (isInfixOf)
 import Data.Map.Strict qualified as Map
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGPipeline
@@ -216,9 +217,22 @@ spec = describe "Polyhedral" $ do
             , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
             , "  arr"
             , "let result = iterate 3 init step"
-            ]
+             ]
     extractedProcNames diagnostics `shouldSatisfy` elem "result"
     rejectedProcNames diagnostics `shouldNotContain` ["result"]
+
+  it "collapses source-level 1D clamp iterate kernels into the wavefront path" $ do
+    body <-
+      loadPolyhedralProcBodyFromSource
+        "result"
+        (BS.pack $ unlines
+          [ "let init = generate [5] (fn [i] => 1.0)"
+          , "let step = fn arr => stencil clamp"
+          , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
+          , "  arr"
+          , "let result = iterate 3 init step"
+          ])
+    hasParallelLoopInStmts body `shouldBe` True
 
   it "extracts and reifies tile-count style ceil-div bounds" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
@@ -759,10 +773,33 @@ loadPreparedDiagnosticsFromSource src =
             defaultPipelineOptions
               { poEnableTiling = True
               , poEnablePolyhedral = True
-              , poEnableParallelization = False
+              , poEnableParallelization = True
               }
       prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
       pure (collectProgramScopDiagnostics2 (preparePolyhedralProgramWithOptions pipelineOpts prog))
+
+loadPolyhedralProcBodyFromSource :: C.CVar -> BS.ByteString -> IO [Stmt]
+loadPolyhedralProcBodyFromSource procName src =
+  case readDecs src of
+    Left perr ->
+      expectationFailure ("Parse error: " ++ perr) >> pure []
+    Right decs -> do
+      let pipelineOpts =
+            defaultPipelineOptions
+              { poEnableTiling = True
+              , poEnablePolyhedral = True
+              , poEnableParallelization = False
+              }
+      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
+      let prepared = preparePolyhedralProgramWithOptions pipelineOpts prog
+          Program procs = polyhedralProgram2 prepared
+      case [procBody proc | proc <- procs, Language.Hydrangea.CFG.procName proc == procName] of
+        [body] ->
+          pure body
+        [] ->
+          expectationFailure ("missing proc: " <> show procName) >> pure []
+        _ ->
+          expectationFailure ("multiple procs named: " <> show procName) >> pure []
 
 extractedProcNames :: [ScopDiagnostic] -> [C.CVar]
 extractedProcNames diagnostics =
@@ -1405,6 +1442,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
+        countWavefrontRingAllocsInStmts (procBody rewritten) `shouldBe` 1
         length [() | SAssign "__hyd_discard" (C.RArrayFree _) <- procBody rewritten] `shouldSatisfy` (>= 1)
       other ->
         expectationFailure ("expected one proc, got: " <> show other)
@@ -1431,6 +1469,64 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
       other ->
         expectationFailure ("expected one proc, got: " <> show other)
 
+  it "collapses hoisted ping-pong iterate kernels into a ring-buffer wavefront too" $ do
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate [])
+            [ innerLoop
+            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+            , SAssign "arr_next" (C.RAtom (C.AVar "arr_next__iter_tmp"))
+            , SAssign "arr_next__iter_tmp" (C.RAtom (C.AVar "arr_cur"))
+            ]
+        proc =
+          mkProc
+            "p"
+            ["T", "n", "arr_cur"]
+            [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+            , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+            , SAssign "arr_next__iter_tmp" (C.RAtom (C.AVar "arr_cur"))
+            , SAssign "arr_cur__iter_init_track" (C.RAtom (C.AVar "arr_cur"))
+            , outerLoop
+            , SAssign "arr_cur__iter_cond" (C.RBinOp C.CNeq (C.AVar "arr_cur") (C.AVar "arr_cur__iter_init_track"))
+            , SIf
+                (C.AVar "arr_cur__iter_cond")
+                [SAssign "__hyd_discard" (C.RArrayFree (C.AVar "arr_cur__iter_init_track"))]
+                []
+            ]
+    case polyhedralProgram2 (Program [proc]) of
+      Program [rewritten] -> do
+        loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
+        hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
+        length [() | SAssign "__hyd_discard" (C.RArrayFree _) <- procBody rewritten] `shouldSatisfy` (>= 1)
+      other ->
+        expectationFailure ("expected one proc, got: " <> show other)
+
+  it "caps ring-buffer width for large-footprint kernels to avoid extra buffer pressure" $ do
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IConst 300000] Serial Nothing LoopMap [])
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IConst 4] Serial Nothing LoopIterate [])
+            [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+            , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+            , innerLoop
+            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+            ]
+        proc = mkProc "p" ["arr_cur"] [outerLoop]
+    case polyhedralProgram2 (Program [proc]) of
+      Program [rewritten] -> do
+        loopRolesInStmts (procBody rewritten) `shouldContain` [LoopIterate]
+      other ->
+        expectationFailure ("expected one proc, got: " <> show other)
+
 loopRolesInStmts :: [Stmt] -> [LoopRole]
 loopRolesInStmts = concatMap go
   where
@@ -1454,3 +1550,17 @@ hasParallelLoopInStmts = any go
         hasParallelLoopInStmts thn || hasParallelLoopInStmts els
       _ ->
         False
+
+countWavefrontRingAllocsInStmts :: [Stmt] -> Int
+countWavefrontRingAllocsInStmts = sum . map go
+  where
+    go stmt = case stmt of
+      SAssign v (C.RArrayAlloc _)
+        | "__wf_ring" `isInfixOf` BS.unpack v ->
+            1
+      SLoop _ body ->
+        countWavefrontRingAllocsInStmts body
+      SIf _ thn els ->
+        countWavefrontRingAllocsInStmts thn + countWavefrontRingAllocsInStmts els
+      _ ->
+        0

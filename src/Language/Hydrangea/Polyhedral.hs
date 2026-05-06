@@ -209,6 +209,9 @@ defaultTileConfig = TileConfig
 defaultWavefrontBlockWidth :: Integer
 defaultWavefrontBlockWidth = 4
 
+defaultWavefrontExtraBufferBudget :: Integer
+defaultWavefrontExtraBufferBudget = 262144
+
 data StripMinePlan
   = StripKeep CVar IndexExpr
   | StripTile StripMinedDim
@@ -322,7 +325,9 @@ data WavefrontKernel = WavefrontKernel
   , wfkCurArray :: CVar
   , wfkNextArray :: CVar
   , wfkAllocShape :: Atom
+  , wfkPreallocatedNext :: Bool
   , wfkHoistedPrefix :: [Stmt]
+  , wfkStageSuffix :: [Stmt]
   , wfkInnerSpec :: LoopSpec
   , wfkInnerBody :: [Stmt]
   , wfkSkewCoeff :: Integer
@@ -1162,9 +1167,18 @@ outerIterateInfo sched = case sched of
         Just (iterT, "")
   _ -> Nothing
 
--- | Detect temporal alias: look for @SAssign cur (RAtom (AVar next))@ at the end of stmts.
+-- | Detect temporal alias at the end of a @LoopIterate@ body.
+-- Supports both the simple tail swap @cur = next@ and the hoisted ping-pong
+-- suffix @cur = next; next = tmp; tmp = cur@.
 detectTemporalAlias :: [Stmt] -> Maybe (CVar, CVar)
 detectTemporalAlias stmts = case reverse stmts of
+  ( SAssign _tmpOut (RAtom (AVar cur2))
+    : SAssign next1 (RAtom (AVar _tmpIn))
+    : SAssign cur1 (RAtom (AVar next))
+    : _
+    )
+      | cur1 == cur2, next1 == next ->
+          Just (cur1, next1)
   (SAssign cur (RAtom (AVar next)) : _) -> Just (cur, next)
   _ -> Nothing
 
@@ -2545,21 +2559,33 @@ matchWavefrontKernel2 scheduled = do
   (prefix, innerStmt, suffix) <- splitFirstMatching2 isWavefrontInnerLoop2 outerBody
   SLoop innerSpec innerBody <- Just innerStmt
   coeff <- wavefrontSkewCoeffForLoop2 iterT innerSpec
-  (suffixBeforeSwap, swapStmt) <- unsnoc2 suffix
-  guard (null suffixBeforeSwap)
-  SAssign curVar (RAtom (AVar nextVar)) <- Just swapStmt
-  (allocShape, prefixWithoutAlloc) <- removeWavefrontAlloc2 nextVar prefix
+  (stageSuffix, curVar, nextVar, preallocatedNext) <- matchWavefrontTail2 suffix
+  (allocShape, prefixWithoutAlloc) <-
+    case removeWavefrontAlloc2 nextVar prefix of
+      Just matched ->
+        Just matched
+      Nothing
+        | preallocatedNext ->
+            Just (AVar "__wavefront_prealloc_shape", prefix)
+      Nothing ->
+        Nothing
   guard (all hoistableWavefrontStmt2 prefixWithoutAlloc)
-  guard (shapePreservingWavefrontPrelude2 curVar prefixWithoutAlloc allocShape)
+  guard
+    ( preallocatedNext
+        || shapePreservingWavefrontPrelude2 curVar prefixWithoutAlloc allocShape
+    )
   guard (not (usesVar2 iterT prefixWithoutAlloc))
   guard (not (usesVar2 nextVar prefixWithoutAlloc))
+  guard (null stageSuffix || length (lsIters innerSpec) == 1)
+  guard (all (\iter -> not (usesVar2 iter stageSuffix)) (lsIters innerSpec))
+  stageWidth <- chooseWavefrontStageWidth2 outerBound innerSpec
   let headIter = wavefrontHeadIter2 innerSpec
       stageExec =
         if wavefrontParallelLegal2 (collectScopDependenceRelations2 (ssOriginal scheduled)) iterT headIter coeff
           then Parallel
                  ParallelSpec
-                   { psStrategy = ParallelGeneric
-                   , psPolicy = Just "schedule(static)"
+                    { psStrategy = ParallelGeneric
+                    , psPolicy = Just "schedule(static)"
                    , psSimdLen = Nothing
                    }
           else Serial
@@ -2570,11 +2596,13 @@ matchWavefrontKernel2 scheduled = do
       , wfkCurArray = curVar
       , wfkNextArray = nextVar
       , wfkAllocShape = allocShape
+      , wfkPreallocatedNext = preallocatedNext
       , wfkHoistedPrefix = prefixWithoutAlloc
+      , wfkStageSuffix = stageSuffix
       , wfkInnerSpec = innerSpec
       , wfkInnerBody = innerBody
       , wfkSkewCoeff = coeff
-      , wfkStageWidth = defaultWavefrontBlockWidth
+      , wfkStageWidth = stageWidth
       , wfkStageExec = stageExec
       }
   where
@@ -2614,6 +2642,42 @@ findCarryDistanceByIter2 :: CVar -> [PolyhedralCarryInfo] -> Maybe Integer
 findCarryDistanceByIter2 iter infos =
   find ((== iter) . pciIter) infos >>= carryDistance2
 
+chooseWavefrontStageWidth2 :: IndexExpr -> LoopSpec -> Maybe Integer
+chooseWavefrontStageWidth2 iterBound innerSpec = do
+  let tripCap =
+        case simplifyIndexExpr iterBound of
+          IConst n -> max 1 (min defaultWavefrontBlockWidth n)
+          _ -> defaultWavefrontBlockWidth
+      footprintCap = wavefrontFootprintWidthCap2 innerSpec
+      stageWidth = min tripCap footprintCap
+  guard (stageWidth >= 2)
+  pure stageWidth
+
+wavefrontFootprintWidthCap2 :: LoopSpec -> Integer
+wavefrontFootprintWidthCap2 innerSpec =
+  case constantWavefrontFootprint2 innerSpec of
+    Nothing ->
+      defaultWavefrontBlockWidth
+    Just footprint
+      | footprint <= 0 ->
+          1
+      | otherwise ->
+          let extraCap = defaultWavefrontExtraBufferBudget `div` footprint
+          in if extraCap <= 0
+               then 1
+               else min defaultWavefrontBlockWidth (1 + extraCap)
+
+constantWavefrontFootprint2 :: LoopSpec -> Maybe Integer
+constantWavefrontFootprint2 innerSpec =
+  case traverse constantIndexExpr2 (map simplifyIndexExpr (lsBounds innerSpec)) of
+    Just bounds -> Just (product bounds)
+    Nothing -> Nothing
+
+constantIndexExpr2 :: IndexExpr -> Maybe Integer
+constantIndexExpr2 expr = case simplifyIndexExpr expr of
+  IConst n -> Just n
+  _ -> Nothing
+
 buildWavefrontBody2 :: WavefrontKernel -> TileM [Stmt]
 buildWavefrontBody2 kernel = do
   timeBlock <- buildForcedStripDim2 (wfkIterT kernel) (wfkIterBound kernel) (wfkStageWidth kernel)
@@ -2629,10 +2693,26 @@ buildWavefrontBody2 kernel = do
       [2 .. wfkStageWidth kernel]
   let stageBuffers = [wfkCurArray kernel, wfkNextArray kernel] ++ extraBuffers
   rotations <- buildWavefrontRotation2 stageBuffers (smdTileLen timeBlock)
-  let allocs =
-        [ SAssign arr (RArrayAlloc (wfkAllocShape kernel))
-        | arr <- drop 1 stageBuffers
-        ]
+  extraShapeVar <- freshLike (wfkCurArray kernel) "__wf_shape"
+  let (extraShapeSetup, allocTargets) =
+        if wfkPreallocatedNext kernel
+          then
+            ( [SAssign extraShapeVar (RArrayShape (AVar (wfkCurArray kernel)))]
+            , extraBuffers
+            )
+          else
+            ( []
+            , drop 1 stageBuffers
+            )
+      allocShape =
+        if wfkPreallocatedNext kernel
+          then AVar extraShapeVar
+          else wfkAllocShape kernel
+      allocs =
+        extraShapeSetup
+          ++ [ SAssign arr (RArrayAlloc allocShape)
+             | arr <- allocTargets
+             ]
       stageTimeSetup =
         [ SAssign tVar (RBinOp CAdd (AVar (smdTileStart timeBlock)) (AInt offset))
         | (offset, tVar) <- zip [0 ..] stageTimeVars
@@ -2680,6 +2760,20 @@ buildWavefrontBody2 kernel = do
         ]
   pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
 
+matchWavefrontTail2 :: [Stmt] -> Maybe ([Stmt], CVar, CVar, Bool)
+matchWavefrontTail2 suffix = case reverse suffix of
+  ( SAssign _tmpOut (RAtom (AVar cur2))
+    : SAssign next1 (RAtom (AVar _tmpIn))
+    : SAssign cur1 (RAtom (AVar next))
+    : restRev
+    )
+      | cur1 == cur2, next1 == next ->
+          Just (reverse restRev, cur1, next1, True)
+  (SAssign cur (RAtom (AVar next)) : restRev) ->
+    Just (reverse restRev, cur, next, False)
+  _ ->
+    Nothing
+
 wavefrontDiagBound2 :: WavefrontKernel -> CVar -> IndexExpr
 wavefrontDiagBound2 kernel blockLenVar =
   simplifyIndexExpr $
@@ -2717,10 +2811,11 @@ buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars =
                   diagIter
                   (wfkInnerSpec kernel)
                   (substStmts2 substEnv (wfkInnerBody kernel))
-          in
-            [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
-            , SIf (AVar eqVar) stageBody []
-            ]
+                ++ substStmts2 substEnv (wfkStageSuffix kernel)
+           in
+             [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
+             , SIf (AVar eqVar) stageBody []
+             ]
 
 buildWavefrontRotation2 :: [CVar] -> CVar -> TileM [Stmt]
 buildWavefrontRotation2 ringVars blockLenVar = do

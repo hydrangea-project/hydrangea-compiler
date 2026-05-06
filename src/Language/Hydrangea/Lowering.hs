@@ -2033,7 +2033,7 @@ genericStencilSegments1D nAtom leftPad rightPad = do
           (IAdd (atomToIndexExpr nAtom) (IConst (negate (leftPad + rightPad))))
           (AInt leftPad)
           SegInterior
-  pure (leftSegs ++ [interiorSeg] ++ rightSegs)
+  pure (interiorSeg : leftSegs ++ rightSegs)
   where
     mkRightSeg k = do
       start <- freshCVar "bd_start"
