@@ -1,6 +1,10 @@
 # Hydrangea
 
-Hydrangea is an experimental compiler for a functional array language with higher-order combinators and rank polymorphism. The main target is optimized C with fusion, SIMD vectorization, and OpenMP parallelization. There is also an Apple Metal backend for macOS, but the C path is the one to reach for first.
+Hydrangea is an experimental compiler for *functional array programs* with *higher-order combinators and rank polymorphism*.
+
+Hydrangea uses aggressive *array fusion* to eliminate intermediary arrays, so functional array programs that work on immutable arrays are lowered into efficient loop nests. From there, Hydrangea uses polyhedral optimization to produce highly efficient C code with OpenMP parallelization.
+
+In this repository, there are a set of benchmarks and graphical demos that show off what the compiler can do.
 
 <a href="docs/images/ray_still_life.png">
   <img src="docs/images/ray_thumb.jpeg" alt="Ray Example" width="400"/>
@@ -13,66 +17,46 @@ Hydrangea is an experimental compiler for a functional array language with highe
 - Lowering into an imperative CFG that can be optimized, vectorized, and parallelized
 - Emitting C that can be inspected, compiled, benchmarked, or embedded
 
-## Quick start
-
-```bash
-# Build the compiler
-cabal build
-
-# Interpret a small program
-cabal run hydrangea-compiler -- --interp examples/simple.hyd
-
-# Generate C for a larger example
-cabal run hydrangea-compiler -- --emit-c examples/mat_mul.hyd
-
-# Compile and run with the default C backend
-cabal run hydrangea-compiler -- examples/mat_mul.hyd
-```
-
-If you are on macOS and want parallel C code, use `nix develop` or point `--cc` / `CC` at a GCC with OpenMP support. The system clang usually is not enough for that path.
-
 ## Example compiler output
 
-Given a dot product procedure like this (assuming arrays `a` and `b`):
+For stencil-shaped kernels, Hydrangea can reschedule loop nests into a form that is friendlier to locality and parallel execution.
 
-```
-reduce (+) 0 (zipwith (*) a b) 
+Given a 2D Laplacian stencil like this:
+
+```hydrangea
+let laplacian img =
+  stencil clamp
+    (fn acc =>
+      acc (-1) 0 + acc 1 0 + acc 0 (-1) + acc 0 1 - (4 * acc 0 0))
+    img
 ```
 
-The compiler will produce C code like this:
+The compiler outpus C like this (simplified from generated output):
 
 ```c
-hyd_array_t* t6 = a();
-hyd_tuple_t t7 = t6->shape;
-hyd_tuple_t out_shp8 = hyd_shape_init(t7);
-int64_t red_dim9 = hyd_shape_last(t7);
-double acc11 = 0.0;
-int64_t k12__vec_trips = (red_dim9 / 4LL);
-hyd_float64x4_t acc11__vec = hyd_vec_set1_f64x4(0LL);
-hyd_array_t* t17 = b();
+/* boundary handling omitted here; this is the tiled interior */
+#pragma omp parallel for collapse(2)
+for (int64_t i_tile = 1; i_tile < n - 1; i_tile += 32) {
+    for (int64_t j_tile = 1; j_tile < m - 1; j_tile += 32) {
+        int64_t i_stop = (i_tile + 32 < n - 1) ? (i_tile + 32) : (n - 1);
+        int64_t j_stop = (j_tile + 32 < m - 1) ? (j_tile + 32) : (m - 1);
 
-#pragma omp parallel for
-for (int64_t k12__vec_i = 0; k12__vec_i < k12__vec_trips; k12__vec_i++) {
-    int64_t k12__vec_base = (k12__vec_i * 4LL);
-    hyd_float64x4_t val14__vec = hyd_vec_loadu_f64x4(((double*)(void*)t6->data) + k12__vec_base);
-    hyd_float64x4_t val16__vec = hyd_vec_loadu_f64x4(((double*)(void*)t17->data) + k12__vec_base);
-    hyd_float64x4_t t18__vec = hyd_vec_mul_f64x4(val14__vec, val16__vec);
-    acc11__vec = hyd_vec_add_f64x4(acc11__vec, t18__vec);
-}
+        for (int64_t i = i_tile; i < i_stop; i++) {
+            for (int64_t j = j_tile; j < j_stop; j++) {
+                int64_t ij = i * m + j;
+                int64_t up = (i - 1) * m + j;
+                int64_t down = (i + 1) * m + j;
+                int64_t left = i * m + (j - 1);
+                int64_t right = i * m + (j + 1);
 
-acc11 = hyd_vec_reduce_add_f64x4(acc11__vec);
-int64_t k12__tail_start = (k12__vec_trips * 4LL);
-int64_t k12__tail_len = (red_dim9 - k12__tail_start);
-for (int64_t k12__tail_i = 0; k12__tail_i < k12__tail_len; k12__tail_i++) {
-    int64_t k12 = (k12__tail_start + k12__tail_i);
-    double val14 = (((double*)(void*)t6->data)[k12]);
-    double val16 = (((double*)(void*)t17->data)[k12]);
-    double t18 = (val14 * val16);
-    acc11 = (acc11 + t18);
+                out[ij] = in[up] + in[down] + in[left] + in[right] - 4 * in[ij];
+            }
+        }
+    }
 }
 ```
 
-The `hyd_vec_add_f64x4` and similar operations are SIMD intrinsics, implemented with the portable [SIMDE library](https://github.com/simd-everywhere/simde).
+That is a snapshot of what Hydrangea is for: start from a compact array combinator like `stencil`, then lower it into a loop nest that can be tiled, reordered, parallelized, and inspected.
 
 
 ## Backends
@@ -82,7 +66,7 @@ The `hyd_vec_add_f64x4` and similar operations are SIMD intrinsics, implemented 
 
 ## How the compiler is organized
 
-Hydrangea starts with a source AST, runs type inference plus refinement checks, then preprocesses declarations through `Uniquify`, `ShapeNormalize`, and `Fusion`. After that it lowers the program into a CFG IR, runs optimization, tiling, SIMD vectorization, and OpenMP parallelization, and finally emits either C or Metal code.
+Hydrangea starts with a source AST, runs type inference plus refinement checks, then preprocesses declarations through `Uniquify`, `ShapeNormalize`, and `Fusion`. After that it lowers the program into a CFG IR, applies various optimizations, and finally emits either C or Metal code.
 
 The main entry points are:
 
