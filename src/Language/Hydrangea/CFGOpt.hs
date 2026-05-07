@@ -148,6 +148,7 @@ substStmts2 env = map go
     go (SArrayWrite arr idx val)    =
       SArrayWrite (substAtom2 env arr) (substAtom2 env idx) (substAtom2 env val)
     go (SLoop spec body)            = SLoop spec (substStmts2 env body)
+    go (SParallelRegion body)       = SParallelRegion (substStmts2 env body)
     go (SIf cond thn els)           =
       SIf (substAtom2 env cond) (substStmts2 env thn) (substStmts2 env els)
     go (SReturn a)                  = SReturn (substAtom2 env a)
@@ -478,6 +479,10 @@ daeBackwards liveAfter (stmt : rest) =
              -- surrounding live set.
              liveBefore = S.unions [live, bodyUsed, boundVars] `S.difference` iterVars
          in  (SLoop spec body' : rest', liveBefore)
+       SParallelRegion body ->
+         let (body', bodyLive) = daeBackwards live body
+             liveBefore = live `S.union` bodyLive
+         in (SParallelRegion body' : rest', liveBefore)
        SIf cond thn els ->
          -- Variables live after the 'SIf' are also live at the end of each
          -- branch, since control flow merges at the join point.
@@ -519,6 +524,9 @@ daeLoopBody loopCarried (stmt : rest) =
              bodyUsed   = usedVarsStmts2 body'
              liveBefore = S.unions [live, bodyUsed, boundVars] `S.difference` iterVars
          in  (SLoop spec body' : rest', liveBefore)
+       SParallelRegion body ->
+         let (body', bodyLive) = daeBackwards live body
+         in (SParallelRegion body' : rest', live `S.union` bodyLive)
        SIf cond thn els ->
          -- Loop-carried variables must survive to the next iteration, so
          -- include them in the live set passed to each branch.
@@ -946,6 +954,10 @@ cseStmts2 = go M.empty
             envLoop  = invalidateVarsCSE loopVars env
             body'    = go envLoop body
         in  SLoop spec body' : go envLoop rest
+      SParallelRegion body ->
+        let body' = go env body
+            env' = invalidateVarsCSE (S.toList (definedVarsStmts2 body)) env
+        in SParallelRegion body' : go env' rest
       SIf cond thn els ->
         let thn'              = go env thn
             els'              = go env els
@@ -997,6 +1009,9 @@ scalarizeZeroDimArrayRoundtrips = rewriteBlock
             SLoop spec body ->
               let body' = rewriteBlock body
                in SLoop spec body' : go tupEnv rest
+            SParallelRegion body ->
+              let body' = rewriteBlock body
+               in SParallelRegion body' : go tupEnv rest
             SIf cond thn els ->
               let thn' = rewriteBlock thn
                   els' = rewriteBlock els
@@ -1088,6 +1103,7 @@ inlineCall Proc { procParams = params, procBody = body } args =
     substStmt env (SArrayWrite arr idx val)  =
       SArrayWrite (substAtom2 env arr) (substAtom2 env idx) (substAtom2 env val)
     substStmt env (SLoop spec loopBody)     = SLoop spec (map (substStmt env) loopBody)
+    substStmt env (SParallelRegion body)    = SParallelRegion (map (substStmt env) body)
     substStmt env (SIf cond thn els)        =
       SIf (substAtom2 env cond) (map (substStmt env) thn) (map (substStmt env) els)
     substStmt env (SReturn a)               = SReturn (substAtom2 env a)

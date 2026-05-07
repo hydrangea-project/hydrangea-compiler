@@ -163,6 +163,7 @@ definedVarsStmt2 stmt = case stmt of
   SAssign v _ -> S.singleton v
   SArrayWrite (AVar arr) _ _ -> S.singleton arr
   SLoop _ body -> S.unions (map definedVarsStmt2 body)
+  SParallelRegion body -> S.unions (map definedVarsStmt2 body)
   SIf _ thn els -> S.unions (map definedVarsStmt2 (thn ++ els))
   SReturn (AVar v) -> S.singleton v
   _ -> S.empty
@@ -232,6 +233,7 @@ usedVarsStmt2 stmt = case stmt of
     let bodyVars = S.unions (map usedVarsStmt2 body)
         boundVars = S.unions (map usedVarsIndexExpr (lsBounds spec))
     in bodyVars `S.union` boundVars
+  SParallelRegion body -> usedVarsStmts2 body
   SIf cond thn els -> S.union (usedVarsAtom2 cond) (S.unions (map usedVarsStmt2 (thn ++ els)))
   SReturn a -> usedVarsAtom2 a
   SBreak -> S.empty
@@ -266,6 +268,7 @@ analyzeStmts2 = concatMap go
     go stmt = case analyzeLoop2 stmt of
       Just info -> info : analyzeStmts2 (li2Body info)
       Nothing -> case stmt of
+        SParallelRegion body -> analyzeStmts2 body
         SIf _ thn els -> analyzeStmts2 thn ++ analyzeStmts2 els
         _ -> []
 

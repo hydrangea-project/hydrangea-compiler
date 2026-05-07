@@ -246,6 +246,19 @@ spec = describe "Polyhedral" $ do
           ])
     countWavefrontRingAllocsInStmts body `shouldSatisfy` (> 0)
 
+  it "guards small source-level 2D clamp iterate kernels with a tiled wavefront profitability check" $ do
+    body <-
+      loadTiledProcBodyFromSource
+        "result"
+        (BS.pack $ unlines
+          [ "let step arr = stencil clamp"
+          , "  (let acc_fn acc = (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1) /. 4.0 in acc_fn)"
+          , "  arr"
+          , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
+          ])
+    countWavefrontProfitabilityGuardsInStmts body `shouldSatisfy` (> 0)
+    countWavefrontRingAllocsInStmts body `shouldSatisfy` (> 0)
+
   it "extracts and reifies tile-count style ceil-div bounds" $ do
     let tileCountBound = IDiv (IAdd (IVar "n") (IConst 31)) (IConst 32)
         loop =
@@ -805,6 +818,29 @@ loadPolyhedralProcBodyFromSource procName src =
       prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
       let prepared = preparePolyhedralProgramWithOptions pipelineOpts prog
           Program procs = polyhedralProgram2 prepared
+      case [procBody proc | proc <- procs, Language.Hydrangea.CFG.procName proc == procName] of
+        [body] ->
+          pure body
+        [] ->
+          expectationFailure ("missing proc: " <> show procName) >> pure []
+        _ ->
+          expectationFailure ("multiple procs named: " <> show procName) >> pure []
+
+loadTiledProcBodyFromSource :: C.CVar -> BS.ByteString -> IO [Stmt]
+loadTiledProcBodyFromSource procName src =
+  case readDecs src of
+    Left perr ->
+      expectationFailure ("Parse error: " ++ perr) >> pure []
+    Right decs -> do
+      let pipelineOpts =
+            defaultPipelineOptions
+              { poEnableTiling = True
+              , poEnablePolyhedral = True
+              , poEnableParallelization = False
+              }
+      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
+      let prepared = preparePolyhedralProgramWithOptions pipelineOpts prog
+          Program procs = polyhedralTileProgram2 prepared
       case [procBody proc | proc <- procs, Language.Hydrangea.CFG.procName proc == procName] of
         [body] ->
           pure body
@@ -1546,6 +1582,8 @@ loopRolesInStmts = concatMap go
     go stmt = case stmt of
       SLoop spec body ->
         lsRole spec : loopRolesInStmts body
+      SParallelRegion body ->
+        loopRolesInStmts body
       SIf _ thn els ->
         loopRolesInStmts thn ++ loopRolesInStmts els
       _ ->
@@ -1558,7 +1596,10 @@ hasParallelLoopInStmts = any go
       SLoop spec body ->
         case lsExec spec of
           Parallel {} -> True
+          Workshare {} -> True
           _ -> hasParallelLoopInStmts body
+      SParallelRegion body ->
+        hasParallelLoopInStmts body
       SIf _ thn els ->
         hasParallelLoopInStmts thn || hasParallelLoopInStmts els
       _ ->
@@ -1573,8 +1614,26 @@ countWavefrontRingAllocsInStmts = sum . map go
             1
       SLoop _ body ->
         countWavefrontRingAllocsInStmts body
+      SParallelRegion body ->
+        countWavefrontRingAllocsInStmts body
       SIf _ thn els ->
         countWavefrontRingAllocsInStmts thn + countWavefrontRingAllocsInStmts els
+      _ ->
+        0
+
+countWavefrontProfitabilityGuardsInStmts :: [Stmt] -> Int
+countWavefrontProfitabilityGuardsInStmts = sum . map go
+  where
+    go stmt = case stmt of
+      SAssign v (C.RBinOp C.CGe _ _)
+        | "__wf_frontier_profitable" `isInfixOf` BS.unpack v ->
+            1
+      SLoop _ body ->
+        countWavefrontProfitabilityGuardsInStmts body
+      SParallelRegion body ->
+        countWavefrontProfitabilityGuardsInStmts body
+      SIf _ thn els ->
+        countWavefrontProfitabilityGuardsInStmts thn + countWavefrontProfitabilityGuardsInStmts els
       _ ->
         0
 
@@ -1584,6 +1643,7 @@ countArrayFreesInStmts = sum . map go
     go stmt = case stmt of
       SAssign "__hyd_discard" (C.RArrayFree _) -> 1
       SLoop _ body -> countArrayFreesInStmts body
+      SParallelRegion body -> countArrayFreesInStmts body
       SIf _ thn els -> countArrayFreesInStmts thn + countArrayFreesInStmts els
       _ -> 0
 
@@ -1595,6 +1655,8 @@ countNamedArrayFreesInStmts target = sum . map go
         | v == target ->
             1
       SLoop _ body ->
+        countNamedArrayFreesInStmts target body
+      SParallelRegion body ->
         countNamedArrayFreesInStmts target body
       SIf _ thn els ->
         countNamedArrayFreesInStmts target thn + countNamedArrayFreesInStmts target els

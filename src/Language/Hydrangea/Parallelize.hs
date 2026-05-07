@@ -100,9 +100,10 @@ extractAccesses2 stmts =
     -- Do not recurse into nested loops: the outer loop's legality is
     -- determined only by accesses at this level; nested-loop deps are
     -- handled by those loops' own legality checks.
-    collectStmt (SLoop _ _)     = []
-    collectStmt (SIf _ thn els) = collect thn ++ collect els
-    collectStmt _               = []
+    collectStmt (SLoop _ _)             = []
+    collectStmt (SParallelRegion body)  = collect body
+    collectStmt (SIf _ thn els)         = collect thn ++ collect els
+    collectStmt _                       = []
 
 ------------------------------------------------------------------------
 -- Array usage summary
@@ -439,6 +440,9 @@ collectArrayAllocSizes = snd . go M.empty M.empty
       SLoop _ body ->
         let (_, bodyAllocs) = go tuples M.empty body
         in  go tuples (M.union allocs bodyAllocs) rest
+      SParallelRegion body ->
+        let (_, bodyAllocs) = go tuples M.empty body
+        in  go tuples (M.union allocs bodyAllocs) rest
       SIf _ thn els ->
         let (_, thnAllocs) = go tuples M.empty thn
             (_, elsAllocs) = go tuples M.empty els
@@ -487,6 +491,7 @@ factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
     stmtHasExternalRead dest stmt = case stmt of
       SAssign _ (RArrayLoad (AVar arr) _) -> arr /= dest
       SLoop _ inner                       -> hasExternalReads dest inner
+      SParallelRegion body                -> hasExternalReads dest body
       SIf _ thn els                       ->
         hasExternalReads dest thn || hasExternalReads dest els
       _                                   -> False
@@ -513,6 +518,7 @@ bodyContainsBreak :: [Stmt] -> Bool
 bodyContainsBreak = any go
   where
     go SBreak           = True
+    go (SParallelRegion body) = any go body
     go (SIf _ thn els)  = any go thn || any go els
     go _                = False
 
@@ -604,6 +610,8 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
         in case parallelizeLoop arrayFacts typeEnv allocSizes insideParallel spec body' of
              Just (spec', _) -> [SLoop spec' body']
              Nothing         -> [SLoop spec  body']
+      SParallelRegion body ->
+        [SParallelRegion (go True body)]
       _ -> [stmt]
 
 -- | Rewrite eligible serial loops in one procedure using the array facts

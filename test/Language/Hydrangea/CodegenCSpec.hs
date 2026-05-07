@@ -72,6 +72,26 @@ spec = describe "CodegenC" $ do
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for schedule(static)"
 
+  it "emits omp parallel regions with inner worksharing loops" $ do
+    let stageSpec =
+          LoopSpec ["i"] [IConst 8]
+            (Workshare (ParallelSpec ParallelGeneric (Just "schedule(static)") Nothing))
+            Nothing
+            LoopMap
+            []
+        prog = Program
+          [ mkProc "p" []
+              [ SParallelRegion
+                  [ SLoop stageSpec []
+                  ]
+              , SReturn (C.AInt 0)
+              ]
+          ]
+        c = codegenProgram2 prog
+    c `shouldSatisfy` isInfixOf "#pragma omp parallel"
+    c `shouldSatisfy` isInfixOf "#pragma omp for schedule(static)"
+    c `shouldSatisfy` (not . isInfixOf "#pragma omp parallel for schedule(static)")
+
   it "emits role-aware comments for outer map-reduction loops" $ do
     let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopMapReduction []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]

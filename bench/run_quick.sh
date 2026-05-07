@@ -11,7 +11,8 @@
 #   MAT_M, MAT_K, MAT_N, WH_N, WH_BINS, GWH_N, GWH_BINS, GWH_KEEP_PERIOD,
 #   COO_NROWS, COO_NCOLS, COO_NNZ, COO_DUP_PERIOD, GRAPH_NODES, GRAPH_DEGREE,
 #   VOX_POINTS, VOX_NX, VOX_NY, VOX_NZ, VOX_KEEP_PERIOD,
-#   VSPLAT_POINTS, VSPLAT_NX, VSPLAT_NY, VSPLAT_NZ, VSPLAT_KEEP_PERIOD
+#   VSPLAT_POINTS, VSPLAT_NX, VSPLAT_NY, VSPLAT_NZ, VSPLAT_KEEP_PERIOD,
+#   JACOBI_WF_H, JACOBI_WF_W, JACOBI_WF_ITERS
 
 set -euo pipefail
 
@@ -83,6 +84,7 @@ BENCH_CC="$(find_openmp_cc)"
 : "${VSPLAT_POINTS:=1000000}" "${VSPLAT_NX:=64}" "${VSPLAT_NY:=64}" "${VSPLAT_NZ:=64}" "${VSPLAT_KEEP_PERIOD:=3}"
 : "${STENCIL_H:=512}" "${STENCIL_W:=512}"
 : "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
+: "${JACOBI_WF_H:=64}" "${JACOBI_WF_W:=1024}" "${JACOBI_WF_ITERS:=20}"
 
 export BS_N NBODY_N MAND_W MAND_H MAND_ITERS
 export SPMV_NROWS SPMV_NCOLS SPMV_NNZ MAT_M MAT_K MAT_N
@@ -93,6 +95,7 @@ export VOX_POINTS VOX_NX VOX_NY VOX_NZ VOX_KEEP_PERIOD
 export VSPLAT_POINTS VSPLAT_NX VSPLAT_NY VSPLAT_NZ VSPLAT_KEEP_PERIOD
 export STENCIL_H STENCIL_W
 export JACOBI_H JACOBI_W JACOBI_ITERS
+export JACOBI_WF_H JACOBI_WF_W JACOBI_WF_ITERS
 
 cd "$REPO_ROOT"
 
@@ -231,6 +234,10 @@ ALL_BENCHMARKS=(
   stencil_interior jacobi_2d
 )
 
+if [ "$BENCH_FILTER" = "jacobi_2d_wavefront" ]; then
+  ALL_BENCHMARKS+=(jacobi_2d_wavefront)
+fi
+
 for bname in "${ALL_BENCHMARKS[@]}"; do
   [ -n "$BENCH_FILTER" ] && [ "$bname" != "$BENCH_FILTER" ] && continue
   case "$bname" in
@@ -297,6 +304,32 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
         _c="N/A"
       fi
       printf "%-35s %15s %15s %15s %15s\n" "jacobi_2d(${JACOBI_ITERS}it)" "$_hyd" "$_repa" "$_accel" "$_c"
+      ;;
+    jacobi_2d_wavefront)
+      _jacobi_ref_bin="$REPO_ROOT/bench/stencil/jacobi_2d_ref"
+      _jacobi_ref_src="$REPO_ROOT/bench/stencil/jacobi_2d_ref.c"
+      if [ ! -x "$_jacobi_ref_bin" ] || [ "$_jacobi_ref_src" -nt "$_jacobi_ref_bin" ]; then
+        "$BENCH_CC" -O3 -march=native -fopenmp -std=c11 -lm \
+          -I "$REPO_ROOT/bench/c_bench" \
+          "$_jacobi_ref_src" -o "$_jacobi_ref_bin" 2>/dev/null || true
+      fi
+      _hyd=$(JACOBI_H="$JACOBI_WF_H" JACOBI_W="$JACOBI_WF_W" JACOBI_ITERS="$JACOBI_WF_ITERS" \
+        run_hydrangea stencil jacobi_2d.hyd main)
+      _repa=$(JACOBI_H="$JACOBI_WF_H" JACOBI_W="$JACOBI_WF_W" JACOBI_ITERS="$JACOBI_WF_ITERS" \
+        run_repa jacobi_2d)
+      _accel=$(JACOBI_H="$JACOBI_WF_H" JACOBI_W="$JACOBI_WF_W" JACOBI_ITERS="$JACOBI_WF_ITERS" \
+        run_accel jacobi_2d)
+      if [ -x "$_jacobi_ref_bin" ]; then
+        _c=$(JACOBI_H="$JACOBI_WF_H" JACOBI_W="$JACOBI_WF_W" JACOBI_ITERS="$JACOBI_WF_ITERS" \
+          BENCH_WARMUP="$WARMUP" BENCH_ITERS="$ITERS" \
+          "$_jacobi_ref_bin" 2>/dev/null | parse_min_ms) || true
+        _c="${_c:-N/A}"
+      else
+        _c="N/A"
+      fi
+      printf "%-35s %15s %15s %15s %15s\n" \
+        "jacobi_2d_wavefront(${JACOBI_WF_H}x${JACOBI_WF_W},${JACOBI_WF_ITERS}it)" \
+        "$_hyd" "$_repa" "$_accel" "$_c"
       ;;
   esac
 done

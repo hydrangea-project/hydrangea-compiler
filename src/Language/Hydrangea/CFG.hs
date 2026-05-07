@@ -231,6 +231,7 @@ data LoopRole
 data ExecPolicy
   = Serial              -- ^ Execute iterations sequentially.
   | Parallel ParallelSpec  -- ^ Execute iterations in parallel.
+  | Workshare ParallelSpec -- ^ Execute iterations as worksharing within an enclosing parallel region.
   | Vector VectorSpec      -- ^ Vectorise iterations with the given SIMD width.
   deriving (Eq, Show)
 
@@ -254,6 +255,7 @@ data Stmt
   = SAssign CVar RHS           -- ^ Bind a variable to a right-hand-side expression.
   | SArrayWrite Atom Atom Atom -- ^ Write a value into an array at an index.
   | SLoop LoopSpec [Stmt]      -- ^ Execute a body over an n-dimensional iteration space.
+  | SParallelRegion [Stmt]     -- ^ Execute a statement block inside one parallel region.
   | SIf Atom [Stmt] [Stmt]     -- ^ Conditional control flow.
   | SReturn Atom               -- ^ Return a value from a procedure.
   | SBreak                     -- ^ Break out of the enclosing loop.
@@ -274,6 +276,7 @@ rewriteStmts2With initialCtx descend rewrite = go initialCtx
     goStmt ctx stmt =
       let stmt' = case stmt of
             SLoop spec body -> SLoop spec (go (descend ctx) body)
+            SParallelRegion body -> SParallelRegion (go ctx body)
             SIf cond thn els -> SIf cond (go ctx thn) (go ctx els)
             _ -> stmt
       in rewrite ctx stmt'
@@ -295,6 +298,9 @@ rewriteStmts2WithM initialCtx descend rewrite = go initialCtx
         SLoop spec body -> do
           body' <- go (descend ctx) body
           rewrite ctx (SLoop spec body')
+        SParallelRegion body -> do
+          body' <- go ctx body
+          rewrite ctx (SParallelRegion body')
         SIf cond thn els -> do
           thn' <- go ctx thn
           els' <- go ctx els

@@ -135,18 +135,21 @@ cleanupProgram (Program procs) =
     ]
 
 serializeParallelStmts :: [Stmt] -> [Stmt]
-serializeParallelStmts = map go
+serializeParallelStmts = concatMap go
   where
     go stmt = case stmt of
       SLoop spec body ->
         let exec' = case lsExec spec of
               Parallel {} -> Serial
+              Workshare {} -> Serial
               other -> other
-        in SLoop spec { lsExec = exec' } (serializeParallelStmts body)
+        in [SLoop spec { lsExec = exec' } (serializeParallelStmts body)]
+      SParallelRegion body ->
+        serializeParallelStmts body
       SIf cond thn els ->
-        SIf cond (serializeParallelStmts thn) (serializeParallelStmts els)
+        [SIf cond (serializeParallelStmts thn) (serializeParallelStmts els)]
       other ->
-        other
+        [other]
 
 serializeParallelProgram :: Program -> Program
 serializeParallelProgram (Program procs) =

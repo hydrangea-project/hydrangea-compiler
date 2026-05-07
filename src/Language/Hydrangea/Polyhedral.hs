@@ -68,7 +68,7 @@ module Language.Hydrangea.Polyhedral
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (guard)
+import Control.Monad (foldM, guard)
 import Control.Monad.State.Strict (State, evalState, modify, runState, state)
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
@@ -427,7 +427,7 @@ tileScheduledScop2 scheduled =
     Just {} -> specialized
     Nothing -> fromMaybe generic (buildBlockedMapReductionScop2 generic)
   where
-    specialized = specializeScheduledScop2 scheduled
+    specialized = specializeTiledScheduledScop2 scheduled
     scop = ssOriginal specialized
     profitability = collectScopProfitabilityFacts2 scop
     relations = collectScopDependenceRelations2 scop
@@ -442,6 +442,10 @@ tileScheduledScop2 scheduled =
 specializeScheduledScop2 :: ScheduledScop -> ScheduledScop
 specializeScheduledScop2 scheduled =
   fromMaybe scheduled (buildWavefrontScop2 scheduled)
+
+specializeTiledScheduledScop2 :: ScheduledScop -> ScheduledScop
+specializeTiledScheduledScop2 scheduled =
+  fromMaybe scheduled (buildTiledWavefrontScop2 scheduled)
 
 buildScheduledScop2 :: Scop -> AffineSchedule -> ScheduleTree -> ScheduledScop
 buildScheduledScop2 scop affineSchedule scheduleTree =
@@ -1838,6 +1842,8 @@ extractStmtListWithAlias aliasMap basePath domain env stmts = go env [] [] (zip 
           (nestedStmts, nestedSchedule) <-
             extractLoopWithAlias aliasMap stmtPath domain envNow innerSpec innerBody
           go envNow (reverse nestedStmts ++ accStmts) (nestedSchedule : accSched) rest
+        SParallelRegion {} ->
+          Left (RejectUnsupportedStmt stmt)
         SIf {} ->
           Left (RejectUnsupportedStmt stmt)
         SReturn {} ->
@@ -2473,6 +2479,23 @@ buildWavefrontScop2 scheduled = do
         evalState (buildWavefrontBody2 kernel) (collectScopNames scop, 0)
   pure strengthened { ssReplacement = Just replacement }
 
+buildTiledWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
+buildTiledWavefrontScop2 scheduled = do
+  let strengthened = strengthenWavefrontScheduled2 scheduled
+      scop = ssOriginal strengthened
+      stmtMap =
+        M.fromList
+          [ (psPath stmt, psStmt stmt)
+          | stmt <- scStatements scop
+          ]
+  kernel <- matchWavefrontKernel2 strengthened
+  fallback <- reifyScheduleTree stmtMap (ssSchedule strengthened)
+  replacement <-
+    evalState
+      (buildTiledWavefrontReplacement2 kernel fallback)
+      (collectScopNames scop, 0)
+  pure strengthened { ssReplacement = Just replacement }
+
 strengthenWavefrontScheduled2 :: ScheduledScop -> ScheduledScop
 strengthenWavefrontScheduled2 scheduled =
   scheduled { ssSchedule = strengthenWavefrontScheduleTree2 relations 0 (ssSchedule scheduled) }
@@ -2582,12 +2605,12 @@ matchWavefrontKernel2 scheduled = do
   let headIter = wavefrontHeadIter2 innerSpec
       stageExec =
         if wavefrontParallelLegal2 (collectScopDependenceRelations2 (ssOriginal scheduled)) iterT headIter coeff
-          then Parallel
+          then Workshare
                  ParallelSpec
-                    { psStrategy = ParallelGeneric
-                    , psPolicy = Just "schedule(static)"
-                   , psSimdLen = Nothing
-                   }
+                     { psStrategy = ParallelGeneric
+                     , psPolicy = Just "schedule(static)"
+                    , psSimdLen = Nothing
+                    }
           else Serial
   pure
     WavefrontKernel
@@ -2682,6 +2705,61 @@ constantIndexExpr2 expr = case simplifyIndexExpr expr of
   IConst n -> Just n
   _ -> Nothing
 
+minWavefrontFrontierParallelWork :: Integer
+minWavefrontFrontierParallelWork = 512
+
+data WavefrontProfitability2
+  = WavefrontProfitReject
+  | WavefrontProfitAccept
+  | WavefrontProfitGuard [Stmt] Atom
+
+wavefrontProfitabilityForTiledPath2 :: WavefrontKernel -> TileM WavefrontProfitability2
+wavefrontProfitabilityForTiledPath2 kernel =
+  case map simplifyIndexExpr (drop 1 (lsBounds (wfkInnerSpec kernel))) of
+    [] ->
+      pure WavefrontProfitAccept
+    tailBounds ->
+      case traverse constantIndexExpr2 tailBounds of
+        Just bounds
+          | product bounds >= minWavefrontFrontierParallelWork ->
+              pure WavefrontProfitAccept
+          | otherwise ->
+              pure WavefrontProfitReject
+        Nothing
+          | all supportsAtomBound tailBounds -> do
+              (boundStmts, boundAtoms) <- fmap unzip (mapM indexExprToAtom tailBounds)
+              (prodStmts, prodAtom) <- multiplyAtoms2 boundAtoms
+              profitable <- freshLike "__wf_frontier_profitable" ""
+              pure $
+                WavefrontProfitGuard
+                  ( concat boundStmts
+                      ++ prodStmts
+                      ++ [SAssign profitable (RBinOp CGe prodAtom (AInt minWavefrontFrontierParallelWork))]
+                  )
+                  (AVar profitable)
+          | otherwise ->
+              pure WavefrontProfitAccept
+
+multiplyAtoms2 :: [Atom] -> TileM ([Stmt], Atom)
+multiplyAtoms2 [] = pure ([], AInt 1)
+multiplyAtoms2 (a : as) = foldM step ([], a) as
+  where
+    step (stmts, acc) next = do
+      prod <- freshLike "__wf_frontier_work" ""
+      pure (stmts ++ [SAssign prod (RBinOp CMul acc next)], AVar prod)
+
+buildTiledWavefrontReplacement2 :: WavefrontKernel -> [Stmt] -> TileM (Maybe [Stmt])
+buildTiledWavefrontReplacement2 kernel fallback = do
+  profitability <- wavefrontProfitabilityForTiledPath2 kernel
+  case profitability of
+    WavefrontProfitReject ->
+      pure Nothing
+    WavefrontProfitAccept ->
+      Just <$> buildWavefrontBody2 kernel
+    WavefrontProfitGuard guardStmts guardAtom -> do
+      wavefrontBody <- buildWavefrontBody2 kernel
+      pure (Just (guardStmts ++ [SIf guardAtom wavefrontBody fallback]))
+
 buildWavefrontBody2 :: WavefrontKernel -> TileM [Stmt]
 buildWavefrontBody2 kernel = do
   timeBlock <- buildForcedStripDim2 (wfkIterT kernel) (wfkIterBound kernel) (wfkStageWidth kernel)
@@ -2728,7 +2806,7 @@ buildWavefrontBody2 kernel = do
             { lsIters = [stageIter]
             , lsBounds = [IVar (smdTileLen timeBlock)]
             , lsOrigins = []
-            , lsExec = wfkStageExec kernel
+            , lsExec = wavefrontStageLoopExec2 kernel
             , lsRed = Nothing
             , lsRole = LoopMap
             }
@@ -2764,7 +2842,11 @@ buildWavefrontBody2 kernel = do
           then extraBuffers
           else drop 1 stageBuffers
   cleanup <- fmap concat (mapM (buildWavefrontCleanup2 kernel) cleanupTargets)
-  pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
+  let loopNest =
+        case wfkStageExec kernel of
+          Workshare {} -> [SParallelRegion [blockLoop]]
+          _ -> [blockLoop]
+  pure (wfkHoistedPrefix kernel ++ allocs ++ loopNest ++ cleanup)
 
 buildWavefrontCleanup2 :: WavefrontKernel -> CVar -> TileM [Stmt]
 buildWavefrontCleanup2 kernel arr = do
@@ -2834,6 +2916,7 @@ buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars =
                     ]
                 innerBody =
                   collapseWavefrontInnerLoop2
+                    (wavefrontFrontierExec2 kernel)
                     diagIter
                     (wfkInnerSpec kernel)
                     (substStmts2 substEnv (wfkInnerBody kernel))
@@ -2885,8 +2968,20 @@ buildWavefrontRotation2 ringVars blockLenVar = do
         ]
   pure (saved ++ concat (zipWith oneRotation [1 .. ringCount - 1] eqVars))
 
-collapseWavefrontInnerLoop2 :: CVar -> LoopSpec -> [Stmt] -> [Stmt]
-collapseWavefrontInnerLoop2 diagIter innerSpec innerBody =
+wavefrontStageLoopExec2 :: WavefrontKernel -> ExecPolicy
+wavefrontStageLoopExec2 kernel =
+  case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
+    (Workshare {}, _ : _ : _) -> Serial
+    (execPolicy, _) -> execPolicy
+
+wavefrontFrontierExec2 :: WavefrontKernel -> ExecPolicy
+wavefrontFrontierExec2 kernel =
+  case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
+    (Workshare p, _ : _ : _) -> Workshare p
+    _ -> Serial
+
+collapseWavefrontInnerLoop2 :: ExecPolicy -> CVar -> LoopSpec -> [Stmt] -> [Stmt]
+collapseWavefrontInnerLoop2 frontierExec diagIter innerSpec innerBody =
   case lsIters innerSpec of
     [] ->
       innerBody
@@ -2902,13 +2997,14 @@ collapseWavefrontInnerLoop2 diagIter innerSpec innerBody =
            then fixedLead ++ innerBody
            else
              fixedLead
-               ++ [ SLoop
-                      innerSpec
-                        { lsIters = tailIters
-                        , lsBounds = tailBounds
-                        , lsOrigins = trimmedOrigins
-                        }
-                      innerBody
+                ++ [ SLoop
+                       innerSpec
+                         { lsIters = tailIters
+                         , lsBounds = tailBounds
+                         , lsExec = frontierExec
+                         , lsOrigins = trimmedOrigins
+                         }
+                       innerBody
                   ]
 
 isWavefrontInnerLoop2 :: Stmt -> Bool

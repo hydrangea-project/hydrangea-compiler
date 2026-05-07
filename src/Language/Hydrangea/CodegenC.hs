@@ -147,7 +147,8 @@ data CodegenEnv = CodegenEnv
     ceFloatVars :: Set CVar,
     ceFloatArrVars :: Set CVar,
     ceVecVars :: Map CVar Int,
-    ceTupleDefs :: Map CVar [Atom]
+    ceTupleDefs :: Map CVar [Atom],
+    ceInsideParallelRegion :: Bool
   }
 
 -- | Derive the classification sets/maps used by genStmts2 from a type environment.
@@ -719,7 +720,8 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
             ceFloatVars = floatVars,
             ceFloatArrVars = floatArrVars,
             ceVecVars = vecVars,
-            ceTupleDefs = tupleDefs
+            ceTupleDefs = tupleDefs,
+            ceInsideParallelRegion = False
           }
       returnedArrayVars retAtom =
         case retAtom of
@@ -875,6 +877,9 @@ genStmts2 env declared liveAfter stmts =
                in case C2.lsRed spec of
                     Just r -> S.insert (C2.rsAccVar r) declaredWithHoists
                     Nothing -> declaredWithHoists
+            C2.SParallelRegion body ->
+              let regionVars = allAssignedVars body `S.intersection` stmtLiveAfter
+              in declared `S.union` regionVars
             C2.SIf _ thn els ->
               let branchVars = allAssignedVars (thn ++ els) `S.intersection` stmtLiveAfter
                in declared `S.union` branchVars
@@ -927,6 +932,25 @@ genStmt2 env declared liveAfter stmt = case stmt of
     | otherwise ->
         genAtom arr <> text "->data[" <> genAtom idx <> text "]" <+> text "=" <+> genAtom val <> text ";"
   C2.SLoop spec body -> genLoop2 env declared spec body
+  C2.SParallelRegion body ->
+    let branchRHS = assignedRHSMap body
+        branchVars =
+          S.toList ((allAssignedVars body `S.intersection` liveAfter) `S.difference` declared)
+        preDecls =
+          vcat
+            [ case Map.lookup v branchRHS of
+                Just rhs ->
+                  varDecl env v rhs <+> text (sanitize v) <> text ";"
+                Nothing -> empty
+            | v <- branchVars
+            ]
+        declared' = declared `S.union` S.fromList branchVars
+        regionEnv = env { ceInsideParallelRegion = True }
+     in preDecls
+          $$ text "#pragma omp parallel"
+          $$ text "{"
+          $$ nest 4 (genStmts2 regionEnv declared' liveAfter body)
+          $$ text "}"
   C2.SIf cond thn els ->
     let branchRHS = assignedRHSMap (thn ++ els)
         branchVars =
@@ -976,6 +1000,14 @@ genLoop2 env declared spec body =
                 C2.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
                 C2.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
            in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (C2.psPolicy p)
+        C2.Workshare p ->
+          let strategyComment = case C2.psStrategy p of
+                C2.ParallelGeneric -> empty
+                C2.ParallelScatterDirect -> text " /* scatter-direct */"
+                C2.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
+                C2.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
+                C2.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (C2.psPolicy p)
         _ -> empty
       origins = C2.lsOrigins spec
       collapseClause
@@ -990,8 +1022,16 @@ genLoop2 env declared spec body =
       parallelPragma extraClauses =
         let simdClause = case C2.lsExec spec of
               C2.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
+              C2.Workshare p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
               _             -> empty
-        in text "#pragma omp parallel for" <> simdClause <> parallelPolicyClause <> collapseClause <> extraClauses
+            basePragma = case C2.lsExec spec of
+              C2.Workshare {} ->
+                if ceInsideParallelRegion env
+                  then text "#pragma omp for"
+                  else text "#pragma omp parallel for"
+              _ ->
+                text "#pragma omp parallel for"
+        in basePragma <> simdClause <> parallelPolicyClause <> collapseClause <> extraClauses
       simdPragma extraClauses = text "#pragma omp simd simdlen(" <> int defaultSimdLen <> text ")" <> extraClauses
       roleComment = case role of
         C2.LoopPlain -> text "loop"
@@ -1167,7 +1207,7 @@ genLoop2 env declared spec body =
                 <> text "++) {"
                 $$ nest 4 (bodyDoc declared')
                 $$ text "}"
-        (C2.Parallel _, Just r, [i], [b]) ->
+        (execPolicy, Just r, [i], [b]) | isOmpLoopExec execPolicy ->
           let cacc = sanitize (C2.rsAccVar r)
               ci = sanitize i
               declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
@@ -1193,7 +1233,7 @@ genLoop2 env declared spec body =
                 <> text "++) {"
                 $$ nest 4 (bodyDoc declared')
                 $$ text "}"
-        (C2.Parallel _, Just r, _, _) ->
+        (execPolicy, Just r, _, _) | isOmpLoopExec execPolicy ->
           let cacc = sanitize (C2.rsAccVar r)
               declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
               alreadyDeclared = C2.rsAccVar r `S.member` declared
@@ -1286,10 +1326,11 @@ genLoop2 env declared spec body =
                     <> text "++) {"
                     $$ nest 4 (bodyDoc declaredWithHoisted)
                     $$ text "}"
-        (C2.Parallel p, _, [i], [b])
-          | C2.psStrategy p == C2.ParallelScatterPrivatizedIntAdd ->
+        (execPolicy, _, [i], [b])
+          | Just p <- ompLoopParallelSpec execPolicy
+          , C2.psStrategy p == C2.ParallelScatterPrivatizedIntAdd ->
               privatizedScatterLoopDoc declaredWithHoisted i b
-        (C2.Parallel _, _, [i], [b]) ->
+        (execPolicy, _, [i], [b]) | isOmpLoopExec execPolicy ->
           let ci = sanitize i
            in text "/* parallel"
                 <+> roleComment
@@ -1309,10 +1350,12 @@ genLoop2 env declared spec body =
                   ( case C2.lsExec spec of
                       C2.Parallel p
                         | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
+                      C2.Workshare p
+                        | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
                       _ -> bodyDoc declaredWithHoisted
                   )
                 $$ text "}"
-        (C2.Parallel _, _, _, _) ->
+        (execPolicy, _, _, _) | isOmpLoopExec execPolicy ->
           text "/* parallel"
             <+> roleComment
             <+> text "*/"
@@ -1324,9 +1367,21 @@ genLoop2 env declared spec body =
               ( case C2.lsExec spec of
                   C2.Parallel p
                     | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
+                  C2.Workshare p
+                    | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
                   _ -> bodyDoc declaredWithHoisted
               )
         (_, _, _, _) -> genNestedLoops iters bounds origins (bodyDoc declaredWithHoisted)
+  where
+    isOmpLoopExec execPolicy = case execPolicy of
+      C2.Parallel {} -> True
+      C2.Workshare {} -> True
+      _ -> False
+
+    ompLoopParallelSpec execPolicy = case execPolicy of
+      C2.Parallel p -> Just p
+      C2.Workshare p -> Just p
+      _ -> Nothing
 
 hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> Map CVar CType -> [C2.Stmt] -> ([C2.Stmt], [C2.Stmt])
 hoistMemoizedZeroArgArrayCalls retKinds retTypes = go
@@ -1342,6 +1397,9 @@ hoistMemoizedZeroArgArrayCalls retKinds retTypes = go
     step (C2.SLoop spec body) =
       let (hoistedBody, keptBody) = go body
        in (hoistedBody, [C2.SLoop spec keptBody])
+    step (C2.SParallelRegion body) =
+      let (hoistedBody, keptBody) = go body
+       in ([], [C2.SParallelRegion (hoistedBody ++ keptBody)])
     step (C2.SIf cond thn els) =
       let (hoistedThn, keptThn) = go thn
           (hoistedEls, keptEls) = go els
@@ -1448,7 +1506,9 @@ hasParallelStmt2 = any go
     go st = case st of
       C2.SLoop spec body -> case C2.lsExec spec of
         C2.Parallel _ -> True
+        C2.Workshare _ -> True
         _ -> hasParallelStmt2 body
+      C2.SParallelRegion body -> hasParallelStmt2 body
       C2.SIf _ thn els -> hasParallelStmt2 thn || hasParallelStmt2 els
       _ -> False
 

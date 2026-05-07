@@ -1,6 +1,6 @@
 # Hydrangea Benchmark Suite
 
-This directory contains eleven scientific benchmarks for the Hydrangea compiler,
+This directory contains scientific benchmarks for the Hydrangea compiler,
 demonstrating array fusion, SIMD vectorization, and parallelization.
 
 ## Benchmarks
@@ -18,10 +18,14 @@ demonstrating array fusion, SIMD vectorization, and parallelization.
 | Graph Messages | `graph_messages/` | `gather`, `zipwith`, `segmented_reduce`, `reduce` |
 | Voxel Rasterization | `voxel_rasterization/` | `generate`, `scatter_guarded`, `map`, `reduce` |
 | Voxel Trilinear Splat | `voxel_trilinear_splat/` | `generate`, `scatter_guarded`, `reduce` |
+| Jacobi 2D Wavefront | `stencil/` | `iterate`, `stencil clamp`, profitability-gated tiled wavefront schedule |
 
 ## Quick Start
 
 ```bash
+./bench/run_quick.sh jacobi_2d_wavefront
+JACOBI_WF_H=64 JACOBI_WF_W=1024 JACOBI_WF_ITERS=20 ./bench/run_quick.sh jacobi_2d_wavefront
+
 # From the repo root, compile all benchmarks:
 cabal run hydrangea-compiler -- --emit-c bench/blackscholes/blackscholes.hyd
 cabal run hydrangea-compiler -- --emit-c bench/nbody/nbody.hyd
@@ -162,6 +166,18 @@ voxel rasterization variant. For now this benchmark is compiled with
 contribution pipeline.
 
 Environment variables: `VSPLAT_POINTS`, `VSPLAT_NX`, `VSPLAT_NY`, `VSPLAT_NZ`, `VSPLAT_KEEP_PERIOD`
+
+### Jacobi 2D Wavefront (`stencil/`, quick-run alias)
+This is a named `run_quick.sh` variant of `jacobi_2d` with wider default sizes
+(`JACOBI_WF_H=64`, `JACOBI_WF_W=1024`, `JACOBI_WF_ITERS=20`) chosen so the
+tiled polyhedral path uses the guarded full wavefront schedule at runtime rather
+than falling back to the ordinary scheduled loop nest. It reuses the same
+Hydrangea, Repa, Accelerate, and C reference kernels as `jacobi_2d`; only the
+default problem size changes. The alias is opt-in: it is available via
+`./bench/run_quick.sh jacobi_2d_wavefront`, but is not part of the default full
+`run_quick.sh` sweep because it is meant as a targeted wavefront diagnostic.
+
+Environment variables: `JACOBI_WF_H`, `JACOBI_WF_W`, `JACOBI_WF_ITERS`
 
 ## Compiler Flags
 

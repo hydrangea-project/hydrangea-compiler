@@ -193,6 +193,8 @@ inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
       _ -> typeEnv
   SLoop _ body ->
     inferStmtListTypes callTypes callParamTypes typeEnv body
+  SParallelRegion body ->
+    inferStmtListTypes callTypes callParamTypes typeEnv body
   SIf _ thn els ->
     let thnEnv = inferStmtListTypes callTypes callParamTypes typeEnv thn
         elsEnv = inferStmtListTypes callTypes callParamTypes thnEnv els

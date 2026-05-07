@@ -406,6 +406,10 @@ transformVectorStmt ctx env stmt =
     SArrayWrite arr _ _ ->
       if atomRefsVector env arr then Nothing else pure (env, [stmt])
 
+    SParallelRegion body -> do
+      body' <- transformVectorBody ctx env body
+      pure (env, [SParallelRegion body'])
+
     SIf {} -> Nothing
     SLoop {} -> Nothing
     SBreak -> Nothing

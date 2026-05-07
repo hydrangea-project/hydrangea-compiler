@@ -3334,6 +3334,7 @@ renameVarInStmt old new stmt =
     SAssign v rhs -> SAssign (if v == old then new else v) (renameVarInRHS old new rhs)
     SArrayWrite a b c -> SArrayWrite (renameVarInAtom old new a) (renameVarInAtom old new b) (renameVarInAtom old new c)
     SLoop spec body -> SLoop (renameLoopSpec old new spec) (map (renameVarInStmt old new) body)
+    SParallelRegion body -> SParallelRegion (map (renameVarInStmt old new) body)
     SIf cond tBranch eBranch -> SIf (renameVarInAtom old new cond) (map (renameVarInStmt old new) tBranch) (map (renameVarInStmt old new) eBranch)
     SReturn a -> SReturn (renameVarInAtom old new a)
     SBreak -> SBreak
