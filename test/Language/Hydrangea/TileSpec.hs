@@ -66,13 +66,35 @@ spec = describe "Tile" $ do
     let tiled = tileStmts2 [outer]
         loopSpecs = collectLoopSpecs tiled
 
-    map lsRole loopSpecs `shouldBe` [LoopPlain, LoopMap, LoopReduction]
+    map lsRole loopSpecs `shouldBe` [LoopPlain, LoopReductionWrapper, LoopReduction]
     map lsBounds loopSpecs `shouldSatisfy` \bounds ->
       case bounds of
         [[IConst 64], [IConst 2], [IVar _]] -> True
         _ -> False
+    lsRed (loopSpecs !! 1) `shouldBe` Just (ReductionSpec "acc" (IConst 0) RAdd)
     lsRed (last loopSpecs) `shouldBe` Just (ReductionSpec "acc" (IConst 0) RAdd)
     hasAccumulatorReload tiled `shouldBe` False
+
+  it "tiles top-level reduction loops into a wrapper plus local reduction" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["k"] [IConst 4096] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
+            [ SAssign "x" (RArrayLoad (AVar "arr") (AVar "k"))
+            , SAssign "acc" (RBinOp CAdd (AVar "acc") (AVar "x"))
+            ]
+
+    let tiled = tileStmts2 [loop]
+        loopSpecs = collectLoopSpecs tiled
+
+    map lsRole loopSpecs `shouldBe` [LoopReductionWrapper, LoopReduction]
+    map lsBounds loopSpecs `shouldSatisfy` \bounds ->
+      case bounds of
+        [[IConst 128], [IVar _]] -> True
+        _ -> False
+    map lsRed loopSpecs `shouldBe`
+      [ Just (ReductionSpec "acc" (IConst 0) RAdd)
+      , Just (ReductionSpec "acc" (IConst 0) RAdd)
+      ]
 
   it "leaves top-level flat loops unchanged when they are not part of a loop nest" $ do
     let loop =
@@ -122,6 +144,8 @@ spec = describe "Tile" $ do
     let tiled = tileStmts2 [outer]
         loopSpecs = collectLoopSpecs tiled
     length loopSpecs `shouldSatisfy` (> 2)
+    map lsRole loopSpecs `shouldSatisfy` \roles ->
+      LoopMapReduction `elem` roles && LoopReduction `elem` roles
 
 collectLoopSpecs :: [Stmt] -> [LoopSpec]
 collectLoopSpecs = concatMap go

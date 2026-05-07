@@ -501,12 +501,13 @@ factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
 ------------------------------------------------------------------------
 
 -- | Returns 'True' when a loop at the given nesting depth should be
--- considered for parallelization.  Reduction-wrapper loops are never
--- parallelized; all other loop roles are eligible only at the outermost
--- level (@insideLoop = False@).
+-- considered for parallelization. Plain reduction-wrapper loops remain
+-- serial, but tiled reduction wrappers that carry a 'ReductionSpec' are
+-- eligible at the outermost level so the existing OpenMP reduction path can
+-- combine tile-private partial reductions.
 shouldParallelizeLoop :: Bool -> LoopSpec -> Bool
 shouldParallelizeLoop insideLoop spec = case lsRole spec of
-  LoopReductionWrapper -> False
+  LoopReductionWrapper -> not insideLoop && lsRed spec /= Nothing
   LoopFold             -> False  -- foldl/scan loops carry an accumulator; never parallelizable
   LoopIterate          -> False  -- iterate temporal loop carries array state; never parallelizable
   _                    -> not insideLoop

@@ -6,6 +6,7 @@ import Data.Map.Strict qualified as Map
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
 import Language.Hydrangea.Parallelize (parallelizeProc2, parallelizeStmts2)
+import Language.Hydrangea.Tile (tileStmts2)
 import Test.Hspec
 
 spec :: Spec
@@ -296,6 +297,25 @@ spec = describe "Parallelize" $ do
         lsExec wrapperSpec `shouldBe` Serial
         lsExec innerSpec `shouldBe` Serial
       _ -> expectationFailure "Expected scalar reduction wrapper structure"
+
+  it "parallelizes tiled top-level reduction wrappers when they carry reduction metadata" $ do
+    let reductionLoop =
+          SLoop
+            (LoopSpec ["k"] [IConst 4096] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
+            [ SAssign "x" (RArrayLoad (AVar "arr") (AVar "k"))
+            , SAssign "acc" (RBinOp CAdd (AVar "acc") (AVar "x"))
+            ]
+    case parallelizeStmts2 (tileStmts2 [reductionLoop]) of
+      [SLoop wrapperSpec body] -> do
+        lsRole wrapperSpec `shouldBe` LoopReductionWrapper
+        lsExec wrapperSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
+        lsRed wrapperSpec `shouldBe` Just (ReductionSpec "acc" (IConst 0) RAdd)
+        case last body of
+          SLoop innerSpec _ -> do
+            lsExec innerSpec `shouldBe` Serial
+            lsRed innerSpec `shouldBe` Just (ReductionSpec "acc" (IConst 0) RAdd)
+          other -> expectationFailure ("Expected inner local reduction loop, got: " <> show other)
+      other -> expectationFailure ("Expected tiled reduction wrapper structure, got: " <> show other)
 
   it "keeps nested reduction loops serial under an outer plain parallel loop" $ do
     let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])

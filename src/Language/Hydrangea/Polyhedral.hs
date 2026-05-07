@@ -1510,7 +1510,11 @@ shouldTileBand depth band =
     && loopRoleSupportsTiling2 band
     && boundsAreIteratorIndependent band
     && all (supportsAtomBound . simplifyIndexExpr) (lbBounds band)
-    && (depth > 0 || hasNestedBand (lbBody band) || length (lbIters band) > 1)
+    && ( depth > 0
+      || hasNestedBand (lbBody band)
+      || length (lbIters band) > 1
+      || lbRole band == LoopReduction
+       )
 
 loopRoleSupportsTiling2 :: LoopBand -> Bool
 loopRoleSupportsTiling2 band = case lbRole band of
@@ -2382,7 +2386,7 @@ reifyScheduleTree stmtMap sched = case sched of
           , lsBounds = map (\td -> tileCountExpr (smdOrigBound td) (smdTileSize td)) tiledDims
           , lsOrigins = []
           , lsExec = Serial
-          , lsRed = Nothing
+          , lsRed = tileWrapperReduction band
           , lsRole = tiledLoopRole (lbRole band)
           }
         innerLocalSpec = LoopSpec
@@ -2418,6 +2422,11 @@ reifyScheduleTree stmtMap sched = case sched of
   ScheduleStmtRef stmtId ->
     pure . pure =<< M.lookup stmtId stmtMap
 
+tileWrapperReduction :: LoopBand -> Maybe ReductionSpec
+tileWrapperReduction band = case tiledLoopRole (lbRole band) of
+  LoopReductionWrapper -> lbReduction band
+  _ -> Nothing
+
 setupStripDim :: StripMinedDim -> [Stmt]
 setupStripDim td =
   [ SAssign (smdTileStart td) (RBinOp CMul (AVar (smdTileIter td)) (AInt (smdTileSize td))) ]
@@ -2432,9 +2441,12 @@ tiledLoopRole role = case role of
   LoopPlain -> LoopPlain
   LoopFold -> LoopFold
   LoopMap -> LoopMap
-  LoopReductionWrapper -> LoopMap
-  LoopReduction -> LoopMap
-  LoopMapReduction -> LoopMap
+  -- Strip-mining a reduction produces an outer wrapper over independent tiles;
+  -- keep that role visible so later passes do not treat the tile loop like a
+  -- generic map.
+  LoopReductionWrapper -> LoopReductionWrapper
+  LoopReduction -> LoopReductionWrapper
+  LoopMapReduction -> LoopMapReduction
   LoopIterate -> LoopIterate
 
 minLenSetup :: StripMinedDim -> [Stmt]
