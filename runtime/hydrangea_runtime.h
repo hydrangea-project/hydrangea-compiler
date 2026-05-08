@@ -8,6 +8,13 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef __cplusplus
+#include <atomic>
+#define HYD_ATOMIC_INT64 std::atomic<int64_t>
+#else
+#define HYD_ATOMIC_INT64 _Atomic int64_t
+#endif
+
 #include "simde/x86/sse2.h"
 #include "simde/x86/avx.h"
 
@@ -217,7 +224,7 @@ typedef struct {
 
 typedef struct {
     unsigned char* data;
-    _Atomic int64_t refcount;
+    HYD_ATOMIC_INT64 refcount;
 } hyd_array_storage_t;
 
 typedef struct {
