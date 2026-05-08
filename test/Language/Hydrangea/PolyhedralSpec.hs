@@ -245,6 +245,7 @@ spec = describe "Polyhedral" $ do
           , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
           ])
     countWavefrontRingAllocsInStmts body `shouldSatisfy` (> 0)
+    hasVectorLoopInStmts body `shouldBe` True
 
   it "guards small source-level 2D clamp iterate kernels with a tiled wavefront profitability check" $ do
     body <-
@@ -1602,6 +1603,21 @@ hasParallelLoopInStmts = any go
         hasParallelLoopInStmts body
       SIf _ thn els ->
         hasParallelLoopInStmts thn || hasParallelLoopInStmts els
+      _ ->
+        False
+
+hasVectorLoopInStmts :: [Stmt] -> Bool
+hasVectorLoopInStmts = any go
+  where
+    go stmt = case stmt of
+      SLoop spec body ->
+        case lsExec spec of
+          Vector {} -> True
+          _ -> hasVectorLoopInStmts body
+      SParallelRegion body ->
+        hasVectorLoopInStmts body
+      SIf _ thn els ->
+        hasVectorLoopInStmts thn || hasVectorLoopInStmts els
       _ ->
         False
 

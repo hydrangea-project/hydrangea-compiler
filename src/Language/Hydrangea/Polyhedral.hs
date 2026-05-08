@@ -2787,7 +2787,8 @@ buildWavefrontBody2 kernel = do
       [2 .. wfkStageWidth kernel]
   let stageBuffers = [wfkCurArray kernel, wfkNextArray kernel] ++ extraBuffers
   rotations <- buildWavefrontRotation2 stageBuffers (smdTileLen timeBlock)
-  stageCases <- buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars
+  (stageSelection, curStageBuf, nextStageBuf, stageTimeVar) <-
+    buildWavefrontStageSelection2 kernel stageIter stageBuffers stageTimeVars
   extraShapeVar <- freshLike (wfkCurArray kernel) "__wf_shape"
   let (extraShapeSetup, allocTargets) =
         if wfkPreallocatedNext kernel
@@ -2812,28 +2813,47 @@ buildWavefrontBody2 kernel = do
         [ SAssign tVar (RBinOp CAdd (AVar (smdTileStart timeBlock)) (AInt offset))
         | (offset, tVar) <- zip [0 ..] stageTimeVars
         ]
+      substEnv =
+        M.fromList
+          [ (wfkCurArray kernel, AVar curStageBuf)
+          , (wfkNextArray kernel, AVar nextStageBuf)
+          , (wfkIterT kernel, AVar stageTimeVar)
+          ]
+      innerBody =
+        collapseWavefrontInnerLoop2
+          (wavefrontFrontierInnerExec2 kernel)
+          diagIter
+          (wfkInnerSpec kernel)
+          (substStmts2 substEnv (wfkInnerBody kernel))
+      suffixBody = substStmts2 substEnv (wfkStageSuffix kernel)
+      cleanupTargets =
+        if wfkPreallocatedNext kernel
+          then extraBuffers
+          else drop 1 stageBuffers
+  guardedInner <- buildWavefrontInnerGuard2 kernel diagIter stageTimeVar innerBody
+  let frontierLoop =
+        SLoop
+          LoopSpec
+            { lsIters = [diagIter]
+            , lsBounds = [wavefrontDiagBound2 kernel (smdTileLen timeBlock)]
+            , lsOrigins = []
+            , lsExec = wavefrontFrontierOuterExec2 kernel
+             , lsRed = Nothing
+             , lsRole = LoopPlain
+             }
+          guardedInner
+      stageLoopBody = stageSelection ++ [frontierLoop] ++ suffixBody
       stageLoop =
         SLoop
           LoopSpec
             { lsIters = [stageIter]
             , lsBounds = [IVar (smdTileLen timeBlock)]
             , lsOrigins = []
-            , lsExec = wavefrontStageLoopExec2 kernel
+            , lsExec = Serial
             , lsRed = Nothing
             , lsRole = LoopMap
             }
-          stageCases
-      diagLoop =
-        SLoop
-          LoopSpec
-            { lsIters = [diagIter]
-            , lsBounds = [wavefrontDiagBound2 kernel (smdTileLen timeBlock)]
-            , lsOrigins = []
-            , lsExec = Serial
-            , lsRed = Nothing
-            , lsRole = LoopPlain
-            }
-          [stageLoop]
+          stageLoopBody
       blockLoop =
         SLoop
           LoopSpec
@@ -2846,19 +2866,11 @@ buildWavefrontBody2 kernel = do
             }
           ( setupStripDim timeBlock
               ++ stageTimeSetup
-              ++ [diagLoop]
+              ++ [stageLoop]
               ++ rotations
           )
-      cleanupTargets =
-        if wfkPreallocatedNext kernel
-          then extraBuffers
-          else drop 1 stageBuffers
   cleanup <- fmap concat (mapM (buildWavefrontCleanup2 kernel) cleanupTargets)
-  let loopNest =
-        case wfkStageExec kernel of
-          Workshare {} -> [SParallelRegion [blockLoop]]
-          _ -> [blockLoop]
-  pure (wfkHoistedPrefix kernel ++ allocs ++ loopNest ++ cleanup)
+  pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
 
 buildWavefrontCleanup2 :: WavefrontKernel -> CVar -> TileM [Stmt]
 buildWavefrontCleanup2 kernel arr = do
@@ -2903,41 +2915,34 @@ wavefrontDiagBound2 kernel blockLenVar =
           (ISub (IVar blockLenVar) (IConst 1))
       )
 
-buildWavefrontStageCases2
+buildWavefrontStageSelection2
   :: WavefrontKernel
   -> CVar
-  -> CVar
   -> [CVar]
   -> [CVar]
-  -> TileM [Stmt]
-buildWavefrontStageCases2 kernel diagIter stageIter stageBuffers stageTimeVars =
-  fmap concat (mapM buildOne (zip3 [0 :: Integer ..] stageBuffers stageTimeVars))
-  where
-    buildOne (slotIx, curBuf, timeVar) =
-      case atMay stageBuffers (fromIntegral slotIx + 1) of
-        Nothing ->
-          pure []
-        Just nextBuf ->
-          do
-            let eqVar = stageIter <> "__eq_" <> BS.pack (show slotIx)
-                substEnv =
-                  M.fromList
-                    [ (wfkCurArray kernel, AVar curBuf)
-                    , (wfkNextArray kernel, AVar nextBuf)
-                    , (wfkIterT kernel, AVar timeVar)
-                    ]
-                innerBody =
-                  collapseWavefrontInnerLoop2
-                    (wavefrontFrontierExec2 kernel)
-                    diagIter
-                    (wfkInnerSpec kernel)
-                    (substStmts2 substEnv (wfkInnerBody kernel))
-                suffixBody = substStmts2 substEnv (wfkStageSuffix kernel)
-            guardedInner <- buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody
+  -> TileM ([Stmt], CVar, CVar, CVar)
+buildWavefrontStageSelection2 kernel stageIter stageBuffers stageTimeVars = do
+  curStageBuf <- freshLike (wfkCurArray kernel) "__wf_stage_cur"
+  nextStageBuf <- freshLike (wfkNextArray kernel) "__wf_stage_next"
+  stageTimeVar <- freshLike (wfkIterT kernel) "__wf_stage_time"
+  let buildOne (slotIx, curBuf, timeVar) =
+        case atMay stageBuffers (fromIntegral slotIx + 1) of
+          Nothing ->
+            pure []
+          Just nextBuf -> do
+            eqVar <- freshLike stageIter ("__eq_" <> BS.pack (show slotIx))
             pure
               [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
-              , SIf (AVar eqVar) (guardedInner ++ suffixBody) []
+              , SIf
+                  (AVar eqVar)
+                  [ SAssign curStageBuf (RAtom (AVar curBuf))
+                  , SAssign nextStageBuf (RAtom (AVar nextBuf))
+                  , SAssign stageTimeVar (RAtom (AVar timeVar))
+                  ]
+                  []
               ]
+  selection <- fmap concat (mapM buildOne (zip3 [0 :: Integer ..] stageBuffers stageTimeVars))
+  pure (selection, curStageBuf, nextStageBuf, stageTimeVar)
 
 buildWavefrontInnerGuard2 :: WavefrontKernel -> CVar -> CVar -> [Stmt] -> TileM [Stmt]
 buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody = do
@@ -2980,17 +2985,26 @@ buildWavefrontRotation2 ringVars blockLenVar = do
         ]
   pure (saved ++ concat (zipWith oneRotation [1 .. ringCount - 1] eqVars))
 
-wavefrontStageLoopExec2 :: WavefrontKernel -> ExecPolicy
-wavefrontStageLoopExec2 kernel =
+wavefrontFrontierOuterExec2 :: WavefrontKernel -> ExecPolicy
+wavefrontFrontierOuterExec2 kernel =
   case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
-    (Workshare {}, _ : _ : _) -> Serial
-    (execPolicy, _) -> execPolicy
-
-wavefrontFrontierExec2 :: WavefrontKernel -> ExecPolicy
-wavefrontFrontierExec2 kernel =
-  case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
-    (Workshare p, _ : _ : _) -> Workshare p
+    (Workshare p, _ : _ : _) -> Parallel p
+    (Parallel p, _ : _ : _) -> Parallel p
+    (execPolicy, [_]) -> execPolicy
     _ -> Serial
+
+wavefrontFrontierInnerExec2 :: WavefrontKernel -> ExecPolicy
+wavefrontFrontierInnerExec2 kernel =
+  case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
+    (Workshare {}, _ : _ : []) ->
+      Vector (VectorSpec wavefrontFrontierSimdLen TailMask)
+    (Parallel {}, _ : _ : []) ->
+      Vector (VectorSpec wavefrontFrontierSimdLen TailMask)
+    _ ->
+      Serial
+
+wavefrontFrontierSimdLen :: Int
+wavefrontFrontierSimdLen = 4
 
 collapseWavefrontInnerLoop2 :: ExecPolicy -> CVar -> LoopSpec -> [Stmt] -> [Stmt]
 collapseWavefrontInnerLoop2 frontierExec diagIter innerSpec innerBody =
