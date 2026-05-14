@@ -158,8 +158,10 @@ spec = describe "CodegenC" $ do
         c = codegenProgram2 prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
     c `shouldSatisfy` isInfixOf "#pragma omp for"
-    c `shouldSatisfy` isInfixOf "#pragma omp critical"
     c `shouldSatisfy` isInfixOf "calloc((size_t)"
+    -- merge uses per-element atomics (not a serializing critical section)
+    c `shouldSatisfy` isInfixOf "#pragma omp atomic"
+    c `shouldNotSatisfy` isInfixOf "#pragma omp critical"
 
   it "emits guarded atomic update code for guarded integer scatter-add loops" $ do
     let loopBody =

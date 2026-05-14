@@ -479,7 +479,7 @@ factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
     profitable dest =
       case (M.lookup dest allocSizes, tripCountValue2 (loopTripCount2 spec)) of
         (Just sz, Just tc) -> sz > 0 && sz <= 64 && tc >= max 32 (sz * 4)
-        _                  -> not (hasExternalReads dest body)
+        _                  -> False  -- unknown output size: prefer atomic scatter (no alloc, no serial merge)
 
     safeNonDest dest (arr, u)
       | arr == dest = True

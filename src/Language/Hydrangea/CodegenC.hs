@@ -1150,21 +1150,19 @@ genLoop2 env declared spec body =
                               $$ guardedPrivUpdate
                           )
                         $$ text "}"
-                        $$ text "#pragma omp critical"
-                        $$ text "{"
+                        $$ text "for (int64_t"
+                        <+> mergeIx
+                        <+> text "= 0;"
+                        <+> mergeIx
+                        <+> text "<"
+                        <+> sizeVar
+                        <> text ";"
+                        <+> mergeIx
+                        <> text "++) {"
                         $$ nest
                           4
-                           ( text "for (int64_t"
-                               <+> mergeIx
-                               <+> text "= 0;"
-                               <+> mergeIx
-                              <+> text "<"
-                              <+> sizeVar
-                              <> text ";"
-                              <+> mergeIx
-                              <> text "++) {"
-                              $$ nest 4 (genArrayAccess CTInt64 arr (AVar (BS.pack mergeIxName)) <+> text "+=" <+> privVar <> text "[" <> mergeIx <> text "];")
-                              $$ text "}"
+                          ( text "#pragma omp atomic"
+                              $$ (genArrayAccess CTInt64 arr (AVar (BS.pack mergeIxName)) <+> text "+=" <+> privVar <> text "[" <> mergeIx <> text "];")
                           )
                         $$ text "}"
                         $$ text "free("

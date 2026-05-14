@@ -622,8 +622,10 @@ spec = do
         ]
       csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
       csrc `shouldSatisfy` isInfixOf "#pragma omp for"
-      csrc `shouldSatisfy` isInfixOf "#pragma omp critical"
       csrc `shouldSatisfy` isInfixOf "calloc((size_t)"
+      -- merge uses per-element atomics (not a serializing critical section)
+      csrc `shouldSatisfy` isInfixOf "#pragma omp atomic"
+      csrc `shouldNotSatisfy` isInfixOf "#pragma omp critical"
 
     it "emits atomic guarded parallel scatter code for masked weighted histogram" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
