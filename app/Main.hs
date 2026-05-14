@@ -28,8 +28,11 @@ import Language.Hydrangea.CodegenC
 import Language.Hydrangea.CodegenMSL (MSLArtifacts(..), MSLOptions(..), defaultMSLOptions, codegenMSL)
 import Language.Hydrangea.ErrorFormat (formatEvalError, formatTypeError)
 import Language.Hydrangea.Frontend
-  ( compileToCOptIOWithPipelineOptionsAndCodegenOptions
+  ( compileToCOptIOWithAllOptions
   , evalDecsFrontend
+  , FrontendOptions(..)
+  , defaultFrontendOptions
+  , inferAndLowerToCFG2WithFrontendOptions
   , lowerToCFG2
   , lowerToCFG2OptWithTypesWithOptions
   , lowerToCFG2WithTypesWithOptions
@@ -74,6 +77,7 @@ usage = unwords
   , "[--export-kernel=<name>]"
   , "[" ++ allTopLevelProcsFlag ++ "]"
    , "[--no-parallel]"
+   , "[--no-fusion]"
    , "[--tiling]"
    , "[--polyhedral]"
    , "[--explicit-vectorization]"
@@ -121,6 +125,7 @@ main = do
       keepC = "--keep-c" `elem` flags
       compileOnly = "--compile-only" `elem` flags
       parallel = not ("--no-parallel" `elem` flags)
+      noFusion = "--no-fusion" `elem` flags
       enableTiling = "--tiling" `elem` flags
       enablePolyhedral = "--polyhedral" `elem` flags
       enableExplicitVectorization = "--explicit-vectorization" `elem` flags
@@ -154,6 +159,7 @@ main = do
           , poEnableParallelization = parallel
           , poVectorWidth = simdWidth
           }
+      frontendOptions = defaultFrontendOptions { frontendSkipFusion = noFusion }
   (input, mpath) <- readInput paths
 
   let ccFlag = flagValue "--cc=" flags
@@ -191,7 +197,7 @@ main = do
     dieWithMessage "--explicit-vectorization is only supported for the C backend."
 
   let generateExportArtifacts decs = do
-        prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
+        prog <- inferAndLowerToCFG2WithFrontendOptions frontendOptions inferOptions decs
         let optimized = optimizeCFG2WithPipelineOptions pipelineOptions prog
         pure (codegenProgram2WithOptionsPrune exportCodegenOptions pruneDead optimized)
 
@@ -225,7 +231,8 @@ main = do
                 Right () -> pure ()
           compileSelectedC =
             let codegenOpts = defaultCodegenOptions { codegenSimdWidth = simdWidth }
-            in compileToCOptIOWithPipelineOptionsAndCodegenOptions
+            in compileToCOptIOWithAllOptions
+                 frontendOptions
                  inferOptions
                  pipelineOptions
                  codegenOpts

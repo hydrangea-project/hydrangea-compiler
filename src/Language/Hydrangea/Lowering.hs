@@ -26,7 +26,7 @@ import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore
@@ -1009,7 +1009,6 @@ lowerExp expr = case expr of
   ESegmentedReduce _ fnExp initExp offsetsExp valsExp -> do
     (si, ai) <- lowerExp initExp
     (so, ao) <- lowerExp offsetsExp
-    (sv, av) <- lowerExp valsExp
     offsetsShp <- freshCVar "segred_offsets_shp"
     offsetsN <- freshCVar "segred_offsets_n"
     outN <- freshCVar "segred_out_n"
@@ -1030,7 +1029,23 @@ lowerExp expr = case expr of
       registerCType acc accTy
       registerCType outArr (CTArray accTy)
     propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+    -- Fix 1: use lowerReductionStep so the inner LoopReduction carries a
+    -- ReductionSpec (enables the SIMD reduction clause, same as other sites).
+    (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+    let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+    -- Fix 2: fuse a 1D generate directly into the inner loop, avoiding
+    -- allocation and two-pass I/O on the intermediate values array.
+    -- Register elemIx as CTInt64 so inlineArrayFn1D sees the correct type
+    -- when deciding how to bind the PVec parameter.
+    registerCType elemIx CTInt64
+    mGenFn <- peelToGenerate1D valsExp
+    (sv, elemStmts) <- case mGenFn of
+      Just genFnExp -> do
+        genStmts <- inlineArrayFn1D genFnExp elemIx elem'
+        pure ([], genStmts)
+      Nothing -> do
+        (sv', av) <- lowerExp valsExp
+        pure (sv', [SAssign elem' (RArrayLoad av (AVar elemIx))])
     pure
       ( si ++ so ++ sv
           ++ [ SAssign offsetsShp (RArrayShape ao)
@@ -1038,16 +1053,17 @@ lowerExp expr = case expr of
              , SAssign outN (RBinOp CSub (AVar offsetsN) (AInt 1))
              , SAssign outShp (RTuple [AVar outN])
              , SAssign outArr (RArrayAlloc (AVar outShp))
-             , SLoop (LoopSpec [seg] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain [])
+             -- Fix 3: LoopSegRedOuter → CodegenC emits schedule(dynamic) for
+             -- load balance on irregular segment lengths.
+             , SLoop (LoopSpec [seg] [atomToIndexExpr (AVar outN)] Serial Nothing LoopSegRedOuter [])
                  [ SAssign start (RArrayLoad ao (AVar seg))
                  , SAssign nextSeg (RBinOp CAdd (AVar seg) (AInt 1))
                  , SAssign stop (RArrayLoad ao (AVar nextSeg))
                  , SAssign segLen (RBinOp CSub (AVar stop) (AVar start))
                  , SAssign acc (RAtom ai)
-                 , SLoop (LoopSpec [k] [atomToIndexExpr (AVar segLen)] Serial Nothing LoopReduction [])
-                     ( [ SAssign elemIx (RBinOp CAdd (AVar start) (AVar k))
-                       , SAssign elem' (RArrayLoad av (AVar elemIx))
-                       ]
+                 , SLoop (LoopSpec [k] [atomToIndexExpr (AVar segLen)] Serial mReductionSpec LoopReduction [])
+                     ( [ SAssign elemIx (RBinOp CAdd (AVar start) (AVar k)) ]
+                       ++ elemStmts
                        ++ bodyStmts
                      )
                  , SArrayWrite (AVar outArr) (AVar seg) (AVar acc)
@@ -3382,6 +3398,60 @@ reductionRedopFromStmts (SAssign v (RBinOp bop (AVar v') _) : rest)
   | v == v' = reductionRedopFromBinOp bop <|> reductionRedopFromStmts rest
 reductionRedopFromStmts (_ : rest) = reductionRedopFromStmts rest
 
+-- | Attempt to infer the reduction operator from the output of
+-- 'inlineBinaryFn' by following the copy chain that the complex-body path
+-- always produces:
+--
+-- @
+--   px  = acc          -- param-rename: copy acc into fresh var px
+--   py  = elem'        -- param-rename: copy elem into fresh var py
+--   ...                -- body computations using px and py (may copy px to x_1, x_1 to x_2, …)
+--   t   = x_n op ...   -- accumulation step: a copy-descendant of acc on left of op
+--   acc = t            -- copy result back to accumulator
+-- @
+--
+-- This handles fused functions such as
+-- @__fusion_f0(x, y) = (+.) x (g y)@, where the accumulator parameter
+-- propagates through a chain of copy bindings before reaching the final
+-- binop, and the right-hand side is a non-trivial transform of the element.
+inferReductionRedopFromInlined :: CVar -> [Stmt] -> Maybe Redop
+inferReductionRedopFromInlined acc stmts = do
+  tFinal <- findFinalCopyTarget acc stmts
+  bop    <- findBinOpUsingCopyChain acc tFinal stmts
+  reductionRedopFromBinOp bop
+
+-- | Build the transitive closure of variables that are direct or indirect
+-- copies (via 'RAtom') of @src@ within @stmts@, in a single forward pass.
+-- Only 'RAtom' copies are followed; binop results are not.
+accCopyChain :: CVar -> [Stmt] -> S.Set CVar
+accCopyChain src stmts = foldl step (S.singleton src) stmts
+  where
+    step seen (SAssign dst (RAtom (AVar v)))
+      | S.member v seen = S.insert dst seen
+    step seen _ = seen
+
+-- | @findFinalCopyTarget dst stmts@ returns @Just src@ when the last
+-- statement is @dst = src@ (an 'RAtom' copy).
+findFinalCopyTarget :: CVar -> [Stmt] -> Maybe CVar
+findFinalCopyTarget dst stmts
+  | not (null stmts)
+  , SAssign dst' (RAtom (AVar src)) <- last stmts
+  , dst == dst' = Just src
+  | otherwise = Nothing
+
+-- | @findBinOpUsingCopyChain acc result stmts@ searches @stmts@ for the
+-- first statement of the form @result = a op ...@ where @a@ is in the
+-- transitive copy chain of @acc@, and returns the 'BinOp'.
+findBinOpUsingCopyChain :: CVar -> CVar -> [Stmt] -> Maybe BinOp
+findBinOpUsingCopyChain acc result stmts = listToMaybe
+  [ bop
+  | SAssign r (RBinOp bop (AVar a) _) <- stmts
+  , r == result
+  , S.member a chain
+  ]
+  where
+    chain = accCopyChain acc stmts
+
 lowerReductionStep :: Exp Range -> CVar -> CVar -> LowerM ([Stmt], Maybe Redop)
 lowerReductionStep fnExp acc elem' = case fnExp of
   EOp _ op ->
@@ -3395,10 +3465,12 @@ lowerReductionStep fnExp acc elem' = case fnExp of
         in pure ([SAssign acc (RBinOp bop (AVar acc) (AVar elem'))], reductionRedopFromBinOp bop)
       _ -> do
         stmts <- inlineBinaryFn fnExp acc elem' acc
-        pure (stmts, reductionRedopFromStmts stmts)
+        pure (stmts, reductionRedopFromStmts stmts
+                       <|> inferReductionRedopFromInlined acc stmts)
   _ -> do
     stmts <- inlineBinaryFn fnExp acc elem' acc
-    pure (stmts, reductionRedopFromStmts stmts)
+    pure (stmts, reductionRedopFromStmts stmts
+                   <|> inferReductionRedopFromInlined acc stmts)
 
 -- | Returns True when the given shape expression is a 1-element vector,
 -- meaning the array is 1-dimensional. Used to skip hyd_flat_to_nd in scatter
@@ -3469,6 +3541,20 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
             pure $ sf ++ partStmts
           Nothing -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
       _ -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
+
+-- | Strip any leading 'ELetIn' function-definition wrappers, registering each
+-- function along the way, and return the generator function expression if the
+-- innermost expression is a 1-D 'EGenerate'.  Returns 'Nothing' for any other
+-- array expression.  Safe to call even in the fallback path because
+-- 'registerFn' is idempotent (plain Map.insert).
+peelToGenerate1D :: Exp Range -> LowerM (Maybe (Exp Range))
+peelToGenerate1D expr = case expr of
+  ELetIn _ (Dec _ name pats _ _ body) rest -> do
+    registerFn name pats body
+    peelToGenerate1D rest
+  EGenerate _ shape genFnExp
+    | shapeRankExp shape == Just 1 -> pure (Just genFnExp)
+  _ -> pure Nothing
 
 inlineArrayFn1D :: Exp Range -> CVar -> CVar -> LowerM [Stmt]
 inlineArrayFn1D fnExp paramVar resultVar = case fnExp of

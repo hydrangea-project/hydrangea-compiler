@@ -1,0 +1,49 @@
+(* 1-D Kernel Density Estimation benchmark.
+   Each of KDE_N source samples contributes to three adjacent histogram bins
+   with a triangular (tent) weighting: the centre bin receives weight 2, the
+   two neighbours receive weight 1.  Out-of-range contributions are suppressed
+   by the guard predicate.
+
+   The entire pipeline — expanding each sample to three contributions, computing
+   bin indices, triangular weights, and guard flags — is expressed as three
+   generate expressions feeding a single scatter_guarded.  With fusion all three
+   generators are absorbed into the scatter write loop: the kernel never
+   materialises the contribution arrays.
+
+   This pattern is structurally unsupported by pull-only fusion systems (Repa,
+   Accelerate): scatter is a write-conflict operation that cannot be expressed
+   as output[i] = f(i), so upstream producers cannot be demand-driven into it.
+
+   Compare with kde_unfused.hyd (reify barriers) to isolate the cost of
+   push-style scatter fusion.
+
+   Environment variables:
+     KDE_N    -- number of source samples
+     KDE_BINS -- number of output bins
+*)
+
+let main =
+  let n    = get_env_int "KDE_N" in
+  let bins = get_env_int "KDE_BINS" in
+  let contribs = n * 3 in
+  let imod x m = x - ((x / m) * m) in
+  (* Each source sample i maps to contribution (i*3 + offset), offset in {0,1,2}.
+     Offset 0 → left neighbour, 1 → centre, 2 → right neighbour. *)
+  let sample_of [k] = k / 3 in
+  let offset_of [k] = imod k 3 in
+  (* Centre bin for sample s *)
+  let centre [k] = (sample_of [k] * bins) / n in
+  (* Destination bin: offset 0 → centre-1, 1 → centre, 2 → centre+1 *)
+  let route [k] = centre [k] + offset_of [k] - 1 in
+  (* Triangular weight: centre gets 2, neighbours get 1 *)
+  let weight [k] = if offset_of [k] = 1 then 2 else 1 in
+  (* Guard: destination bin must be in [0, bins) *)
+  let in_range [k] =
+    let r = route [k] in
+    if r >= 0 then r < bins else (0 = 1) in
+  let density =
+    scatter_guarded (+) (fill [bins] 0)
+      (generate [contribs] route)
+      (generate [contribs] weight)
+      (generate [contribs] in_range) in
+  index () (reduce (+) 0 density)

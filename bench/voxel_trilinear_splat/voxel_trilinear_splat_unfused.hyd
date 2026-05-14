@@ -1,0 +1,62 @@
+(* Trilinear voxel splatting — unfused baseline.
+   Identical computation to voxel_trilinear_splat.hyd, but the three generator
+   expressions (route_of, weight_of, keep_of) are wrapped in `reify` so the
+   fusion pass cannot collapse them into the scatter_guarded write loop.  The
+   three contribution arrays are fully materialised before the scatter executes.
+
+   Use alongside voxel_trilinear_splat.hyd to measure the performance impact of
+   push-style scatter fusion over a richer 3D trilinear kernel.
+
+   This benchmark requires `--no-solver-check` for the same reason as the fused
+   version (refinement solver cannot yet infer the necessary bounds facts).
+
+   Environment variables:
+     VSPLAT_POINTS       -- number of source points
+     VSPLAT_NX           -- voxel-grid x extent
+     VSPLAT_NY           -- voxel-grid y extent
+     VSPLAT_NZ           -- voxel-grid z extent
+     VSPLAT_KEEP_PERIOD  -- keep every k-th point
+*)
+
+let main =
+  let n = get_env_int "VSPLAT_POINTS" in
+  let nx = get_env_int "VSPLAT_NX" in
+  let ny = get_env_int "VSPLAT_NY" in
+  let nz = get_env_int "VSPLAT_NZ" in
+  let keep_period = get_env_int "VSPLAT_KEEP_PERIOD" in
+  let nvox = nx * ny * nz in
+  let contribs = n * 8 in
+  let imod x m = x - ((x / m) * m) in
+  let route_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let x = imod (p * 17 + 3 + bx) nx in
+    let y = imod (p * 29 + 5 + by) ny in
+    let z = imod (p * 43 + 7 + bz) nz in
+    ((z * ny) + y) * nx + x in
+  let weight_of [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let fx = imod (p * 5 + 1) 4 in
+    let fy = imod (p * 7 + 2) 4 in
+    let fz = imod (p * 11 + 3) 4 in
+    let wx = (1 - bx) * (4 - fx) + bx * fx in
+    let wy = (1 - by) * (4 - fy) + by * fy in
+    let wz = (1 - bz) * (4 - fz) + bz * fz in
+    let base = (p * 3) + 1 in
+    float_of (base * wx * wy * wz) /. 64.0 in
+  let keep_of [i] =
+    let p = i / 8 in
+    ((p / keep_period) * keep_period) = p in
+  let routes  = reify (generate [contribs] route_of) in
+  let weights = reify (generate [contribs] weight_of) in
+  let keeps   = reify (generate [contribs] keep_of) in
+  let voxels =
+    scatter_guarded (+.) (fill [nvox] 0.0) routes weights keeps in
+  index () (reduce (+.) 0.0 voxels)

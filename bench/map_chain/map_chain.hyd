@@ -1,0 +1,17 @@
+(* Map-chain fusion benchmark.
+   Applies a three-step element-wise transformation pipeline to a float array
+   and writes the result.  With fusion all three maps and the generate collapse
+   into a single loop with no intermediate allocation.  Returns a float checksum
+   so that the benchmark harness does not spend time on file I/O.
+
+   Environment variable:
+     CHAIN_N   -- number of elements
+*)
+
+let main =
+  let n = get_env_int "CHAIN_N" in
+  let src = generate [n] (fn [i] => float_of i /. float_of n) in
+  let a = map (fn x => x *. x) src in
+  let b = map (fn x => x -. 0.5) a in
+  let c = map (fn x => x *. 2.0 +. 1.0) b in
+  reduce (+.) 0.0 c

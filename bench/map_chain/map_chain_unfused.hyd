@@ -1,0 +1,21 @@
+(* Map-chain fusion benchmark — unfused baseline.
+   Identical computation to map_chain.hyd, but each intermediate array is
+   wrapped in `reify` to prevent the fusion pass from eliminating it.  This
+   forces two intermediate float arrays to be fully materialised, making the
+   allocation cost visible.  Returns a float checksum so that the benchmark
+   harness does not spend time on file I/O.
+
+   Use alongside map_chain.hyd to measure the performance impact of pull-style
+   array fusion.
+
+   Environment variable:
+     CHAIN_N   -- number of elements
+*)
+
+let main =
+  let n = get_env_int "CHAIN_N" in
+  let src = generate [n] (fn [i] => float_of i /. float_of n) in
+  let a = reify (map (fn x => x *. x) src) in
+  let b = reify (map (fn x => x -. 0.5) a) in
+  let c = map (fn x => x *. 2.0 +. 1.0) b in
+  reduce (+.) 0.0 c

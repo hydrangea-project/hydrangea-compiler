@@ -225,6 +225,8 @@ data LoopRole
   | LoopReduction
   | LoopMapReduction
   | LoopIterate
+  | LoopSegRedOuter  -- ^ Outer loop over segments in a segmented reduction;
+                     --   parallelized with dynamic scheduling for load balance.
   deriving (Eq, Show)
 
 -- | Execution policy for a loop.

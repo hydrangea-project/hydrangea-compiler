@@ -1,0 +1,33 @@
+(* 1-D Kernel Density Estimation — unfused baseline.
+   Identical computation to kde.hyd, but the three generate expressions for
+   route, weight, and in_range are each wrapped in `reify` to prevent the
+   fusion pass from absorbing them into the scatter_guarded write loop.  The
+   three contribution arrays are fully materialised before scatter executes.
+
+   Use alongside kde.hyd to measure the performance impact of push-style
+   scatter fusion.
+
+   Environment variables:
+     KDE_N    -- number of source samples
+     KDE_BINS -- number of output bins
+*)
+
+let main =
+  let n    = get_env_int "KDE_N" in
+  let bins = get_env_int "KDE_BINS" in
+  let contribs = n * 3 in
+  let imod x m = x - ((x / m) * m) in
+  let sample_of [k] = k / 3 in
+  let offset_of [k] = imod k 3 in
+  let centre [k] = (sample_of [k] * bins) / n in
+  let route [k] = centre [k] + offset_of [k] - 1 in
+  let weight [k] = if offset_of [k] = 1 then 2 else 1 in
+  let in_range [k] =
+    let r = route [k] in
+    if r >= 0 then r < bins else (0 = 1) in
+  let routes   = reify (generate [contribs] route) in
+  let weights  = reify (generate [contribs] weight) in
+  let guards   = reify (generate [contribs] in_range) in
+  let density =
+    scatter_guarded (+) (fill [bins] 0) routes weights guards in
+  index () (reduce (+) 0 density)

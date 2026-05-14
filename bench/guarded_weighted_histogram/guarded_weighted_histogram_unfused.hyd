@@ -1,0 +1,31 @@
+(* Guarded weighted histogram — unfused baseline.
+   Identical computation to guarded_weighted_histogram.hyd, but the three map
+   expressions feeding scatter_guarded are each wrapped in `reify` so the
+   fusion pass cannot absorb them into the scatter write loop.  This forces
+   three intermediate arrays (routes, weights, keeps) to be fully allocated and
+   populated before the scatter executes.
+
+   Use alongside guarded_weighted_histogram.hyd to measure the performance
+   impact of push-style scatter fusion — a fusion pattern that pull-only
+   systems such as Repa and Accelerate cannot express.
+
+   Environment variables:
+     GWH_N          -- number of source samples
+     GWH_BINS       -- number of histogram bins
+     GWH_KEEP_PERIOD -- sample keep period (keep every k-th sample)
+*)
+
+let main =
+  let n = get_env_int "GWH_N" in
+  let bins = get_env_int "GWH_BINS" in
+  let keep_period = get_env_int "GWH_KEEP_PERIOD" in
+  let src = generate [n] (let sample [i] = i in sample) in
+  let route x = (x * bins) / n in
+  let weight x = (x * 3) + 1 in
+  let keep x = ((x / keep_period) * keep_period) = x in
+  let routes  = reify (map route src) in
+  let weights = reify (map weight src) in
+  let keeps   = reify (map keep src) in
+  let hist =
+    scatter_guarded (+) (fill [bins] 0) routes weights keeps in
+  index () (reduce (+) 0 hist)

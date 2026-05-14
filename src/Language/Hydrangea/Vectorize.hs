@@ -163,6 +163,7 @@ vectorCandidate w ctx spec body
         LoopMapReduction -> False
         LoopReductionWrapper -> False
         LoopIterate -> False
+        LoopSegRedOuter -> False  -- outer seg-red loop is parallelized, not vectorized
 
 hasExplicitVectorOps :: [Stmt] -> Bool
 hasExplicitVectorOps = any go

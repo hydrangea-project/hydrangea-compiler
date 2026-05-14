@@ -510,6 +510,7 @@ shouldParallelizeLoop insideLoop spec = case lsRole spec of
   LoopReductionWrapper -> not insideLoop && lsRed spec /= Nothing
   LoopFold             -> False  -- foldl/scan loops carry an accumulator; never parallelizable
   LoopIterate          -> False  -- iterate temporal loop carries array state; never parallelizable
+  LoopSegRedOuter      -> not insideLoop  -- segmented reduce outer; always eligible
   _                    -> not insideLoop
 
 -- | Returns 'True' when any statement in the list (or in nested conditionals,

@@ -1024,6 +1024,9 @@ genLoop2 env declared spec body =
               C2.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
               C2.Workshare p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
               _             -> empty
+            schedClause
+              | role == C2.LoopSegRedOuter = text " schedule(dynamic)"
+              | otherwise                  = empty
             basePragma = case C2.lsExec spec of
               C2.Workshare {} ->
                 if ceInsideParallelRegion env
@@ -1031,7 +1034,7 @@ genLoop2 env declared spec body =
                   else text "#pragma omp parallel for"
               _ ->
                 text "#pragma omp parallel for"
-        in basePragma <> simdClause <> parallelPolicyClause <> collapseClause <> extraClauses
+        in basePragma <> simdClause <> schedClause <> parallelPolicyClause <> collapseClause <> extraClauses
       simdPragma extraClauses = text "#pragma omp simd simdlen(" <> int defaultSimdLen <> text ")" <> extraClauses
       roleComment = case role of
         C2.LoopPlain -> text "loop"
@@ -1041,6 +1044,7 @@ genLoop2 env declared spec body =
         C2.LoopReduction -> text "reduction loop"
         C2.LoopMapReduction -> text "map-reduction outer loop"
         C2.LoopIterate -> text "iterate temporal loop"
+        C2.LoopSegRedOuter -> text "segmented-reduce outer loop"
       defaultSimdLen = case C2.lsExec spec of
         C2.Vector v -> C2.vsWidth v
         _ -> 1

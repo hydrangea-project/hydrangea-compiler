@@ -39,16 +39,29 @@ import Language.Hydrangea.CodegenC
   , codegenProgram2
   , codegenProgram2Prune
   , codegenProgram2WithOptionsPrune
-  , defaultCodegenOptions
   )
+
+-- | Options controlling the high-level frontend preprocessing pipeline.
+data FrontendOptions = FrontendOptions
+  { frontendSkipFusion :: Bool
+    -- ^ When 'True', skip the array-fusion pass entirely.  Intermediate
+    --   arrays that would normally be fused away are materialised; useful
+    --   for benchmarking the impact of fusion.
+  } deriving (Eq, Show)
+
+defaultFrontendOptions :: FrontendOptions
+defaultFrontendOptions = FrontendOptions { frontendSkipFusion = False }
 
 -- | Normalize and fuse declarations before lowering or code generation.
 preprocessDecs :: [Dec Range] -> [Dec Range]
-preprocessDecs decs =
+preprocessDecs = preprocessDecsWithOptions defaultFrontendOptions
+
+-- | Like 'preprocessDecs' but respects 'FrontendOptions'.
+preprocessDecsWithOptions :: FrontendOptions -> [Dec Range] -> [Dec Range]
+preprocessDecsWithOptions opts decs =
   let u = uniquifyDecs decs
       n = normalizeShapesDecs u
-      f = fuseDecs n
-  in f
+  in if frontendSkipFusion opts then n else fuseDecs n
 
 formatInferResult :: Either err a -> (err -> String) -> Either String a
 formatInferResult result formatErr =
@@ -187,9 +200,12 @@ lowerToCFG2WithConcreteTypes :: Map.Map Var CType -> [Dec Range] -> C2.Program
 lowerToCFG2WithConcreteTypes typeEnv = lowerDecs2WithTypeEnv typeEnv . preprocessDecs
 
 inferAndLowerToCFG2 :: InferOptions -> [Dec Range] -> IO C2.Program
-inferAndLowerToCFG2 opts decs = do
+inferAndLowerToCFG2 = inferAndLowerToCFG2WithFrontendOptions defaultFrontendOptions
+
+inferAndLowerToCFG2WithFrontendOptions :: FrontendOptions -> InferOptions -> [Dec Range] -> IO C2.Program
+inferAndLowerToCFG2WithFrontendOptions frontOpts opts decs = do
   (typeEnv, rankEnv) <- inferTopLevelTypesAndRanksWithOptions opts decs
-  let pre = preprocessDecs decs
+  let pre = preprocessDecsWithOptions frontOpts decs
   let prog = lowerDecs2WithTypeEnvAndRanks typeEnv rankEnv pre
   pure prog
 
@@ -336,6 +352,14 @@ compileToCOptIOWithPipelineOptionsAndCodegenOptions
   :: InferOptions -> PipelineOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptIOWithPipelineOptionsAndCodegenOptions inferOpts pipelineOpts codegenOpts prune decs =
   compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune <$> inferAndLowerToCFG2 inferOpts decs
+
+-- | Like 'compileToCOptIOWithPipelineOptionsAndCodegenOptions' but also
+-- accepts 'FrontendOptions' to e.g. disable the fusion pass.
+compileToCOptIOWithAllOptions
+  :: FrontendOptions -> InferOptions -> PipelineOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
+compileToCOptIOWithAllOptions frontOpts inferOpts pipelineOpts codegenOpts prune decs =
+  compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune
+    <$> inferAndLowerToCFG2WithFrontendOptions frontOpts inferOpts decs
 
 -- | Erase source-range annotations from an expression.
 stripRange :: Exp Range -> Either String (Exp ())
