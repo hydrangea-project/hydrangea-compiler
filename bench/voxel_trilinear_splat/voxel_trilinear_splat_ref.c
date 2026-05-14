@@ -20,66 +20,66 @@
 #include "../c_bench/timing.h"
 
 typedef struct {
-    int n, nx, ny, nz, keep_period;
-    int nvox;
+    int64_t n, nx, ny, nz, keep_period;
+    int64_t nvox;
     double *voxels;
 } VSplatData;
 
 static double vsplat_run_once(void *vdata)
 {
     VSplatData *d = (VSplatData *)vdata;
-    int n = d->n, nx = d->nx, ny = d->ny, nz = d->nz;
-    int kp = d->keep_period, nvox = d->nvox;
-    int contribs = n * 8;
+    int64_t n = d->n, nx = d->nx, ny = d->ny, nz = d->nz;
+    int64_t kp = d->keep_period, nvox = d->nvox;
+    int64_t contribs = n * 8;
 
     memset(d->voxels, 0, (size_t)nvox * sizeof(double));
 
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < contribs; i++) {
-        int p = i / 8;
+    for (int64_t i = 0; i < contribs; i++) {
+        int64_t p = i / 8;
         /* keep predicate */
         if ((p / kp) * kp != p) continue;
 
-        int c  = i % 8;
-        int bx = c % 2;
-        int by = (c / 2) % 2;
-        int bz = (c / 4) % 2;
+        int64_t c  = i % 8;
+        int64_t bx = c % 2;
+        int64_t by = (c / 2) % 2;
+        int64_t bz = (c / 4) % 2;
 
-        int x = ((p * 17 + 3) + bx) % nx;
-        int y = ((p * 29 + 5) + by) % ny;
-        int z = ((p * 43 + 7) + bz) % nz;
+        int64_t x = ((p * 17 + 3) + bx) % nx;
+        int64_t y = ((p * 29 + 5) + by) % ny;
+        int64_t z = ((p * 43 + 7) + bz) % nz;
 
-        int fx = (p * 5  + 1) % 4;
-        int fy = (p * 7  + 2) % 4;
-        int fz = (p * 11 + 3) % 4;
-        int wx = (1 - bx) * (4 - fx) + bx * fx;
-        int wy = (1 - by) * (4 - fy) + by * fy;
-        int wz = (1 - bz) * (4 - fz) + bz * fz;
-        int base = (p * 3) + 1;
+        int64_t fx = (p * 5  + 1) % 4;
+        int64_t fy = (p * 7  + 2) % 4;
+        int64_t fz = (p * 11 + 3) % 4;
+        int64_t wx = (1 - bx) * (4 - fx) + bx * fx;
+        int64_t wy = (1 - by) * (4 - fy) + by * fy;
+        int64_t wz = (1 - bz) * (4 - fz) + bz * fz;
+        int64_t base = (p * 3) + 1;
         double weight = (double)(base * wx * wy * wz) / 64.0;
 
-        int idx = ((z * ny) + y) * nx + x;
+        int64_t idx = ((z * ny) + y) * nx + x;
 
         #pragma omp atomic
         d->voxels[idx] += weight;
     }
 
     double sum = 0.0;
-    for (int v = 0; v < nvox; v++) sum += d->voxels[v];
+    for (int64_t v = 0; v < nvox; v++) sum += d->voxels[v];
     return sum;
 }
 
 int main(void)
 {
-    int n   = hb_get_env_int("VSPLAT_POINTS");
-    int nx  = hb_get_env_int("VSPLAT_NX");
-    int ny  = hb_get_env_int("VSPLAT_NY");
-    int nz  = hb_get_env_int("VSPLAT_NZ");
-    int kp  = hb_get_env_int("VSPLAT_KEEP_PERIOD");
-    int warmup = hb_get_env_int_or("BENCH_WARMUP", 3);
-    int iters  = hb_get_env_int_or("BENCH_ITERS",  10);
+    int64_t n   = hb_get_env_int64("VSPLAT_POINTS");
+    int64_t nx  = hb_get_env_int64("VSPLAT_NX");
+    int64_t ny  = hb_get_env_int64("VSPLAT_NY");
+    int64_t nz  = hb_get_env_int64("VSPLAT_NZ");
+    int64_t kp  = hb_get_env_int64("VSPLAT_KEEP_PERIOD");
+    int     warmup = hb_get_env_int_or("BENCH_WARMUP", 3);
+    int     iters  = hb_get_env_int_or("BENCH_ITERS",  10);
 
-    int nvox = nx * ny * nz;
+    int64_t nvox = nx * ny * nz;
     double *voxels = (double *)malloc((size_t)nvox * sizeof(double));
 
     VSplatData d = { n, nx, ny, nz, kp, nvox, voxels };

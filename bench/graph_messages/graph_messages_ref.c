@@ -23,42 +23,42 @@
 #include "../c_bench/timing.h"
 
 typedef struct {
-    int n, degree;
-    long *node_out;
+    int64_t n, degree;
+    int64_t *node_out;
 } GraphData;
 
 static double graph_run_once(void *vdata)
 {
     GraphData *d = (GraphData *)vdata;
-    int n = d->n, deg = d->degree;
+    int64_t n = d->n, deg = d->degree;
 
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++) {
-        long sum = 0;
-        for (int j = 0; j < deg; j++) {
-            int k = i * deg + j;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t sum = 0;
+        for (int64_t j = 0; j < deg; j++) {
+            int64_t k = i * deg + j;
             /* dst[k] = k / degree = i (since i*degree <= k < (i+1)*degree) */
-            int dst = k / deg;
-            int dst_feature = dst + 1;  /* node_vals[dst] = dst + 1 */
-            int edge_val = k + 1;
-            sum += (long)edge_val * dst_feature;
+            int64_t dst = k / deg;
+            int64_t dst_feature = dst + 1;  /* node_vals[dst] = dst + 1 */
+            int64_t edge_val = k + 1;
+            sum += edge_val * dst_feature;
         }
         d->node_out[i] = sum;
     }
 
-    long total = 0;
-    for (int i = 0; i < n; i++) total += d->node_out[i];
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) total += d->node_out[i];
     return (double)total;
 }
 
 int main(void)
 {
-    int n      = hb_get_env_int("GRAPH_NODES");
-    int deg    = hb_get_env_int("GRAPH_DEGREE");
-    int warmup = hb_get_env_int_or("BENCH_WARMUP", 3);
-    int iters  = hb_get_env_int_or("BENCH_ITERS",  10);
+    int64_t n      = hb_get_env_int64("GRAPH_NODES");
+    int64_t deg    = hb_get_env_int64("GRAPH_DEGREE");
+    int     warmup = hb_get_env_int_or("BENCH_WARMUP", 3);
+    int     iters  = hb_get_env_int_or("BENCH_ITERS",  10);
 
-    long *node_out = (long *)malloc((size_t)n * sizeof(long));
+    int64_t *node_out = (int64_t *)malloc((size_t)n * sizeof(int64_t));
 
     GraphData d = { n, deg, node_out };
     hb_run_timed("main", warmup, iters, graph_run_once, &d);

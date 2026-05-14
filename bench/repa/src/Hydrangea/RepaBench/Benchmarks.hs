@@ -757,8 +757,9 @@ laplacianSt = makeStencil (R.Z R.:. 3 R.:. 3) $ \(R.Z R.:. i R.:. j) -> case (i,
   _        -> Nothing
 
 stencilInteriorKernel :: Int -> Int -> R.Array R.U R.DIM2 Double -> IO (R.Array R.U R.DIM2 Double)
-stencilInteriorKernel _ _ input =
-  R.computeUnboxedP $ mapStencil2 BoundClamp laplacianSt input
+stencilInteriorKernel h w input = do
+  full <- R.computeUnboxedP $ mapStencil2 BoundClamp laplacianSt input
+  R.computeUnboxedP $ R.extract (R.Z R.:. 1 R.:. 1) (R.Z R.:. (h-2) R.:. (w-2)) full
 
 -- | Averaging Jacobi stencil using Repa's native mapStencil2 combinator with
 -- clamped boundary.  Matches jacobi_2d.hyd: output = avg of 4 neighbours.

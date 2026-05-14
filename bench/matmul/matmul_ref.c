@@ -15,20 +15,20 @@
 #include "../c_bench/timing.h"
 
 typedef struct {
-    int m, k, n;
+    int64_t m, k, n;
     double *A, *B, *C;
 } MatMulData;
 
 static double matmul_run_once(void *vdata)
 {
     MatMulData *d = (MatMulData *)vdata;
-    int m = d->m, k = d->k, n = d->n;
+    int64_t m = d->m, k = d->k, n = d->n;
 
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
             double sum = 0.0;
-            for (int t = 0; t < k; t++) {
+            for (int64_t t = 0; t < k; t++) {
                 sum += d->A[i * k + t] * d->B[t * n + j];
             }
             d->C[i * n + j] = sum;
@@ -36,17 +36,17 @@ static double matmul_run_once(void *vdata)
     }
 
     double total = 0.0;
-    for (int i = 0; i < m * n; i++) total += d->C[i];
+    for (int64_t i = 0; i < m * n; i++) total += d->C[i];
     return total;
 }
 
 int main(void)
 {
-    int m      = hb_get_env_int("MAT_M");
-    int k      = hb_get_env_int("MAT_K");
-    int n      = hb_get_env_int("MAT_N");
-    int warmup = hb_get_env_int_or("BENCH_WARMUP", 3);
-    int iters  = hb_get_env_int_or("BENCH_ITERS",  10);
+    int64_t m      = hb_get_env_int64("MAT_M");
+    int64_t k      = hb_get_env_int64("MAT_K");
+    int64_t n      = hb_get_env_int64("MAT_N");
+    int     warmup = hb_get_env_int_or("BENCH_WARMUP", 3);
+    int     iters  = hb_get_env_int_or("BENCH_ITERS",  10);
 
     double *A = (double *)malloc((size_t)m * (size_t)k * sizeof(double));
     double *B = (double *)malloc((size_t)k * (size_t)n * sizeof(double));

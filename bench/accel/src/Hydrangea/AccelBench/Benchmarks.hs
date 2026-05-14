@@ -354,9 +354,15 @@ voxelTrilinearSplatKernel n nx ny nz keepPeriod =
        weights
 
 -- | 5-point Laplacian using Accelerate's native stencil combinator with
--- clamped boundary.  Matches stencil_interior.hyd and stencil_2d.hyd.
+-- clamped boundary.  Computes full h×w output, then extracts the
+-- interior (h-2)×(w-2) sub-array to match stencil_interior.hyd.
 stencilInteriorKernel :: Acc (Matrix Double) -> Acc (Matrix Double)
-stencilInteriorKernel = A.stencil step A.clamp
+stencilInteriorKernel input =
+  let full = A.stencil step A.clamp input
+      A.Z_ A.::. h A.::. w = A.shape full
+  in A.backpermute (A.lift (Z :. h - 2 :. w - 2))
+                   (\(I2 r c) -> I2 (r + 1) (c + 1))
+                   full
   where
     step ((_, n, _), (w', c, e), (_, s, _)) =
       n + s + w' + e + c * (-4.0 :: A.Exp Double)

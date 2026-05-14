@@ -28,6 +28,7 @@
 #pragma once
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,32 @@ static inline int hb_get_env_int_or(const char *name, int fallback)
     return (int)v;
 }
 
+static inline int64_t hb_get_env_int64(const char *name)
+{
+    const char *val = getenv(name);
+    if (!val) {
+        fprintf(stderr, "error: required environment variable '%s' not set\n", name);
+        exit(1);
+    }
+    char *end;
+    long long v = strtoll(val, &end, 10);
+    if (*end != '\0') {
+        fprintf(stderr, "error: '%s' is not an integer: '%s'\n", name, val);
+        exit(1);
+    }
+    return (int64_t)v;
+}
+
+static inline int64_t hb_get_env_int64_or(const char *name, int64_t fallback)
+{
+    const char *val = getenv(name);
+    if (!val) return fallback;
+    char *end;
+    long long v = strtoll(val, &end, 10);
+    if (*end != '\0') return fallback;
+    return (int64_t)v;
+}
+
 /* --------------------------------------------------------------------------
  * CSV I/O
  * -------------------------------------------------------------------------- */
@@ -82,10 +109,10 @@ static FILE *hb_open_csv(const char *path)
 
 /* Read up to max_n comma/newline/whitespace-separated doubles from path.
  * Returns actual count read. */
-static inline int hb_read_csv_doubles(const char *path, double *out, int max_n)
+static inline int64_t hb_read_csv_doubles(const char *path, double *out, int64_t max_n)
 {
     FILE *f = hb_open_csv(path);
-    int n = 0;
+    int64_t n = 0;
     while (n < max_n) {
         double v;
         if (fscanf(f, " %lf", &v) != 1) break;
@@ -99,14 +126,31 @@ static inline int hb_read_csv_doubles(const char *path, double *out, int max_n)
 
 /* Read up to max_n comma/newline/whitespace-separated ints from path.
  * Returns actual count read. */
-static inline int hb_read_csv_ints(const char *path, int *out, int max_n)
+static inline int64_t hb_read_csv_ints(const char *path, int *out, int64_t max_n)
 {
     FILE *f = hb_open_csv(path);
-    int n = 0;
+    int64_t n = 0;
     while (n < max_n) {
         int v;
         if (fscanf(f, " %d", &v) != 1) break;
         out[n++] = v;
+        int c = fgetc(f);
+        if (c != ',' && c != EOF) ungetc(c, f);
+    }
+    fclose(f);
+    return n;
+}
+
+/* Read up to max_n comma/newline/whitespace-separated int64s from path.
+ * Returns actual count read. */
+static inline int64_t hb_read_csv_int64s(const char *path, int64_t *out, int64_t max_n)
+{
+    FILE *f = hb_open_csv(path);
+    int64_t n = 0;
+    while (n < max_n) {
+        long long v;
+        if (fscanf(f, " %lld", &v) != 1) break;
+        out[n++] = (int64_t)v;
         int c = fgetc(f);
         if (c != ',' && c != EOF) ungetc(c, f);
     }
