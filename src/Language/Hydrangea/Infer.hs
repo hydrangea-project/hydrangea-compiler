@@ -1948,6 +1948,7 @@ infer (EBoundLetIn _ x boundExp rhs body) = do
   withBinding x (Forall [] [] UTyInt) $
     withValBound x boundTerm $
       infer body
+infer (EReify _ e) = infer e
 infer (EOp _ op) = pure $ case op of
   Plus _    -> ii2i; Minus _   -> ii2i; Times _   -> ii2i; Divide _  -> ii2i; Mod _ -> ii2i
   Eq _      -> ii2b; Neq _     -> ii2b; Lt _       -> ii2b; Le _     -> ii2b

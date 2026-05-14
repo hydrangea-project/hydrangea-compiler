@@ -364,6 +364,13 @@ data Exp a
     -- value in @[0, E)@, then binds @x@ with that value-bound annotation for
     -- propagation through @body@.  Identity at runtime.
     EBoundLetIn a Var (Exp a) (Exp a) (Exp a)
+  | -- | Reification barrier: @reify e@ evaluates @e@ and returns the result.
+    -- Semantically identical to @e@, but instructs the fusion pass to
+    -- materialize the result rather than fusing it into consumers.  Use this
+    -- on array-valued expressions that are shared across multiple consumers
+    -- whose fusion would replicate expensive work (e.g. a reduce inside a
+    -- generate that is used in three downstream maps).
+    EReify a (Exp a)
   deriving (Functor, Foldable)
 
 -- | Boundary condition for stencil operations.
@@ -457,6 +464,7 @@ firstParam e = case e of
   EGetEnvString a _ -> a
   EStencil a _ _ _ -> a
   EBoundLetIn a _ _ _ _ -> a
+  EReify a _ -> a
 
 deriving instance (Show a) => Show (Exp a)
 

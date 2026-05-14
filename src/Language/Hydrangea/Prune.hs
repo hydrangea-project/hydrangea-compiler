@@ -99,6 +99,7 @@ collectTopLevelRefs topNames expr bound =
     EGetEnvInt _ e -> go e bound
     EGetEnvString _ e -> go e bound
     EStencil _ bnd f arr -> goBnd bnd bound `S.union` go f bound `S.union` go arr bound
+    EReify _ e -> go e bound
     _ -> S.empty
   where
     go = collectTopLevelRefs topNames

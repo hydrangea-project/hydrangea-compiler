@@ -27,15 +27,16 @@ let vzs = read_array_float [n] "bench/nbody/vzs.csv"
 let add3 p q =
   ((fst (fst p) +. fst (fst q), snd (fst p) +. snd (fst q)), snd p +. snd q)
 
-(* All computation is inside main so the benchmark kernel recomputes it
-   fresh each iteration without triple-calling the O(N^2) new_pos.
-   eps2, g, dt are local to main so they compile as scalar constants
-   (not function calls) in the inner loop, enabling auto-vectorization. *)
+(* new_pos : array [n] ((float, float), float)
+   Computes the updated (x, y, z) position for each particle in one Euler step.
+   The result is wrapped in reify so the fusion pass materialises it as a
+   single intermediate array rather than inlining the O(N^2) reduce_generate
+   into each of the three downstream extract-and-write loops. *)
 let main =
   let eps2 = 0.01 in
   let g = 6.674e-11 in
   let dt = 0.01 in
-  let new_pos = generate [n] (fn [i] =>
+  let new_pos = reify (generate [n] (fn [i] =>
     let axyz = index () (reduce_generate add3 ((0.0, 0.0), 0.0) [n]
       (fn [j] =>
         let dx = index [j] xs -. index [i] xs in
@@ -50,7 +51,7 @@ let main =
     let az = snd axyz in
     ((index [i] xs +. (index [i] vxs +. ax *. dt) *. dt,
       index [i] ys +. (index [i] vys +. ay *. dt) *. dt),
-     index [i] zs +. (index [i] vzs +. az *. dt) *. dt)) in
+     index [i] zs +. (index [i] vzs +. az *. dt) *. dt))) in
   let new_xs = generate [n] (fn [i] => fst (fst (index [i] new_pos))) in
   let new_ys = generate [n] (fn [i] => snd (fst (index [i] new_pos))) in
   let new_zs = generate [n] (fn [i] => snd (index [i] new_pos)) in

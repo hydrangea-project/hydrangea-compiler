@@ -187,6 +187,7 @@ instance Pretty (Exp a) where
   pPrint (EBoundLetIn _ x boundE rhs body) =
     parens (text "let" <+> text (unpack x) <+> text "bound" <+> pPrint boundE
             <+> text "=" <+> pPrint rhs <+> text "in" <+> pPrint body)
+  pPrint (EReify _ e) = text "reify" <+> pPrint e
 
 instance Pretty (BoundaryCondition a) where
   pPrint BClamp        = text "clamp"

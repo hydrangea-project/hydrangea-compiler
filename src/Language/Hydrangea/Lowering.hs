@@ -392,6 +392,8 @@ lowerExp expr = case expr of
     (sb, ab) <- lowerExp body
     pure (sr ++ [bindStmt] ++ sb, ab)
 
+  EReify _ e -> lowerExp e
+
   EApp _ fn arg -> handleApp fn arg
 
   -- === Array operations ===

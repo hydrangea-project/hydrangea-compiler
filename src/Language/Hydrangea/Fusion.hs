@@ -137,6 +137,7 @@ collectVarsExp expr =
       collectVarsBndFusion bnd `S.union` collectVarsExp f `S.union` collectVarsExp arr
     EBoundLetIn _ x boundExp rhs body ->
       S.insert x (collectVarsExp boundExp `S.union` collectVarsExp rhs `S.union` collectVarsExp body)
+    EReify _ e -> collectVarsExp e
 
 collectVarsBndFusion :: BoundaryCondition a -> Set Var
 collectVarsBndFusion BClamp     = S.empty
@@ -249,6 +250,7 @@ freeVarsExp expr =
     EBoundLetIn _ x boundExp rhs body ->
       collectVarsExp boundExp `S.union` freeVarsExp rhs
         `S.union` S.delete x (freeVarsExp body)
+    EReify _ e -> freeVarsExp e
 
 freeVarsBnd :: BoundaryCondition a -> Set Var
 freeVarsBnd BClamp     = S.empty
@@ -339,6 +341,7 @@ boundVarsExp expr =
       boundVarsBnd bnd `S.union` boundVarsExp f `S.union` boundVarsExp arr
     EBoundLetIn _ x _ rhs body ->
       S.insert x (boundVarsExp rhs `S.union` boundVarsExp body)
+    EReify _ e -> boundVarsExp e
 
 boundVarsBnd :: BoundaryCondition a -> Set Var
 boundVarsBnd BClamp     = S.empty
@@ -434,6 +437,7 @@ countVarExp v expr =
       countVarBnd v bnd + countVarExp v f + countVarExp v arr
     EBoundLetIn _ _ boundExp rhs body ->
       countVarExp v boundExp + countVarExp v rhs + countVarExp v body
+    EReify _ e -> countVarExp v e
 
 countVarBnd :: Var -> BoundaryCondition a -> Int
 countVarBnd _ BClamp     = 0
@@ -545,6 +549,7 @@ substExp v replacement expr =
           boundExp' = substExp v replacement boundExp
           body' = if x == v then body else substExp v replacement body
       in EBoundLetIn a x boundExp' rhs' body'
+    EReify a e -> EReify a (substExp v replacement e)
 
 substBnd :: Var -> Exp a -> BoundaryCondition a -> BoundaryCondition a
 substBnd _ _ BClamp     = BClamp
@@ -635,6 +640,7 @@ isArrayExp expr =
     ESlice {} -> True
     EReshape {} -> True
     ELetIn _ _ body -> isArrayExp body
+    EReify _ e -> isArrayExp e
     _ -> False
 
 freshVar :: ByteString -> FusionM Var
@@ -1151,6 +1157,7 @@ normExp expr =
       rhs' <- normExp rhs
       body' <- withNormEnv (M.insert x x' env) (normExp body)
       pure (EBoundLetIn a x' boundExp' rhs' body')
+    EReify a e -> EReify a <$> normExp e
 
 normBndFusion :: BoundaryCondition a -> State NormFusionState (BoundaryCondition a)
 normBndFusion BClamp     = pure BClamp
@@ -1298,11 +1305,14 @@ fuseOnce expr =
           let inlineable = null pats
               usage = countVarExp name e'
               captureRisk = not $ S.null (freeVarsExp body `S.intersection` boundVarsExp e')
+              -- reify is an explicit materialization barrier: never inline it.
+              isReify = case body of { EReify {} -> True; _ -> False }
               -- Inline array expressions (fusion), or function-valued expressions
               -- that appear exactly once (enables cross-binding beta reduction).
               -- Producer expressions (generate/fill) are pure and cheap to re-evaluate,
               -- so inline them even at multiple use sites to enable scatter fusion.
               shouldInline = inlineable && not captureRisk
+                          && not isReify
                           && (isArrayExp body || isFunctionExp body)
                           && (usage == 1 || isProducerExp body)
           in if shouldInline
@@ -1429,6 +1439,7 @@ fuseOnce expr =
       fuseReshape a s' arr'
     EBoundLetIn a x boundExp rhs body ->
       EBoundLetIn a x <$> fuseOnce boundExp <*> fuseOnce rhs <*> fuseOnce body
+    EReify a e -> EReify a <$> fuseOnce e
 
 fuseDecM :: (Eq a) => Dec a -> FusionM (Dec a)
 fuseDecM (Dec a name pats mw poly body) = do

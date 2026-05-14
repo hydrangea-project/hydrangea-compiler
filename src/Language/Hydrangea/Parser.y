@@ -78,6 +78,7 @@ import Language.Hydrangea.Syntax
   gather     { L.RangedToken L.Gather _ }
   iterate    { L.RangedToken L.Iterate _ }
   stencil    { L.RangedToken L.Stencil _ }
+  reify      { L.RangedToken L.Reify _ }
   clamp      { L.RangedToken L.Clamp _ }
   wrap       { L.RangedToken L.Wrap _ }
   mirror     { L.RangedToken L.Mirror _ }
@@ -332,6 +333,7 @@ expspecial :: { Exp L.Range }
   | get_env_string atom        { EGetEnvString (L.rtRange $1 <-> info $2) $2 }
   | iterate atom atom atom     { EIterate (L.rtRange $1 <-> info $4) $2 $3 $4 }
   | stencil boundary atom atom { EStencil (L.rtRange $1 <-> info $4) $2 $3 $4 }
+  | reify atom                 { EReify (L.rtRange $1 <-> info $2) $2 }
 
 boundary :: { BoundaryCondition L.Range }
   : clamp                    { BClamp }

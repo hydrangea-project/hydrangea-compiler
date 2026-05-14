@@ -207,6 +207,7 @@ normExp expr = case expr of
   EBoundLetIn a v boundExp rhs body ->
     EBoundLetIn a v <$> normExp boundExp <*> normExp rhs <*> normExp body
   EStencil a bnd f arr -> EStencil a <$> normBnd bnd <*> normExp f <*> normExp arr
+  EReify a e -> EReify a <$> normExp e
 
 normBnd :: BoundaryCondition a -> ShapeM a (BoundaryCondition a)
 normBnd BClamp     = pure BClamp

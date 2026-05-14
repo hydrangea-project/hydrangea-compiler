@@ -138,6 +138,7 @@ uniqExp expr =
       rhs' <- uniqExp rhs
       body' <- withEnv (M.insert x x' env) (uniqExp body)
       pure (EBoundLetIn a x' boundExp' rhs' body')
+    EReify a e -> EReify a <$> uniqExp e
 
 uniqBnd :: BoundaryCondition a -> UniqM (BoundaryCondition a)
 uniqBnd BClamp        = pure BClamp
@@ -289,6 +290,7 @@ collectVarsExp expr =
     EStencil _ bnd f arr -> collectVarsBnd bnd `S.union` collectVarsExp f `S.union` collectVarsExp arr
     EBoundLetIn _ x boundExp rhs body ->
       S.insert x (collectVarsExp boundExp `S.union` collectVarsExp rhs `S.union` collectVarsExp body)
+    EReify _ e -> collectVarsExp e
 
 collectVarsBnd :: BoundaryCondition a -> Set Var
 collectVarsBnd BClamp     = S.empty

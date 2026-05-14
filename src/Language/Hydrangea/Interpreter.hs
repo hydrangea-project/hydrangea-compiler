@@ -156,6 +156,7 @@ evalExp expr env = case expr of
   EBoundLetIn _ x _ rhs body -> do
     val <- evalExp rhs env
     evalExp body (Map.insert x val env)
+  EReify _ e -> evalExp e env
   EGenerate _ szExpr fnExpr -> do
     vSz <- evalExp szExpr env
     shape <- liftEither $ shapeFromValue vSz
