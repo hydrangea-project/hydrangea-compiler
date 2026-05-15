@@ -12,7 +12,8 @@
 #   COO_NROWS, COO_NCOLS, COO_NNZ, COO_DUP_PERIOD, GRAPH_NODES, GRAPH_DEGREE,
 #   VOX_POINTS, VOX_NX, VOX_NY, VOX_NZ, VOX_KEEP_PERIOD,
 #   VSPLAT_POINTS, VSPLAT_NX, VSPLAT_NY, VSPLAT_NZ, VSPLAT_KEEP_PERIOD,
-#   JACOBI_WF_H, JACOBI_WF_W, JACOBI_WF_ITERS
+#   JACOBI_WF_H, JACOBI_WF_W, JACOBI_WF_ITERS,
+#   KDE_N, KDE_BINS
 
 set -euo pipefail
 
@@ -85,6 +86,7 @@ BENCH_CC="$(find_openmp_cc)"
 : "${STENCIL_H:=512}" "${STENCIL_W:=512}"
 : "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
 : "${JACOBI_WF_H:=64}" "${JACOBI_WF_W:=1024}" "${JACOBI_WF_ITERS:=20}"
+: "${KDE_N:=1000000}" "${KDE_BINS:=1024}"
 
 export BS_N NBODY_N MAND_W MAND_H MAND_ITERS
 export SPMV_NROWS SPMV_NCOLS SPMV_NNZ MAT_M MAT_K MAT_N
@@ -96,6 +98,7 @@ export VSPLAT_POINTS VSPLAT_NX VSPLAT_NY VSPLAT_NZ VSPLAT_KEEP_PERIOD
 export STENCIL_H STENCIL_W
 export JACOBI_H JACOBI_W JACOBI_ITERS
 export JACOBI_WF_H JACOBI_WF_W JACOBI_WF_ITERS
+export KDE_N KDE_BINS
 
 cd "$REPO_ROOT"
 
@@ -231,7 +234,7 @@ ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
-  stencil_interior jacobi_2d
+  stencil_interior jacobi_2d kde
 )
 
 if [ "$BENCH_FILTER" = "jacobi_2d_wavefront" ]; then
@@ -304,6 +307,14 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
         _c="N/A"
       fi
       printf "%-35s %15s %15s %15s %15s\n" "jacobi_2d(${JACOBI_ITERS}it)" "$_hyd" "$_repa" "$_accel" "$_c"
+      ;;
+    kde)
+      build_c "kde" 2>/dev/null || true
+      _hyd=$(run_hydrangea kde kde.hyd main)
+      _repa=$(run_repa kde)
+      _accel=$(run_accel kde)
+      _c=$(run_c "kde")
+      printf "%-35s %15s %15s %15s %15s\n" "kde(n=${KDE_N},bins=${KDE_BINS})" "$_hyd" "$_repa" "$_accel" "$_c"
       ;;
     jacobi_2d_wavefront)
       _jacobi_ref_bin="$REPO_ROOT/bench/stencil/jacobi_2d_ref"

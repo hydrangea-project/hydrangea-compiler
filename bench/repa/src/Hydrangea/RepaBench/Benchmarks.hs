@@ -77,6 +77,7 @@ benchmarks =
   , Benchmark "coo_spmv" runCooSpmv
   , Benchmark "stencil_interior" runStencilInterior
   , Benchmark "jacobi_2d" runJacobi2D
+  , Benchmark "kde" runKDE
   ]
 
 runAllBenchmarks :: IO ()
@@ -946,6 +947,7 @@ runBenchmarkByNameTimed opts name = case name of
   "voxel_trilinear_splat"      -> timedVoxelTrilinearSplat opts
   "stencil_interior"           -> timedStencilInterior opts
   "jacobi_2d"                  -> timedJacobi2D opts
+  "kde"                        -> timedKDE opts
   _ -> die $ "no timed harness for benchmark: " ++ name
 
 timedBlackScholes :: TimingOptions -> IO ()
@@ -1087,3 +1089,41 @@ timedJacobi2D opts = runTimingHarnessIO "main" opts load run R.sumAllS
       let initial = R.computeUnboxedS $ R.fromFunction (R.Z R.:. h R.:. w) (const 1.0)
       pure (h, w, nIters, initial)
     run (h, w, nIters, initial) = jacobi2DKernel h w nIters initial
+
+-- | 1-D KDE (triangular tent kernel).
+-- Each of n samples contributes to three adjacent histogram bins.
+-- Repa has no scatter primitive; we use M.fromListWith (+) as with the
+-- histogram benchmarks.
+kdeKernel :: Int -> Int -> R.Array R.U R.DIM1 Int
+kdeKernel n bins =
+  let contribs = n * 3
+      contributions =
+        [ (route, weight)
+        | k <- [0 .. contribs - 1]
+        , let sample = k `div` 3
+        , let offset = k - sample * 3
+        , let centre = (sample * bins) `div` n
+        , let route  = centre + offset - 1
+        , route >= 0, route < bins
+        , let weight = if offset == 1 then 2 else 1
+        ]
+      histMap = M.fromListWith (+) contributions
+  in R.computeUnboxedS $
+       R.fromFunction (R.Z R.:. bins) $ \(R.Z R.:. b) ->
+         M.findWithDefault 0 b histMap
+
+runKDE :: IO ()
+runKDE = do
+  n    <- readEnvInt "KDE_N"
+  bins <- readEnvInt "KDE_BINS"
+  let result = kdeKernel n bins
+  print (fromIntegral (R.sumAllS result) :: Int)
+
+timedKDE :: TimingOptions -> IO ()
+timedKDE opts = runTimingHarness "main" opts load run (fromIntegral . R.sumAllS)
+  where
+    load = do
+      n    <- readEnvInt "KDE_N"
+      bins <- readEnvInt "KDE_BINS"
+      pure (n, bins)
+    run (n, bins) = kdeKernel n bins

@@ -134,6 +134,7 @@ benchmarks =
   , Benchmark "coo_spmv"                   runCooSpmv
   , Benchmark "stencil_interior"           runStencilInterior
   , Benchmark "jacobi_2d"                  runJacobi2D
+  , Benchmark "kde"                        runKDE
   ]
 
 runAllBenchmarks :: IO ()
@@ -548,6 +549,7 @@ runBenchmarkByNameTimed opts name = case name of
   "coo_spmv"                   -> timedCooSpmv opts
   "stencil_interior"           -> timedStencilInterior opts
   "jacobi_2d"                  -> timedJacobi2D opts
+  "kde"                        -> timedKDE opts
   _ -> die $ "no timed harness for benchmark: " ++ name
 
 timedBlackScholes :: TimingOptions -> IO ()
@@ -714,3 +716,45 @@ timedJacobi2D opts = do
     run step (nIters, initial) = go step nIters initial
     go _ 0 arr = arr
     go step n arr = go step (n - 1) (step arr)
+
+-- | 1-D KDE (triangular tent kernel).
+-- Each of n samples contributes to three adjacent histogram bins.
+-- route(k) = centre + offset - 1 is computed in both `idxs` and `keep`,
+-- demonstrating Accelerate's lack of automatic sub-expression sharing across
+-- the separate generators it inlines into the permute loop.
+kdeKernel :: Int -> Int -> Acc (Vector Int)
+kdeKernel n bins =
+  let contribs = n * 3
+      idxs    = A.generate (A.constant (Z :. contribs)) $ \(I1 k) ->
+                  let sample = k `div` 3
+                      offset = k - sample * 3
+                      centre = (sample * A.constant bins) `div` A.constant n
+                  in centre + offset - 1
+      weights = A.generate (A.constant (Z :. contribs)) $ \(I1 k) ->
+                  A.cond (k `mod` 3 A.== 1) (2 :: A.Exp Int) 1
+      keep    = A.generate (A.constant (Z :. contribs)) $ \(I1 k) ->
+                  let sample = k `div` 3
+                      offset = k - sample * 3
+                      centre = (sample * A.constant bins) `div` A.constant n
+                      route  = centre + offset - 1
+                  in route A.>= 0 A.&& route A.< A.constant bins
+      zeros   = A.fill (A.constant (Z :. bins)) (0 :: A.Exp Int)
+  in A.permute (+) zeros
+       (\(I1 k) -> A.cond (keep A.! I1 k) (Just_ (I1 (idxs A.! I1 k))) Nothing_)
+       weights
+
+runKDE :: IO ()
+runKDE = do
+  n    <- readEnvInt "KDE_N"
+  bins <- readEnvInt "KDE_BINS"
+  let result = CPU.run $ kdeKernel n bins
+  print (Prelude.sum (A.toList result) :: Int)
+
+timedKDE :: TimingOptions -> IO ()
+timedKDE opts = runTimingHarness "main" opts load run sumAllInts
+  where
+    load = do
+      n    <- readEnvInt "KDE_N"
+      bins <- readEnvInt "KDE_BINS"
+      pure (n, bins)
+    run (n, bins) = CPU.run $ kdeKernel n bins
