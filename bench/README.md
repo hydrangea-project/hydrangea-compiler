@@ -25,6 +25,7 @@ demonstrating array fusion, SIMD vectorization, and parallelization.
 ```bash
 ./bench/run_quick.sh jacobi_2d_wavefront
 JACOBI_WF_H=64 JACOBI_WF_W=1024 JACOBI_WF_ITERS=20 ./bench/run_quick.sh jacobi_2d_wavefront
+./bench/run_quick.sh --skip-uninformative
 
 # From the repo root, compile all benchmarks:
 cabal run hydrangea-compiler -- --emit-c bench/blackscholes/blackscholes.hyd
@@ -70,6 +71,30 @@ bench/coo_csr_build/run.sh  # COO_CONFIGS="1024 1024 100000 ..."
 bench/graph_messages/run.sh  # GRAPH_SIZES="10000 100000 500000"
 bench/voxel_rasterization/run.sh  # VOX_SIZES="100000 1000000 5000000"
 bench/voxel_trilinear_splat/run.sh  # VSPLAT_SIZES="100000 1000000 5000000"
+```
+
+For a full suite sweep that writes one CSV per benchmark with Hydrangea, Repa,
+Accelerate, and C+OMP timings, use:
+
+```bash
+./bench/run_full_sweep.sh
+./bench/run_full_sweep.sh --skip-uninformative
+./bench/run_full_sweep.sh --out-dir=bench/results/custom_suite
+```
+
+`--skip-uninformative` leaves the benchmark rows in place but writes `N/A` for
+comparisons that are dominated by library limitations rather than interesting
+algorithmic differences: Accelerate on `blackscholes` (no fast vendor `erf`) and
+Repa on the scatter benchmarks (`weighted_histogram`,
+`guarded_weighted_histogram`, `voxel_rasterization`, and
+`voxel_trilinear_splat`). The same flag is also supported by
+`./bench/run_sweep.sh`.
+
+To turn those CSVs into paper-friendly PDF plots with gnuplot:
+
+```bash
+./bench/plot_full_sweep.sh
+./bench/plot_full_sweep.sh --csv-dir=bench/results/custom_suite --out-dir=bench/results/custom_suite/plots
 ```
 
 ## Benchmark Details

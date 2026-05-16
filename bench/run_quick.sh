@@ -2,7 +2,7 @@
 # bench/run_quick.sh — run all (or one) benchmark at default size, print a table.
 #
 # Usage:
-#   ./bench/run_quick.sh [<benchmark>] [--warmup=N] [--iters=N] [--cc=<compiler>]
+#   ./bench/run_quick.sh [<benchmark>] [--warmup=N] [--iters=N] [--cc=<compiler>] [--skip-uninformative]
 #
 # Columns: hydrangea (compiled C+OpenMP), repa, accelerate (LLVM CPU), C+OMP reference.
 #
@@ -24,16 +24,31 @@ WARMUP=3
 ITERS=10
 BENCH_FILTER=""
 CC_OVERRIDE=""
+SKIP_UNINFORMATIVE=0
 
 for arg in "$@"; do
   case "$arg" in
     --warmup=*) WARMUP="${arg#--warmup=}" ;;
     --iters=*)  ITERS="${arg#--iters=}" ;;
     --cc=*)     CC_OVERRIDE="${arg#--cc=}" ;;
+    --skip-uninformative) SKIP_UNINFORMATIVE=1 ;;
     --*) echo "Unknown option: $arg" >&2; exit 1 ;;
     *)   BENCH_FILTER="$arg" ;;
   esac
 done
+
+skip_uninformative_repa() {
+  [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
+  case "$1" in
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+skip_uninformative_accel() {
+  [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
+  [ "$1" = "blackscholes" ]
+}
 
 # Set up LLVM for GHC's LLVM backend (needed to build/run Repa/Accelerate benchmarks).
 # On macOS, probe Homebrew for an LLVM installation if llc/opt are not already on PATH.
@@ -101,6 +116,10 @@ export JACOBI_WF_H JACOBI_WF_W JACOBI_WF_ITERS
 export KDE_N KDE_BINS
 
 cd "$REPO_ROOT"
+
+if [ "$SKIP_UNINFORMATIVE" = 1 ]; then
+  echo "Skipping uninformative comparisons: Accelerate blackscholes; Repa scatter kernels." >&2
+fi
 
 # ---- Build phase -----------------------------------------------------------
 
@@ -183,6 +202,7 @@ run_hydrangea() {
 
 run_repa() {
   local name="$1"
+  if skip_uninformative_repa "$name"; then echo "N/A"; return; fi
   if [ -z "$REPA_BIN" ] || [ ! -x "$REPA_BIN" ]; then echo "N/A"; return; fi
   local result
   result=$("$REPA_BIN" bench "$name" --warmup="$WARMUP" --iters="$ITERS" \
@@ -192,6 +212,7 @@ run_repa() {
 
 run_accel() {
   local name="$1"
+  if skip_uninformative_accel "$name"; then echo "N/A"; return; fi
   if [ -z "$ACCEL_BIN" ] || [ ! -x "$ACCEL_BIN" ]; then echo "N/A"; return; fi
   local result
   result=$("$ACCEL_BIN" bench "$name" --warmup="$WARMUP" --iters="$ITERS" \
