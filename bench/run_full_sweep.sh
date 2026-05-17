@@ -35,7 +35,7 @@ done
 skip_uninformative_repa() {
   [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
   case "$1" in
-    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain|kde|coo_csr_build) return 0 ;;
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain|kde|kde_chain|coo_csr_build) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -95,6 +95,7 @@ BENCH_CC="$(find_openmp_cc)"
 : "${STENCIL_H:=512}" "${STENCIL_W:=512}"
 : "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
 : "${KDE_N:=1000000}" "${KDE_BINS:=1024}"
+: "${KDECHAIN_N:=1000000}" "${KDECHAIN_BINS:=1024}" "${KDECHAIN_KEEP_PERIOD:=5}"
 
 export BS_N NBODY_N MAND_W MAND_H MAND_ITERS
 export SPMV_NROWS SPMV_NCOLS SPMV_NNZ MAT_M MAT_K MAT_N
@@ -107,6 +108,7 @@ export VSCHAIN_POINTS VSCHAIN_NX VSCHAIN_NY VSCHAIN_NZ VSCHAIN_KEEP_PERIOD
 export STENCIL_H STENCIL_W
 export JACOBI_H JACOBI_W JACOBI_ITERS
 export KDE_N KDE_BINS
+export KDECHAIN_N KDECHAIN_BINS KDECHAIN_KEEP_PERIOD
 
 cd "$REPO_ROOT"
 mkdir -p "$OUT_DIR"
@@ -413,12 +415,22 @@ sweep_kde() {
   done
 }
 
+sweep_kde_chain() {
+  local csv="$OUT_DIR/kde_chain.csv"
+  echo "  kde_chain -> $csv" >&2
+  write_csv_header "$csv"
+  for n in 100000 250000 500000 1000000 2000000 5000000 10000000 15000000 20000000 30000000; do
+    sweep_one kde_chain kde_chain.hyd main "--no-solver-check" "$n" "$csv" \
+      "KDECHAIN_N=$n" "KDECHAIN_BINS=1024" "KDECHAIN_KEEP_PERIOD=5"
+  done
+}
+
 ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
   voxel_trilinear_splat_chain
-  stencil_interior jacobi_2d kde
+  stencil_interior jacobi_2d kde kde_chain
 )
 
 echo "Running full benchmark CSV sweep (results -> $OUT_DIR)..." >&2
@@ -441,6 +453,7 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
     stencil_interior)           sweep_stencil_interior ;;
     jacobi_2d)                  sweep_jacobi_2d ;;
     kde)                        sweep_kde ;;
+    kde_chain)                  sweep_kde_chain ;;
   esac
 done
 

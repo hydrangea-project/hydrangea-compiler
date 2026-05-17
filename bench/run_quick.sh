@@ -14,7 +14,7 @@
 #   VSPLAT_POINTS, VSPLAT_NX, VSPLAT_NY, VSPLAT_NZ, VSPLAT_KEEP_PERIOD,
 #   VSCHAIN_POINTS, VSCHAIN_NX, VSCHAIN_NY, VSCHAIN_NZ, VSCHAIN_KEEP_PERIOD,
 #   JACOBI_WF_H, JACOBI_WF_W, JACOBI_WF_ITERS,
-#   KDE_N, KDE_BINS
+#   KDE_N, KDE_BINS, KDECHAIN_N, KDECHAIN_BINS, KDECHAIN_KEEP_PERIOD
 
 set -euo pipefail
 
@@ -41,7 +41,7 @@ done
 skip_uninformative_repa() {
   [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
   case "$1" in
-    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain|kde|coo_csr_build) return 0 ;;
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain|kde|kde_chain|coo_csr_build) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -104,6 +104,7 @@ BENCH_CC="$(find_openmp_cc)"
 : "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
 : "${JACOBI_WF_H:=64}" "${JACOBI_WF_W:=1024}" "${JACOBI_WF_ITERS:=20}"
 : "${KDE_N:=1000000}" "${KDE_BINS:=1024}"
+: "${KDECHAIN_N:=1000000}" "${KDECHAIN_BINS:=1024}" "${KDECHAIN_KEEP_PERIOD:=5}"
 
 export BS_N NBODY_N MAND_W MAND_H MAND_ITERS
 export SPMV_NROWS SPMV_NCOLS SPMV_NNZ MAT_M MAT_K MAT_N
@@ -117,6 +118,7 @@ export STENCIL_H STENCIL_W
 export JACOBI_H JACOBI_W JACOBI_ITERS
 export JACOBI_WF_H JACOBI_WF_W JACOBI_WF_ITERS
 export KDE_N KDE_BINS
+export KDECHAIN_N KDECHAIN_BINS KDECHAIN_KEEP_PERIOD
 
 cd "$REPO_ROOT"
 
@@ -259,7 +261,7 @@ ALL_BENCHMARKS=(
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
   voxel_trilinear_splat_chain
-  stencil_interior jacobi_2d kde
+  stencil_interior jacobi_2d kde kde_chain
 )
 
 if [ "$BENCH_FILTER" = "jacobi_2d_wavefront" ]; then
@@ -342,6 +344,16 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
       _accel=$(run_accel kde)
       _c=$(run_c "kde")
       printf "%-35s %15s %15s %15s %15s\n" "kde(n=${KDE_N},bins=${KDE_BINS})" "$_hyd" "$_repa" "$_accel" "$_c"
+      ;;
+    kde_chain)
+      build_c "kde_chain" 2>/dev/null || true
+      _hyd=$(run_hydrangea kde_chain kde_chain.hyd main "--no-solver-check")
+      _repa=$(run_repa kde_chain)
+      _accel=$(run_accel kde_chain)
+      _c=$(run_c "kde_chain")
+      printf "%-35s %15s %15s %15s %15s\n" \
+        "kde_chain(n=${KDECHAIN_N},bins=${KDECHAIN_BINS},keep=${KDECHAIN_KEEP_PERIOD})" \
+        "$_hyd" "$_repa" "$_accel" "$_c"
       ;;
     jacobi_2d_wavefront)
       _jacobi_ref_bin="$REPO_ROOT/bench/stencil/jacobi_2d_ref"

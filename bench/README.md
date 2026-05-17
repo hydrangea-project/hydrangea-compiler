@@ -19,6 +19,7 @@ demonstrating array fusion, SIMD vectorization, and parallelization.
 | Voxel Rasterization | `voxel_rasterization/` | `generate`, `scatter_guarded`, `map`, `reduce` |
 | Voxel Trilinear Splat | `voxel_trilinear_splat/` | `generate`, `scatter_guarded`, `reduce` |
 | Voxel Trilinear Splat Chain | `voxel_trilinear_splat_chain/` | nested `scatter_guarded`, `generate`, `reduce` |
+| KDE Chain | `kde_chain/` | nested `scatter_guarded`, `generate`, `reduce` |
 | Jacobi 2D Wavefront | `stencil/` | `iterate`, `stencil clamp`, profitability-gated tiled wavefront schedule |
 
 ## Quick Start
@@ -41,6 +42,7 @@ cabal run hydrangea-compiler -- --emit-c bench/graph_messages/graph_messages.hyd
 cabal run hydrangea-compiler -- --emit-c bench/voxel_rasterization/voxel_rasterization.hyd
 cabal run hydrangea-compiler -- --no-solver-check --emit-c bench/voxel_trilinear_splat/voxel_trilinear_splat.hyd
 cabal run hydrangea-compiler -- --no-solver-check --emit-c bench/voxel_trilinear_splat_chain/voxel_trilinear_splat_chain.hyd
+cabal run hydrangea-compiler -- --no-solver-check --emit-c bench/kde_chain/kde_chain.hyd
 
 # Generate inputs (Python 3 required):
 python3 bench/blackscholes/gen_input.py 1000000
@@ -57,6 +59,7 @@ GWH_N=1000000 GWH_BINS=256 GWH_KEEP_PERIOD=3 cabal run hydrangea-compiler -- ben
 VOX_POINTS=1000000 VOX_NX=64 VOX_NY=64 VOX_NZ=64 VOX_KEEP_PERIOD=3 cabal run hydrangea-compiler -- bench/voxel_rasterization/voxel_rasterization.hyd
 VSPLAT_POINTS=1000000 VSPLAT_NX=64 VSPLAT_NY=64 VSPLAT_NZ=64 VSPLAT_KEEP_PERIOD=3 cabal run hydrangea-compiler -- --no-solver-check bench/voxel_trilinear_splat/voxel_trilinear_splat.hyd
 VSCHAIN_POINTS=500000 VSCHAIN_NX=64 VSCHAIN_NY=64 VSCHAIN_NZ=64 VSCHAIN_KEEP_PERIOD=3 cabal run hydrangea-compiler -- --no-solver-check bench/voxel_trilinear_splat_chain/voxel_trilinear_splat_chain.hyd
+KDECHAIN_N=1000000 KDECHAIN_BINS=1024 KDECHAIN_KEEP_PERIOD=5 cabal run hydrangea-compiler -- --no-solver-check bench/kde_chain/kde_chain.hyd
 ```
 
 ## Per-Benchmark Run Scripts
@@ -75,6 +78,7 @@ bench/graph_messages/run.sh  # GRAPH_SIZES="10000 100000 500000"
 bench/voxel_rasterization/run.sh  # VOX_SIZES="100000 1000000 5000000"
 bench/voxel_trilinear_splat/run.sh  # VSPLAT_SIZES="100000 1000000 5000000"
 bench/voxel_trilinear_splat_chain/run.sh  # VSCHAIN_SIZES="100000 500000 2000000"
+bench/kde_chain/run.sh  # KDECHAIN_SIZES="100000 1000000 5000000"
 ```
 
 For a full suite sweep that writes one CSV per benchmark with Hydrangea, Repa,
@@ -91,7 +95,7 @@ comparisons that are dominated by library limitations rather than interesting
 algorithmic differences: Accelerate on `blackscholes` (no fast vendor `erf`) and
 Repa on the scatter benchmarks (`weighted_histogram`,
 `guarded_weighted_histogram`, `voxel_rasterization`,
-`voxel_trilinear_splat`, and `voxel_trilinear_splat_chain`). The same flag is also supported by
+`voxel_trilinear_splat`, `voxel_trilinear_splat_chain`, and `kde_chain`). The same flag is also supported by
 `./bench/run_sweep.sh`.
 
 To turn those CSVs into paper-friendly PDF plots with gnuplot:
@@ -218,6 +222,16 @@ pass can collapse into one shared destination buffer. Like the single-pass
 variant, this currently uses `--no-solver-check`.
 
 Environment variables: `VSCHAIN_POINTS`, `VSCHAIN_NX`, `VSCHAIN_NY`, `VSCHAIN_NZ`, `VSCHAIN_KEEP_PERIOD`
+
+### KDE Chain (`kde_chain/`)
+Three nested guarded tent-kernel deposition passes into one 1-D histogram. Each
+phase jitters the bin centre slightly, scales the phase weights differently, and
+keeps a different phase-shifted subset of samples, so the source program forms a
+literal nested `scatter_guarded` chain over dense colliding histogram updates.
+This gives a smaller integer-only counterpart to `voxel_trilinear_splat_chain`.
+Like the voxel-chain benchmarks, this currently uses `--no-solver-check`.
+
+Environment variables: `KDECHAIN_N`, `KDECHAIN_BINS`, `KDECHAIN_KEEP_PERIOD`
 
 ### Jacobi 2D Wavefront (`stencil/`, quick-run alias)
 This is a named `run_quick.sh` variant of `jacobi_2d` with wider default sizes

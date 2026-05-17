@@ -131,6 +131,7 @@ benchmarks =
   , Benchmark "voxel_rasterization"        runVoxelRasterization
   , Benchmark "voxel_trilinear_splat"      runVoxelTrilinearSplat
   , Benchmark "voxel_trilinear_splat_chain" runVoxelTrilinearSplatChain
+  , Benchmark "kde_chain"                  runKDEChain
   , Benchmark "softmax"                    runSoftmax
   , Benchmark "coo_spmv"                   runCooSpmv
   , Benchmark "stencil_interior"           runStencilInterior
@@ -603,6 +604,7 @@ runBenchmarkByNameTimed opts name = case name of
   "voxel_rasterization"        -> timedVoxelRasterization opts
   "voxel_trilinear_splat"      -> timedVoxelTrilinearSplat opts
   "voxel_trilinear_splat_chain" -> timedVoxelTrilinearSplatChain opts
+  "kde_chain"                  -> timedKDEChain opts
   "softmax"                    -> timedSoftmax opts
   "coo_spmv"                   -> timedCooSpmv opts
   "stencil_interior"           -> timedStencilInterior opts
@@ -813,11 +815,54 @@ kdeKernel n bins =
        (\(I1 k) -> A.cond (keep A.! I1 k) (Just_ (I1 (idxs A.! I1 k))) Nothing_)
        weights
 
+kdeChainPassKernel :: Int -> Int -> Int -> Int -> Acc (Vector Int) -> Acc (Vector Int)
+kdeChainPassKernel phase n bins keepPeriod defaults =
+  let contribs = n * 3
+      phaseE   = A.constant phase
+      idxs     = A.generate (A.constant (Z :. contribs)) $ \(I1 k) ->
+                   let sample = k `div` 3
+                       offset = k - sample * 3
+                       base   = (sample * A.constant bins) `div` A.constant n
+                       jitter = ((sample * (phaseE + 3)) + phaseE) `mod` 5 - 2
+                   in base + jitter + offset - 1
+      weights  = A.generate (A.constant (Z :. contribs)) $ \(I1 k) ->
+                   let offset = k `mod` 3
+                       peak   = A.cond (offset A.== 1) (3 :: A.Exp Int) 1
+                   in peak * (phaseE + 1)
+      keep     = A.generate (A.constant (Z :. contribs)) $ \(I1 k) ->
+                   let sample      = k `div` 3
+                       offset      = k - sample * 3
+                       phaseSample = sample + phaseE
+                       base        = (sample * A.constant bins) `div` A.constant n
+                       jitter      = ((sample * (phaseE + 3)) + phaseE) `mod` 5 - 2
+                       route       = base + jitter + offset - 1
+                       phaseOk     =
+                         (phaseSample `div` A.constant keepPeriod) * A.constant keepPeriod A.== phaseSample
+                   in phaseOk A.&& route A.>= 0 A.&& route A.< A.constant bins
+  in A.permute (+) defaults
+       (\(I1 k) -> A.cond (keep A.! I1 k) (Just_ (I1 (idxs A.! I1 k))) Nothing_)
+       weights
+
+kdeChainKernel :: Int -> Int -> Int -> Acc (Vector Int)
+kdeChainKernel n bins keepPeriod =
+  let zeros = A.fill (A.constant (Z :. bins)) (0 :: A.Exp Int)
+      pass0 = kdeChainPassKernel 0 n bins keepPeriod zeros
+      pass1 = kdeChainPassKernel 1 n bins keepPeriod pass0
+  in kdeChainPassKernel 2 n bins keepPeriod pass1
+
 runKDE :: IO ()
 runKDE = do
   n    <- readEnvInt "KDE_N"
   bins <- readEnvInt "KDE_BINS"
   let result = CPU.run $ kdeKernel n bins
+  print (Prelude.sum (A.toList result) :: Int)
+
+runKDEChain :: IO ()
+runKDEChain = do
+  n          <- readEnvInt "KDECHAIN_N"
+  bins       <- readEnvInt "KDECHAIN_BINS"
+  keepPeriod <- readEnvInt "KDECHAIN_KEEP_PERIOD"
+  let result = CPU.run $ kdeChainKernel n bins keepPeriod
   print (Prelude.sum (A.toList result) :: Int)
 
 timedKDE :: TimingOptions -> IO ()
@@ -828,3 +873,13 @@ timedKDE opts = runTimingHarness "main" opts load run sumAllInts
       bins <- readEnvInt "KDE_BINS"
       pure (n, bins)
     run (n, bins) = CPU.run $ kdeKernel n bins
+
+timedKDEChain :: TimingOptions -> IO ()
+timedKDEChain opts = runTimingHarness "main" opts load run sumAllInts
+  where
+    load = do
+      n    <- readEnvInt "KDECHAIN_N"
+      bins <- readEnvInt "KDECHAIN_BINS"
+      kp   <- readEnvInt "KDECHAIN_KEEP_PERIOD"
+      pure (n, bins, kp)
+    run (n, bins, kp) = CPU.run $ kdeChainKernel n bins kp

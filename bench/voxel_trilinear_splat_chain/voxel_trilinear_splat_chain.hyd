@@ -1,0 +1,75 @@
+(* Chained trilinear voxel splatting benchmark.
+   Applies three nested guarded trilinear splat passes from the same
+   deterministic point cloud into a single dense voxel grid. Each pass uses a
+   phase-specific jitter pattern, so the program forms a literal scatter chain:
+
+     scatter_guarded (+.) (scatter_guarded (+.) (scatter_guarded (+.) zeros ... ) ... ) ...
+
+   This is meant to exercise scatter-chain fusion directly: the compiler can
+   collapse the nested scatters into one shared destination buffer rather than
+   materialising intermediate voxel grids between passes.
+
+   Environment variables:
+     VSCHAIN_POINTS       -- number of source points
+     VSCHAIN_NX           -- voxel-grid x extent
+     VSCHAIN_NY           -- voxel-grid y extent
+     VSCHAIN_NZ           -- voxel-grid z extent
+     VSCHAIN_KEEP_PERIOD  -- keep every k-th point in each pass
+*)
+
+let main =
+  let n = get_env_int "VSCHAIN_POINTS" in
+  let nx = get_env_int "VSCHAIN_NX" in
+  let ny = get_env_int "VSCHAIN_NY" in
+  let nz = get_env_int "VSCHAIN_NZ" in
+  let keep_period = get_env_int "VSCHAIN_KEEP_PERIOD" in
+  let nvox = nx * ny * nz in
+  let contribs = n * 8 in
+  let imod x m = x - ((x / m) * m) in
+  let route_of phase [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let x = imod (p * (17 + phase * 2) + (3 + phase * 5) + bx) nx in
+    let y = imod (p * (29 + phase * 3) + (5 + phase * 7) + by) ny in
+    let z = imod (p * (43 + phase * 5) + (7 + phase * 11) + bz) nz in
+    ((z * ny) + y) * nx + x in
+  let weight_of phase [i] =
+    let p = i / 8 in
+    let c = imod i 8 in
+    let bx = imod c 2 in
+    let by = imod (c / 2) 2 in
+    let bz = imod (c / 4) 2 in
+    let fx = imod (p * (5 + phase) + (1 + phase)) 4 in
+    let fy = imod (p * (7 + phase) + (2 + phase * 2)) 4 in
+    let fz = imod (p * (11 + phase) + (3 + phase * 3)) 4 in
+    let wx = (1 - bx) * (4 - fx) + bx * fx in
+    let wy = (1 - by) * (4 - fy) + by * fy in
+    let wz = (1 - bz) * (4 - fz) + bz * fz in
+    let base = (p * (phase + 3)) + (phase + 1) in
+    float_of (base * wx * wy * wz) /. 64.0 in
+  let keep_of [i] =
+    let p = i / 8 in
+    ((p / keep_period) * keep_period) = p in
+  let route0 idx = route_of 0 idx in
+  let route1 idx = route_of 1 idx in
+  let route2 idx = route_of 2 idx in
+  let weight0 idx = weight_of 0 idx in
+  let weight1 idx = weight_of 1 idx in
+  let weight2 idx = weight_of 2 idx in
+  let voxels =
+    scatter_guarded (+.)
+      (scatter_guarded (+.)
+        (scatter_guarded (+.) (fill [nvox] 0.0)
+          (generate [contribs] route0)
+          (generate [contribs] weight0)
+          (generate [contribs] keep_of))
+        (generate [contribs] route1)
+        (generate [contribs] weight1)
+        (generate [contribs] keep_of))
+      (generate [contribs] route2)
+      (generate [contribs] weight2)
+      (generate [contribs] keep_of) in
+  index () (reduce (+.) 0.0 voxels)

@@ -1,0 +1,69 @@
+(* Chained 1-D kernel density estimation benchmark.
+   Applies three nested guarded tent-kernel scatters into one histogram. Each
+   phase uses a slightly different centre jitter, phase-specific keep mask, and
+   weight scale, so the source program contains a literal scatter_guarded chain
+   rather than a single expanded scatter.
+
+   This complements voxel_trilinear_splat_chain with a 1-D integer workload:
+   many dense collisions into a small histogram, but no large voxel-grid state
+   or floating-point trilinear weights.
+
+   This benchmark currently uses `--no-solver-check`: the guarded chained route
+   expressions are valid, but refinement inference does not yet prove all facts
+   needed for the nested fused scatter pipeline.
+
+   Environment variables:
+     KDECHAIN_N            -- number of source samples
+     KDECHAIN_BINS         -- number of output histogram bins
+     KDECHAIN_KEEP_PERIOD  -- keep every k-th phase-shifted sample
+*)
+
+let main =
+  let n = get_env_int "KDECHAIN_N" in
+  let bins = get_env_int "KDECHAIN_BINS" in
+  let keep_period = get_env_int "KDECHAIN_KEEP_PERIOD" in
+  let contribs = n * 3 in
+  let imod x m = x - ((x / m) * m) in
+  let sample_of [k] = k / 3 in
+  let offset_of [k] = imod k 3 in
+  let centre_of phase [k] =
+    let s = sample_of [k] in
+    let base = (s * bins) / n in
+    let jitter = imod (s * (phase + 3) + phase) 5 - 2 in
+    base + jitter in
+  let route_of phase [k] = centre_of phase [k] + offset_of [k] - 1 in
+  let weight_of phase [k] =
+    let peak = if offset_of [k] = 1 then 3 else 1 in
+    peak * (phase + 1) in
+  let keep_of phase [k] =
+    let s = sample_of [k] in
+    let phase_sample = s + phase in
+    let phase_ok = ((phase_sample / keep_period) * keep_period) = phase_sample in
+    let r = route_of phase [k] in
+    if phase_ok then
+      if r >= 0 then r < bins else (0 = 1)
+    else
+      (0 = 1) in
+  let route0 idx = route_of 0 idx in
+  let route1 idx = route_of 1 idx in
+  let route2 idx = route_of 2 idx in
+  let weight0 idx = weight_of 0 idx in
+  let weight1 idx = weight_of 1 idx in
+  let weight2 idx = weight_of 2 idx in
+  let keep0 idx = keep_of 0 idx in
+  let keep1 idx = keep_of 1 idx in
+  let keep2 idx = keep_of 2 idx in
+  let density =
+    scatter_guarded (+)
+      (scatter_guarded (+)
+        (scatter_guarded (+) (fill [bins] 0)
+          (generate [contribs] route0)
+          (generate [contribs] weight0)
+          (generate [contribs] keep0))
+        (generate [contribs] route1)
+        (generate [contribs] weight1)
+        (generate [contribs] keep1))
+      (generate [contribs] route2)
+      (generate [contribs] weight2)
+      (generate [contribs] keep2) in
+  index () (reduce (+) 0 density)
