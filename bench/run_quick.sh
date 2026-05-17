@@ -40,7 +40,7 @@ done
 skip_uninformative_repa() {
   [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
   case "$1" in
-    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat) return 0 ;;
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|kde|coo_csr_build) return 0 ;;
     *) return 1 ;;
   esac
 }

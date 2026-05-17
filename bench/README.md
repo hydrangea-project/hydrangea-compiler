@@ -97,6 +97,20 @@ To turn those CSVs into paper-friendly PDF plots with gnuplot:
 ./bench/plot_full_sweep.sh --csv-dir=bench/results/custom_suite --out-dir=bench/results/custom_suite/plots
 ```
 
+For plots normalized to the C+OMP baseline, with log-scaled x/y axes and
+gnuplot-ready converted CSVs written alongside the PDFs, use:
+
+```bash
+./bench/plot_full_sweep_normalized.sh
+./bench/plot_full_sweep_normalized.sh voxel_trilinear_splat
+./bench/plot_full_sweep_normalized.sh --csv-dir=bench/results/custom_suite
+./bench/plot_full_sweep_normalized.sh --csv-dir=bench/results/custom_suite --data-dir=bench/results/custom_suite/normalized_c_omp --out-dir=bench/results/custom_suite/plots_normalized_c_omp
+```
+
+The normalized CSVs have columns
+`size,hydrangea_rel,repa_rel,accelerate_rel,c_omp_rel`, where `1` marks the
+C+OMP baseline.
+
 ## Benchmark Details
 
 ### Black-Scholes (`blackscholes/`)
