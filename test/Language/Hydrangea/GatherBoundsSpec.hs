@@ -457,11 +457,14 @@ spec = describe "gather bounds checking" $ do
         (isInfixOf "UnsatConstraints")
 
   -- ------------------------------------------------------------------ --
-  -- make_index warning
+  -- make_index obligation discharge
   -- ------------------------------------------------------------------ --
-  describe "make_index warnings" $ do
+  describe "make_index obligation discharge" $ do
 
-    it "make_index emits a warning about unverified bound" $ do
+    -- When the source array's element bound is known (e.g. from a generate
+    -- whose body is a constant), the solver discharges the obligation cleanly
+    -- and emits no "make_index" or "could not verify" warning.
+    it "make_index with known source bound is discharged cleanly" $ do
       let src = BS.unlines
             [ "let src     = generate [10] (let f [i] = i in f)"
             , "let raw_idx = generate [5]  (let f [i] = 0 in f)"
@@ -473,9 +476,30 @@ spec = describe "gather bounds checking" $ do
         Right decs -> do
           result <- inferDecsTopWithWarnings decs
           case result of
-            Left msg -> expectationFailure ("Expected success: " ++ msg)
+            Left msg  -> expectationFailure ("Expected success: " ++ msg)
             Right (_, warnings) ->
-              warnings `shouldSatisfy` any (isInfixOf "make_index")
+              warnings `shouldSatisfy` all (not . isInfixOf "make_index bound not statically verified")
+
+    -- When the source array's element bound is NOT known (unanalyzable body),
+    -- the obligation is ungrounded and the solver emits a "could not verify"
+    -- note rather than a hard failure.  No "make_index bound not statically
+    -- verified" message should appear — that old warning is gone.
+    it "make_index with unknown source bound emits could-not-verify note" $ do
+      let src = BS.unlines
+            [ "let src     = generate [10] (let f [i] = i in f)"
+            , "let raw_idx = generate [5]  (fn [i] => i / 2)"
+            , "let idx     = make_index 10 raw_idx"
+            , "let main    = gather idx src"
+            ]
+      case readDecs src of
+        Left err -> expectationFailure ("Parse error: " ++ err)
+        Right decs -> do
+          result <- inferDecsTopWithWarnings decs
+          case result of
+            Left msg  -> expectationFailure ("Expected success with warning: " ++ msg)
+            Right (_, warnings) -> do
+              warnings `shouldSatisfy` all (not . isInfixOf "make_index bound not statically verified")
+              warnings `shouldSatisfy` any (isInfixOf "could not verify")
 
   -- ------------------------------------------------------------------ --
   -- index bounds checking
@@ -1460,3 +1484,199 @@ spec = describe "gather bounds checking" $ do
         , "let idx  = map (let f x = x in f) perm"
         , "let main = gather idx src"
         ]
+
+  -- ------------------------------------------------------------------ --
+  -- coo_sum_duplicates / csr_from_sorted_coo element-bound propagation
+  -- ------------------------------------------------------------------ --
+  -- Both constructors now emit TValBoundDim facts on their output index
+  -- arrays (rows/cols for COO; col_idx for CSR) so that downstream
+  -- gathers can be statically verified without extra annotations.
+  -- ------------------------------------------------------------------ --
+  describe "sparse array constructor bound propagation" $ do
+
+    it "COO: gather coo.rows into nrows-sized source accepted" $ do
+      -- coo_sum_duplicates 3 4 6 … produces rows with TValBoundDim = 3;
+      -- gather into generate [3] is therefore safe.
+      expectDecsOk $ BS.unlines
+        [ "let rows = generate [6] (let f [i] = i / 2 in f)"
+        , "let cols = generate [6] (let f [i] = i / 2 in f)"
+        , "let vals = generate [6] (let f [i] = i + 1 in f)"
+        , "let coo  = coo_sum_duplicates 3 4 6 rows cols vals"
+        , "let src  = generate [3] (let g [i] = i in g)"
+        , "let main = gather coo.rows src"
+        ]
+
+    it "COO: gather coo.rows into under-sized source rejected" $ do
+      -- rows bound = 3 but src has only 2 elements → unsafe
+      expectDecsError
+        ( BS.unlines
+            [ "let rows = generate [6] (let f [i] = i / 2 in f)"
+            , "let cols = generate [6] (let f [i] = i / 2 in f)"
+            , "let vals = generate [6] (let f [i] = i + 1 in f)"
+            , "let coo  = coo_sum_duplicates 3 4 6 rows cols vals"
+            , "let src  = generate [2] (let g [i] = i in g)"
+            , "let main = gather coo.rows src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "COO: gather coo.cols into ncols-sized source accepted" $ do
+      -- cols bound = 4; gather into generate [4] is safe
+      expectDecsOk $ BS.unlines
+        [ "let rows = generate [6] (let f [i] = i / 2 in f)"
+        , "let cols = generate [6] (let f [i] = i / 2 in f)"
+        , "let vals = generate [6] (let f [i] = i + 1 in f)"
+        , "let coo  = coo_sum_duplicates 3 4 6 rows cols vals"
+        , "let src  = generate [4] (let g [i] = i in g)"
+        , "let main = gather coo.cols src"
+        ]
+
+    it "CSR: gather csr.col_idx into ncols-sized source accepted" $ do
+      -- csr_from_sorted_coo 3 4 … produces col_idx with TValBoundDim = 4;
+      -- gather into generate [4] is therefore safe.
+      expectDecsOk $ BS.unlines
+        [ "let rows = generate [4] (let f [i] = i / 2 in f)"
+        , "let cols = generate [4] (let f [i] = i in f)"
+        , "let vals = generate [4] (let f [i] = i + 1 in f)"
+        , "let csr  = csr_from_sorted_coo 3 4 4 rows cols vals"
+        , "let src  = generate [4] (let g [i] = i in g)"
+        , "let main = gather csr.col_idx src"
+        ]
+
+    it "CSR: gather csr.col_idx into under-sized source rejected" $ do
+      -- col_idx bound = 4 but src has only 3 elements → unsafe
+      expectDecsError
+        ( BS.unlines
+            [ "let rows = generate [4] (let f [i] = i / 2 in f)"
+            , "let cols = generate [4] (let f [i] = i in f)"
+            , "let vals = generate [4] (let f [i] = i + 1 in f)"
+            , "let csr  = csr_from_sorted_coo 3 4 4 rows cols vals"
+            , "let src  = generate [3] (let g [i] = i in g)"
+            , "let main = gather csr.col_idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  -- ------------------------------------------------------------------ --
+  -- bound propagation through nested lets and generates                 --
+  -- ------------------------------------------------------------------ --
+  -- These tests exercise the three new inference paths added to Infer.hs:
+  --
+  --  Change 1 (inferBVal EIndex): when the argument to 'index' is a named
+  --    array variable with a registered value-bound dimension, the scalar
+  --    element inherits that bound (BoundOf (TValBoundDim rfVar 0)).
+  --
+  --  Change 2 (ELetIn scalar bound propagation): zero-argument scalar let-
+  --    bindings check whether the RHS has an inferrable BoundOf value; if
+  --    so, the bound is entered into valBoundCtx for the continuation.
+  --    This lets bound information flow through chains of lets.
+  --
+  --  Change 3 (EGenerate pre-created arrVar): the generator's index param
+  --    is inserted into valBoundCtx with bound TDim arrVar 0 BEFORE the
+  --    function body is type-checked, so nested lets inside the body can
+  --    chain their bounds off the generator index.
+  describe "bound propagation through nested lets" $ do
+
+    -- Change 1: EIndex propagates the array's value-bound dimension.
+    -- 'col_idx' is a make_index with bound ncols; indexing into it yields
+    -- an element whose value is statically known to be < ncols.
+    it "let-bound index element inherits array value bound (Change 1)" $ do
+      expectDecsOk $ BS.unlines
+        [ "let ncols    = 5"
+        , "let nnz      = 4"
+        , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+        , "let col_idx  = make_index ncols raw_idx"
+        , "let x_vec    = generate [ncols] (fn [i] => i)"
+        , "let get_val [k] = let col = index [k] col_idx in index [col] x_vec"
+        , "let main = generate [nnz] get_val"
+        ]
+
+    it "let-bound index element: rejected when dest array too small (Change 1)" $ do
+      -- col_idx has value bound ncols=5, but x_vec only has 4 elements.
+      expectDecsError
+        ( BS.unlines
+            [ "let ncols    = 5"
+            , "let nnz      = 4"
+            , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+            , "let col_idx  = make_index ncols raw_idx"
+            , "let x_vec    = generate [4] (fn [i] => i)"
+            , "let get_val [k] = let col = index [k] col_idx in index [col] x_vec"
+            , "let main = generate [nnz] get_val"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Change 2: ELetIn propagates bound through a chain of scalar lets.
+    -- 'col' is bounded by col_idx's value dimension; indexing into x_vec is safe.
+    it "scalar let chain propagates bound for gather (Change 2)" $ do
+      expectDecsOk $ BS.unlines
+        [ "let ncols   = 6"
+        , "let nnz     = 3"
+        , "let raw_idx = generate [nnz] (fn [i] => 0)"
+        , "let col_idx = make_index ncols raw_idx"
+        , "let x_vec   = generate [ncols] (fn [i] => i)"
+        , "let main    = generate [nnz] (fn [k] =>"
+        , "                let col = index [k] col_idx in"
+        , "                index [col] x_vec)"
+        ]
+
+    it "scalar let chain: rejected when destination too small (Change 2)" $ do
+      -- col_idx value bound = 6, but x_vec has only 5 elements.
+      expectDecsError
+        ( BS.unlines
+            [ "let ncols   = 6"
+            , "let nnz     = 3"
+            , "let raw_idx = generate [nnz] (fn [i] => 0)"
+            , "let col_idx = make_index ncols raw_idx"
+            , "let x_vec   = generate [5] (fn [i] => i)"
+            , "let main    = generate [nnz] (fn [k] =>"
+            , "                let col = index [k] col_idx in"
+            , "                index [col] x_vec)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Change 3: the generator index 'k' is in valBoundCtx with bound TDim arrVar 0
+    -- during body inference, so lets chaining off 'k' can inherit bounds.
+    it "generate index parameter bound enables nested let chains (Change 3)" $ do
+      expectDecsOk $ BS.unlines
+        [ "let ncols    = 4"
+        , "let nnz      = 6"
+        , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+        , "let col_idx  = make_index ncols raw_idx"
+        , "let x_vec    = generate [ncols] (fn [j] => j)"
+        , "let main     = generate [nnz] (fn [k] =>"
+        , "                 let col = index [k] col_idx in"
+        , "                 index [col] x_vec)"
+        ]
+
+    -- SpMV-style double-nested generate: inner generate produces row segments
+    -- whose element indices are bounded by the column count.  This exercises
+    -- all three changes together in a realistic pattern.
+    it "SpMV-style nested generate: col index bounded by ncols (all changes)" $ do
+      expectDecsOk $ BS.unlines
+        [ "let ncols    = 5"
+        , "let nnz      = 8"
+        , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+        , "let col_idx  = make_index ncols raw_idx"
+        , "let x_vec    = generate [ncols] (fn [j] => j)"
+        , "let main     = generate [nnz] (fn [k] =>"
+        , "                 let col = index [k] col_idx in"
+        , "                 index [col] x_vec)"
+        ]
+
+    it "SpMV-style: rejected when x_vec too small for col bound (all changes)" $ do
+      -- col values bounded by ncols=5 but x_vec has only 4 elements.
+      expectDecsError
+        ( BS.unlines
+            [ "let ncols    = 5"
+            , "let nnz      = 8"
+            , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+            , "let col_idx  = make_index ncols raw_idx"
+            , "let x_vec    = generate [4] (fn [j] => j)"
+            , "let main     = generate [nnz] (fn [k] =>"
+            , "                 let col = index [k] col_idx in"
+            , "                 index [col] x_vec)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")

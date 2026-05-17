@@ -52,6 +52,7 @@ stripRefines ty =
     TyCons t1 t2 -> TyCons (stripRefines t1) (stripRefines t2)
     TyFun t1 t2 -> TyFun (stripRefines t1) (stripRefines t2)
     TyArray s e -> TyArray (stripRefines s) (stripRefines e)
+    TyRecord fields -> TyRecord (map (\(f, t) -> (f, stripRefines t)) fields)
     TyVar v -> TyVar v
     TyInt -> TyInt
     TyBool -> TyBool
