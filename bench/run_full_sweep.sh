@@ -35,7 +35,7 @@ done
 skip_uninformative_repa() {
   [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
   case "$1" in
-    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|kde|coo_csr_build) return 0 ;;
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain|kde|coo_csr_build) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -91,6 +91,7 @@ BENCH_CC="$(find_openmp_cc)"
 : "${GRAPH_NODES:=100000}" "${GRAPH_DEGREE:=16}"
 : "${VOX_POINTS:=1000000}" "${VOX_NX:=64}" "${VOX_NY:=64}" "${VOX_NZ:=64}" "${VOX_KEEP_PERIOD:=3}"
 : "${VSPLAT_POINTS:=1000000}" "${VSPLAT_NX:=64}" "${VSPLAT_NY:=64}" "${VSPLAT_NZ:=64}" "${VSPLAT_KEEP_PERIOD:=3}"
+: "${VSCHAIN_POINTS:=500000}" "${VSCHAIN_NX:=64}" "${VSCHAIN_NY:=64}" "${VSCHAIN_NZ:=64}" "${VSCHAIN_KEEP_PERIOD:=3}"
 : "${STENCIL_H:=512}" "${STENCIL_W:=512}"
 : "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
 : "${KDE_N:=1000000}" "${KDE_BINS:=1024}"
@@ -102,6 +103,7 @@ export COO_NROWS COO_NCOLS COO_NNZ COO_DUP_PERIOD
 export GRAPH_NODES GRAPH_DEGREE
 export VOX_POINTS VOX_NX VOX_NY VOX_NZ VOX_KEEP_PERIOD
 export VSPLAT_POINTS VSPLAT_NX VSPLAT_NY VSPLAT_NZ VSPLAT_KEEP_PERIOD
+export VSCHAIN_POINTS VSCHAIN_NX VSCHAIN_NY VSCHAIN_NZ VSCHAIN_KEEP_PERIOD
 export STENCIL_H STENCIL_W
 export JACOBI_H JACOBI_W JACOBI_ITERS
 export KDE_N KDE_BINS
@@ -345,6 +347,16 @@ sweep_voxel_trilinear_splat() {
   done
 }
 
+sweep_voxel_trilinear_splat_chain() {
+  local csv="$OUT_DIR/voxel_trilinear_splat_chain.csv"
+  echo "  voxel_trilinear_splat_chain -> $csv" >&2
+  write_csv_header "$csv"
+  for n in 100000 250000 500000 1000000 2000000 4000000 8000000 12000000 16000000 20000000; do
+    sweep_one voxel_trilinear_splat_chain voxel_trilinear_splat_chain.hyd main "--no-solver-check" "$n" "$csv" \
+      "VSCHAIN_POINTS=$n" "VSCHAIN_NX=64" "VSCHAIN_NY=64" "VSCHAIN_NZ=64" "VSCHAIN_KEEP_PERIOD=3"
+  done
+}
+
 sweep_stencil_interior() {
   local csv="$OUT_DIR/stencil_interior.csv"
   echo "  stencil_interior -> $csv" >&2
@@ -405,6 +417,7 @@ ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
+  voxel_trilinear_splat_chain
   stencil_interior jacobi_2d kde
 )
 
@@ -424,6 +437,7 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
     graph_messages)             sweep_graph_messages ;;
     voxel_rasterization)        sweep_voxel_rasterization ;;
     voxel_trilinear_splat)      sweep_voxel_trilinear_splat ;;
+    voxel_trilinear_splat_chain) sweep_voxel_trilinear_splat_chain ;;
     stencil_interior)           sweep_stencil_interior ;;
     jacobi_2d)                  sweep_jacobi_2d ;;
     kde)                        sweep_kde ;;

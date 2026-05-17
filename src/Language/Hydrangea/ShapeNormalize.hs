@@ -192,6 +192,13 @@ normExp expr = case expr of
   EScatterGuarded a c d idx vals guardArr ->
     EScatterGuarded a <$> normExp c <*> normExp d <*> normExp idx <*> normExp vals <*> normExp guardArr
   EScatterGenerate a c d idx f -> EScatterGenerate a <$> normExp c <*> normExp d <*> normExp idx <*> normExp f
+  EScatterChain a c d phases -> do
+    c' <- normExp c
+    d' <- normExp d
+    phases' <- mapM (\p -> ScatterPhase <$> normExp (spIndex p)
+                                         <*> normExp (spValues p)
+                                         <*> mapM normExp (spGuard p)) phases
+    pure (EScatterChain a c' d' phases')
   EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
   EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
   ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr

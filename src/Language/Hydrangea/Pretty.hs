@@ -168,6 +168,12 @@ instance Pretty (Exp a) where
     text "scatter_guarded" <+> pPrint comb <+> pPrint defaults <+> pPrint idxArr <+> pPrint vals <+> pPrint guardArr
   pPrint (EScatterGenerate _ comb defaults idxArr valFn) =
     text "scatter_generate" <+> pPrint comb <+> pPrint defaults <+> pPrint idxArr <+> pPrint valFn
+  pPrint (EScatterChain _ comb defaults phases) =
+    text "scatter_chain" <+> pPrint comb <+> pPrint defaults
+      <+> brackets (sep (punctuate comma (map ppPhase phases)))
+    where
+      ppPhase p = parens (pPrint (spIndex p) <+> comma <+> pPrint (spValues p)
+                            <> maybe empty (\g -> comma <+> pPrint g) (spGuard p))
   pPrint (EGather _ idxArr arr) = text "gather" <+> pPrint idxArr <+> pPrint arr
   pPrint (EIndex _ idx arr) = text "index" <+> pPrint idx <+> pPrint arr
   pPrint (ECheckIndex _ idx defVal arr) = text "check_index" <+> pPrint idx <+> pPrint defVal <+> pPrint arr

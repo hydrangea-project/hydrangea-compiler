@@ -72,6 +72,10 @@ collectTopLevelRefs topNames expr bound =
     EScatter _ c d idx v -> S.unions (map (`go` bound) [c,d,idx,v])
     EScatterGuarded _ c d idx v g -> S.unions (map (`go` bound) [c,d,idx,v,g])
     EScatterGenerate _ c d idx f -> S.unions (map (`go` bound) [c,d,idx,f])
+    EScatterChain _ c d phases ->
+      S.unions (go c bound : go d bound :
+        concatMap (\p -> [go (spIndex p) bound, go (spValues p) bound]
+                         ++ maybe [] (\g -> [go g bound]) (spGuard p)) phases)
     EGather _ idx a -> go idx bound `S.union` go a bound
     EIndex _ i a -> go i bound `S.union` go a bound
     ECheckIndex _ i def a -> go i bound `S.union` go def bound `S.union` go a bound

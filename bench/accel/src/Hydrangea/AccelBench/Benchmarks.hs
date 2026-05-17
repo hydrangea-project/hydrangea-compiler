@@ -130,6 +130,7 @@ benchmarks =
   , Benchmark "graph_messages"             runGraphMessages
   , Benchmark "voxel_rasterization"        runVoxelRasterization
   , Benchmark "voxel_trilinear_splat"      runVoxelTrilinearSplat
+  , Benchmark "voxel_trilinear_splat_chain" runVoxelTrilinearSplatChain
   , Benchmark "softmax"                    runSoftmax
   , Benchmark "coo_spmv"                   runCooSpmv
   , Benchmark "stencil_interior"           runStencilInterior
@@ -354,6 +355,52 @@ voxelTrilinearSplatKernel n nx ny nz keepPeriod =
        (\(I1 i) -> A.cond (keep A.! I1 i) (Just_ (I1 (idxs A.! I1 i))) Nothing_)
        weights
 
+voxelTrilinearSplatPassKernel
+  :: Int -> Int -> Int -> Int -> Int -> Int
+  -> Acc (Vector Double)
+  -> Acc (Vector Double)
+voxelTrilinearSplatPassKernel phase n nx ny nz keepPeriod defaults =
+  let contribs = n * 8
+      phaseE   = A.constant phase
+      idxs     = A.generate (A.constant (Z :. contribs)) $ \(I1 i) ->
+                   let p  = i `div` 8
+                       c  = i `mod` 8
+                       bx = c `mod` 2
+                       by = (c `div` 2) `mod` 2
+                       bz = (c `div` 4) `mod` 2
+                       x  = (p * (A.constant 17 + phaseE * 2) + (A.constant 3 + phaseE * 5) + bx) `mod` A.constant nx
+                       y  = (p * (A.constant 29 + phaseE * 3) + (A.constant 5 + phaseE * 7) + by) `mod` A.constant ny
+                       z  = (p * (A.constant 43 + phaseE * 5) + (A.constant 7 + phaseE * 11) + bz) `mod` A.constant nz
+                   in ((z * A.constant ny) + y) * A.constant nx + x
+      weights  = A.generate (A.constant (Z :. contribs)) $ \(I1 i) ->
+                   let p  = i `div` 8
+                       c  = i `mod` 8
+                       bx = c `mod` 2
+                       by = (c `div` 2) `mod` 2
+                       bz = (c `div` 4) `mod` 2
+                       fx = (p * (A.constant 5 + phaseE) + (A.constant 1 + phaseE)) `mod` 4
+                       fy = (p * (A.constant 7 + phaseE) + (A.constant 2 + phaseE * 2)) `mod` 4
+                       fz = (p * (A.constant 11 + phaseE) + (A.constant 3 + phaseE * 3)) `mod` 4
+                       wx = (1 - bx) * (4 - fx) + bx * fx
+                       wy = (1 - by) * (4 - fy) + by * fy
+                       wz = (1 - bz) * (4 - fz) + bz * fz
+                       base = (p * (phaseE + 3)) + (phaseE + 1)
+                   in A.fromIntegral (base * wx * wy * wz) / 64.0 :: A.Exp Double
+      keep     = A.generate (A.constant (Z :. contribs)) $ \(I1 i) ->
+                   let p = i `div` 8
+                   in (p `div` A.constant keepPeriod) * A.constant keepPeriod A.== p
+  in A.permute (+) defaults
+       (\(I1 i) -> A.cond (keep A.! I1 i) (Just_ (I1 (idxs A.! I1 i))) Nothing_)
+       weights
+
+voxelTrilinearSplatChainKernel :: Int -> Int -> Int -> Int -> Int -> Acc (Vector Double)
+voxelTrilinearSplatChainKernel n nx ny nz keepPeriod =
+  let size  = nx * ny * nz
+      zeros = A.fill (A.constant (Z :. size)) (0.0 :: A.Exp Double)
+      pass0 = voxelTrilinearSplatPassKernel 0 n nx ny nz keepPeriod zeros
+      pass1 = voxelTrilinearSplatPassKernel 1 n nx ny nz keepPeriod pass0
+  in voxelTrilinearSplatPassKernel 2 n nx ny nz keepPeriod pass1
+
 -- | 5-point Laplacian using Accelerate's native stencil combinator with
 -- clamped boundary.  Computes full h×w output, then extracts the
 -- interior (h-2)×(w-2) sub-array to match stencil_interior.hyd.
@@ -508,6 +555,16 @@ runVoxelTrilinearSplat = do
   let result = CPU.run $ voxelTrilinearSplatKernel n nx ny nz keepPeriod
   print (Prelude.sum (A.toList result) :: Double)
 
+runVoxelTrilinearSplatChain :: IO ()
+runVoxelTrilinearSplatChain = do
+  n          <- readEnvInt "VSCHAIN_POINTS"
+  nx         <- readEnvInt "VSCHAIN_NX"
+  ny         <- readEnvInt "VSCHAIN_NY"
+  nz         <- readEnvInt "VSCHAIN_NZ"
+  keepPeriod <- readEnvInt "VSCHAIN_KEEP_PERIOD"
+  let result = CPU.run $ voxelTrilinearSplatChainKernel n nx ny nz keepPeriod
+  print (Prelude.sum (A.toList result) :: Double)
+
 runStencilInterior :: IO ()
 runStencilInterior = do
   h <- readEnvInt "STENCIL_H"
@@ -545,6 +602,7 @@ runBenchmarkByNameTimed opts name = case name of
   "graph_messages"             -> timedGraphMessages opts
   "voxel_rasterization"        -> timedVoxelRasterization opts
   "voxel_trilinear_splat"      -> timedVoxelTrilinearSplat opts
+  "voxel_trilinear_splat_chain" -> timedVoxelTrilinearSplatChain opts
   "softmax"                    -> timedSoftmax opts
   "coo_spmv"                   -> timedCooSpmv opts
   "stencil_interior"           -> timedStencilInterior opts
@@ -677,6 +735,18 @@ timedVoxelTrilinearSplat opts = runTimingHarness "main" opts load run sumAllDoub
       kp <- readEnvInt "VSPLAT_KEEP_PERIOD"
       pure (n, nx, ny, nz, kp)
     run (n, nx, ny, nz, kp) = CPU.run $ voxelTrilinearSplatKernel n nx ny nz kp
+
+timedVoxelTrilinearSplatChain :: TimingOptions -> IO ()
+timedVoxelTrilinearSplatChain opts = runTimingHarness "main" opts load run sumAllDoubles
+  where
+    load = do
+      n  <- readEnvInt "VSCHAIN_POINTS"
+      nx <- readEnvInt "VSCHAIN_NX"
+      ny <- readEnvInt "VSCHAIN_NY"
+      nz <- readEnvInt "VSCHAIN_NZ"
+      kp <- readEnvInt "VSCHAIN_KEEP_PERIOD"
+      pure (n, nx, ny, nz, kp)
+    run (n, nx, ny, nz, kp) = CPU.run $ voxelTrilinearSplatChainKernel n nx ny nz kp
 
 timedCooSpmv :: TimingOptions -> IO ()
 timedCooSpmv opts = runTimingHarness "main" opts load run sumAllDoubles

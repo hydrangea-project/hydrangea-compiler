@@ -214,6 +214,18 @@ decName (Dec _ name _ _ _ _) = name
 decPolyTy :: Dec a -> Maybe Polytype
 decPolyTy (Dec _ _ _ _ polyty _) = polyty
 
+-- | A single phase of a scatter chain.
+-- Each phase contributes to the same output buffer using the chain's combine function.
+data ScatterPhase a = ScatterPhase
+  { spIndex  :: Exp a        -- ^ index array: positions to scatter into
+  , spValues :: Exp a        -- ^ values array: values to scatter
+  , spGuard  :: Maybe (Exp a) -- ^ optional guard: only contribute when true
+  } deriving (Functor, Foldable)
+
+deriving instance (Show a) => Show (ScatterPhase a)
+deriving instance (Eq a)   => Eq   (ScatterPhase a)
+deriving instance (Ord a)  => Ord  (ScatterPhase a)
+
 -- | Expression AST parameterised by an annotation @a@ (typically a source 'Range').
 data Exp a
   = -- | Integer literal with its annotation and numeric value
@@ -321,6 +333,12 @@ data Exp a
     --   Equivalent to @EScatter c d idx (EGenerate (EShapeOf idx) valFn)@.
     --   Fields: combine, defaults, index array, value generator function.
     EScatterGenerate a (Exp a) (Exp a) (Exp a) (Exp a)
+  | -- | N-phase scatter chain into a single shared buffer.
+    -- All phases use the same combine function @c@ and execute sequentially.
+    -- The buffer is initialised from @dflt@ and reused across all phases,
+    -- eliminating all intermediate scatter results.
+    -- Fields: combine, defaults, phases.
+    EScatterChain a (Exp a) (Exp a) [ScatterPhase a]
   | -- | Gather values from an array using an index array
     EGather a (Exp a) (Exp a)
   | -- | Index into an array: index, array
@@ -448,6 +466,7 @@ firstParam e = case e of
   EScatter a _ _ _ _ -> a
   EScatterGuarded a _ _ _ _ _ -> a
   EScatterGenerate a _ _ _ _ -> a
+  EScatterChain a _ _ _ -> a
   EGather a _ _ -> a
   EIndex a _ _ -> a
   ECheckIndex a _ _ _ -> a

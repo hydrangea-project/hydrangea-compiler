@@ -812,6 +812,27 @@ inferBVal expr = case expr of
     mb1 <- inferBVal e1
     mb2 <- inferBVal e2
     return $ bvalMax <$> mb1 <*> mb2
+  EIndex _ _idx arrExp ->
+    -- When the array is a named variable with a registered value-bound dimension,
+    -- the indexed scalar inherits that bound.  This enables e.g.
+    --   let col = index [k] col_idx
+    -- to acquire col_idx's element bound (TValBoundDim rfVar 0) as col's bound,
+    -- so that subsequent uses of col as an index can be statically verified.
+    -- Only handled for direct variable references; complex array expressions
+    -- fall through to Nothing (conservative).
+    case arrExp of
+      EVar _ v -> do
+        ctx <- ask
+        case M.lookup v ctx of
+          Just (Forall [] _ ty) -> do
+            ty' <- applyBindings ty
+            let (mRfVar, inner) = unwrapRefine ty'
+            case (mRfVar, stripRefineTop inner) of
+              (Just rfVar, UTyArray _ _) ->
+                pure $ Just $ BoundOf (TValBoundDim rfVar 0)
+              _ -> pure Nothing
+          _ -> pure Nothing
+      _ -> pure Nothing
   _ -> return Nothing
   where
     combine f e1 e2 = do
@@ -1160,7 +1181,20 @@ infer (EGenerate _ shapeExp fn) = do
   expected <- expectedShapeFromExp shapeExp
   _ <- wrange (firstParam shapeExp) $ expected =:= sTy
   sTy'   <- applyBindings expected
-  fty    <- infer fn
+  -- Pre-create arrVar so it can be used as a bound for the generator's index
+  -- parameter during fn type inference.  This enables Change 2 (ELetIn bound
+  -- propagation) to chain bounds from the generator index through nested lets.
+  -- E.g. in  generate [N] (fn [k] => let k_abs = k + offset in ...)
+  -- k is available in valBoundCtx with bound TDim arrVar 0 while inferring fn,
+  -- so inferBVal(k + offset) can produce BoundOf(TDim arrVar 0 + offset_bound).
+  arrVar <- freshPredVar
+  -- Infer the generator function type.  For inline lambdas with a recognizable
+  -- parameter name, bind that parameter in valBoundCtx so nested let-bindings
+  -- inside the body can inherit bounds from arithmetic on the index variable.
+  fty <- case extractFnParamVars fn of
+    (paramVar : _) ->
+      withValBound paramVar (TDim arrVar 0) $ infer fn
+    [] -> infer fn
   elemTy <- fresh
   fty'   <- applyBindings fty
   case fty' of
@@ -1169,7 +1203,7 @@ infer (EGenerate _ shapeExp fn) = do
       return ()
     _ -> return ()
   _ <- wrange (firstParam shapeExp) $ fty =:= UTyFun sTy' elemTy
-  (arrVar, arrTy) <- freshRefined (UTyArray sTy' elemTy)
+  let arrTy = wrapRefine arrVar (UTyArray sTy' elemTy)
   shapeTerms <- termsFromIndexExp shapeExp
   emitArrayShapeFacts arrVar shapeTerms
   -- Emit bounds hypotheses for the generator function's index argument pred vars.
@@ -1622,7 +1656,12 @@ infer (EMakeIndex _ nExp arrExp) = do
   -- Assert the user-declared exclusive upper bound on element values.
   nTerm <- termFromExp nExp
   emitPred (PEq (TValBoundDim arrVarOut 0) nTerm)
-  emitWarning "note: make_index bound not statically verified"
+  -- Emit an SMT obligation: the source array's existing element bound must be ≤ n.
+  -- If the source bound is grounded (established by a prior emitPred), the solver
+  -- will verify it.  If not grounded, the obligation becomes ObligationUnknown and
+  -- the solver emits a "could not verify" note instead of a hard failure, preserving
+  -- conservative behaviour for arrays whose element bounds are unknown at compile time.
+  emitObl (PLe (TValBoundDim srcVar 0) nTerm)
   return arrTyOut
 infer (ECOOSumDuplicates _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = do
   nrowsTy <- infer nrowsExp
@@ -1650,12 +1689,20 @@ infer (ECOOSumDuplicates _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = d
   _ <- wrange (firstParam rowsExp) $ eRows =:= UTyInt
   _ <- wrange (firstParam colsExp) $ eCols =:= UTyInt
   _ <- wrange (firstParam valsExp) $ eVals =:= UTyInt
+  -- Propagate element-value bounds to the output index arrays so that
+  -- downstream gathers (e.g. gather coo.rows src) can be statically verified.
+  nrowsTerm <- termFromExp nrowsExp
+  ncolsTerm <- termFromExp ncolsExp
+  (rowsOutVar, rowsOutTy) <- freshRefined (UTyArray sRows' UTyInt)
+  (colsOutVar, colsOutTy) <- freshRefined (UTyArray sRows' UTyInt)
+  emitPred (PEq (TValBoundDim rowsOutVar 0) nrowsTerm)
+  emitPred (PEq (TValBoundDim colsOutVar 0) ncolsTerm)
   pure $ uTyRecord
     [ ("nrows", UTyInt)
     , ("ncols", UTyInt)
     , ("nnz", UTyInt)
-    , ("rows", UTyArray sRows' UTyInt)
-    , ("cols", UTyArray sRows' UTyInt)
+    , ("rows", rowsOutTy)
+    , ("cols", colsOutTy)
     , ("vals", UTyArray sRows' UTyInt)
     ]
 infer (ECSRFromSortedCOO _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = do
@@ -1684,13 +1731,18 @@ infer (ECSRFromSortedCOO _ nrowsExp ncolsExp nnzExp rowsExp colsExp valsExp) = d
   _ <- wrange (firstParam rowsExp) $ eRows =:= UTyInt
   _ <- wrange (firstParam colsExp) $ eCols =:= UTyInt
   _ <- wrange (firstParam valsExp) $ eVals =:= UTyInt
+  -- Propagate element-value bound to col_idx so that downstream gathers
+  -- (e.g. gather csr.col_idx src) can be statically verified.
+  ncolsTerm <- termFromExp ncolsExp
+  (colIdxVar, colIdxTy) <- freshRefined (UTyArray sRows' UTyInt)
+  emitPred (PEq (TValBoundDim colIdxVar 0) ncolsTerm)
   let rowPtrShape = mkTyConsFromVec [UTyInt]
   pure $ uTyRecord
     [ ("nrows", UTyInt)
     , ("ncols", UTyInt)
     , ("nnz", UTyInt)
     , ("row_ptr", UTyArray rowPtrShape UTyInt)
-    , ("col_idx", UTyArray sRows' UTyInt)
+    , ("col_idx", colIdxTy)
     , ("vals", UTyArray sRows' UTyInt)
     ]
 infer (EPermute _ comb defaults permFn arrExp) = do
@@ -1785,6 +1837,47 @@ infer (EScatterGuarded _ comb defaults idxArr vals guardArr) = do
 infer (EScatterGenerate _ comb defaults idxArr valFn) =
   infer (EScatter (firstParam defaults) comb defaults idxArr
            (EGenerate (firstParam idxArr) (EShapeOf (firstParam idxArr) idxArr) valFn))
+infer (EScatterChain _ comb defaults phases) = do
+  -- A scatter chain produces an array of the same type as the defaults.
+  -- Each phase must have index and values arrays compatible with the defaults.
+  defaultsTy <- infer defaults
+  (mDstVar, sDst, eDst) <- asArrayType (firstParam defaults) defaultsTy
+  combTy <- infer comb
+  _ <- wrange (firstParam comb) $ combTy =:= UTyFun eDst (UTyFun eDst eDst)
+  forM_ phases $ \(ScatterPhase idxArrExp valsExp guardExp) -> do
+    idxArrTy <- infer idxArrExp
+    valsTy   <- infer valsExp
+    (mIdxVar, sSrc, idxTy) <- asArrayType (firstParam idxArrExp) idxArrTy
+    (_mSrcVar', sSrc', eSrc) <- asArrayType (firstParam valsExp) valsTy
+    _ <- wrange (firstParam idxArrExp) $ sSrc =:= sSrc'
+    idxTy' <- normalizeShapeToTupleOf (firstParam idxArrExp) UTyInt idxTy
+    sDst_p <- promoteShapeUVar (firstParam defaults) sDst
+    sDstNorm <- normalizeShapeToTupleOf (firstParam defaults) UTyInt sDst_p
+    _ <- wrange (firstParam idxArrExp) $ idxTy' =:= sDstNorm
+    _ <- wrange (firstParam valsExp) $ eSrc =:= eDst
+    idxElemRank <- shapeArityFromType (firstParam idxArrExp) idxTy'
+    case (mIdxVar, mDstVar) of
+      (Just idxVar, Just dstVar) ->
+        forM_ [0 .. idxElemRank - 1] $ \i ->
+          emitObl (PLe (TValBoundDim idxVar i) (TDim dstVar i))
+      _ -> return ()
+    case guardExp of
+      Nothing -> return ()
+      Just gExp -> do
+        guardTy <- infer gExp
+        (_mGVar, sSrcG, guardElemTy) <- asArrayType (firstParam gExp) guardTy
+        _ <- wrange (firstParam gExp) $ sSrc =:= sSrcG
+        _ <- wrange (firstParam gExp) $ guardElemTy =:= UTyBool
+        return ()
+  sDst' <- applyBindings sDst
+  (arrVar, arrTyOut) <- freshRefined (UTyArray sDst' eDst)
+  case mDstVar of
+    Nothing -> return arrTyOut
+    Just dstVar -> do
+      rank <- shapeArityFromType (firstParam defaults) sDst'
+      forM_ [0 .. rank - 1] $ \i ->
+        emitPred (PEq (TDim arrVar i) (TDim dstVar i))
+      return arrTyOut
 infer (EGather _ idxArr arrExp) = do
   idxArrTy <- infer idxArr
   arrTy    <- infer arrExp
@@ -1928,7 +2021,21 @@ infer (ELetIn r dec e) = do
   sch <- case xs of
     [] -> tell rhsPreds >> return (Forall [] [] ty)
     _  -> return (Forall xs rhsPreds ty)
-  withBinding v sch $ wrange r $ infer e
+  -- For zero-argument scalar let-bindings, try to infer a value bound for the
+  -- RHS and, if successful, propagate it into valBoundCtx for the continuation.
+  -- This enables chains like:
+  --   let col = index [k] col_idx  →  valBoundCtx[col] = TValBoundDim col_idx_var 0
+  --   let k_abs = k + row_start    →  valBoundCtx[k_abs] = bound of k + bound of row_start
+  -- so that downstream index operations on col or k_abs can be statically verified.
+  -- Only applied when pats is empty (scalar binding); function bindings are skipped.
+  let continuation = withBinding v sch $ wrange r $ infer e
+  if null pats
+    then do
+      mBval <- inferBVal body
+      case mBval of
+        Just (BoundOf bt) -> withValBound v bt continuation
+        _                 -> continuation
+    else continuation
 infer (EBoundLetIn _ x boundExp rhs body) = do
   rhsTy <- infer rhs
   _ <- wrange (firstParam rhs) $ rhsTy =:= UTyInt

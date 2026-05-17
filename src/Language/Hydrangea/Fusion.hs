@@ -119,6 +119,10 @@ collectVarsExp expr =
     EScatter _ c d idx v -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp v
     EScatterGuarded _ c d idx v g -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp v `S.union` collectVarsExp g
     EScatterGenerate _ c d idx f -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp f
+    EScatterChain _ c d phases ->
+      collectVarsExp c `S.union` collectVarsExp d
+        `S.union` S.unions (map (\p -> collectVarsExp (spIndex p) `S.union` collectVarsExp (spValues p)
+                                        `S.union` maybe S.empty collectVarsExp (spGuard p)) phases)
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a
@@ -231,6 +235,10 @@ freeVarsExp expr =
     EScatter _ c d idx v -> freeVarsExp c `S.union` freeVarsExp d `S.union` freeVarsExp idx `S.union` freeVarsExp v
     EScatterGuarded _ c d idx v g -> freeVarsExp c `S.union` freeVarsExp d `S.union` freeVarsExp idx `S.union` freeVarsExp v `S.union` freeVarsExp g
     EScatterGenerate _ c d idx f -> freeVarsExp c `S.union` freeVarsExp d `S.union` freeVarsExp idx `S.union` freeVarsExp f
+    EScatterChain _ c d phases ->
+      freeVarsExp c `S.union` freeVarsExp d
+        `S.union` S.unions (map (\p -> freeVarsExp (spIndex p) `S.union` freeVarsExp (spValues p)
+                                        `S.union` maybe S.empty freeVarsExp (spGuard p)) phases)
     EGather _ idx a -> freeVarsExp idx `S.union` freeVarsExp a
     EIndex _ i a -> freeVarsExp i `S.union` freeVarsExp a
     ECheckIndex _ i def a -> freeVarsExp i `S.union` freeVarsExp def `S.union` freeVarsExp a
@@ -323,6 +331,10 @@ boundVarsExp expr =
     EScatter _ c d idx v -> boundVarsExp c `S.union` boundVarsExp d `S.union` boundVarsExp idx `S.union` boundVarsExp v
     EScatterGuarded _ c d idx v g -> boundVarsExp c `S.union` boundVarsExp d `S.union` boundVarsExp idx `S.union` boundVarsExp v `S.union` boundVarsExp g
     EScatterGenerate _ c d idx f -> boundVarsExp c `S.union` boundVarsExp d `S.union` boundVarsExp idx `S.union` boundVarsExp f
+    EScatterChain _ c d phases ->
+      boundVarsExp c `S.union` boundVarsExp d
+        `S.union` S.unions (map (\p -> boundVarsExp (spIndex p) `S.union` boundVarsExp (spValues p)
+                                        `S.union` maybe S.empty boundVarsExp (spGuard p)) phases)
     EGather _ idx a -> boundVarsExp idx `S.union` boundVarsExp a
     EIndex _ i a -> boundVarsExp i `S.union` boundVarsExp a
     ECheckIndex _ i def a -> boundVarsExp i `S.union` boundVarsExp def `S.union` boundVarsExp a
@@ -419,6 +431,10 @@ countVarExp v expr =
     EScatter _ c d idx val -> countVarExp v c + countVarExp v d + countVarExp v idx + countVarExp v val
     EScatterGuarded _ c d idx val g -> countVarExp v c + countVarExp v d + countVarExp v idx + countVarExp v val + countVarExp v g
     EScatterGenerate _ c d idx f -> countVarExp v c + countVarExp v d + countVarExp v idx + countVarExp v f
+    EScatterChain _ c d phases ->
+      countVarExp v c + countVarExp v d
+        + sum (map (\p -> countVarExp v (spIndex p) + countVarExp v (spValues p)
+                          + maybe 0 (countVarExp v) (spGuard p)) phases)
     EGather _ idx a -> countVarExp v idx + countVarExp v a
     EIndex _ i a -> countVarExp v i + countVarExp v a
     ECheckIndex _ i def a -> countVarExp v i + countVarExp v def + countVarExp v a
@@ -525,6 +541,11 @@ substExp v replacement expr =
     EScatterGuarded a c d idx val g ->
       EScatterGuarded a (substExp v replacement c) (substExp v replacement d) (substExp v replacement idx) (substExp v replacement val) (substExp v replacement g)
     EScatterGenerate a c d idx f -> EScatterGenerate a (substExp v replacement c) (substExp v replacement d) (substExp v replacement idx) (substExp v replacement f)
+    EScatterChain a c d phases ->
+      EScatterChain a (substExp v replacement c) (substExp v replacement d)
+        (map (\p -> ScatterPhase (substExp v replacement (spIndex p))
+                                 (substExp v replacement (spValues p))
+                                 (fmap (substExp v replacement) (spGuard p))) phases)
     EGather a idx arr -> EGather a (substExp v replacement idx) (substExp v replacement arr)
     EIndex a idx arr -> EIndex a (substExp v replacement idx) (substExp v replacement arr)
     ECheckIndex a idx def arr -> ECheckIndex a (substExp v replacement idx) (substExp v replacement def) (substExp v replacement arr)
@@ -633,6 +654,7 @@ isArrayExp expr =
     EScatter {} -> True
     EScatterGuarded {} -> True
     EScatterGenerate {} -> True
+    EScatterChain {} -> True
     EGather {} -> True
     EFill {} -> True
     EShapeOf {} -> False
@@ -991,6 +1013,23 @@ emitScatter a sk =
     Nothing -> EScatter a (skCombine sk) (skDefault sk) (skIndex sk) (skValues sk)
     Just guardArr -> EScatterGuarded a (skCombine sk) (skDefault sk) (skIndex sk) (skValues sk) guardArr
 
+-- | Check whether two combine expressions are structurally equal (modulo annotation).
+-- Used to guard scatter chain fusion: phases sharing the same combine can be fused.
+combinesMatch :: (Eq a) => Exp a -> Exp a -> Bool
+combinesMatch c1 c2 = fmap (const ()) c1 == fmap (const ()) c2
+
+-- | Peel nested scatters from a 'ScatterKernel' whose default is itself a scatter,
+-- collecting phases bottom-up.  Returns the innermost non-scatter default expression
+-- and the ordered list of phases from innermost to outermost.
+collectChainPhases :: (Eq a) => a -> ScatterKernel a -> (Exp a, [ScatterPhase a])
+collectChainPhases a sk =
+  let phase = ScatterPhase (skIndex sk) (skValues sk) (skGuard sk)
+  in case asScatter a (skDefault sk) of
+       Just innerSk | combinesMatch (skCombine sk) (skCombine innerSk) ->
+         let (deepDflt, innerPhases) = collectChainPhases a innerSk
+         in (deepDflt, innerPhases ++ [phase])
+       _ -> (skDefault sk, [phase])
+
 -- | Absorb an inner @EMap g@ on the values side into the combine function
 -- (Rocq: @FuseScatterMap@, @scatter_combine_map_fun@).
 --
@@ -1135,6 +1174,13 @@ normExp expr =
     EScatterGuarded a c d idx vals guardArr ->
       EScatterGuarded a <$> normExp c <*> normExp d <*> normExp idx <*> normExp vals <*> normExp guardArr
     EScatterGenerate a c d idx f -> EScatterGenerate a <$> normExp c <*> normExp d <*> normExp idx <*> normExp f
+    EScatterChain a c d phases -> do
+      c' <- normExp c
+      d' <- normExp d
+      phases' <- mapM (\p -> ScatterPhase <$> normExp (spIndex p)
+                                           <*> normExp (spValues p)
+                                           <*> mapM normExp (spGuard p)) phases
+      pure (EScatterChain a c' d' phases')
     EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
     EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr
@@ -1192,15 +1238,88 @@ fuseDec dec =
 -- generated helper names remain unique across them.
 fuseDecs :: (Eq a) => [Dec a] -> [Dec a]
 fuseDecs decs =
-  -- First pass: fuse each declaration independently.
-  let initState0 = FusionState {freshCounter = 0, usedVars = S.unions (map collectVarsDec decs)}
-      fused0 = evalState (runFusionM (mapM fuseDecM decs)) initState0
-      -- Second pass: inline single-use function-valued declarations that are
-      -- now visible as function expressions after the first fusion round.
+  -- Pre-pass: inline single-use intermediate scatter array declarations before
+  -- any fusion runs.  This lets the scatter chain rule (Rule 3) see nested
+  -- scatter expressions directly in the default position of an outer scatter,
+  -- rather than a variable that will only be resolved after the first fusion
+  -- pass has already converted the inner scatter to scatter_generate.
+  let preInlined = inlineScatterArrayDecs decs
+      -- First pass: fuse each declaration independently.
+      initState0 = FusionState {freshCounter = 0, usedVars = S.unions (map collectVarsDec preInlined)}
+      fused0 = evalState (runFusionM (mapM fuseDecM preInlined)) initState0
+      -- Second pass: inline single-use function-valued (and other array-valued)
+      -- declarations that are now visible as expressions after the first fusion round.
       inlined = inlineFnValueDecs fused0
       -- Third pass: fuse again to beta-reduce the newly inlined applications.
       initState1 = FusionState {freshCounter = 0, usedVars = S.unions (map collectVarsDec inlined)}
    in evalState (runFusionM (mapM fuseDecM inlined)) initState1
+
+-- | Pre-fusion pass: inline single-use top-level scatter/permute array
+-- declarations into their use sites BEFORE fusion runs.  This allows the
+-- scatter chain rule to see nested scatter expressions directly rather than
+-- variables that would only be inlined after the inner scatter has already
+-- been converted to scatter_generate.
+-- | Returns True when @name@ appears in @expr@ in a position that is NOT
+-- strictly the bottom of a scatter-default chain.
+--
+-- A "default chain" is the recursive @d@ argument of @EScatter@,
+-- @EScatterGuarded@, or @EPermute@.  An occurrence of @name@ is acceptable
+-- ONLY if it is reached exclusively by following default-chain edges and is
+-- an @EVar name@ leaf.  Any occurrence in index, values, guard, or in any
+-- non-scatter context (including a bare alias @let main = name@) is "bad".
+--
+-- @inDefault@ tracks whether the current position is inside a default chain.
+appearsInNonScatterDefault :: Var -> Exp a -> Bool
+appearsInNonScatterDefault name = go False
+  where
+    go inDefault expr
+      | countVarExp name expr == 0 = False  -- name absent: no non-default usage
+      | otherwise = case expr of
+          EVar _ v ->
+            -- Name found: bad unless we're inside a default chain
+            v == name && not inDefault
+          EScatter _ _ d idx vals ->
+            countVarExp name idx > 0 ||     -- bad: in index
+            countVarExp name vals > 0 ||    -- bad: in values
+            go True d                        -- follow default chain
+          EScatterGuarded _ _ d idx vals g ->
+            countVarExp name idx > 0 ||
+            countVarExp name vals > 0 ||
+            countVarExp name g > 0 ||
+            go True d
+          EPermute _ _ d _ arr ->
+            countVarExp name arr > 0 ||
+            go True d
+          -- For all other expressions: name appearing here is not in a default chain.
+          _ -> True
+
+inlineScatterArrayDecs :: (Eq a) => [Dec a] -> [Dec a]
+inlineScatterArrayDecs = go []
+  where
+    go _env [] = []
+    go env (Dec a name [] mw poly body : rest) =
+      let body' = applyEnv env body
+          restBodies = map (\(Dec _ _ _ _ _ b) -> applyEnv env b) rest
+          totalUsage = sum (map (countVarExp name) restBodies)
+          isReify = case body' of { EReify {} -> True; _ -> False }
+          isRawScatter = case body' of
+            EScatter {}        -> True
+            EScatterGuarded {} -> True
+            EPermute {}        -> True
+            _                  -> False
+          -- Only inline when: (a) single-use, (b) every use is strictly the
+          -- bottom of a scatter default chain (not a standalone alias, not in
+          -- index/values/guard, not in reduce/map/etc.)
+          eligible = isRawScatter && not isReify && totalUsage == 1
+                       && not (any (appearsInNonScatterDefault name) restBodies)
+      in if eligible
+           then go ((name, body') : env) rest
+           else Dec a name [] mw poly body' : go env rest
+    go env (Dec a name pats mw poly body : rest) =
+      let body' = applyEnv env body
+      in Dec a name pats mw poly body' : go env rest
+
+    applyEnv env e = foldl (\acc (v, r) -> substExp v r acc) e env
 
 -- | Inline function-valued top-level declarations into their single use sites.
 --
@@ -1217,7 +1336,12 @@ inlineFnValueDecs = go []
     go env (Dec a name [] mw poly body : rest) =
       let body' = applyEnv env body
           totalUsage = sum (map (\(Dec _ _ _ _ _ b) -> countVarExp name (applyEnv env b)) rest)
-          eligible = isFunctionExp body' && totalUsage == 1
+          isReify = case body' of { EReify {} -> True; _ -> False }
+          -- Inline single-use function-valued expressions (enables cross-binding beta
+          -- reduction). Array-valued declarations are handled separately by
+          -- inlineScatterArrayDecs (which only inlines scatter defaults).
+          eligible = isFunctionExp body'
+                     && totalUsage == 1
       in if eligible
            then go ((name, body') : env) rest
            else Dec a name [] mw poly body' : go env rest
@@ -1367,25 +1491,42 @@ fuseOnce expr =
       arr' <- fuseOnce arr
       fusePermute a c' d' p' arr'
     EScatter a c d idx vals -> do
-      c' <- fuseOnce c
-      d' <- fuseOnce d
-      idx' <- fuseOnce idx
-      vals' <- fuseOnce vals
-      fuseScatter a c' d' idx' vals'
+      -- Scatter chain rule: check for chain pattern BEFORE recursing on subterms.
+      -- If the default is itself a scatter with a matching combine, fuse into
+      -- EScatterChain immediately so that subsequent rules don't convert the
+      -- inner scatter to scatter_generate first (which would prevent detection).
+      case asScatter a d of
+        Just innerSk | combinesMatch c (skCombine innerSk) -> do
+          let outerPhase = ScatterPhase idx vals Nothing
+              (deepDflt, innerPhases) = collectChainPhases a innerSk
+          fuseOnce (EScatterChain a c deepDflt (innerPhases ++ [outerPhase]))
+        _ -> do
+          c' <- fuseOnce c
+          d' <- fuseOnce d
+          idx' <- fuseOnce idx
+          vals' <- fuseOnce vals
+          fuseScatter a c' d' idx' vals'
     EScatterGuarded a c d idx vals guardArr -> do
-      c' <- fuseOnce c
-      d' <- fuseOnce d
-      idx' <- fuseOnce idx
-      vals' <- fuseOnce vals
-      guardArr' <- fuseOnce guardArr
-      let sk0 = ScatterKernel
-            { skCombine = c'
-            , skDefault = d'
-            , skIndex = idx'
-            , skValues = vals'
-            , skGuard = Just guardArr'
-            }
-      fuseScatterKernel a sk0
+      -- Scatter chain rule: same early-exit for guarded scatter.
+      case asScatter a d of
+        Just innerSk | combinesMatch c (skCombine innerSk) -> do
+          let outerPhase = ScatterPhase idx vals (Just guardArr)
+              (deepDflt, innerPhases) = collectChainPhases a innerSk
+          fuseOnce (EScatterChain a c deepDflt (innerPhases ++ [outerPhase]))
+        _ -> do
+          c' <- fuseOnce c
+          d' <- fuseOnce d
+          idx' <- fuseOnce idx
+          vals' <- fuseOnce vals
+          guardArr' <- fuseOnce guardArr
+          let sk0 = ScatterKernel
+                { skCombine = c'
+                , skDefault = d'
+                , skIndex = idx'
+                , skValues = vals'
+                , skGuard = Just guardArr'
+                }
+          fuseScatterKernel a sk0
     EScatterGenerate a c d idx valFn -> do
       c' <- fuseOnce c
       d' <- fuseOnce d
@@ -1398,6 +1539,15 @@ fuseOnce expr =
           idx'' <- emitProducer a pIdx
           pure (EScatterGenerate a c' d' idx'' valFn')
         _ -> pure (EScatterGenerate a c' d' idx' valFn')
+    EScatterChain a c d phases -> do
+      c' <- fuseOnce c
+      d' <- fuseOnce d
+      phases' <- mapM (\p -> do
+          idx' <- fuseOnce (spIndex p)
+          vals' <- fuseOnce (spValues p)
+          guard' <- mapM fuseOnce (spGuard p)
+          pure (ScatterPhase idx' vals' guard')) phases
+      pure (EScatterChain a c' d' phases')
     EGather a idx arr -> do
       idx' <- fuseOnce idx
       arr' <- fuseOnce arr
@@ -1647,136 +1797,153 @@ fuseScatterKernel a sk =
                 then pure (ELetIn a dec (emitScatter a sk { skIndex = body }))
                 else pure (emitScatter a sk)
         _ ->
-          -- Rule 6: scatter_reindex — when both index and values are EMap over
-          -- the same source array (possibly with different mapping functions),
-          -- avoid materialising both intermediate mapped arrays by converting
-          -- to EScatterGenerate with inline generators for both index and values.
+          -- Rule 3: scatter chain fusion — when the default is itself a scatter
+          -- with the same combine function, fold both into an EScatterChain.
           --
-          --   scatter c d (map t1 src) (map t2 src)
-          --   => let idxFn i = t1 (index i src)
-          --          valFn i = t2 (index i src)
-          --          idxGen  = generate (shape_of src) idxFn
-          --      in scatter_generate c d idxGen valFn
+          --   scatter c (scatter c d0 idx0 vals0) idx1 vals1
+          --   =>  scatter_chain c d0 [(idx0, vals0), (idx1, vals1)]
           --
-          -- This is more general than the strict Rocq scatter_reindex (which
-          -- requires t1 = t2); it fires whenever both arrays share the same
-          -- source, covering the common histogram/segmented-reduction pattern:
-          --   scatter (+) zeros (map bin arr) (map weight arr)
-          -- Both the route array and the values array are now generated lazily,
-          -- consistent with Cases 6b and 6c.
-          case (skGuard sk, skIndex sk, skValues sk) of
-            (Nothing, EMap _ t1 rawIdx, EMap _ t2 rawVals)
-              | fmap (const ()) rawIdx == fmap (const ()) rawVals -> do
-                  (idxFn, idxI) <- mkLet1 a
-                  (valFn, valI) <- mkLet1 a
-                  let idxBody = EApp a t1 (EIndex a (EVar a idxI) rawIdx)
-                      idxDec  = mkDec1 a idxFn idxI idxBody
-                      valBody = EApp a t2 (EIndex a (EVar a valI) rawVals)
-                      valDec  = mkDec1 a valFn valI valBody
-                      idxGen  = EGenerate a (EShapeOf a rawIdx) (EVar a idxFn)
-                  pure $ ELetIn a idxDec
+          -- All phases execute sequentially into one shared buffer initialised
+          -- to d0, eliminating the intermediate array entirely.
+          -- (Rocq: FuseScatterChain)
+          case skDefault sk of
+            inner | Just innerSk <- asScatter a inner
+                  , combinesMatch (skCombine sk) (skCombine innerSk) ->
+              -- Collect all nested phases bottom-up.
+              let outerPhase = ScatterPhase (skIndex sk) (skValues sk) (skGuard sk)
+                  (deepDflt, innerPhases) = collectChainPhases a innerSk
+              in pure (EScatterChain a (skCombine sk) deepDflt (innerPhases ++ [outerPhase]))
+            _ ->
+              -- Rule 6: scatter_reindex — when both index and values are EMap over
+              -- the same source array (possibly with different mapping functions),
+              -- avoid materialising both intermediate mapped arrays by converting
+              -- to EScatterGenerate with inline generators for both index and values.
+              --
+              --   scatter c d (map t1 src) (map t2 src)
+              --   => let idxFn i = t1 (index i src)
+              --          valFn i = t2 (index i src)
+              --          idxGen  = generate (shape_of src) idxFn
+              --      in scatter_generate c d idxGen valFn
+              --
+              -- This is more general than the strict Rocq scatter_reindex (which
+              -- requires t1 = t2); it fires whenever both arrays share the same
+              -- source, covering the common histogram/segmented-reduction pattern:
+              --   scatter (+) zeros (map bin arr) (map weight arr)
+              -- Both the route array and the values array are now generated lazily,
+              -- consistent with Cases 6b and 6c.
+              case (skGuard sk, skIndex sk, skValues sk) of
+                (Nothing, EMap _ t1 rawIdx, EMap _ t2 rawVals)
+                  | fmap (const ()) rawIdx == fmap (const ()) rawVals -> do
+                      (idxFn, idxI) <- mkLet1 a
+                      (valFn, valI) <- mkLet1 a
+                      let idxBody = EApp a t1 (EIndex a (EVar a idxI) rawIdx)
+                          idxDec  = mkDec1 a idxFn idxI idxBody
+                          valBody = EApp a t2 (EIndex a (EVar a valI) rawVals)
+                          valDec  = mkDec1 a valFn valI valBody
+                          idxGen  = EGenerate a (EShapeOf a rawIdx) (EVar a idxFn)
+                      pure $ ELetIn a idxDec
+                               (ELetIn a valDec
+                                 (EScatterGenerate a (skCombine sk) (skDefault sk)
+                                                     idxGen (EVar a valFn)))
+                (Nothing, EZipWith _ routeFn xs ys, EZipWith _ valueFn xs' ys')
+                  | fmap (const ()) xs == fmap (const ()) xs'
+                  , fmap (const ()) ys == fmap (const ()) ys' -> do
+                      (idxFn, idxI) <- mkLet1 a
+                      (valFn, valI) <- mkLet1 a
+                      let idxBody =
+                            EApp a
+                              (EApp a routeFn (EIndex a (EVar a idxI) xs))
+                              (EIndex a (EVar a idxI) ys)
+                          valBody =
+                            EApp a
+                              (EApp a valueFn (EIndex a (EVar a valI) xs))
+                              (EIndex a (EVar a valI) ys)
+                          idxDec = mkDec1 a idxFn idxI idxBody
+                          valDec = mkDec1 a valFn valI valBody
+                          idxGen = EGenerate a (EShapeOf a xs) (EVar a idxFn)
+                      pure $
+                        ELetIn a idxDec
+                          (ELetIn a valDec
+                            (EScatterGenerate a (skCombine sk) (skDefault sk)
+                              idxGen (EVar a valFn)))
+                (Nothing, idxExp, valsExp)
+                  | Just (idxBody, idxSources) <- scatterSourceAt a "__scatter_idx" idxExp
+                  , Just (valBody, valSources) <- scatterSourceAt a "__scatter_val" valsExp
+                  , iterSrc : _ <- mergeScatterSources idxSources valSources
+                  -> do
+                      (idxFn, idxI) <- mkLet1 a
+                      (valFn, valI) <- mkLet1 a
+                      let idxDec = mkDec1 a idxFn idxI (substExp "__scatter_idx" (EVar a idxI) idxBody)
+                          valDec = mkDec1 a valFn valI (substExp "__scatter_val" (EVar a valI) valBody)
+                          idxGen = EGenerate a (EShapeOf a iterSrc) (EVar a idxFn)
+                      pure $
+                         ELetIn a idxDec
                            (ELetIn a valDec
                              (EScatterGenerate a (skCombine sk) (skDefault sk)
-                                                 idxGen (EVar a valFn)))
-            (Nothing, EZipWith _ routeFn xs ys, EZipWith _ valueFn xs' ys')
-              | fmap (const ()) xs == fmap (const ()) xs'
-              , fmap (const ()) ys == fmap (const ()) ys' -> do
-                  (idxFn, idxI) <- mkLet1 a
-                  (valFn, valI) <- mkLet1 a
-                  let idxBody =
-                        EApp a
-                          (EApp a routeFn (EIndex a (EVar a idxI) xs))
-                          (EIndex a (EVar a idxI) ys)
-                      valBody =
-                        EApp a
-                          (EApp a valueFn (EIndex a (EVar a valI) xs))
-                          (EIndex a (EVar a valI) ys)
-                      idxDec = mkDec1 a idxFn idxI idxBody
-                      valDec = mkDec1 a valFn valI valBody
-                      idxGen = EGenerate a (EShapeOf a xs) (EVar a idxFn)
-                  pure $
-                    ELetIn a idxDec
-                      (ELetIn a valDec
-                        (EScatterGenerate a (skCombine sk) (skDefault sk)
-                          idxGen (EVar a valFn)))
-            (Nothing, idxExp, valsExp)
-              | Just (idxBody, idxSources) <- scatterSourceAt a "__scatter_idx" idxExp
-              , Just (valBody, valSources) <- scatterSourceAt a "__scatter_val" valsExp
-              , iterSrc : _ <- mergeScatterSources idxSources valSources
-              -> do
-                  (idxFn, idxI) <- mkLet1 a
-                  (valFn, valI) <- mkLet1 a
-                  let idxDec = mkDec1 a idxFn idxI (substExp "__scatter_idx" (EVar a idxI) idxBody)
-                      valDec = mkDec1 a valFn valI (substExp "__scatter_val" (EVar a valI) valBody)
-                      idxGen = EGenerate a (EShapeOf a iterSrc) (EVar a idxFn)
-                  pure $
-                     ELetIn a idxDec
-                       (ELetIn a valDec
-                         (EScatterGenerate a (skCombine sk) (skDefault sk)
-                           idxGen (EVar a valFn)))
-            (Just guardExp, idxExp, valsExp)
-              | Just (idxBody, idxSources) <- scatterSourceAt a "__scatter_idx" idxExp
-              , Just (valBody, valSources) <- scatterSourceAt a "__scatter_val" valsExp
-              , Just (guardBody, guardSources) <- scatterSourceAt a "__scatter_guard" guardExp
-              , iterSrc : _ <- mergeScatterSources idxSources
-                                 (mergeScatterSources valSources guardSources)
-              -> do
-                  (idxFn, idxI) <- mkLet1 a
-                  (valFn, valI) <- mkLet1 a
-                  (guardFn, guardI) <- mkLet1 a
-                  let idxDec =
-                        mkDec1 a idxFn idxI
-                          (substExp "__scatter_idx" (EVar a idxI) idxBody)
-                      valDec =
-                        mkDec1 a valFn valI
-                          (substExp "__scatter_val" (EVar a valI) valBody)
-                      guardDec =
-                        mkDec1 a guardFn guardI
-                          (substExp "__scatter_guard" (EVar a guardI) guardBody)
-                      iterShape = EShapeOf a iterSrc
-                      idxGen = EGenerate a iterShape (EVar a idxFn)
-                      valGen = EGenerate a iterShape (EVar a valFn)
-                      guardGen = EGenerate a iterShape (EVar a guardFn)
-                  pure $
-                    ELetIn a idxDec
-                      (ELetIn a valDec
-                        (ELetIn a guardDec
-                          (EScatterGuarded a (skCombine sk) (skDefault sk)
-                            idxGen valGen guardGen)))
-            (Nothing, idxExp, valsExp)
-              | isDerivedProducerExp idxExp || isDerivedProducerExp valsExp
-              , Just pIdx <- asScatterProducer idxExp
-              , Just pVals <- asScatterProducer valsExp
-              , fmap (const ()) (producerShape pIdx) == fmap (const ()) (producerShape pVals) -> do
-                  idx' <- emitProducer a pIdx
-                  (valDec, valFnExp) <- emitKernel1 a (producerElem pVals)
-                  let emitWith idxBody = ELetIn a valDec
-                        (EScatterGenerate a (skCombine sk) (skDefault sk) idxBody valFnExp)
-                  pure $
-                    case idx' of
-                      ELetIn _ dec idxBody | isArrayExp idxBody ->
-                        ELetIn a dec (emitWith idxBody)
-                      _ ->
-                        emitWith idx'
-            _ ->
-              -- Rule 3: absorb EMap on values side into combine.
-              case scatterAbsorbMapValues a sk of
-                Just m -> do
-                  (dec, sk') <- m
-                  pure $ ELetIn a dec (emitScatter a sk')
-                Nothing ->
-                  -- Rule 4: simplify composite index producer.
-                  case asProducer (skIndex sk) of
-                    Just pIdx | isCompositeProducerExp (skIndex sk) -> do
+                               idxGen (EVar a valFn)))
+                (Just guardExp, idxExp, valsExp)
+                  | Just (idxBody, idxSources) <- scatterSourceAt a "__scatter_idx" idxExp
+                  , Just (valBody, valSources) <- scatterSourceAt a "__scatter_val" valsExp
+                  , Just (guardBody, guardSources) <- scatterSourceAt a "__scatter_guard" guardExp
+                  , iterSrc : _ <- mergeScatterSources idxSources
+                                     (mergeScatterSources valSources guardSources)
+                  -> do
+                      (idxFn, idxI) <- mkLet1 a
+                      (valFn, valI) <- mkLet1 a
+                      (guardFn, guardI) <- mkLet1 a
+                      let idxDec =
+                            mkDec1 a idxFn idxI
+                              (substExp "__scatter_idx" (EVar a idxI) idxBody)
+                          valDec =
+                            mkDec1 a valFn valI
+                              (substExp "__scatter_val" (EVar a valI) valBody)
+                          guardDec =
+                            mkDec1 a guardFn guardI
+                              (substExp "__scatter_guard" (EVar a guardI) guardBody)
+                          iterShape = EShapeOf a iterSrc
+                          idxGen = EGenerate a iterShape (EVar a idxFn)
+                          valGen = EGenerate a iterShape (EVar a valFn)
+                          guardGen = EGenerate a iterShape (EVar a guardFn)
+                      pure $
+                        ELetIn a idxDec
+                          (ELetIn a valDec
+                            (ELetIn a guardDec
+                              (EScatterGuarded a (skCombine sk) (skDefault sk)
+                                idxGen valGen guardGen)))
+                (Nothing, idxExp, valsExp)
+                  | isDerivedProducerExp idxExp || isDerivedProducerExp valsExp
+                  , Just pIdx <- asScatterProducer idxExp
+                  , Just pVals <- asScatterProducer valsExp
+                  , fmap (const ()) (producerShape pIdx) == fmap (const ()) (producerShape pVals) -> do
                       idx' <- emitProducer a pIdx
-                      pure (emitScatter a sk { skIndex = idx' })
-                    _ ->
-                      -- Rule 5: values side is a generate → emit EScatterGenerate to
-                      -- avoid materialising the intermediate values array.
-                      case (skGuard sk, skValues sk) of
-                        (Nothing, EGenerate _ _sh valFn) ->
-                          pure (EScatterGenerate a (skCombine sk) (skDefault sk) (skIndex sk) valFn)
-                        _ -> pure (emitScatter a sk)
+                      (valDec, valFnExp) <- emitKernel1 a (producerElem pVals)
+                      let emitWith idxBody = ELetIn a valDec
+                            (EScatterGenerate a (skCombine sk) (skDefault sk) idxBody valFnExp)
+                      pure $
+                        case idx' of
+                          ELetIn _ dec idxBody | isArrayExp idxBody ->
+                            ELetIn a dec (emitWith idxBody)
+                          _ ->
+                            emitWith idx'
+                _ ->
+                  -- Rule 3: absorb EMap on values side into combine.
+                  case scatterAbsorbMapValues a sk of
+                    Just m -> do
+                      (dec, sk') <- m
+                      pure $ ELetIn a dec (emitScatter a sk')
+                    Nothing ->
+                      -- Rule 4: simplify composite index producer.
+                      case asProducer (skIndex sk) of
+                        Just pIdx | isCompositeProducerExp (skIndex sk) -> do
+                          idx' <- emitProducer a pIdx
+                          pure (emitScatter a sk { skIndex = idx' })
+                        _ ->
+                          -- Rule 5: values side is a generate → emit EScatterGenerate to
+                          -- avoid materialising the intermediate values array.
+                          case (skGuard sk, skValues sk) of
+                            (Nothing, EGenerate _ _sh valFn) ->
+                              pure (EScatterGenerate a (skCombine sk) (skDefault sk) (skIndex sk) valFn)
+                            _ -> pure (emitScatter a sk)
 
 fuseReduce :: (Eq a) => a -> Exp a -> Exp a -> Exp a -> FusionM (Exp a)
 fuseReduce a f z arr =

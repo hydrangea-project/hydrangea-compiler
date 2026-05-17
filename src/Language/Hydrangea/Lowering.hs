@@ -20,7 +20,7 @@ module Language.Hydrangea.Lowering
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (foldM, when, zipWithM)
+import Control.Monad (foldM, forM, when, zipWithM)
 import Control.Monad.State
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
@@ -1787,6 +1787,57 @@ lowerExp expr = case expr of
                 ]
              , ad
              )
+
+  EScatterChain _ combExp defaultsExp phases -> do
+    -- Lower the initial buffer once; all phases write into the same allocation.
+    (sd, ad) <- lowerExp defaultsExp
+    phaseStmts <- forM phases $ \(ScatterPhase idxArrExp valsExp guardExp) -> do
+      (si, ai) <- lowerExp idxArrExp
+      (sv, av) <- lowerExp valsExp
+      shp <- freshCVar "shp"
+      n <- freshCVar "n"
+      i <- freshIterVar "i"
+      val <- freshCVar "val"
+      oldVal <- freshCVar "old"
+      newVal <- freshCVar "new"
+      idx <- freshCVar "idx"
+      combStmts <- inlineBinaryFn combExp val oldVal newVal
+      case guardExp of
+        Nothing ->
+          pure ( si ++ sv
+               ++ [ SAssign shp (RArrayShape ai)
+                  , SAssign n (RShapeSize (AVar shp))
+                  , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                      ( [ SAssign idx (RArrayLoad ai (AVar i))
+                        , SAssign val (RArrayLoad av (AVar i))
+                        , SAssign oldVal (RArrayLoad ad (AVar idx))
+                        ] ++ combStmts ++
+                        [ SArrayWrite ad (AVar idx) (AVar newVal)
+                        ]
+                      )
+                  ]
+               )
+        Just guardArrExp -> do
+          (sg, ag) <- lowerExp guardArrExp
+          guardVal <- freshCVar "guard"
+          pure ( si ++ sv ++ sg
+               ++ [ SAssign shp (RArrayShape ai)
+                  , SAssign n (RShapeSize (AVar shp))
+                  , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                      ( [ SAssign guardVal (RArrayLoad ag (AVar i))
+                        , SIf (AVar guardVal)
+                            ( [ SAssign idx (RArrayLoad ai (AVar i))
+                              , SAssign val (RArrayLoad av (AVar i))
+                              , SAssign oldVal (RArrayLoad ad (AVar idx))
+                              ] ++ combStmts ++
+                              [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                            )
+                            []
+                        ]
+                      )
+                  ]
+               )
+    pure (sd ++ concat phaseStmts, ad)
 
   EGather _ idxArrExp srcArrExp -> do
     (sidx, aidx) <- lowerExp idxArrExp

@@ -116,6 +116,13 @@ uniqExp expr =
     EScatter a c d idx v -> EScatter a <$> uniqExp c <*> uniqExp d <*> uniqExp idx <*> uniqExp v
     EScatterGuarded a c d idx v g -> EScatterGuarded a <$> uniqExp c <*> uniqExp d <*> uniqExp idx <*> uniqExp v <*> uniqExp g
     EScatterGenerate a c d idx f -> EScatterGenerate a <$> uniqExp c <*> uniqExp d <*> uniqExp idx <*> uniqExp f
+    EScatterChain a c d phases -> do
+      c' <- uniqExp c
+      d' <- uniqExp d
+      phases' <- mapM (\p -> ScatterPhase <$> uniqExp (spIndex p)
+                                           <*> uniqExp (spValues p)
+                                           <*> mapM uniqExp (spGuard p)) phases
+      pure (EScatterChain a c' d' phases')
     EGather a idx arr -> EGather a <$> uniqExp idx <*> uniqExp arr
     EIndex a idx arr -> EIndex a <$> uniqExp idx <*> uniqExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> uniqExp idx <*> uniqExp def <*> uniqExp arr
@@ -273,6 +280,10 @@ collectVarsExp expr =
     EScatter _ c d idx v -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp v
     EScatterGuarded _ c d idx v g -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp v `S.union` collectVarsExp g
     EScatterGenerate _ c d idx f -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp f
+    EScatterChain _ c d phases ->
+      collectVarsExp c `S.union` collectVarsExp d
+        `S.union` S.unions (map (\p -> collectVarsExp (spIndex p) `S.union` collectVarsExp (spValues p)
+                                        `S.union` maybe S.empty collectVarsExp (spGuard p)) phases)
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a

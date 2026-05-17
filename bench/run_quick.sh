@@ -12,6 +12,7 @@
 #   COO_NROWS, COO_NCOLS, COO_NNZ, COO_DUP_PERIOD, GRAPH_NODES, GRAPH_DEGREE,
 #   VOX_POINTS, VOX_NX, VOX_NY, VOX_NZ, VOX_KEEP_PERIOD,
 #   VSPLAT_POINTS, VSPLAT_NX, VSPLAT_NY, VSPLAT_NZ, VSPLAT_KEEP_PERIOD,
+#   VSCHAIN_POINTS, VSCHAIN_NX, VSCHAIN_NY, VSCHAIN_NZ, VSCHAIN_KEEP_PERIOD,
 #   JACOBI_WF_H, JACOBI_WF_W, JACOBI_WF_ITERS,
 #   KDE_N, KDE_BINS
 
@@ -40,7 +41,7 @@ done
 skip_uninformative_repa() {
   [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
   case "$1" in
-    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|kde|coo_csr_build) return 0 ;;
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain|kde|coo_csr_build) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -98,6 +99,7 @@ BENCH_CC="$(find_openmp_cc)"
 : "${GRAPH_NODES:=100000}" "${GRAPH_DEGREE:=16}"
 : "${VOX_POINTS:=1000000}" "${VOX_NX:=64}" "${VOX_NY:=64}" "${VOX_NZ:=64}" "${VOX_KEEP_PERIOD:=3}"
 : "${VSPLAT_POINTS:=1000000}" "${VSPLAT_NX:=64}" "${VSPLAT_NY:=64}" "${VSPLAT_NZ:=64}" "${VSPLAT_KEEP_PERIOD:=3}"
+: "${VSCHAIN_POINTS:=500000}" "${VSCHAIN_NX:=64}" "${VSCHAIN_NY:=64}" "${VSCHAIN_NZ:=64}" "${VSCHAIN_KEEP_PERIOD:=3}"
 : "${STENCIL_H:=512}" "${STENCIL_W:=512}"
 : "${JACOBI_H:=256}" "${JACOBI_W:=256}" "${JACOBI_ITERS:=50}"
 : "${JACOBI_WF_H:=64}" "${JACOBI_WF_W:=1024}" "${JACOBI_WF_ITERS:=20}"
@@ -110,6 +112,7 @@ export COO_NROWS COO_NCOLS COO_NNZ COO_DUP_PERIOD
 export GRAPH_NODES GRAPH_DEGREE
 export VOX_POINTS VOX_NX VOX_NY VOX_NZ VOX_KEEP_PERIOD
 export VSPLAT_POINTS VSPLAT_NX VSPLAT_NY VSPLAT_NZ VSPLAT_KEEP_PERIOD
+export VSCHAIN_POINTS VSCHAIN_NX VSCHAIN_NY VSCHAIN_NZ VSCHAIN_KEEP_PERIOD
 export STENCIL_H STENCIL_W
 export JACOBI_H JACOBI_W JACOBI_ITERS
 export JACOBI_WF_H JACOBI_WF_W JACOBI_WF_ITERS
@@ -255,6 +258,7 @@ ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
+  voxel_trilinear_splat_chain
   stencil_interior jacobi_2d kde
 )
 
@@ -287,6 +291,8 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
       run_bench voxel_rasterization voxel_rasterization.hyd main ;;
     voxel_trilinear_splat)
       run_bench voxel_trilinear_splat voxel_trilinear_splat.hyd main "--no-solver-check" ;;
+    voxel_trilinear_splat_chain)
+      run_bench voxel_trilinear_splat_chain voxel_trilinear_splat_chain.hyd main "--no-solver-check" ;;
     stencil_interior)
       gen_inputs "stencil_interior"
       # C ref has a non-standard directory layout (lives under bench/stencil/)

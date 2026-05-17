@@ -589,6 +589,38 @@ evalExp expr env = case expr of
         ai = firstParam idxArrExpr
     in evalExp (EScatter a combExpr defaultsExpr idxArrExpr
                   (EGenerate ai (EShapeOf ai idxArrExpr) valFnExpr)) env
+  EScatterChain _ combExpr defaultsExpr phases -> do
+    -- Evaluate the chain by running phases sequentially on the same buffer.
+    vComb <- evalExp combExpr env
+    initBuf <- evalExp defaultsExpr env
+    let applyPhase buf (ScatterPhase idxE valsE guardE) = do
+          vIdxArr <- evalExp idxE env
+          vValsArr <- evalExp valsE env
+          case (buf, vIdxArr, vValsArr) of
+            (VArray dstShape dstVals, VArray idxShape idxVals, VArray _valsShape vals) -> do
+              let applyOne dstVals' (idxVal, val, gv) =
+                    case gv of
+                      VBool False -> pure dstVals'
+                      _ -> do
+                        idxShape' <- liftEither $ shapeFromValue idxVal
+                        dstOffset <- resolveOffset dstShape idxShape'
+                        if dstOffset < 0 || dstOffset >= length dstVals'
+                          then throwError $ IndexOutOfBounds "ScatterChain: index out of bounds"
+                          else do
+                            let oldVal = dstVals' !! fromIntegral dstOffset
+                            combined <- evalApp vComb val env >>= \fnVal -> evalApp fnVal oldVal env
+                            pure $ take (fromIntegral dstOffset) dstVals' ++ [combined] ++ drop (fromIntegral dstOffset + 1) dstVals'
+              guards <- case guardE of
+                Nothing -> pure (replicate (length idxVals) (VBool True))
+                Just gExpr -> do
+                  vg <- evalExp gExpr env
+                  case vg of
+                    VArray _ gs -> pure gs
+                    _ -> throwError $ TypeError "ScatterChain: guard must be array"
+              result <- foldM applyOne dstVals (zip3 idxVals vals guards)
+              pure $ VArray dstShape result
+            _ -> throwError $ TypeError "ScatterChain: expected arrays for index and values"
+    foldM applyPhase initBuf phases
   EGather _ idxArrExpr arrExpr -> do
     vIdxArr <- evalExp idxArrExpr env
     varr <- evalExp arrExpr env

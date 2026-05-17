@@ -31,7 +31,7 @@ done
 skip_uninformative_repa() {
   [ "$SKIP_UNINFORMATIVE" = 1 ] || return 1
   case "$1" in
-    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat) return 0 ;;
+    weighted_histogram|guarded_weighted_histogram|voxel_rasterization|voxel_trilinear_splat|voxel_trilinear_splat_chain) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -99,7 +99,8 @@ build_c() {
 echo "Building C reference binaries..." >&2
 for bname in blackscholes nbody mandelbrot spmv matmul \
   weighted_histogram guarded_weighted_histogram \
-  coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat; do
+  coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat \
+  voxel_trilinear_splat_chain; do
   [ -n "$BENCH_FILTER" ] && [ "$bname" != "$BENCH_FILTER" ] && continue
   build_c "$bname" 2>/dev/null || true
 done
@@ -336,6 +337,18 @@ sweep_voxel_trilinear_splat() {
   done
 }
 
+sweep_voxel_trilinear_splat_chain() {
+  local csv="$REPO_ROOT/bench/results/voxel_trilinear_splat_chain.csv"
+  echo "  voxel_trilinear_splat_chain → $csv" >&2
+  echo "size,hydrangea_ms,repa_ms,c_ms" > "$csv"
+  export VSCHAIN_NX=64 VSCHAIN_NY=64 VSCHAIN_NZ=64 VSCHAIN_KEEP_PERIOD=3
+  for n in 100000 250000 500000 1000000 2000000 4000000 8000000 12000000 16000000 20000000; do
+    sweep_one voxel_trilinear_splat_chain voxel_trilinear_splat_chain.hyd main "--no-solver-check" "$n" \
+      "VSCHAIN_POINTS=$n" "VSCHAIN_NX=64" "VSCHAIN_NY=64" "VSCHAIN_NZ=64" "VSCHAIN_KEEP_PERIOD=3" >> "$csv"
+    echo "    size=$n done" >&2
+  done
+}
+
 sweep_stencil_interior() {
   local csv="$REPO_ROOT/bench/results/stencil_interior.csv"
   echo "  stencil_interior → $csv" >&2
@@ -389,6 +402,7 @@ ALL_BENCHMARKS=(
   blackscholes nbody mandelbrot spmv matmul
   weighted_histogram guarded_weighted_histogram
   coo_csr_build graph_messages voxel_rasterization voxel_trilinear_splat
+  voxel_trilinear_splat_chain
   stencil_interior jacobi_2d
 )
 
@@ -408,6 +422,7 @@ for bname in "${ALL_BENCHMARKS[@]}"; do
     graph_messages)           sweep_graph_messages ;;
     voxel_rasterization)      sweep_voxel_rasterization ;;
     voxel_trilinear_splat)    sweep_voxel_trilinear_splat ;;
+    voxel_trilinear_splat_chain) sweep_voxel_trilinear_splat_chain ;;
     stencil_interior)         sweep_stencil_interior ;;
     jacobi_2d)                sweep_jacobi_2d ;;
   esac
