@@ -26,9 +26,14 @@ if [[ "$(uname -s)" == "Darwin" ]] && [[ -z "${LIBRARY_PATH:-}" ]]; then
 fi
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$ROOT"
 
-PROJECT="bench/accel/cabal.project"
+# Run cabal from within the bench/accel project directory to avoid cabal-install
+# bug #8684 (target resolution fails when --project-file points to a sub-directory
+# project from the repo root).  All $ROOT/bench/… data-file paths are absolute so
+# they continue to resolve correctly after the cd.
+cd "$ROOT/bench/accel"
+
+PROJECT="cabal.project"
 BENCHES=(
   blackscholes
   nbody

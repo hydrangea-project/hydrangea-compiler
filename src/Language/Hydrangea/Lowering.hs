@@ -1791,10 +1791,7 @@ lowerExp expr = case expr of
   EScatterChain _ combExp defaultsExp phases -> do
     -- Lower the initial buffer once; all phases write into the same allocation.
     (sd, ad) <- lowerExp defaultsExp
-    phaseStmts <- forM phases $ \(ScatterPhase idxArrExp valsExp guardExp) -> do
-      (si, ai) <- lowerExp idxArrExp
-      (sv, av) <- lowerExp valsExp
-      shp <- freshCVar "shp"
+    phaseStmts <- forM phases $ \(ScatterPhase idxArrExp valsExp mGuardExp) -> do
       n <- freshCVar "n"
       i <- freshIterVar "i"
       val <- freshCVar "val"
@@ -1802,41 +1799,185 @@ lowerExp expr = case expr of
       newVal <- freshCVar "new"
       idx <- freshCVar "idx"
       combStmts <- inlineBinaryFn combExp val oldVal newVal
-      case guardExp of
-        Nothing ->
-          pure ( si ++ sv
-               ++ [ SAssign shp (RArrayShape ai)
-                  , SAssign n (RShapeSize (AVar shp))
-                  , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                      ( [ SAssign idx (RArrayLoad ai (AVar i))
-                        , SAssign val (RArrayLoad av (AVar i))
-                        , SAssign oldVal (RArrayLoad ad (AVar idx))
-                        ] ++ combStmts ++
-                        [ SArrayWrite ad (AVar idx) (AVar newVal)
-                        ]
-                      )
-                  ]
-               )
-        Just guardArrExp -> do
-          (sg, ag) <- lowerExp guardArrExp
-          guardVal <- freshCVar "guard"
-          pure ( si ++ sv ++ sg
-               ++ [ SAssign shp (RArrayShape ai)
-                  , SAssign n (RShapeSize (AVar shp))
-                  , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                      ( [ SAssign guardVal (RArrayLoad ag (AVar i))
-                        , SIf (AVar guardVal)
-                            ( [ SAssign idx (RArrayLoad ai (AVar i))
-                              , SAssign val (RArrayLoad av (AVar i))
-                              , SAssign oldVal (RArrayLoad ad (AVar idx))
-                              ] ++ combStmts ++
-                              [ SArrayWrite ad (AVar idx) (AVar newVal) ]
-                            )
-                            []
-                        ]
-                      )
-                  ]
-               )
+      case (idxArrExp, valsExp) of
+        -- Fast path: idx and vals are both generates — inline their bodies
+        -- directly into the scatter loop, avoiding intermediate array allocation.
+        (EGenerate _ shpExp routeFn, EGenerate _ _ valFnExp) -> do
+          (sshp, ashp) <- lowerExp shpExp
+          case mGuardExp of
+            -- Unguarded: inline route + val only.
+            Nothing ->
+              if is1DShapeExp shpExp
+                then do
+                  routeStmts <- inlineArrayFn1D routeFn i idx
+                  valStmts   <- inlineArrayFn1D valFnExp i val
+                  (hoistedCalls, kernelStmts) <-
+                    hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+                  pure ( sshp ++ hoistedCalls
+                       ++ [ SAssign n (RShapeSize ashp)
+                          , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                              ( kernelStmts ++
+                                [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                ] ++ combStmts ++
+                                [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                              )
+                          ]
+                       )
+                else do
+                  ndIdx <- freshCVar "nd"
+                  registerCType ndIdx CTTuple
+                  noteDenseLinearIndex ndIdx i
+                  routeStmts <- inlineArrayFn routeFn ndIdx idx
+                  valStmts   <- inlineArrayFn valFnExp ndIdx val
+                  (hoistedCalls, kernelStmts) <-
+                    hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+                  pure ( sshp ++ hoistedCalls
+                       ++ [ SAssign n (RShapeSize ashp)
+                          , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                              ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
+                                ] ++ kernelStmts ++
+                                [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                ] ++ combStmts ++
+                                [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                              )
+                          ]
+                       )
+            -- Guarded where guard is also a generate: inline all three.
+            Just (EGenerate _ _ guardFnExp) -> do
+              guardVal <- freshCVar "guard"
+              if is1DShapeExp shpExp
+                then do
+                  routeStmts  <- inlineArrayFn1D routeFn i idx
+                  valStmts    <- inlineArrayFn1D valFnExp i val
+                  guardStmts  <- inlineArrayFn1D guardFnExp i guardVal
+                  (hoistedCalls, kernelStmts) <-
+                    hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
+                  pure ( sshp ++ hoistedCalls
+                       ++ [ SAssign n (RShapeSize ashp)
+                          , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                              ( kernelStmts ++
+                                [ SIf (AVar guardVal)
+                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                      ] ++ combStmts ++
+                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                    )
+                                    []
+                                ]
+                              )
+                          ]
+                       )
+                else do
+                  ndIdx <- freshCVar "nd"
+                  registerCType ndIdx CTTuple
+                  noteDenseLinearIndex ndIdx i
+                  routeStmts  <- inlineArrayFn routeFn ndIdx idx
+                  valStmts    <- inlineArrayFn valFnExp ndIdx val
+                  guardStmts  <- inlineArrayFn guardFnExp ndIdx guardVal
+                  (hoistedCalls, kernelStmts) <-
+                    hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
+                  pure ( sshp ++ hoistedCalls
+                       ++ [ SAssign n (RShapeSize ashp)
+                          , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                              ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
+                                ] ++ kernelStmts ++
+                                [ SIf (AVar guardVal)
+                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                      ] ++ combStmts ++
+                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                    )
+                                    []
+                                ]
+                              )
+                          ]
+                       )
+            -- Guarded but guard is not a generate: inline route+val, materialize guard.
+            Just guardArrExp -> do
+              (sg, ag) <- lowerExp guardArrExp
+              guardVal <- freshCVar "guard"
+              if is1DShapeExp shpExp
+                then do
+                  routeStmts <- inlineArrayFn1D routeFn i idx
+                  valStmts   <- inlineArrayFn1D valFnExp i val
+                  (hoistedCalls, kernelStmts) <-
+                    hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+                  pure ( sshp ++ sg ++ hoistedCalls
+                       ++ [ SAssign n (RShapeSize ashp)
+                          , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                              ( kernelStmts ++
+                                [ SAssign guardVal (RArrayLoad ag (AVar i))
+                                , SIf (AVar guardVal)
+                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                      ] ++ combStmts ++
+                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                    )
+                                    []
+                                ]
+                              )
+                          ]
+                       )
+                else do
+                  ndIdx <- freshCVar "nd"
+                  registerCType ndIdx CTTuple
+                  noteDenseLinearIndex ndIdx i
+                  routeStmts <- inlineArrayFn routeFn ndIdx idx
+                  valStmts   <- inlineArrayFn valFnExp ndIdx val
+                  (hoistedCalls, kernelStmts) <-
+                    hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+                  pure ( sshp ++ sg ++ hoistedCalls
+                       ++ [ SAssign n (RShapeSize ashp)
+                          , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                              ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
+                                ] ++ kernelStmts ++
+                                [ SAssign guardVal (RArrayLoad ag (AVar i))
+                                , SIf (AVar guardVal)
+                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
+                                      ] ++ combStmts ++
+                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                    )
+                                    []
+                                ]
+                              )
+                          ]
+                       )
+        -- Slow path: materialize index and value arrays, then read from them.
+        _ -> do
+          (si, ai) <- lowerExp idxArrExp
+          (sv, av) <- lowerExp valsExp
+          shp <- freshCVar "shp"
+          case mGuardExp of
+            Nothing ->
+              pure ( si ++ sv
+                   ++ [ SAssign shp (RArrayShape ai)
+                      , SAssign n (RShapeSize (AVar shp))
+                      , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                          ( [ SAssign idx (RArrayLoad ai (AVar i))
+                            , SAssign val (RArrayLoad av (AVar i))
+                            , SAssign oldVal (RArrayLoad ad (AVar idx))
+                            ] ++ combStmts ++
+                            [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                          )
+                      ]
+                   )
+            Just guardArrExp -> do
+              (sg, ag) <- lowerExp guardArrExp
+              guardVal <- freshCVar "guard"
+              pure ( si ++ sv ++ sg
+                   ++ [ SAssign shp (RArrayShape ai)
+                      , SAssign n (RShapeSize (AVar shp))
+                      , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                          ( [ SAssign guardVal (RArrayLoad ag (AVar i))
+                            , SIf (AVar guardVal)
+                                ( [ SAssign idx (RArrayLoad ai (AVar i))
+                                  , SAssign val (RArrayLoad av (AVar i))
+                                  , SAssign oldVal (RArrayLoad ad (AVar idx))
+                                  ] ++ combStmts ++
+                                  [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                )
+                                []
+                            ]
+                          )
+                      ]
+                   )
     pure (sd ++ concat phaseStmts, ad)
 
   EGather _ idxArrExp srcArrExp -> do
