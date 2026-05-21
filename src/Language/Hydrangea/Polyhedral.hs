@@ -1493,7 +1493,8 @@ tileScheduleTree2 profitability relations depth sched = case sched of
   ScheduleLoopBand band -> do
     body' <- tileScheduleTree2 profitability relations (depth + 1) (lbBody band)
     let band' = band { lbBody = body' }
-    if not (shouldTileBand depth band')
+        shouldTile = shouldTileBand depth band'
+    if not shouldTile
       then pure (ScheduleLoopBand band')
       else do
         plans <- buildStripMinePlans defaultTileConfig profitability relations depth band'

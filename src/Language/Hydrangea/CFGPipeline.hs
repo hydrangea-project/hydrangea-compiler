@@ -24,6 +24,7 @@ module Language.Hydrangea.CFGPipeline
   , fullPipeline2
   ) where
 
+
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGOpt
 import Language.Hydrangea.Parallelize
