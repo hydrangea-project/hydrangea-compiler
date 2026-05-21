@@ -4,9 +4,12 @@ Hydrangea is an experimental compiler for *functional array programs* with highe
 
 The central idea is aggressive *array fusion*: chains of combinators like `map`, `zipWith`, `generate`, `scatter`, and `stencil` are fused away before any code is emitted, so the program never allocates the intermediate arrays that a naive evaluation would produce. The fused loop nests are then lowered into a CFG IR where tiling, vectorization, and OpenMP parallelization are applied before generating C code.
 
-<a href="docs/images/ray_still_life.png">
-  <img src="docs/images/ray_thumb.jpeg" alt="Ray Example" width="400"/>
-</a>
+<div align="center">
+  <a href="docs/images/ray_still_life.png">
+    <img src="docs/images/ray_thumb.jpeg" alt="Still life rendered by the ray_sdl demo" width="400"/>
+  </a>
+  <p><em>Still life rendered by the <a href="demo/ray_sdl"><code>ray_sdl</code></a> demo</em></p>
+</div>
 
 ## Examples
 
@@ -88,6 +91,20 @@ for (int64_t i_tile = 0; i_tile < (h + 31) / 32; i_tile++) {
     }
 }
 ```
+
+## Static bounds checking
+
+Hydrangea uses *refinement type inference* to prove array-safety conditions at compile time. Rather than inserting runtime guards, the compiler tries to verify statically that every index stays within bounds, that scatter targets are in range, and that gather sources are large enough.
+
+Bounds flow through the type system as refinement predicates on integer variables. For example, annotating a precondition on a wrapper function:
+
+```hydrangea
+let take (n, arr) where bound n (dim arr 0) = gather (iota n) arr
+```
+
+tells the solver that `n` satisfies `0 ≤ n < dim arr 0`. It propagates that fact through to the `gather` call and discharges the index-safety obligation without any runtime check.
+
+When the checker cannot discharge an obligation it emits a note and falls back gracefully; `--no-solver-check` disables the solver entirely. Full details and patterns are in [`docs/static-bounds-checking.md`](docs/static-bounds-checking.md).
 
 ## Backends
 
