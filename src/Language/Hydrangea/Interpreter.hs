@@ -589,6 +589,14 @@ evalExp expr env = case expr of
         ai = firstParam idxArrExpr
     in evalExp (EScatter a combExpr defaultsExpr idxArrExpr
                   (EGenerate ai (EShapeOf ai idxArrExpr) valFnExpr)) env
+  EScatterGen ann combExpr defaultsExpr phases ->
+    -- Desugar each generator-phase into an EGenerate-array scatter phase and
+    -- run via the EScatterChain interpreter.
+    let toPhase (ScatterGenPhase shp idxFn valFn guardFn) =
+          let ai = firstParam shp
+              mkGen f = EGenerate ai shp f
+           in ScatterPhase (mkGen idxFn) (mkGen valFn) (fmap mkGen guardFn)
+    in evalExp (EScatterChain ann combExpr defaultsExpr (map toPhase phases)) env
   EScatterChain _ combExpr defaultsExpr phases -> do
     -- Evaluate the chain by running phases sequentially on the same buffer.
     vComb <- evalExp combExpr env

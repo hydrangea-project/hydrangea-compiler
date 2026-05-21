@@ -1,0 +1,25 @@
+(* weighted_histogram.hyd
+   Compute a weighted histogram: accumulate squared values into bins.
+
+   scatter (+) zeros (map binFn data) (map valueFn data)
+
+   Both index and value arrays derive from the same source `data`, which
+   triggers Case 6a scatter_reindex fusion: neither intermediate mapped
+   array is materialised.  Instead the scatter_generate loop computes
+     route[i] = data[i] mod 64          (bin index)
+     value[i] = data[i] * data[i]       (contribution)
+   directly, reading `data` once per element and routing on-the-fly.
+
+   Expected result: bin[k] = sum of (x*x) for all x in data where x % 64 = k
+   With data = [0..1023]: bin[k] holds the sum of squares of all integers
+   in [0..1023] that are congruent to k mod 64.
+
+   For each bin k, the elements are k, k+64, k+128, ..., k+960  (16 values).
+   Sum of squares: sum_{j=0}^{15} (k + 64*j)^2 *)
+
+let data = generate [1024] (let f [i] = i in f)
+
+let binFn   x = x % 64
+let valueFn x = x * x
+
+let main = scatter (+) (fill [64] 0) (map binFn data) (map valueFn data)

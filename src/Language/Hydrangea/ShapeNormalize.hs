@@ -199,6 +199,14 @@ normExp expr = case expr of
                                          <*> normExp (spValues p)
                                          <*> mapM normExp (spGuard p)) phases
     pure (EScatterChain a c' d' phases')
+  EScatterGen a c d phases -> do
+    c' <- normExp c
+    d' <- normExp d
+    phases' <- mapM (\p -> ScatterGenPhase <$> normExp (sgpShape p)
+                                            <*> normExp (sgpIndexFn p)
+                                            <*> normExp (sgpValueFn p)
+                                            <*> mapM normExp (sgpGuardFn p)) phases
+    pure (EScatterGen a c' d' phases')
   EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
   EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
   ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr

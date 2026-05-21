@@ -69,6 +69,15 @@ anyExp p expr
         EScatterGuarded _ c d idx vals guardArr ->
           anyExp p c || anyExp p d || anyExp p idx || anyExp p vals || anyExp p guardArr
         EScatterGenerate _ c d idx f -> anyExp p c || anyExp p d || anyExp p idx || anyExp p f
+        EScatterChain _ c d phases ->
+          anyExp p c || anyExp p d
+            || any (\ph -> anyExp p (spIndex ph) || anyExp p (spValues ph)
+                            || maybe False (anyExp p) (spGuard ph)) phases
+        EScatterGen _ c d phases ->
+          anyExp p c || anyExp p d
+            || any (\ph -> anyExp p (sgpShape ph) || anyExp p (sgpIndexFn ph)
+                            || anyExp p (sgpValueFn ph)
+                            || maybe False (anyExp p) (sgpGuardFn ph)) phases
         EGather _ idx arr -> anyExp p idx || anyExp p arr
         EIndex _ idx arr -> anyExp p idx || anyExp p arr
         ECheckIndex _ idx def arr -> anyExp p idx || anyExp p def || anyExp p arr
@@ -90,7 +99,7 @@ anySliceDim p = \case
   SliceAll _ -> False
   SliceRange _ s l -> anyExp p s || anyExp p l
 
-hasMap, hasZipWith, hasGenerate, hasFill, hasReduceGenerate, hasPermute, hasGather, hasScatter, hasScatterGenerate, hasReplicate, hasSlice, hasReshape, hasIndex :: Exp a -> Bool
+hasMap, hasZipWith, hasGenerate, hasFill, hasReduceGenerate, hasPermute, hasGather, hasScatter, hasScatterGenerate, hasScatterGen, hasReplicate, hasSlice, hasReshape, hasIndex :: Exp a -> Bool
 hasMap = anyExp (\case EMap {} -> True; _ -> False)
 hasZipWith = anyExp (\case EZipWith {} -> True; _ -> False)
 hasGenerate = anyExp (\case EGenerate {} -> True; _ -> False)
@@ -100,6 +109,7 @@ hasPermute = anyExp (\case EPermute {} -> True; _ -> False)
 hasGather = anyExp (\case EGather {} -> True; _ -> False)
 hasScatter = anyExp (\case EScatter {} -> True; EScatterGuarded {} -> True; _ -> False)
 hasScatterGenerate = anyExp (\case EScatterGenerate {} -> True; _ -> False)
+hasScatterGen = anyExp (\case EScatterGen {} -> True; _ -> False)
 hasReplicate = anyExp (\case EReplicate {} -> True; _ -> False)
 hasSlice = anyExp (\case ESlice {} -> True; _ -> False)
 hasReshape = anyExp (\case EReshape {} -> True; _ -> False)
@@ -625,6 +635,40 @@ spec = do
       expectFusionSensible
         "let f [i] = (i + 1) * 10 in let idxFn [i] = [i] in let c x y = x + y in scatter c (fill [3] 0) (generate [3] idxFn) (generate [3] f)"
         (\fused -> hasScatterGenerate fused `shouldBe` True)
+
+  describe "Fusion - EScatterGen (multi-phase chain of generator-form scatters)" $ do
+    it "nested scatters with generate-form index/values fuse to EScatterGen" $ do
+      -- Two nested scatters whose index/value arrays are both EGenerate at the
+      -- same shape collapse first into an EScatterChain (chain fusion) and
+      -- then lift to EScatterGen (per-phase generator inlining).  Mirrors
+      -- Rocq's EScatterGen fusion target.
+      expectFusionSensible
+        ( "let r0 [i] = [i] in let v0 [i] = i + 100 in"
+          <> " let r1 [i] = [7 - i] in let v1 [i] = i + 200 in"
+          <> " let c x y = x + y in"
+          <> " scatter c"
+          <> "   (scatter c (fill [8] 0) (generate [8] r0) (generate [8] v0))"
+          <> "   (generate [8] r1) (generate [8] v1)"
+        )
+        (\fused -> do
+            hasScatterGen fused `shouldBe` True
+            hasScatter fused `shouldBe` False
+            hasScatterGenerate fused `shouldBe` False)
+
+    it "guarded scatter chain with generator-form arrays fuses to EScatterGen" $ do
+      expectFusionSensible
+        ( "let r0 [i] = [i] in let v0 [i] = i + 100 in"
+          <> " let r1 [i] = [7 - i] in let v1 [i] = i + 200 in"
+          <> " let g [i] = (i / 2) * 2 = i in"
+          <> " let c x y = x + y in"
+          <> " scatter_guarded c"
+          <> "   (scatter_guarded c (fill [8] 0)"
+          <> "     (generate [8] r0) (generate [8] v0) (generate [8] g))"
+          <> "   (generate [8] r1) (generate [8] v1) (generate [8] g)"
+        )
+        (\fused -> do
+            hasScatterGen fused `shouldBe` True
+            hasScatter fused `shouldBe` False)
 
   describe "Fusion - scatter_reindex (Rule 6: same-source index and values)" $ do
     it "scatter (map routing src) (map value src) fuses to EScatterGenerate" $ do

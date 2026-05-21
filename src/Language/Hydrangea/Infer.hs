@@ -1837,6 +1837,15 @@ infer (EScatterGuarded _ comb defaults idxArr vals guardArr) = do
 infer (EScatterGenerate _ comb defaults idxArr valFn) =
   infer (EScatter (firstParam defaults) comb defaults idxArr
            (EGenerate (firstParam idxArr) (EShapeOf (firstParam idxArr) idxArr) valFn))
+infer (EScatterGen ann comb defaults phases) =
+  -- Desugar to EScatterChain by lifting each per-phase generator body into an
+  -- EGenerate of the phase's shape, so typing reuses the established
+  -- EScatterChain rule unchanged.
+  let toPhase (ScatterGenPhase shp idxFn valFn guardFn) =
+        let ai = firstParam shp
+            mkGen f = EGenerate ai shp f
+         in ScatterPhase (mkGen idxFn) (mkGen valFn) (fmap mkGen guardFn)
+  in infer (EScatterChain ann comb defaults (map toPhase phases))
 infer (EScatterChain _ comb defaults phases) = do
   -- A scatter chain produces an array of the same type as the defaults.
   -- Each phase must have index and values arrays compatible with the defaults.

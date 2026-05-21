@@ -123,6 +123,11 @@ collectVarsExp expr =
       collectVarsExp c `S.union` collectVarsExp d
         `S.union` S.unions (map (\p -> collectVarsExp (spIndex p) `S.union` collectVarsExp (spValues p)
                                         `S.union` maybe S.empty collectVarsExp (spGuard p)) phases)
+    EScatterGen _ c d phases ->
+      collectVarsExp c `S.union` collectVarsExp d
+        `S.union` S.unions (map (\p -> collectVarsExp (sgpShape p) `S.union` collectVarsExp (sgpIndexFn p)
+                                         `S.union` collectVarsExp (sgpValueFn p)
+                                         `S.union` maybe S.empty collectVarsExp (sgpGuardFn p)) phases)
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a
@@ -239,6 +244,11 @@ freeVarsExp expr =
       freeVarsExp c `S.union` freeVarsExp d
         `S.union` S.unions (map (\p -> freeVarsExp (spIndex p) `S.union` freeVarsExp (spValues p)
                                         `S.union` maybe S.empty freeVarsExp (spGuard p)) phases)
+    EScatterGen _ c d phases ->
+      freeVarsExp c `S.union` freeVarsExp d
+        `S.union` S.unions (map (\p -> freeVarsExp (sgpShape p) `S.union` freeVarsExp (sgpIndexFn p)
+                                         `S.union` freeVarsExp (sgpValueFn p)
+                                         `S.union` maybe S.empty freeVarsExp (sgpGuardFn p)) phases)
     EGather _ idx a -> freeVarsExp idx `S.union` freeVarsExp a
     EIndex _ i a -> freeVarsExp i `S.union` freeVarsExp a
     ECheckIndex _ i def a -> freeVarsExp i `S.union` freeVarsExp def `S.union` freeVarsExp a
@@ -335,6 +345,11 @@ boundVarsExp expr =
       boundVarsExp c `S.union` boundVarsExp d
         `S.union` S.unions (map (\p -> boundVarsExp (spIndex p) `S.union` boundVarsExp (spValues p)
                                         `S.union` maybe S.empty boundVarsExp (spGuard p)) phases)
+    EScatterGen _ c d phases ->
+      boundVarsExp c `S.union` boundVarsExp d
+        `S.union` S.unions (map (\p -> boundVarsExp (sgpShape p) `S.union` boundVarsExp (sgpIndexFn p)
+                                         `S.union` boundVarsExp (sgpValueFn p)
+                                         `S.union` maybe S.empty boundVarsExp (sgpGuardFn p)) phases)
     EGather _ idx a -> boundVarsExp idx `S.union` boundVarsExp a
     EIndex _ i a -> boundVarsExp i `S.union` boundVarsExp a
     ECheckIndex _ i def a -> boundVarsExp i `S.union` boundVarsExp def `S.union` boundVarsExp a
@@ -435,6 +450,11 @@ countVarExp v expr =
       countVarExp v c + countVarExp v d
         + sum (map (\p -> countVarExp v (spIndex p) + countVarExp v (spValues p)
                           + maybe 0 (countVarExp v) (spGuard p)) phases)
+    EScatterGen _ c d phases ->
+      countVarExp v c + countVarExp v d
+        + sum (map (\p -> countVarExp v (sgpShape p) + countVarExp v (sgpIndexFn p)
+                           + countVarExp v (sgpValueFn p)
+                           + maybe 0 (countVarExp v) (sgpGuardFn p)) phases)
     EGather _ idx a -> countVarExp v idx + countVarExp v a
     EIndex _ i a -> countVarExp v i + countVarExp v a
     ECheckIndex _ i def a -> countVarExp v i + countVarExp v def + countVarExp v a
@@ -546,6 +566,12 @@ substExp v replacement expr =
         (map (\p -> ScatterPhase (substExp v replacement (spIndex p))
                                  (substExp v replacement (spValues p))
                                  (fmap (substExp v replacement) (spGuard p))) phases)
+    EScatterGen a c d phases ->
+      EScatterGen a (substExp v replacement c) (substExp v replacement d)
+        (map (\p -> ScatterGenPhase (substExp v replacement (sgpShape p))
+                                    (substExp v replacement (sgpIndexFn p))
+                                    (substExp v replacement (sgpValueFn p))
+                                    (fmap (substExp v replacement) (sgpGuardFn p))) phases)
     EGather a idx arr -> EGather a (substExp v replacement idx) (substExp v replacement arr)
     EIndex a idx arr -> EIndex a (substExp v replacement idx) (substExp v replacement arr)
     ECheckIndex a idx def arr -> ECheckIndex a (substExp v replacement idx) (substExp v replacement def) (substExp v replacement arr)
@@ -655,6 +681,7 @@ isArrayExp expr =
     EScatterGuarded {} -> True
     EScatterGenerate {} -> True
     EScatterChain {} -> True
+    EScatterGen {} -> True
     EGather {} -> True
     EFill {} -> True
     EShapeOf {} -> False
@@ -1021,14 +1048,63 @@ combinesMatch c1 c2 = fmap (const ()) c1 == fmap (const ()) c2
 -- | Peel nested scatters from a 'ScatterKernel' whose default is itself a scatter,
 -- collecting phases bottom-up.  Returns the innermost non-scatter default expression
 -- and the ordered list of phases from innermost to outermost.
+--
+-- Recognises an inner 'EScatterGen' with a matching combine as a chain
+-- default: its phases are re-materialised as @EGenerate σ body@ arrays so the
+-- outer scatter can extend the chain.  Subsequent 'liftChainToGen' will
+-- collapse them back to the fused 'EScatterGen' form when applicable.
 collectChainPhases :: (Eq a) => a -> ScatterKernel a -> (Exp a, [ScatterPhase a])
 collectChainPhases a sk =
   let phase = ScatterPhase (skIndex sk) (skValues sk) (skGuard sk)
-  in case asScatter a (skDefault sk) of
-       Just innerSk | combinesMatch (skCombine sk) (skCombine innerSk) ->
-         let (deepDflt, innerPhases) = collectChainPhases a innerSk
-         in (deepDflt, innerPhases ++ [phase])
-       _ -> (skDefault sk, [phase])
+  in case skDefault sk of
+       EScatterGen _ c' d genPhases | combinesMatch (skCombine sk) c' ->
+         (d, map genPhaseToPhase genPhases ++ [phase])
+       _ ->
+         case asScatter a (skDefault sk) of
+           Just innerSk | combinesMatch (skCombine sk) (skCombine innerSk) ->
+             let (deepDflt, innerPhases) = collectChainPhases a innerSk
+             in (deepDflt, innerPhases ++ [phase])
+           _ -> (skDefault sk, [phase])
+
+-- | Re-materialise a scatter-gen phase as an 'EGenerate'-array
+-- 'ScatterPhase' (used to fold an 'EScatterGen' default into chain form).
+genPhaseToPhase :: ScatterGenPhase a -> ScatterPhase a
+genPhaseToPhase (ScatterGenPhase shp ki kv kg) =
+  let ai = firstParam shp
+      mkGen f = EGenerate ai shp f
+  in ScatterPhase (mkGen ki) (mkGen kv) (fmap mkGen kg)
+
+-- | Recognise a phase array as @EGenerate σ body@.
+asGenerateForm :: Exp a -> Maybe (Exp a, Exp a)
+asGenerateForm (EGenerate _ sh body) = Just (sh, body)
+asGenerateForm _ = Nothing
+
+-- | Try to convert one chain phase to a generator-form phase.  All slots
+-- (index, values, and guard if present) must be @EGenerate@ at the same
+-- syntactic shape (modulo annotations).
+phaseToGenPhase :: (Eq a) => ScatterPhase a -> Maybe (ScatterGenPhase a)
+phaseToGenPhase (ScatterPhase idx vals mGuard) = do
+  (sIdx, kIdx) <- asGenerateForm idx
+  (sVal, kVal) <- asGenerateForm vals
+  if fmap (const ()) sIdx /= fmap (const ()) sVal then Nothing else
+    case mGuard of
+      Nothing -> Just (ScatterGenPhase sIdx kIdx kVal Nothing)
+      Just g  -> do
+        (sG, kG) <- asGenerateForm g
+        if fmap (const ()) sIdx /= fmap (const ()) sG then Nothing else
+          Just (ScatterGenPhase sIdx kIdx kVal (Just kG))
+
+-- | Promote an 'EScatterChain' to 'EScatterGen' when every phase has all
+-- arrays in @EGenerate σ body@ form at a common per-phase shape.  Returns
+-- the original chain if any phase fails to lift.  Mirrors the Rocq
+-- @EScatterGen@ fusion target (see theory/Fusion/FuseStepAlg.v
+-- @fuse_scatter_gen_match@ + @fuse_scatter_guarded_gen_match@).
+liftChainToGen :: (Eq a) => a -> Exp a -> Exp a -> [ScatterPhase a] -> Exp a
+liftChainToGen a c d phases =
+  case (phases, traverse phaseToGenPhase phases) of
+    ([], _)              -> EScatterChain a c d phases
+    (_, Just genPhases)  -> EScatterGen a c d genPhases
+    _                    -> EScatterChain a c d phases
 
 -- | Absorb an inner @EMap g@ on the values side into the combine function
 -- (Rocq: @FuseScatterMap@, @scatter_combine_map_fun@).
@@ -1181,6 +1257,14 @@ normExp expr =
                                            <*> normExp (spValues p)
                                            <*> mapM normExp (spGuard p)) phases
       pure (EScatterChain a c' d' phases')
+    EScatterGen a c d phases -> do
+      c' <- normExp c
+      d' <- normExp d
+      phases' <- mapM (\p -> ScatterGenPhase <$> normExp (sgpShape p)
+                                              <*> normExp (sgpIndexFn p)
+                                              <*> normExp (sgpValueFn p)
+                                              <*> mapM normExp (sgpGuardFn p)) phases
+      pure (EScatterGen a c' d' phases')
     EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
     EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr
@@ -1492,41 +1576,55 @@ fuseOnce expr =
       fusePermute a c' d' p' arr'
     EScatter a c d idx vals -> do
       -- Scatter chain rule: check for chain pattern BEFORE recursing on subterms.
-      -- If the default is itself a scatter with a matching combine, fuse into
-      -- EScatterChain immediately so that subsequent rules don't convert the
-      -- inner scatter to scatter_generate first (which would prevent detection).
-      case asScatter a d of
-        Just innerSk | combinesMatch c (skCombine innerSk) -> do
+      -- If the default is itself a scatter (regular or fused EScatterGen) with
+      -- a matching combine, fuse into EScatterChain immediately so subsequent
+      -- rules don't convert the inner scatter to scatter_generate first.  The
+      -- EScatterGen branch unlifts the inner gen-phases to materialised-array
+      -- chain phases so 'liftChainToGen' can re-lift the whole result.
+      case d of
+        EScatterGen _ c' d0 genPhases | combinesMatch c c' -> do
           let outerPhase = ScatterPhase idx vals Nothing
-              (deepDflt, innerPhases) = collectChainPhases a innerSk
-          fuseOnce (EScatterChain a c deepDflt (innerPhases ++ [outerPhase]))
-        _ -> do
-          c' <- fuseOnce c
-          d' <- fuseOnce d
-          idx' <- fuseOnce idx
-          vals' <- fuseOnce vals
-          fuseScatter a c' d' idx' vals'
+              innerPhases = map genPhaseToPhase genPhases
+          fuseOnce (EScatterChain a c d0 (innerPhases ++ [outerPhase]))
+        _ ->
+          case asScatter a d of
+            Just innerSk | combinesMatch c (skCombine innerSk) -> do
+              let outerPhase = ScatterPhase idx vals Nothing
+                  (deepDflt, innerPhases) = collectChainPhases a innerSk
+              fuseOnce (EScatterChain a c deepDflt (innerPhases ++ [outerPhase]))
+            _ -> do
+              c' <- fuseOnce c
+              d' <- fuseOnce d
+              idx' <- fuseOnce idx
+              vals' <- fuseOnce vals
+              fuseScatter a c' d' idx' vals'
     EScatterGuarded a c d idx vals guardArr -> do
-      -- Scatter chain rule: same early-exit for guarded scatter.
-      case asScatter a d of
-        Just innerSk | combinesMatch c (skCombine innerSk) -> do
+      -- Scatter chain rule: same early-exit for guarded scatter, with EScatterGen support.
+      case d of
+        EScatterGen _ c' d0 genPhases | combinesMatch c c' -> do
           let outerPhase = ScatterPhase idx vals (Just guardArr)
-              (deepDflt, innerPhases) = collectChainPhases a innerSk
-          fuseOnce (EScatterChain a c deepDflt (innerPhases ++ [outerPhase]))
-        _ -> do
-          c' <- fuseOnce c
-          d' <- fuseOnce d
-          idx' <- fuseOnce idx
-          vals' <- fuseOnce vals
-          guardArr' <- fuseOnce guardArr
-          let sk0 = ScatterKernel
-                { skCombine = c'
-                , skDefault = d'
-                , skIndex = idx'
-                , skValues = vals'
-                , skGuard = Just guardArr'
-                }
-          fuseScatterKernel a sk0
+              innerPhases = map genPhaseToPhase genPhases
+          fuseOnce (EScatterChain a c d0 (innerPhases ++ [outerPhase]))
+        _ ->
+          case asScatter a d of
+            Just innerSk | combinesMatch c (skCombine innerSk) -> do
+              let outerPhase = ScatterPhase idx vals (Just guardArr)
+                  (deepDflt, innerPhases) = collectChainPhases a innerSk
+              fuseOnce (EScatterChain a c deepDflt (innerPhases ++ [outerPhase]))
+            _ -> do
+              c' <- fuseOnce c
+              d' <- fuseOnce d
+              idx' <- fuseOnce idx
+              vals' <- fuseOnce vals
+              guardArr' <- fuseOnce guardArr
+              let sk0 = ScatterKernel
+                    { skCombine = c'
+                    , skDefault = d'
+                    , skIndex = idx'
+                    , skValues = vals'
+                    , skGuard = Just guardArr'
+                    }
+              fuseScatterKernel a sk0
     EScatterGenerate a c d idx valFn -> do
       c' <- fuseOnce c
       d' <- fuseOnce d
@@ -1547,7 +1645,15 @@ fuseOnce expr =
           vals' <- fuseOnce (spValues p)
           guard' <- mapM fuseOnce (spGuard p)
           pure (ScatterPhase idx' vals' guard')) phases
-      pure (EScatterChain a c' d' phases')
+      pure (liftChainToGen a c' d' phases')
+    EScatterGen a c d phases -> do
+      c' <- fuseOnce c
+      d' <- fuseOnce d
+      phases' <- mapM (\p -> ScatterGenPhase <$> fuseOnce (sgpShape p)
+                                              <*> fuseOnce (sgpIndexFn p)
+                                              <*> fuseOnce (sgpValueFn p)
+                                              <*> mapM fuseOnce (sgpGuardFn p)) phases
+      pure (EScatterGen a c' d' phases')
     EGather a idx arr -> do
       idx' <- fuseOnce idx
       arr' <- fuseOnce arr
@@ -1807,12 +1913,18 @@ fuseScatterKernel a sk =
           -- to d0, eliminating the intermediate array entirely.
           -- (Rocq: FuseScatterChain)
           case skDefault sk of
+            EScatterGen _ c' d0 genPhases | combinesMatch (skCombine sk) c' ->
+              -- Inner default is already a fused EScatterGen: unlift its phases,
+              -- append the outer one, and let liftChainToGen re-lift.
+              let outerPhase = ScatterPhase (skIndex sk) (skValues sk) (skGuard sk)
+                  innerPhases = map genPhaseToPhase genPhases
+              in pure (liftChainToGen a (skCombine sk) d0 (innerPhases ++ [outerPhase]))
             inner | Just innerSk <- asScatter a inner
                   , combinesMatch (skCombine sk) (skCombine innerSk) ->
               -- Collect all nested phases bottom-up.
               let outerPhase = ScatterPhase (skIndex sk) (skValues sk) (skGuard sk)
                   (deepDflt, innerPhases) = collectChainPhases a innerSk
-              in pure (EScatterChain a (skCombine sk) deepDflt (innerPhases ++ [outerPhase]))
+              in pure (liftChainToGen a (skCombine sk) deepDflt (innerPhases ++ [outerPhase]))
             _ ->
               -- Rule 6: scatter_reindex — when both index and values are EMap over
               -- the same source array (possibly with different mapping functions),

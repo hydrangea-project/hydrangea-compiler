@@ -123,6 +123,14 @@ uniqExp expr =
                                            <*> uniqExp (spValues p)
                                            <*> mapM uniqExp (spGuard p)) phases
       pure (EScatterChain a c' d' phases')
+    EScatterGen a c d phases -> do
+      c' <- uniqExp c
+      d' <- uniqExp d
+      phases' <- mapM (\p -> ScatterGenPhase <$> uniqExp (sgpShape p)
+                                              <*> uniqExp (sgpIndexFn p)
+                                              <*> uniqExp (sgpValueFn p)
+                                              <*> mapM uniqExp (sgpGuardFn p)) phases
+      pure (EScatterGen a c' d' phases')
     EGather a idx arr -> EGather a <$> uniqExp idx <*> uniqExp arr
     EIndex a idx arr -> EIndex a <$> uniqExp idx <*> uniqExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> uniqExp idx <*> uniqExp def <*> uniqExp arr
@@ -284,6 +292,11 @@ collectVarsExp expr =
       collectVarsExp c `S.union` collectVarsExp d
         `S.union` S.unions (map (\p -> collectVarsExp (spIndex p) `S.union` collectVarsExp (spValues p)
                                         `S.union` maybe S.empty collectVarsExp (spGuard p)) phases)
+    EScatterGen _ c d phases ->
+      collectVarsExp c `S.union` collectVarsExp d
+        `S.union` S.unions (map (\p -> collectVarsExp (sgpShape p) `S.union` collectVarsExp (sgpIndexFn p)
+                                         `S.union` collectVarsExp (sgpValueFn p)
+                                         `S.union` maybe S.empty collectVarsExp (sgpGuardFn p)) phases)
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a

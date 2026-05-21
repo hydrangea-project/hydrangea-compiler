@@ -174,6 +174,13 @@ instance Pretty (Exp a) where
     where
       ppPhase p = parens (pPrint (spIndex p) <+> comma <+> pPrint (spValues p)
                             <> maybe empty (\g -> comma <+> pPrint g) (spGuard p))
+  pPrint (EScatterGen _ comb defaults phases) =
+    text "scatter_gen" <+> pPrint comb <+> pPrint defaults
+      <+> brackets (sep (punctuate comma (map ppGenPhase phases)))
+    where
+      ppGenPhase p = parens (pPrint (sgpShape p) <+> comma <+> pPrint (sgpIndexFn p)
+                              <+> comma <+> pPrint (sgpValueFn p)
+                              <> maybe empty (\g -> comma <+> pPrint g) (sgpGuardFn p))
   pPrint (EGather _ idxArr arr) = text "gather" <+> pPrint idxArr <+> pPrint arr
   pPrint (EIndex _ idx arr) = text "index" <+> pPrint idx <+> pPrint arr
   pPrint (ECheckIndex _ idx defVal arr) = text "check_index" <+> pPrint idx <+> pPrint defVal <+> pPrint arr

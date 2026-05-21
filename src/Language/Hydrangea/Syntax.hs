@@ -226,6 +226,23 @@ deriving instance (Show a) => Show (ScatterPhase a)
 deriving instance (Eq a)   => Eq   (ScatterPhase a)
 deriving instance (Ord a)  => Ord  (ScatterPhase a)
 
+-- | A single phase of a fused scatter-gen chain (@EScatterGen@).
+-- Mirrors the Rocq @EScatterGen@ per-phase tuple @(σ, k_i, k_v, k_g?)@: rather
+-- than materializing index/values/guard as arrays, each phase iterates over
+-- @sgpShape@ and inlines the generator bodies @sgpIndexFn@, @sgpValueFn@, and
+-- optionally @sgpGuardFn@.  Each generator body is a function expression that
+-- takes a single index argument of shape @sgpShape@.
+data ScatterGenPhase a = ScatterGenPhase
+  { sgpShape   :: Exp a       -- ^ iteration shape σ
+  , sgpIndexFn :: Exp a       -- ^ index generator function (Idx σ -> dst index)
+  , sgpValueFn :: Exp a       -- ^ value generator function (Idx σ -> element)
+  , sgpGuardFn :: Maybe (Exp a) -- ^ optional guard generator function (Idx σ -> Bool)
+  } deriving (Functor, Foldable)
+
+deriving instance (Show a) => Show (ScatterGenPhase a)
+deriving instance (Eq a)   => Eq   (ScatterGenPhase a)
+deriving instance (Ord a)  => Ord  (ScatterGenPhase a)
+
 -- | Expression AST parameterised by an annotation @a@ (typically a source 'Range').
 data Exp a
   = -- | Integer literal with its annotation and numeric value
@@ -339,6 +356,16 @@ data Exp a
     -- eliminating all intermediate scatter results.
     -- Fields: combine, defaults, phases.
     EScatterChain a (Exp a) (Exp a) [ScatterPhase a]
+  | -- | N-phase scatter chain where each phase's index/value/guard arrays are
+    -- expressed as generator kernels rather than materialized arrays.
+    -- Mirrors Rocq @EScatterGen@: the scatter-side analog of
+    -- @EReduceGenerate@, generalized to multiple phases (analog of
+    -- @EScatterChain@).  Each phase iterates over its own shape σ and inlines
+    -- @sgpIndexFn@, @sgpValueFn@, and optionally @sgpGuardFn@ directly into
+    -- the per-phase loop.  All phases write into the shared buffer initialised
+    -- from @dflt@, using the shared combine function @c@.
+    -- Fields: combine, defaults, phases.
+    EScatterGen a (Exp a) (Exp a) [ScatterGenPhase a]
   | -- | Gather values from an array using an index array
     EGather a (Exp a) (Exp a)
   | -- | Index into an array: index, array
@@ -467,6 +494,7 @@ firstParam e = case e of
   EScatterGuarded a _ _ _ _ _ -> a
   EScatterGenerate a _ _ _ _ -> a
   EScatterChain a _ _ _ -> a
+  EScatterGen a _ _ _ -> a
   EGather a _ _ -> a
   EIndex a _ _ -> a
   ECheckIndex a _ _ _ -> a
