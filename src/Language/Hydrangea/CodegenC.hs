@@ -919,6 +919,7 @@ genStmt2 env declared liveAfter stmt = case stmt of
     where
       genAssignRHS assignedRhs = case assignedRhs of
         RArrayAlloc shp -> genArrayAllocExpr (ceArrayElemTypes env) v shp
+        RArrayCopy src -> text "hyd_array_alloc_copy(" <> genAtom src <> text ")"
         RProj 0 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".fst"
         RProj 1 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".snd"
         _ -> genRHS (ceArrayElemTypes env) (ceFloatArrVars env) (Map.lookup v (ceVecVars env)) (ceTupleDefs env) assignedRhs
@@ -1564,6 +1565,7 @@ localArrayVarsProc2 typeEnv (C2.Proc {C2.procBody = body}) =
       _ -> False
     ownsArrayHeader rhs = case rhs of
       RArrayAlloc {} -> True
+      RArrayCopy {} -> True
       RCall {} -> True
       _ -> False
     -- Arrays passed as CEArray components to RPairMake are owned by the
@@ -1620,6 +1622,7 @@ arrayVarsStmt2 :: C2.Stmt -> Set CVar
 arrayVarsStmt2 st = case st of
   C2.SAssign v rhs -> case rhs of
     RArrayAlloc {} -> S.singleton v
+    RArrayCopy {} -> S.singleton v
     RCall fn _ | fn == "hyd_read_array_csv" -> S.singleton v
     RCall fn _ | fn == "hyd_read_float_array_csv" -> S.singleton v
     _ -> S.empty
@@ -2121,6 +2124,7 @@ varDecl env v rhs
         | src `S.member` ceFloatVars env -> text "double"
       RAtom (AVecVar src) -> text (vecTypeName (Map.findWithDefault defaultVectorWidth src (ceVecVars env)))
       RArrayAlloc {} -> text "hyd_array_t*"
+      RArrayCopy {} -> text "hyd_array_t*"
       RArrayShape {} -> text "hyd_tuple_t"
       RShapeInit {} -> text "hyd_tuple_t"
       RTuple {} -> text "hyd_tuple_t"
@@ -2178,6 +2182,7 @@ genRHS _ _ _ _ (RRecord fields) =
     <> text "}"
 genRHS _ _ _ _ (RRecordProj field a) = genAtom a <> text "." <> text (sanitizeFieldName field)
 genRHS _ _ _ _ (RArrayAlloc shp) = text "hyd_array_alloc(" <> genAtom shp <> text ")"
+genRHS _ _ _ _ (RArrayCopy src) = text "hyd_array_alloc_copy(" <> genAtom src <> text ")"
 genRHS arrayElemTypes fa _ _ (RArrayLoad arr idx)
   | AVar v <- arr, Just eltTy <- Map.lookup v arrayElemTypes = genArrayAccess eltTy arr idx
   | AVar v <- arr, v `S.member` fa = text "hyd_array_get_float(" <> genAtom arr <> text "," <+> genAtom idx <> text ")"
@@ -2286,6 +2291,8 @@ inferArrayElemTypesFromStmts retTypes stmts initial = go initial
       C2.SAssign v (RCall fn _)
         | Just (CTArray eltTy) <- Map.lookup fn retTypes -> Map.insert v eltTy known
       C2.SAssign v (RAtom (AVar src))
+        | Just eltTy <- Map.lookup src known -> Map.insert v eltTy known
+      C2.SAssign v (RArrayCopy (AVar src))
         | Just eltTy <- Map.lookup src known -> Map.insert v eltTy known
       C2.SLoop _ body -> inferArrayElemTypesFromStmts retTypes body known
       C2.SIf _ thn els ->

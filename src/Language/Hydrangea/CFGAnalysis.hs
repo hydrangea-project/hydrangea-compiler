@@ -190,6 +190,7 @@ usedVarsRHS2 rhs = case rhs of
   RRecordProj _ a -> usedVarsAtom2 a
   RArrayLoad a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
   RArrayAlloc a -> usedVarsAtom2 a
+  RArrayCopy a -> usedVarsAtom2 a
   RArrayShape a -> usedVarsAtom2 a
   RShapeSize a -> usedVarsAtom2 a
   RShapeInit a -> usedVarsAtom2 a

@@ -123,6 +123,7 @@ substRHS2 env rhs =
     RRecordProj field a     -> RRecordProj field (sub a)
     RArrayLoad a1 a2        -> RArrayLoad (sub a1) (sub a2)
     RArrayAlloc a           -> RArrayAlloc (sub a)
+    RArrayCopy a            -> RArrayCopy (sub a)
     RNdToFlat a shp         -> RNdToFlat (sub a) (sub shp)
     RFlatToNd a shp         -> RFlatToNd (sub a) (sub shp)
     R2DToFlat a w           -> R2DToFlat (sub a) (sub w)
@@ -840,15 +841,15 @@ restructureIterateBody spec body = do
       guard (shapeArrVar == curVar)   -- shape reads from the cur variable
       guard (allocVar == nextVar)     -- alloc writes to the next variable
       let shapeStmt = SAssign shpVar (RArrayShape (AVar curVar))
-          allocStmt = SAssign nextVar (RArrayAlloc (AVar shpVar))
+          allocStmt = SAssign nextVar (RArrayCopy (AVar curVar))
           skip = S.fromList [shapeIdx, allocIdx]
       mkResult skip [shapeStmt, allocStmt]
 
     -- Fallback: only the alloc matches (shape is pre-computed outside loop).
-    -- Hoist just the alloc; the shape stmt stays in the loop body.
+    -- Hoist just a copy; the original alloc stmt is replaced.
     (_, Just (allocIdx, allocVar))
       | allocVar == nextVar ->
-          mkResult (S.singleton allocIdx) [prefix !! allocIdx]
+          mkResult (S.singleton allocIdx) [SAssign nextVar (RArrayCopy (AVar curVar))]
 
     _ -> Nothing
 

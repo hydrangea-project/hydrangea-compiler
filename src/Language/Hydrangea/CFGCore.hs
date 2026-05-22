@@ -95,6 +95,8 @@ data RHS
   | RPairFst CElemType Atom    -- ^ CElemType is the type of the extracted fst field
   | RPairSnd CElemType Atom    -- ^ CElemType is the type of the extracted snd field
   | RArrayAlloc Atom
+  | RArrayCopy Atom    -- ^ Allocate a fresh array with the same shape/elem-size as the
+                       --   source atom and copy all data into it (alloc + memcpy).
   | RArrayLoad Atom Atom
   | RArrayShape Atom
   | RShapeSize Atom

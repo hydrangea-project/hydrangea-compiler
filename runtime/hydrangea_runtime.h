@@ -306,6 +306,12 @@ static hyd_array_t* hyd_array_alloc_bytes(hyd_tuple_t shape, size_t elem_size) {
     return hyd_array_make_header(storage, shape, elem_size);
 }
 
+static hyd_array_t* hyd_array_alloc_copy(const hyd_array_t* src) {
+    hyd_array_t* dst = hyd_array_alloc_bytes(src->shape, src->elem_size);
+    memcpy(dst->data, src->data, (size_t)hyd_shape_size(src->shape) * src->elem_size);
+    return dst;
+}
+
 static hyd_array_t* hyd_array_alloc(hyd_tuple_t shape) {
     return hyd_array_alloc_bytes(shape, sizeof(int64_t));
 }

@@ -1628,6 +1628,9 @@ countWavefrontRingAllocsInStmts = sum . map go
       SAssign v (C.RArrayAlloc _)
         | "__wf_ring" `isInfixOf` BS.unpack v ->
             1
+      SAssign v (C.RArrayCopy _)
+        | "__wf_ring" `isInfixOf` BS.unpack v ->
+            1
       SLoop _ body ->
         countWavefrontRingAllocsInStmts body
       SParallelRegion body ->

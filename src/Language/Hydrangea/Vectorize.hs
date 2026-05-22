@@ -236,6 +236,7 @@ substScalarRHS iter base rhs = case rhs of
   C.RPairFst ct a -> C.RPairFst ct (substScalarAtom iter base a)
   C.RPairSnd ct a -> C.RPairSnd ct (substScalarAtom iter base a)
   C.RArrayAlloc a -> C.RArrayAlloc (substScalarAtom iter base a)
+  C.RArrayCopy a -> C.RArrayCopy (substScalarAtom iter base a)
   C.RArrayLoad a b -> C.RArrayLoad (substScalarAtom iter base a) (substScalarAtom iter base b)
   C.RArrayShape a -> C.RArrayShape (substScalarAtom iter base a)
   C.RShapeSize a -> C.RShapeSize (substScalarAtom iter base a)
@@ -266,6 +267,7 @@ rhsRefsVector env rhs = case rhs of
   C.RPairFst _ a -> atomRefsVector env a
   C.RPairSnd _ a -> atomRefsVector env a
   C.RArrayAlloc a -> atomRefsVector env a
+  C.RArrayCopy a -> atomRefsVector env a
   C.RArrayLoad a b -> atomRefsVector env a || atomRefsVector env b
   C.RArrayShape a -> atomRefsVector env a
   C.RShapeSize a -> atomRefsVector env a

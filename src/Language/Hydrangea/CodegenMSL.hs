@@ -2710,6 +2710,7 @@ preLoopCType typeEnv retKinds v rhs =
     Just ct -> cTypeName ct
     Nothing -> case rhs of
       RArrayAlloc {} -> "hyd_array_t*"
+      RArrayCopy {} -> "hyd_array_t*"
       RArrayShape {} -> "hyd_tuple_t"
       RShapeInit {} -> "hyd_tuple_t"
       RTuple {} -> "hyd_tuple_t"
@@ -2770,6 +2771,7 @@ genPreLoopRHS typeEnv retKinds v rhs = case rhs of
   RShapeInit shp -> "hyd_shape_init(" ++ genCAtom shp ++ ")"
   RShapeLast shp -> "hyd_shape_last(" ++ genCAtom shp ++ ")"
   RArrayAlloc shp -> "hyd_array_alloc(" ++ genCAtom shp ++ ")"
+  RArrayCopy src -> "hyd_array_alloc_copy(" ++ genCAtom src ++ ")"
   RBinOp op a1 a2 -> "(" ++ genCAtom a1 ++ " " ++ mslBinOp op ++ " " ++ genCAtom a2 ++ ")"
   RUnOp CNeg a -> "(-" ++ genCAtom a ++ ")"
   RUnOp op a -> mslUnOp op ++ "(" ++ genCAtom a ++ ")"

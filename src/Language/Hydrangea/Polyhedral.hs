@@ -79,7 +79,7 @@ import Data.Maybe (fromMaybe, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG
-import Language.Hydrangea.CFGAnalysis (definedVarsStmts2, usedVarsIndexExpr, usedVarsStmts2)
+import Language.Hydrangea.CFGAnalysis (definedVarsStmts2, usedVarsIndexExpr, usedVarsStmt2, usedVarsStmts2)
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
 import Language.Hydrangea.CFGOpt (substStmts2)
 
@@ -2485,21 +2485,7 @@ applyScheduledScopToProc2 scheduled proc
           }
 
 buildWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
-buildWavefrontScop2 scheduled = do
-  let strengthened = strengthenWavefrontScheduled2 scheduled
-      scop = ssOriginal strengthened
-      stmtMap =
-        M.fromList
-          [ (psPath stmt, psStmt stmt)
-          | stmt <- scStatements scop
-          ]
-  kernel <- matchWavefrontKernel2 strengthened
-  fallback <- reifyScheduleTree stmtMap (ssSchedule strengthened)
-  replacement <-
-    evalState
-      (buildTiledWavefrontReplacement2 kernel fallback)
-      (collectScopNames scop, 0)
-  pure strengthened { ssReplacement = Just replacement }
+buildWavefrontScop2 = buildTiledWavefrontScop2
 
 buildTiledWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
 buildTiledWavefrontScop2 scheduled = do
@@ -2826,26 +2812,14 @@ buildWavefrontBody2 kernel = do
   rotations <- buildWavefrontRotation2 stageBuffers (smdTileLen timeBlock)
   (stageSelection, curStageBuf, nextStageBuf, stageTimeVar) <-
     buildWavefrontStageSelection2 kernel stageIter stageBuffers stageTimeVars
-  extraShapeVar <- freshLike (wfkCurArray kernel) "__wf_shape"
-  let (extraShapeSetup, allocTargets) =
+  let allocTargets =
         if wfkPreallocatedNext kernel
-          then
-            ( [SAssign extraShapeVar (RArrayShape (AVar (wfkCurArray kernel)))]
-            , extraBuffers
-            )
-          else
-            ( []
-            , drop 1 stageBuffers
-            )
-      allocShape =
-        if wfkPreallocatedNext kernel
-          then AVar extraShapeVar
-          else wfkAllocShape kernel
+          then extraBuffers
+          else drop 1 stageBuffers
       allocs =
-        extraShapeSetup
-          ++ [ SAssign arr (RArrayAlloc allocShape)
-             | arr <- allocTargets
-             ]
+        [ SAssign arr (RArrayCopy (AVar (wfkCurArray kernel)))
+        | arr <- allocTargets
+        ]
       stageTimeSetup =
         [ SAssign tVar (RBinOp CAdd (AVar (smdTileStart timeBlock)) (AInt offset))
         | (offset, tVar) <- zip [0 ..] stageTimeVars
@@ -2986,9 +2960,13 @@ buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody = do
   let originExpr =
         simplifyIndexExpr $
           IMul (IConst (wfkSkewCoeff kernel)) (IVar timeVar)
-      upperExpr = IAdd originExpr (wavefrontHeadBound2 (wfkInnerSpec kernel))
+      headBound = wavefrontHeadBound2 (wfkInnerSpec kernel)
   (lowerSetup, lowerAtom) <- indexExprToAtom originExpr
-  (upperSetup, upperAtom) <- indexExprToAtom upperExpr
+  -- Reuse lowerAtom for the upper bound to avoid recomputing the skew offset.
+  (headSetup, headAtom) <- indexExprToAtom headBound
+  upperVar <- freshLike diagIter "__wf_valid_upper"
+  let upperSetup = headSetup ++ [SAssign upperVar (RBinOp CAdd lowerAtom headAtom)]
+      upperAtom = AVar upperVar
   geVar <- freshLike diagIter "__wf_valid_ge"
   ltVar <- freshLike diagIter "__wf_valid_lt"
   validVar <- freshLike diagIter "__wf_valid"
@@ -3059,16 +3037,23 @@ collapseWavefrontInnerLoop2 frontierExec diagIter innerSpec innerBody =
       in if null tailIters
            then fixedLead ++ innerBody
            else
-             fixedLead
-                ++ [ SLoop
-                       innerSpec
-                         { lsIters = tailIters
-                         , lsBounds = tailBounds
-                         , lsExec = frontierExec
-                         , lsOrigins = trimmedOrigins
-                         }
-                       innerBody
-                  ]
+             -- Hoist leading stmts that don't reference any inner loop variable
+             -- (e.g., skew-prelude assignments like `i = i_s - skew*time`) out
+             -- of the j-loop so they don't execute once per j iteration.
+             let tailIterVars = S.fromList tailIters
+                 isInvariant s = S.null (usedVarsStmt2 s `S.intersection` tailIterVars)
+                 (hoistable, dependent) = span isInvariant innerBody
+             in fixedLead
+                  ++ hoistable
+                  ++ [ SLoop
+                        innerSpec
+                          { lsIters = tailIters
+                          , lsBounds = tailBounds
+                          , lsExec = frontierExec
+                          , lsOrigins = trimmedOrigins
+                          }
+                        dependent
+                    ]
 
 isWavefrontInnerLoop2 :: Stmt -> Bool
 isWavefrontInnerLoop2 stmt = case stmt of

@@ -241,6 +241,8 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
              Nothing -> typeEnv1
   C.RArrayAlloc {} ->
     typeEnv
+  C.RArrayCopy {} ->
+    typeEnv
   C.RArrayLoad arr _ ->
     case lookupArrayElemType2 typeEnv arr of
       Just eltTy ->

@@ -367,6 +367,55 @@ spec = do
             untiledOut <- readFile (untiledDir </> "jacobi_out.csv")
             tiledOut `shouldBe` untiledOut
 
+    it "wavefront-tiled jacobi is correct for large arrays (wavefront actually fires)" $ withCC $
+      withSystemTempDirectory "hydrangea-jacobi-large" $ \tmp -> do
+        src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"
+        case readDecs src of
+          Left perr -> expectationFailure $ "Parse error: " ++ perr
+          Right decs -> do
+            let polyOpts =
+                  defaultPipelineOptions
+                    { poEnableTiling = True
+                    , poEnablePolyhedral = True
+                    , poEnableExplicitVectorization = False
+                    , poEnableParallelization = False
+                    }
+                untiledOpts = polyOpts { poEnableTiling = False }
+                -- 516x516 → interior width t25 = 514 ≥ 512, so the wavefront
+                -- profitability guard fires and the wavefront body actually runs.
+                jacobiEnv =
+                  [ ("JACOBI_H", "516")
+                  , ("JACOBI_W", "516")
+                  , ("JACOBI_ITERS", "4")
+                  ]
+                tiledDir   = tmp </> "tiled"
+                untiledDir = tmp </> "untiled"
+            tiledC <-
+              compileToCOptIOWithPipelineOptionsAndCodegenOptions
+                defaultInferOptions
+                polyOpts
+                defaultCodegenOptions
+                False
+                decs
+            untiledC <-
+              compileToCOptIOWithPipelineOptionsAndCodegenOptions
+                defaultInferOptions
+                untiledOpts
+                defaultCodegenOptions
+                False
+                decs
+            createDirectoryIfMissing True tiledDir
+            createDirectoryIfMissing True untiledDir
+            tiledExe   <- compileCToExecutable tiledDir   tiledC   False
+            untiledExe <- compileCToExecutable untiledDir untiledC False
+            tiledExit   <- runExecutableInDir tiledDir   tiledExe   jacobiEnv
+            untiledExit <- runExecutableInDir untiledDir untiledExe jacobiEnv
+            tiledExit   `shouldBe` ExitSuccess
+            untiledExit `shouldBe` ExitSuccess
+            tiledOut   <- readFile (tiledDir   </> "jacobi_out.csv")
+            untiledOut <- readFile (untiledDir </> "jacobi_out.csv")
+            tiledOut `shouldBe` untiledOut
+
     it "compiles a 1D index through a function parameter (Issue 3 fix)" $ withCC $
       checkInlineSrc $ BS.pack $ unlines
         [ "let f arr = index [0] arr + index [1] arr"
