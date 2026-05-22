@@ -71,28 +71,6 @@ postHoistIterateFixpoint = go 20
 normalizeIterateBodies :: [Stmt] -> [Stmt]
 normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs2 . fixpointOpt
 
-stmtsNeedIterateNormalization :: [Stmt] -> Bool
-stmtsNeedIterateNormalization = any stmtNeedsIterateNormalization
-  where
-    stmtNeedsIterateNormalization :: Stmt -> Bool
-    stmtNeedsIterateNormalization stmt = case stmt of
-      SLoop spec body ->
-        (lsRole spec == LoopIterate && stmtsContainIf body)
-          || stmtsNeedIterateNormalization body
-      SIf _ thn els ->
-        stmtsNeedIterateNormalization thn || stmtsNeedIterateNormalization els
-      _ ->
-        False
-
-    stmtsContainIf :: [Stmt] -> Bool
-    stmtsContainIf = any containsIf
-
-    containsIf :: Stmt -> Bool
-    containsIf stmt = case stmt of
-      SIf _ thn els -> True || stmtsContainIf thn || stmtsContainIf els
-      SLoop _ body -> stmtsContainIf body
-      _ -> False
-
 programHasConditionalIterates :: Program -> Bool
 programHasConditionalIterates (Program procs) = any (stmtsHaveConditionalIterate . procBody) procs
   where
@@ -169,15 +147,20 @@ optimizePipelineWithTiling enableTiling stmts =
 
 -- | Run the CFG cleanup steps that prepare loop nests for polyhedral
 -- extraction or scheduling.
+--
+-- We unconditionally apply 'normalizeIterateBodies' so that
+-- 'hoistIterateAllocs2' always runs before polyhedral extraction.  Hoisting
+-- the buffer allocation out of the iterate loop is required for the
+-- wavefront schedule to fire correctly: the wavefront ring-buffer logic
+-- assumes the "next" allocation is live outside the SCoP.  The previous
+-- conditional (only hoist when the iterate body contains an @if@) caused
+-- the allocaton to stay inside the SCoP, making the wavefront use an
+-- undeclared variable.
 preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
 preparePolyhedralProgramWithOptions _opts (Program procs) =
   Program
     [ proc
-        { procBody =
-            let body' = optimizePipelineWithTiling False (procBody proc)
-            in if stmtsNeedIterateNormalization body'
-                 then normalizeIterateBodies body'
-                 else body'
+        { procBody = normalizeIterateBodies (optimizePipelineWithTiling False (procBody proc))
         }
     | proc <- procs
     ]

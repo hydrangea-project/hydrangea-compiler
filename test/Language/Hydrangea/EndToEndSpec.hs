@@ -315,7 +315,7 @@ spec = do
           , "  input"
           ])
 
-    it "emits skewed tiled jacobi interior C and matches the untiled polyhedral path" $ withCC $
+    it "emits wavefront-tiled jacobi interior C and matches the untiled polyhedral path" $ withCC $
       withSystemTempDirectory "hydrangea-jacobi" $ \tmp -> do
         src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"
         case readDecs src of
@@ -350,7 +350,11 @@ spec = do
                 defaultCodegenOptions
                 False
                 decs
-            tiledC `shouldSatisfy` isInfixOf "__skew_origin"
+            -- The polyhedral tiling pass now uses a wavefront schedule with ring
+            -- buffers; check that the wavefront profitability guard and ring-buffer
+            -- allocations are present in the tiled C output.
+            tiledC `shouldSatisfy` isInfixOf "__wf_frontier_profitable"
+            tiledC `shouldSatisfy` isInfixOf "__wf_ring"
             createDirectoryIfMissing True tiledDir
             createDirectoryIfMissing True untiledDir
             tiledExe <- compileCToExecutable tiledDir tiledC False

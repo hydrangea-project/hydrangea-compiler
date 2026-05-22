@@ -2488,9 +2488,17 @@ buildWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
 buildWavefrontScop2 scheduled = do
   let strengthened = strengthenWavefrontScheduled2 scheduled
       scop = ssOriginal strengthened
+      stmtMap =
+        M.fromList
+          [ (psPath stmt, psStmt stmt)
+          | stmt <- scStatements scop
+          ]
   kernel <- matchWavefrontKernel2 strengthened
-  let replacement =
-        evalState (buildWavefrontBody2 kernel) (collectScopNames scop, 0)
+  fallback <- reifyScheduleTree stmtMap (ssSchedule strengthened)
+  replacement <-
+    evalState
+      (buildTiledWavefrontReplacement2 kernel fallback)
+      (collectScopNames scop, 0)
   pure strengthened { ssReplacement = Just replacement }
 
 buildTiledWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
@@ -2590,21 +2598,48 @@ isWavefrontLoopMapTree2 sched = case sched of
 
 matchWavefrontKernel2 :: ScheduledScop -> Maybe WavefrontKernel
 matchWavefrontKernel2 scheduled = do
-  [SLoop outerSpec outerBody] <- reifyScheduleTree stmtMap (ssSchedule scheduled)
+  reified <- reifyScheduleTree stmtMap (ssSchedule scheduled)
+  [SLoop outerSpec outerBody] <- Just reified
   guard (lsRole outerSpec == LoopIterate)
   [iterT] <- pure (lsIters outerSpec)
   [outerBound] <- pure (map simplifyIndexExpr (lsBounds outerSpec))
-  (prefix, innerStmt, suffix) <- splitFirstMatching2 isWavefrontInnerLoop2 outerBody
+  (prefix, innerStmt, suffix) <-
+    splitFirstMatching2 isWavefrontInnerLoop2 outerBody
   SLoop innerSpec innerBody <- Just innerStmt
   coeff <- wavefrontSkewCoeffForLoop2 iterT innerSpec
-  (stageSuffix, curVar, nextVar, preallocatedNext) <- matchWavefrontTail2 suffix
+  (stageSuffix, curVar, nextVar, preallocatedNext0) <- matchWavefrontTail2 suffix
+  -- The polyhedral scheduler may hoist buffer-rotation assignments for
+  -- nextVar into the prefix (before the inner loop), splitting the usual
+  -- three-statement ping-pong across the prefix and suffix. Detect this and
+  -- treat nextVar as preallocated, stripping its rotation from the prefix so
+  -- the wavefront ring-buffer machinery takes over.
+  --
+  -- We match only non-alloc assignments (RAtom, RBinOp, etc.) so that a
+  -- plain SAssign nextVar (RArrayAlloc ...) in the prefix is still handled
+  -- by removeWavefrontAlloc2, not incorrectly stripped as a rotation.
+  let nextVarInPrefix =
+        not preallocatedNext0
+          && any
+               ( \s -> case s of
+                   SAssign v rhs ->
+                     v == nextVar && case rhs of
+                       RArrayAlloc {} -> False
+                       _ -> True
+                   _ -> False
+               )
+               prefix
+      preallocatedNext = preallocatedNext0 || nextVarInPrefix
+      prefixForMatch
+        | nextVarInPrefix =
+            filter (\s -> case s of SAssign v _ -> v /= nextVar; _ -> True) prefix
+        | otherwise = prefix
   (allocShape, prefixWithoutAlloc) <-
-    case removeWavefrontAlloc2 nextVar prefix of
+    case removeWavefrontAlloc2 nextVar prefixForMatch of
       Just matched ->
         Just matched
       Nothing
         | preallocatedNext ->
-            Just (AVar "__wavefront_prealloc_shape", prefix)
+            Just (AVar "__wavefront_prealloc_shape", prefixForMatch)
       Nothing ->
         Nothing
   guard (all hoistableWavefrontStmt2 prefixWithoutAlloc)
@@ -2621,8 +2656,8 @@ matchWavefrontKernel2 scheduled = do
         if wavefrontParallelLegal2 (collectScopDependenceRelations2 (ssOriginal scheduled)) iterT headIter coeff
           then Workshare
                  ParallelSpec
-                     { psStrategy = ParallelGeneric
-                     , psPolicy = Just "schedule(static)"
+                    { psStrategy = ParallelGeneric
+                    , psPolicy = Just "schedule(static)"
                     , psSimdLen = Nothing
                     }
           else Serial
