@@ -3,8 +3,12 @@
 -- |
 -- Module: Language.Hydrangea.CFGPipeline
 --
--- Explicit pipeline for the canonical CFG loop representation.
--- Combines optimization, tiling, vectorization, and parallelization in order.
+-- Reusable CFG program pipelines.
+--
+-- This module assembles the CFG cleanup, tiling, vectorization, polyhedral,
+-- and parallelization passes into a handful of program-level entry points.
+-- These are library defaults: the CLI in @app/Main.hs@ can override
+-- 'defaultPipelineOptions' to expose different end-user defaults.
 module Language.Hydrangea.CFGPipeline
   ( -- * Pipeline configuration
     PipelineOptions(..)
@@ -40,6 +44,10 @@ data PipelineOptions = PipelineOptions
   , poVectorWidth :: Int
   }
 
+-- | Library-level default pipeline settings.
+--
+-- These defaults favor the C backend's optimization path. The CLI applies its
+-- own flag-derived defaults on top when compiling user programs.
 defaultPipelineOptions :: PipelineOptions
 defaultPipelineOptions = PipelineOptions
   { poEnableTiling = True
@@ -70,6 +78,10 @@ postHoistIterateFixpoint = go 20
 -- branching, so run the scalar cleanup pass again afterwards.
 normalizeIterateBodies :: [Stmt] -> [Stmt]
 normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs . fixpointOpt
+
+mapProcBodies :: ([Stmt] -> [Stmt]) -> Program -> Program
+mapProcBodies rewriteBody (Program procs) =
+  Program [proc { procBody = rewriteBody (procBody proc) } | proc <- procs]
 
 programHasConditionalIterates :: Program -> Bool
 programHasConditionalIterates (Program procs) = any (stmtsHaveConditionalIterate . procBody) procs
@@ -105,13 +117,7 @@ programHasConditionalIterates (Program procs) = any (stmtsHaveConditionalIterate
     stmtsContainIterate = any containsIterate
 
 cleanupProgram :: Program -> Program
-cleanupProgram (Program procs) =
-  Program
-    [ proc
-        { procBody = hoistIterateAllocs (fixpointOpt (procBody proc))
-        }
-    | proc <- procs
-    ]
+cleanupProgram = mapProcBodies (hoistIterateAllocs . fixpointOpt)
 
 serializeParallelStmts :: [Stmt] -> [Stmt]
 serializeParallelStmts = concatMap go
@@ -131,8 +137,7 @@ serializeParallelStmts = concatMap go
         [other]
 
 serializeParallelProgram :: Program -> Program
-serializeParallelProgram (Program procs) =
-  Program [proc { procBody = serializeParallelStmts (procBody proc) } | proc <- procs]
+serializeParallelProgram = mapProcBodies serializeParallelStmts
 
 -- | Optimization-only pipeline.
 optimizePipeline :: [Stmt] -> [Stmt]
@@ -149,21 +154,16 @@ optimizePipelineWithTiling enableTiling stmts =
 -- extraction or scheduling.
 --
 -- We unconditionally apply 'normalizeIterateBodies' so that
--- 'hoistIterateAllocs2' always runs before polyhedral extraction.  Hoisting
+-- 'hoistIterateAllocs' always runs before polyhedral extraction. Hoisting
 -- the buffer allocation out of the iterate loop is required for the
 -- wavefront schedule to fire correctly: the wavefront ring-buffer logic
 -- assumes the "next" allocation is live outside the SCoP.  The previous
 -- conditional (only hoist when the iterate body contains an @if@) caused
--- the allocaton to stay inside the SCoP, making the wavefront use an
+-- the allocation to stay inside the SCoP, making the wavefront use an
 -- undeclared variable.
 preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
-preparePolyhedralProgramWithOptions _opts (Program procs) =
-  Program
-    [ proc
-        { procBody = normalizeIterateBodies (optimizePipelineWithTiling False (procBody proc))
-        }
-    | proc <- procs
-    ]
+preparePolyhedralProgramWithOptions _opts =
+  mapProcBodies (normalizeIterateBodies . optimizePipelineWithTiling False)
 
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
@@ -179,8 +179,7 @@ vectorizePipelineWithOptions opts prog =
         | poEnablePolyhedral opts =
             cleanupPolyhedral (polyhedralProgram prepared)
         | otherwise = applyHoist prepared
-      applyHoist (Program procs) =
-        Program [proc { procBody = hoistIterateAllocs (procBody proc) } | proc <- procs]
+      applyHoist = mapProcBodies hoistIterateAllocs
       optimizedNoParallel
         | poEnableParallelization opts = optimized
         | otherwise = serializeParallelProgram optimized
@@ -227,13 +226,12 @@ metalPipeline = metalPipelineWithTiling True
 
 -- | Optimize and parallelize without SIMD vectorization with optional tiling.
 metalPipelineWithTiling :: Bool -> Program -> Program
-metalPipelineWithTiling enableTiling (Program procs) =
-  let optimized = [proc { procBody = optimizePipelineWithTiling enableTiling (procBody proc) } | proc <- procs]
-  in  parallelizeProgram (Program optimized)
+metalPipelineWithTiling enableTiling =
+  parallelizeProgram . mapProcBodies (optimizePipelineWithTiling enableTiling)
 
 -- | Run the full CFG pipeline: optimize, vectorize, parallelize, then clean up again.
 fullPipeline :: Program -> Program
 fullPipeline prog =
   case parallelizeProgram (vectorizePipeline prog) of
-    Program procs ->
-      Program [proc { procBody = fixpointOpt (procBody proc) } | proc <- procs]
+    optimized ->
+      mapProcBodies fixpointOpt optimized

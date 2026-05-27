@@ -3,21 +3,27 @@
 -- |
 -- Module: Language.Hydrangea.CFGOpt
 --
--- Scalar optimizations over the CFG IR.  The pipeline comprises:
+-- Scalar CFG cleanup and optimization passes.
 --
--- 1. /Copy propagation/ ('copyProp2') — forward substitution of direct
+-- The main fixpoint pipeline currently combines:
+--
+-- 1. /Copy propagation/ ('copyProp') — forward substitution of direct
 --    @x = a@ assignments.
--- 2. /Common subexpression elimination/ ('cseStmts2') — replace repeated
+-- 2. /Common subexpression elimination/ ('cseStmts') — replace repeated
 --    pure computations with a reference to the first variable that computed
 --    the same canonical expression.
--- 3. /Dead assignment elimination/ ('deadAssignElim2') — backwards liveness
+-- 3. /Scalarization of 0-D array roundtrips/ ('scalarizeZeroDimArrayRoundtrips')
+--    — collapse lowered scalar materialization patterns back to scalar values.
+-- 4. /Dead assignment elimination/ ('deadAssignElim') — backwards liveness
 --    analysis that removes pure assignments whose result is never used.
--- 4. /Loop-invariant code motion/ ('loopInvariantCodeMotion2') — hoist pure
+-- 5. /Loop-invariant code motion/ ('loopInvariantCodeMotion') — hoist pure
 --    loop-invariant computations to the loop pre-header.
--- 5. /Inlining/ ('inlineProgram') — inline small, non-recursive procedures
---    to expose further optimization opportunities.
 --
--- Passes are composed and iterated to a fixpoint by 'optimizeProgram2'.
+-- The module also provides targeted restructuring passes such as iterate-loop
+-- unswitching and allocation hoisting, plus /Inlining/ ('inlineProgram'),
+-- which exposes further optimization opportunities.
+--
+-- These passes are composed and iterated to a fixpoint by 'optimizeProgram'.
 module Language.Hydrangea.CFGOpt
   ( -- * Entry points
     optimizeStmts
@@ -61,8 +67,8 @@ import Language.Hydrangea.CFGAnalysis
 
 -- | Returns 'True' when an 'RHS' is /pure/: it produces a value with no
 -- observable side effects and may therefore be removed if the defined
--- variable is dead.  Array and vector stores ('RArrayStore', 'RVecStore')
--- and procedure calls ('RCall') are conservatively treated as impure.
+-- variable is dead. Vector stores, procedure calls, and explicit frees are
+-- conservatively treated as impure.
 rhsIsPure :: RHS -> Bool
 rhsIsPure rhs = case rhs of
   RAtom{}       -> True
@@ -90,6 +96,23 @@ rhsIsPure rhs = case rhs of
   RPairSnd{}    -> True
   RArrayFree{}  -> False     -- side effect: frees heap memory
   _             -> False
+
+-- | Recognize cached zero-argument value procedures that are safe to treat
+-- like pure expressions for hoisting/unswitching purposes.
+isZeroArgCall :: RHS -> Bool
+isZeroArgCall (RCall _ []) = True
+isZeroArgCall _ = False
+
+-- | Count scalar assignments in a statement tree so hoisting/unswitching can
+-- reject duplicated definitions.
+countAssignedVars :: [Stmt] -> Map ByteString Int
+countAssignedVars = foldr go M.empty
+  where
+    go stmt acc = case stmt of
+      SAssign x _ -> M.insertWith (+) x 1 acc
+      SLoop _ body -> foldr go acc body
+      SIf _ thn els -> foldr go (foldr go acc thn) els
+      _ -> acc
 
 ------------------------------------------------------------------------
 -- Atom / RHS substitution
@@ -582,8 +605,6 @@ loopInvariantCodeMotion = concatMap goStmt
       && M.findWithDefault 0 x defCounts == 1
       && (rhsIsPure rhs || isZeroArgCall rhs)
       && S.null (usedVarsRHS rhs `S.intersection` loopDeps)
-      where isZeroArgCall (RCall _ []) = True
-            isZeroArgCall _            = False
     isHoistable _ _ _ _ = False
 
     hoistCommonBranchPrefix :: Set ByteString -> Stmt -> [Stmt]
@@ -602,18 +623,9 @@ loopInvariantCodeMotion = concatMap goStmt
 
     isBranchHoistable :: Set ByteString -> Stmt -> Bool
     isBranchHoistable loopDeps (SAssign _ rhs) =
-      (rhsIsPure rhs || (case rhs of RCall _ [] -> True; _ -> False))
+      (rhsIsPure rhs || isZeroArgCall rhs)
       && S.null (usedVarsRHS rhs `S.intersection` loopDeps)
     isBranchHoistable _ _ = False
-
-    countAssignedVars :: [Stmt] -> Map ByteString Int
-    countAssignedVars = foldr go M.empty
-      where
-        go stmt acc = case stmt of
-          SAssign x _ -> M.insertWith (+) x 1 acc
-          SLoop _ body -> foldr go acc body
-          SIf _ thn els -> foldr go (foldr go acc thn) els
-          _ -> acc
 
 ------------------------------------------------------------------------
 -- Loop-invariant conditional unswitching
@@ -665,7 +677,7 @@ unswitchLoopInvariantIf = concatMap goStmt
                 Nothing
           stmt : rest
             | invariantPrefixStmt hoistedDefs stmt ->
-                let hoistedDefs' = hoistedDefs `S.union` definedVarsStmt stmt
+                let hoistedDefs' = hoistedDefs `S.union` definedVarsStmts [stmt]
                 in go (stmt : prefix) hoistedDefs' rest
             | otherwise ->
                 Nothing
@@ -687,24 +699,6 @@ unswitchLoopInvariantIf = concatMap goStmt
         disallowed :: Set ByteString -> Set ByteString
         disallowed hoistedDefs =
           iterDefs `S.union` (bodyDefs `S.difference` hoistedDefs)
-
-        definedVarsStmt :: Stmt -> Set ByteString
-        definedVarsStmt stmt = case stmt of
-          SAssign x _ -> S.singleton x
-          _ -> S.empty
-
-        countAssignedVars :: [Stmt] -> Map ByteString Int
-        countAssignedVars = foldr goCount M.empty
-          where
-            goCount stmt acc = case stmt of
-              SAssign x _ -> M.insertWith (+) x 1 acc
-              SLoop _ innerBody -> foldr goCount acc innerBody
-              SIf _ thn els -> foldr goCount (foldr goCount acc thn) els
-              _ -> acc
-
-        isZeroArgCall :: RHS -> Bool
-        isZeroArgCall (RCall _ []) = True
-        isZeroArgCall _ = False
 
 ------------------------------------------------------------------------
 -- No-op cleanup
