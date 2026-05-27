@@ -24,9 +24,9 @@
 -- 'procArrayFacts'; the statement-level helper 'parallelizeStmts2' wraps
 -- a synthetic procedure to remain conservative.
 module Language.Hydrangea.Parallelize
-  ( parallelizeProc2
-  , parallelizeProgram2
-  , parallelizeStmts2
+  ( parallelizeProc
+  , parallelizeProgram
+  , parallelizeStmts
   ) where
 
 import Data.Map.Strict (Map)
@@ -35,20 +35,20 @@ import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..))
 import Language.Hydrangea.CFG
-import Language.Hydrangea.CFGTyping (recoverProcTypeEnv2)
+import Language.Hydrangea.CFGTyping (recoverProcTypeEnv)
 import Language.Hydrangea.CFGAnalysis
-  ( isParallelTripCount2
-  , loopTripCount2
-  , tripCountValue2
+  ( isParallelTripCount
+  , loopTripCount
+  , tripCountValue
   )
 import Language.Hydrangea.Dependence
-  ( findDependences2
-  , ArrayAccess2(..)
-  , AccessType2(..)
-  , Dependence2(..)
-  , depDirection2
-  , depIsLoopCarried2
-  , DependenceDirection2(..)
+  ( findDependences
+  , ArrayAccess(..)
+  , AccessType(..)
+  , Dependence(..)
+  , depDirection
+  , depIsLoopCarried
+  , DependenceDirection(..)
   )
 
 type ArrayFacts = Map CVar ArrayFact
@@ -86,17 +86,17 @@ atomToIndexExpr _        = ICall "opaque" []
 -- depth-first order, assigning each a unique sequential index.  The index
 -- is used by 'findDependences2' to determine the relative order of a source
 -- and target access within the same loop body.
-extractAccesses2 :: [Stmt] -> [ArrayAccess2]
-extractAccesses2 stmts =
-  zipWith (\i acc -> acc { aa2StmtIndex = i }) [0..] (collect stmts)
+extractAccesses :: [Stmt] -> [ArrayAccess]
+extractAccesses stmts =
+  zipWith (\i acc -> acc { aaStmtIndex = i }) [0..] (collect stmts)
   where
-    collect :: [Stmt] -> [ArrayAccess2]
+    collect :: [Stmt] -> [ArrayAccess]
     collect = concatMap collectStmt
 
     collectStmt (SArrayWrite (AVar arr) idx _) =
-      [ArrayAccess2 arr (atomToIndexExpr idx) Write2 0]
+      [ArrayAccess arr (atomToIndexExpr idx) Write 0]
     collectStmt (SAssign _ (RArrayLoad (AVar arr) idx)) =
-      [ArrayAccess2 arr (atomToIndexExpr idx) Read2 0]
+      [ArrayAccess arr (atomToIndexExpr idx) Read 0]
     -- Do not recurse into nested loops: the outer loop's legality is
     -- determined only by accesses at this level; nested-loop deps are
     -- handled by those loops' own legality checks.
@@ -119,19 +119,19 @@ emptyLoopArrayUsage :: LoopArrayUsage
 emptyLoopArrayUsage = LoopArrayUsage False False
 
 -- | Incorporate one access type into an existing usage summary.
-accumulateArrayUsage :: LoopArrayUsage -> AccessType2 -> LoopArrayUsage
+accumulateArrayUsage :: LoopArrayUsage -> AccessType -> LoopArrayUsage
 accumulateArrayUsage u accessType = case accessType of
-  Read2      -> u { lauReads  = True }
-  Write2     -> u { lauWrites = True }
-  ReadWrite2 -> u { lauReads  = True, lauWrites = True }
+  Read      -> u { lauReads  = True }
+  Write     -> u { lauWrites = True }
+  ReadWrite -> u { lauReads  = True, lauWrites = True }
 
 -- | Build a per-array read/write summary for all accesses in a loop body.
 collectLoopArrayUsage :: [Stmt] -> Map CVar LoopArrayUsage
-collectLoopArrayUsage = foldl' record M.empty . extractAccesses2
+collectLoopArrayUsage = foldl' record M.empty . extractAccesses
   where
     record m acc =
-      M.insertWith mergeUsage (aa2ArrayVar acc)
-        (accumulateArrayUsage emptyLoopArrayUsage (aa2AccessType acc)) m
+      M.insertWith mergeUsage (aaArrayVar acc)
+        (accumulateArrayUsage emptyLoopArrayUsage (aaAccessType acc)) m
 
     mergeUsage a b = LoopArrayUsage
       { lauReads  = lauReads  a || lauReads  b
@@ -153,23 +153,23 @@ collectLoopArrayUsage = foldl' record M.empty . extractAccesses2
 --   and handled by the OpenMP reduction clause.
 passesConservativeDependenceCheck :: LoopSpec -> [Stmt] -> Bool
 passesConservativeDependenceCheck spec body =
-  isParallelTripCount2 (loopTripCount2 spec)
+  isParallelTripCount (loopTripCount spec)
   && not hasBlockingDependence
   && not hasReadWriteHazard
   && (lsRole spec == LoopReduction || not (hasScalarCarriedDep spec body))
   where
-    accesses = extractAccesses2 body
-    deps     = findDependences2 accesses
+    accesses = extractAccesses body
+    deps     = findDependences accesses
     usage    = collectLoopArrayUsage body
 
     -- Read-read dependences never block parallelism; only consider pairs
     -- where at least one access is a write.
-    isWriteAccess at = at == Write2 || at == ReadWrite2
-    hasWriteEnd d    = isWriteAccess (aa2AccessType (depSource2 d))
-                    || isWriteAccess (aa2AccessType (depTarget2 d))
+    isWriteAccess at = at == Write || at == ReadWrite
+    hasWriteEnd d    = isWriteAccess (aaAccessType (depSource d))
+                    || isWriteAccess (aaAccessType (depTarget d))
 
     hasBlockingDependence =
-      any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward && hasWriteEnd d) deps
+      any (\d -> depIsLoopCarried d && depDirection d /= DDForward && hasWriteEnd d) deps
     hasReadWriteHazard =
       any (\u -> lauReads u && lauWrites u) (M.elems usage)
 
@@ -320,7 +320,7 @@ detectInjectiveScatterKernel spec body = do
 -- write-once, and all other accessed arrays to be read-only.
 factsPermitDirectScatterLoop :: ArrayFacts -> LoopSpec -> [Stmt] -> Bool
 factsPermitDirectScatterLoop arrayFacts spec body =
-  isParallelTripCount2 (loopTripCount2 spec) &&
+  isParallelTripCount (loopTripCount spec) &&
   case detectInjectiveScatterKernel spec body of
     Nothing   -> False
     Just info ->
@@ -380,7 +380,7 @@ detectScatterAtomicAddKernel spec body = do
     ] of
     [single] -> Just single
     _        -> Nothing
-  if isParallelTripCount2 (loopTripCount2 spec)
+  if isParallelTripCount (loopTripCount spec)
     then Just (ScatterAtomicAddInfo destArr valueTy)
     else Nothing
   where
@@ -477,7 +477,7 @@ factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
             _ -> False
   where
     profitable dest =
-      case (M.lookup dest allocSizes, tripCountValue2 (loopTripCount2 spec)) of
+      case (M.lookup dest allocSizes, tripCountValue (loopTripCount spec)) of
         (Just sz, Just tc) -> sz > 0 && sz <= 64 && tc >= max 32 (sz * 4)
         _                  -> False  -- unknown output size: prefer atomic scatter (no alloc, no serial merge)
 
@@ -574,7 +574,7 @@ parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
 
     canParallelizeWithFacts =
       lsRole spec == LoopMap
-      && isParallelTripCount2 (loopTripCount2 spec)
+      && isParallelTripCount (loopTripCount spec)
       && factsPermitParallelLoop arrayFacts body
     canParallelizeDirectScatter     = factsPermitDirectScatterLoop     arrayFacts           spec body
     canParallelizePrivatizedScatter = factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body
@@ -618,18 +618,18 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
 
 -- | Rewrite eligible serial loops in one procedure using the array facts
 -- and type environment attached to that procedure by the lowering pass.
-parallelizeProc2 :: Proc -> Proc
-parallelizeProc2 proc =
-  let typeEnv    = recoverProcTypeEnv2 M.empty M.empty proc
+parallelizeProc :: Proc -> Proc
+parallelizeProc proc =
+  let typeEnv    = recoverProcTypeEnv M.empty M.empty proc
       allocSizes = collectArrayAllocSizes (procBody proc)
   in  proc { procBody = parallelizeProcWithFacts
                           (procArrayFacts proc) typeEnv allocSizes (procBody proc) }
 
 -- | Parallelize every procedure in a program.
-parallelizeProgram2 :: Program -> Program
-parallelizeProgram2 (Program procs) = Program (map parallelizeProc2 procs)
+parallelizeProgram :: Program -> Program
+parallelizeProgram (Program procs) = Program (map parallelizeProc procs)
 
 -- | Rewrite eligible serial loops in a statement list using the
 -- conservative dependence-based legality check (no array facts available).
-parallelizeStmts2 :: [Stmt] -> [Stmt]
-parallelizeStmts2 = procBody . parallelizeProc2 . mkProc "parallelize_stmts2" []
+parallelizeStmts :: [Stmt] -> [Stmt]
+parallelizeStmts = procBody . parallelizeProc . mkProc "parallelize_stmts2" []

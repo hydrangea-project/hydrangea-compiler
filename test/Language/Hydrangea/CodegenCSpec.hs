@@ -11,9 +11,9 @@ import Language.Hydrangea.CodegenC
   ( BenchmarkConfig(..)
   , CodegenArtifacts(..)
   , CodegenOptions(..)
-  , codegenProgram2
-  , codegenProgram2WithOptions
-  , codegenProgram2WithOptionsPrune
+  , codegenProgram
+  , codegenProgramWithOptions
+  , codegenProgramWithOptionsPrune
   , defaultCodegenOptions
   )
 import Test.Hspec
@@ -27,7 +27,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for"
 
   it "emits omp simd from Vector ExecPolicy" $ do
@@ -37,7 +37,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(4)"
 
   it "omits omp simd for very short vector loops" $ do
@@ -47,7 +47,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` (not . isInfixOf "#pragma omp simd simdlen(4)")
 
   it "emits parallel reduction clause from ReductionSpec" $ do
@@ -55,21 +55,21 @@ spec = describe "CodegenC" $ do
         spec' = LoopSpec ["i"] [IConst 16] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing))
                   (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AInt 0)]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "reduction(+:acc)"
 
   it "emits collapse for ND parallel loops" $ do
     let spec' = LoopSpec ["i", "j", "k"] [IConst 2, IConst 3, IConst 4]
                   (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopPlain []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for collapse(3)"
 
   it "emits policy clauses carried by ParallelSpec" $ do
     let spec' = LoopSpec ["i"] [IConst 8]
                   (Parallel (ParallelSpec ParallelGeneric (Just "schedule(static)") Nothing)) Nothing LoopPlain []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for schedule(static)"
 
   it "emits omp parallel regions with inner worksharing loops" $ do
@@ -87,7 +87,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel"
     c `shouldSatisfy` isInfixOf "#pragma omp for schedule(static)"
     c `shouldSatisfy` (not . isInfixOf "#pragma omp parallel for schedule(static)")
@@ -95,7 +95,7 @@ spec = describe "CodegenC" $ do
   it "emits role-aware comments for outer map-reduction loops" $ do
     let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopMapReduction []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "map-reduction outer loop"
 
   it "emits ND reduction pragmas with collapse" $ do
@@ -104,7 +104,7 @@ spec = describe "CodegenC" $ do
                   (Parallel (ParallelSpec ParallelGeneric Nothing Nothing))
                   (Just (ReductionSpec "acc" (IConst 1) C.RMul)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AVar "acc")]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for collapse(2) reduction(*:acc)"
 
   it "emits strategy comments for direct scatter parallel loops" $ do
@@ -114,7 +114,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-direct */"
 
   it "emits atomic update code for integer scatter-add loops" $ do
@@ -133,7 +133,7 @@ spec = describe "CodegenC" $ do
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-int */"
     c `shouldSatisfy` isInfixOf "#pragma omp atomic update"
     c `shouldSatisfy` isInfixOf "+= val;"
@@ -155,7 +155,7 @@ spec = describe "CodegenC" $ do
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64), ("routes", C.CTArray C.CTInt64), ("vals", C.CTArray C.CTInt64)] }
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
     c `shouldSatisfy` isInfixOf "#pragma omp for"
     c `shouldSatisfy` isInfixOf "calloc((size_t)"
@@ -183,7 +183,7 @@ spec = describe "CodegenC" $ do
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-int */"
     c `shouldSatisfy` isInfixOf "if (guard)"
     c `shouldSatisfy` isInfixOf "#pragma omp atomic update"
@@ -204,7 +204,7 @@ spec = describe "CodegenC" $ do
               ])
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTDouble)] }
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-float */"
     c `shouldSatisfy` isInfixOf "#pragma omp atomic update"
     c `shouldSatisfy` isInfixOf "+= val;"
@@ -216,7 +216,7 @@ spec = describe "CodegenC" $ do
                   [ SReturn (C.AInt 0) ]
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 10LL; i++)"
     c `shouldSatisfy` isInfixOf "return"
 
@@ -227,7 +227,7 @@ spec = describe "CodegenC" $ do
                   [ SReturn (C.AInt 0) ]
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 3LL; i++)"
     c `shouldSatisfy` isInfixOf "for (int64_t j = 0; j < 4LL; j++)"
 
@@ -240,7 +240,7 @@ spec = describe "CodegenC" $ do
               , SReturn (AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` (\out -> "->data[" `isInfixOf` out || "(((" `isInfixOf` out)
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 10LL; i++)"
 
@@ -251,7 +251,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AVar "t")
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "(hyd_tuple_t){.ndims="
 
   it "emits array shape operation" $ do
@@ -261,7 +261,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AVar "shp")
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "->shape"
 
   it "emits array load" $ do
@@ -271,7 +271,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AVar "x")
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` (\out -> "->data[" `isInfixOf` out || "(((" `isInfixOf` out)
 
   it "emits record struct typedefs and field access from CTRecord" $ do
@@ -283,7 +283,7 @@ spec = describe "CodegenC" $ do
                 ])
               { procTypeEnv = Map.fromList [("r", C.CTRecord [("x", C.CTInt64), ("y", C.CTDouble)]), ("xv", C.CTInt64)] }
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "int64_t x;"
     c `shouldSatisfy` isInfixOf "double y;"
     c `shouldSatisfy` isInfixOf ".x = 1LL"
@@ -294,7 +294,7 @@ spec = describe "CodegenC" $ do
         spec' = LoopSpec ["i"] [IConst 16] Serial
                   (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AVar "acc")]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "int64_t acc = 0LL;"
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 16LL; i++)"
 
@@ -305,7 +305,7 @@ spec = describe "CodegenC" $ do
                   [ SReturn (C.AInt 0) ]
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < n; i++)"
 
   it "emits vector loop without remainder when TailNone" $ do
@@ -315,7 +315,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "vectorized loop, width = 4"
     c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(4)"
 
@@ -326,7 +326,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "compiler handles tail"
     c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(4)"
 
@@ -335,7 +335,7 @@ spec = describe "CodegenC" $ do
         spec' = LoopSpec ["i"] [IConst 16] (Vector (VectorSpec 2 TailNone))
                   (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SAssign "x" (C.RAtom (C.AFloat 1.0)), SLoop spec' body, SReturn (C.AVar "acc")]]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(2) reduction(+:acc)"
 
   it "emits vector intrinsics for explicit RVec lowering" $ do
@@ -356,7 +356,7 @@ spec = describe "CodegenC" $ do
               , SReturn (C.AInt 0)
               ]
           ]
-        c = codegenProgram2 prog
+        c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "hyd_float64x4_t x__vec"
     c `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"
     c `shouldSatisfy` isInfixOf "hyd_vec_add_f64x4"
@@ -377,7 +377,7 @@ spec = describe "CodegenC" $ do
             { procTypeEnv = Map.fromList [("tmp", C.CTArray C.CTInt64)] }
         prog = Program [inputProc, kernelProc]
         artifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenBenchmark = Just (BenchmarkConfig "kernel" 1 1)
@@ -403,7 +403,7 @@ spec = describe "CodegenC" $ do
             { procTypeEnv = Map.fromList [("tmp", C.CTArray C.CTInt64)] }
         prog = Program [inputProc, kernelProc]
         artifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenBenchmark = Just (BenchmarkConfig "kernel" 1 1)
@@ -424,13 +424,13 @@ spec = describe "CodegenC" $ do
             { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
         prog = Program [kernelProc]
         nonBenchArtifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenEmitMain = False
               }
             prog
         benchArtifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenBenchmark = Just (BenchmarkConfig "kernel" 1 1)
@@ -454,7 +454,7 @@ spec = describe "CodegenC" $ do
             { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
         prog = Program [kernelProc]
         artifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenBenchmark = Just (BenchmarkConfig "kernel" 2 3)
               }
@@ -469,7 +469,7 @@ spec = describe "CodegenC" $ do
         kernelProc = mkProc "kernel" [] [SReturn (C.AFloat 1.0)]
         prog = Program [helperProc, kernelProc]
         artifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenBenchmark = Just (BenchmarkConfig "kernel" 1 2)
               }
@@ -483,7 +483,7 @@ spec = describe "CodegenC" $ do
   it "emits export wrapper and suppresses main in export mode" $ do
     let prog = Program [mkProc "main" [] [SReturn (C.AInt 42)]]
         artifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenExportKernel = Just "main"
@@ -500,7 +500,7 @@ spec = describe "CodegenC" $ do
   it "exports a parameterized kernel with forwarded arguments" $ do
     let prog = Program [mkProc "kernel" ["n"] [SReturn (C.AVar "n")]]
         artifacts =
-          codegenProgram2WithOptions
+          codegenProgramWithOptions
             defaultCodegenOptions
               { codegenEmitMain = False
               , codegenExportKernel = Just "kernel"
@@ -519,7 +519,7 @@ spec = describe "CodegenC" $ do
             [ mkProc "main" [] [SReturn (C.AInt 42)]
             , mkProc "dead" [] [SReturn (C.AInt 7)]
             ]
-    case codegenProgram2WithOptionsPrune defaultCodegenOptions True prog of
+    case codegenProgramWithOptionsPrune defaultCodegenOptions True prog of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } -> do
         c `shouldSatisfy` isInfixOf "int64_t hyd_main(void)"

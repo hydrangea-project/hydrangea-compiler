@@ -11,17 +11,17 @@ module Language.Hydrangea.CFGPipeline
   , defaultPipelineOptions
     -- * Pipelines
   , preparePolyhedralProgramWithOptions
-  , optimizePipeline2
+  , optimizePipeline
   , optimizePipelineWithTiling
-  , vectorizePipeline2
+  , vectorizePipeline
   , vectorizePipelineWithWidth
   , vectorizePipelineWithOptions
-  , parallelPipeline2
+  , parallelPipeline
   , parallelPipelineWithWidth
   , pipelineWithOptions
-  , metalPipeline2
+  , metalPipeline
   , metalPipelineWithTiling
-  , fullPipeline2
+  , fullPipeline
   ) where
 
 
@@ -51,7 +51,7 @@ defaultPipelineOptions = PipelineOptions
 
 -- | Run the local optimization pass to fixpoint.
 fixpointOpt :: [Stmt] -> [Stmt]
-fixpointOpt = optimizeStmts2
+fixpointOpt = optimizeStmts
 
 -- | After iterate-allocation hoisting, run only the structurally safe cleanup
 -- passes that expose invariant case splits without touching the ping-pong
@@ -62,14 +62,14 @@ postHoistIterateFixpoint = go 20
     go :: Int -> [Stmt] -> [Stmt]
     go 0 stmts = stmts
     go n stmts =
-      let stmts' = unswitchLoopInvariantIf2 stmts
+      let stmts' = unswitchLoopInvariantIf stmts
       in if stmts' == stmts then stmts else go (n - 1) stmts'
 
 -- | Normalize iterate bodies before downstream scheduling/vectorization.
 -- Hoisting the ping-pong allocs can expose additional invariant shape-case
 -- branching, so run the scalar cleanup pass again afterwards.
 normalizeIterateBodies :: [Stmt] -> [Stmt]
-normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs2 . fixpointOpt
+normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs . fixpointOpt
 
 programHasConditionalIterates :: Program -> Bool
 programHasConditionalIterates (Program procs) = any (stmtsHaveConditionalIterate . procBody) procs
@@ -108,7 +108,7 @@ cleanupProgram :: Program -> Program
 cleanupProgram (Program procs) =
   Program
     [ proc
-        { procBody = hoistIterateAllocs2 (fixpointOpt (procBody proc))
+        { procBody = hoistIterateAllocs (fixpointOpt (procBody proc))
         }
     | proc <- procs
     ]
@@ -135,15 +135,15 @@ serializeParallelProgram (Program procs) =
   Program [proc { procBody = serializeParallelStmts (procBody proc) } | proc <- procs]
 
 -- | Optimization-only pipeline.
-optimizePipeline2 :: [Stmt] -> [Stmt]
-optimizePipeline2 = optimizePipelineWithTiling True
+optimizePipeline :: [Stmt] -> [Stmt]
+optimizePipeline = optimizePipelineWithTiling True
 
 -- | Optimization-only pipeline with optional tiling.
 optimizePipelineWithTiling :: Bool -> [Stmt] -> [Stmt]
 optimizePipelineWithTiling enableTiling stmts =
-  let stmts' = optimizeStmts2 stmts
-      stmts'' = if enableTiling then tileStmts2 stmts' else stmts'
-  in  optimizeStmts2 stmts''
+  let stmts' = optimizeStmts stmts
+      stmts'' = if enableTiling then tileStmts stmts' else stmts'
+  in  optimizeStmts stmts''
 
 -- | Run the CFG cleanup steps that prepare loop nests for polyhedral
 -- extraction or scheduling.
@@ -174,17 +174,17 @@ vectorizePipelineWithOptions opts prog =
         | otherwise = cleanupProgram scheduled
       optimized
         | poEnablePolyhedral opts && poEnableTiling opts =
-            cleanupPolyhedral (polyhedralTileProgram2 prepared)
-        | poEnableTiling opts = cleanupProgram (polyhedralIdentityTileProgram2 prepared)
+            cleanupPolyhedral (polyhedralTileProgram prepared)
+        | poEnableTiling opts = cleanupProgram (polyhedralIdentityTileProgram prepared)
         | poEnablePolyhedral opts =
-            cleanupPolyhedral (polyhedralProgram2 prepared)
+            cleanupPolyhedral (polyhedralProgram prepared)
         | otherwise = applyHoist prepared
       applyHoist (Program procs) =
-        Program [proc { procBody = hoistIterateAllocs2 (procBody proc) } | proc <- procs]
+        Program [proc { procBody = hoistIterateAllocs (procBody proc) } | proc <- procs]
       optimizedNoParallel
         | poEnableParallelization opts = optimized
         | otherwise = serializeParallelProgram optimized
-  in  vectorizeProgram2WithWidthAndExplicit
+  in  vectorizeProgramWithWidthAndExplicit
         (poVectorWidth opts)
         (poEnableExplicitVectorization opts)
         optimizedNoParallel
@@ -200,40 +200,40 @@ vectorizePipelineWithWidth w =
       }
 
 -- | Run optimization followed by vectorization.
-vectorizePipeline2 :: Program -> Program
-vectorizePipeline2 = vectorizePipelineWithWidth defaultVectorWidth
+vectorizePipeline :: Program -> Program
+vectorizePipeline = vectorizePipelineWithWidth defaultVectorWidth
 
 -- | Run optimization followed by loop parallelization using the given SIMD lane width.
 parallelPipelineWithWidth :: Int -> Program -> Program
 parallelPipelineWithWidth w prog =
-  parallelizeProgram2 (vectorizePipelineWithWidth w prog)
+  parallelizeProgram (vectorizePipelineWithWidth w prog)
 
 -- | Run optimization followed by loop parallelization.
-parallelPipeline2 :: Program -> Program
-parallelPipeline2 = parallelPipelineWithWidth defaultVectorWidth
+parallelPipeline :: Program -> Program
+parallelPipeline = parallelPipelineWithWidth defaultVectorWidth
 
 -- | Run optimization, vectorization, and optional parallelization.
 pipelineWithOptions :: PipelineOptions -> Program -> Program
 pipelineWithOptions opts prog =
   let vecProg = vectorizePipelineWithOptions opts prog
   in if poEnableParallelization opts
-       then parallelizeProgram2 vecProg
+       then parallelizeProgram vecProg
        else vecProg
 
 -- | Optimize and parallelize without SIMD vectorization. Suitable for GPU
 -- backends where SIMD is handled by the hardware (e.g. Metal/MSL).
-metalPipeline2 :: Program -> Program
-metalPipeline2 = metalPipelineWithTiling True
+metalPipeline :: Program -> Program
+metalPipeline = metalPipelineWithTiling True
 
 -- | Optimize and parallelize without SIMD vectorization with optional tiling.
 metalPipelineWithTiling :: Bool -> Program -> Program
 metalPipelineWithTiling enableTiling (Program procs) =
   let optimized = [proc { procBody = optimizePipelineWithTiling enableTiling (procBody proc) } | proc <- procs]
-  in  parallelizeProgram2 (Program optimized)
+  in  parallelizeProgram (Program optimized)
 
 -- | Run the full CFG pipeline: optimize, vectorize, parallelize, then clean up again.
-fullPipeline2 :: Program -> Program
-fullPipeline2 prog =
-  case parallelizeProgram2 (vectorizePipeline2 prog) of
+fullPipeline :: Program -> Program
+fullPipeline prog =
+  case parallelizeProgram (vectorizePipeline prog) of
     Program procs ->
       Program [proc { procBody = fixpointOpt (procBody proc) } | proc <- procs]

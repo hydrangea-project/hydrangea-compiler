@@ -13,7 +13,7 @@ import Language.Hydrangea.CFGCore (RHS(..))
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
   , CodegenOptions(..)
-  , codegenProgram2WithOptionsPrune
+  , codegenProgramWithOptionsPrune
   , defaultCodegenOptions
   )
 import Language.Hydrangea.Frontend
@@ -85,19 +85,19 @@ emitParallelCFromSource src = parseDecsOrFail src >>= compileToCOptParallelIO Fa
 emitExportArtifactsFromSource :: ByteString -> ByteString -> IO CodegenArtifacts
 emitExportArtifactsFromSource kernel src = do
   decs <- parseDecsOrFail src
-  prog <- lowerToCFG2WithTypes decs
-  case codegenProgram2WithOptionsPrune
+  prog <- lowerToCFGWithTypes decs
+  case codegenProgramWithOptionsPrune
          defaultCodegenOptions
            { codegenEmitMain = False
            , codegenExportKernel = Just kernel
            }
          False
-         (optimizeParallelCFG2 prog) of
+         (optimizeParallelCFG prog) of
     Left err -> fail err
     Right artifacts -> pure artifacts
 
 lowerOptFromSource :: ByteString -> IO Program
-lowerOptFromSource src = parseDecsOrFail src >>= lowerToCFG2OptWithTypes
+lowerOptFromSource src = parseDecsOrFail src >>= lowerToCFGOptWithTypes
 
 lookupProc :: ByteString -> Program -> Proc
 lookupProc name (Program procs) =

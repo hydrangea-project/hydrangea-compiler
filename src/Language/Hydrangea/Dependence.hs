@@ -6,40 +6,40 @@
 -- Dependence analysis operating on CFG index expressions. Uses exact equality
 -- and simple affine checks (e.g., i vs i + const).
 module Language.Hydrangea.Dependence
-  ( ArrayAccess2(..)
-  , AccessType2(..)
-  , Dependence2(..)
-  , DependenceDirection2(..)
-  , findDependences2
+  ( ArrayAccess(..)
+  , AccessType(..)
+  , Dependence(..)
+  , DependenceDirection(..)
+  , findDependences
   ) where
 
 import Language.Hydrangea.CFG
 import Control.Monad (guard)
 
 -- | Kind of memory access performed at a CFG array reference.
-data AccessType2 = Read2 | Write2 | ReadWrite2
+data AccessType = Read | Write | ReadWrite
   deriving (Eq, Show)
 
 -- | Normalized array access used by dependence analysis.
-data ArrayAccess2 = ArrayAccess2
-  { aa2ArrayVar :: CVar
-  , aa2Index :: IndexExpr
-  , aa2AccessType :: AccessType2
-  , aa2StmtIndex :: Int
+data ArrayAccess = ArrayAccess
+  { aaArrayVar :: CVar
+  , aaIndex :: IndexExpr
+  , aaAccessType :: AccessType
+  , aaStmtIndex :: Int
   }
   deriving (Eq, Show)
 
 -- | Direction classification for a dependence edge.
-data DependenceDirection2 = DDForward | DDBackward | DDUnknown
+data DependenceDirection = DDForward | DDBackward | DDUnknown
   deriving (Eq, Show)
 
 -- | Conservative dependence result between two accesses in one loop body.
-data Dependence2 = Dependence2
-  { depSource2 :: ArrayAccess2
-  , depTarget2 :: ArrayAccess2
-  , depDirection2 :: DependenceDirection2
-  , depIsLoopCarried2 :: Bool
-  , depDistance2 :: Maybe [Integer]
+data Dependence = Dependence
+  { depSource :: ArrayAccess
+  , depTarget :: ArrayAccess
+  , depDirection :: DependenceDirection
+  , depIsLoopCarried :: Bool
+  , depDistance :: Maybe [Integer]
   }
   deriving (Eq, Show)
 
@@ -49,19 +49,19 @@ data Dependence2 = Dependence2
 -- * simple affine difference on one iterator (i -> i + const) -> forward
 -- * ND tuples compared element-wise
 -- * otherwise unknown
-findDependences2 :: [ArrayAccess2] -> [Dependence2]
-findDependences2 accesses = do
+findDependences :: [ArrayAccess] -> [Dependence]
+findDependences accesses = do
   src <- accesses
   tgt <- accesses
-  guard (aa2ArrayVar src == aa2ArrayVar tgt)
-  guard (aa2StmtIndex src < aa2StmtIndex tgt)
-  let (dir, dist) = analyzeIndex2 (aa2Index src) (aa2Index tgt)
-      loopCarried = aa2StmtIndex src /= aa2StmtIndex tgt
-  return Dependence2 { depSource2 = src, depTarget2 = tgt, depDirection2 = dir, depIsLoopCarried2 = loopCarried, depDistance2 = dist }
+  guard (aaArrayVar src == aaArrayVar tgt)
+  guard (aaStmtIndex src < aaStmtIndex tgt)
+  let (dir, dist) = analyzeIndex (aaIndex src) (aaIndex tgt)
+      loopCarried = aaStmtIndex src /= aaStmtIndex tgt
+  return Dependence { depSource = src, depTarget = tgt, depDirection = dir, depIsLoopCarried = loopCarried, depDistance = dist }
 
 -- Analyze two IndexExprs conservatively.
-analyzeIndex2 :: IndexExpr -> IndexExpr -> (DependenceDirection2, Maybe [Integer])
-analyzeIndex2 a b
+analyzeIndex :: IndexExpr -> IndexExpr -> (DependenceDirection, Maybe [Integer])
+analyzeIndex a b
   | sa == sb = (DDForward, Just [0])
   | otherwise = analyzeAffine sa sb
   where
@@ -69,7 +69,7 @@ analyzeIndex2 a b
     sb = simplifyIndexExpr b
 
 -- Analyze affine differences and return direction plus optional per-dimension distances.
-analyzeAffine :: IndexExpr -> IndexExpr -> (DependenceDirection2, Maybe [Integer])
+analyzeAffine :: IndexExpr -> IndexExpr -> (DependenceDirection, Maybe [Integer])
 analyzeAffine (ITuple as) (ITuple bs)
   | length as == length bs =
       let results = zipWith analyzeAffineSingle as bs
@@ -87,7 +87,7 @@ analyzeAffine (ITuple as) (ITuple bs)
 analyzeAffine x y = analyzeAffineSingle x y
 
 -- Analyze a single-dimension pair and return optional distance vector (single element list).
-analyzeAffineSingle :: IndexExpr -> IndexExpr -> (DependenceDirection2, Maybe [Integer])
+analyzeAffineSingle :: IndexExpr -> IndexExpr -> (DependenceDirection, Maybe [Integer])
 analyzeAffineSingle x y =
   case (extractSingleVarAffine x, extractSingleVarAffine y) of
     (Just (vx, kx, cx), Just (vy, ky, cy)) | vx == vy && kx == ky ->

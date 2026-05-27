@@ -22,7 +22,7 @@ import Language.Hydrangea.CodegenC
   ( BenchmarkConfig(..)
   , CodegenArtifacts(..)
   , CodegenOptions(..)
-  , codegenProgram2WithOptionsPrune
+  , codegenProgramWithOptionsPrune
   , defaultCodegenOptions
   )
 import Language.Hydrangea.CodegenMSL (MSLArtifacts(..), MSLOptions(..), defaultMSLOptions, codegenMSL)
@@ -32,12 +32,12 @@ import Language.Hydrangea.Frontend
   , evalDecsFrontend
   , FrontendOptions(..)
   , defaultFrontendOptions
-  , inferAndLowerToCFG2WithFrontendOptions
-  , lowerToCFG2
-  , lowerToCFG2OptWithTypesWithOptions
-  , lowerToCFG2WithTypesWithOptions
-  , optimizeCFG2WithPipelineOptions
-  , optimizeMetalCFG2WithTiling
+  , inferAndLowerToCFGWithFrontendOptions
+  , lowerToCFG
+  , lowerToCFGOptWithTypesWithOptions
+  , lowerToCFGWithTypesWithOptions
+  , optimizeCFGWithPipelineOptions
+  , optimizeMetalCFGWithTiling
   , readDecs
   )
 import Language.Hydrangea.CFGPipeline
@@ -46,7 +46,7 @@ import Language.Hydrangea.CFGPipeline
   , preparePolyhedralProgramWithOptions
   )
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions, runInferDecsWithOptions)
-import Language.Hydrangea.Polyhedral (collectProgramScopDiagnostics2)
+import Language.Hydrangea.Polyhedral (collectProgramScopDiagnostics)
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Language.Hydrangea.Fusion (fuseDecs)
 import Language.Hydrangea.Uniquify (uniquifyDecs)
@@ -197,9 +197,9 @@ main = do
     dieWithMessage "--explicit-vectorization is only supported for the C backend."
 
   let generateExportArtifacts decs = do
-        prog <- inferAndLowerToCFG2WithFrontendOptions frontendOptions inferOptions decs
-        let optimized = optimizeCFG2WithPipelineOptions pipelineOptions prog
-        pure (codegenProgram2WithOptionsPrune exportCodegenOptions pruneDead optimized)
+        prog <- inferAndLowerToCFGWithFrontendOptions frontendOptions inferOptions decs
+        let optimized = optimizeCFGWithPipelineOptions pipelineOptions prog
+        pure (codegenProgramWithOptionsPrune exportCodegenOptions pruneDead optimized)
 
       writeExportHeaderIfRequested artifacts =
         forM_ outputHFile $ \headerPath ->
@@ -251,17 +251,17 @@ main = do
         mapM_ (putStrLn . render . pPrint) fused
       when printCFG $ do
         _ <- runCheckedInference
-        prog <- lowerToCFG2OptWithTypesWithOptions inferOptions decs
+        prog <- lowerToCFGOptWithTypesWithOptions inferOptions decs
         print prog
       when printCFGRaw $ do
         _ <- runCheckedInference
-        let prog = lowerToCFG2 decs
+        let prog = lowerToCFG decs
         print prog
       when printPolyhedralScops $ do
         _ <- runCheckedInference
-        prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
+        prog <- lowerToCFGWithTypesWithOptions inferOptions decs
         let prepared = preparePolyhedralProgramWithOptions pipelineOptions prog
-            diagnostics = collectProgramScopDiagnostics2 prepared
+            diagnostics = collectProgramScopDiagnostics prepared
         if null diagnostics
           then putStrLn "No polyhedral SCoPs found."
           else mapM_ print diagnostics
@@ -332,8 +332,8 @@ main = do
                 when hasError exitFailure
           else if useMetal then do
             _ <- runCheckedInference
-            prog <- lowerToCFG2WithTypesWithOptions inferOptions decs
-            let optimized = optimizeMetalCFG2WithTiling enableTiling prog
+            prog <- lowerToCFGWithTypesWithOptions inferOptions decs
+            let optimized = optimizeMetalCFGWithTiling enableTiling prog
                 metalOpts = defaultMSLOptions
                   { mslKernelToEmit = fmap BS.pack metalKernelFlag
                   , mslMultiKernel = not noMultiKernel

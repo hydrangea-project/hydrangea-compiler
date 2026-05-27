@@ -5,7 +5,7 @@
 --
 -- Metal Shading Language (MSL) compute backend for macOS / Apple Silicon.
 --
--- Translates the same @C2.Program@ IR consumed by the C backend into:
+-- Translates the same @CFG.Program@ IR consumed by the C backend into:
 --
 -- * A @.metal@ kernel source file (scalar compute kernel).
 -- * A self-contained Objective-C harness (@.m@) that invokes CPU helper
@@ -37,8 +37,8 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Language.Hydrangea.CFG qualified as C2
-import Language.Hydrangea.CFGAnalysis (usedVarsStmts2)
+import Language.Hydrangea.CFG qualified as CFG
+import Language.Hydrangea.CFGAnalysis (usedVarsStmts)
 import Language.Hydrangea.CFGCore
   ( Atom (..),
     BinOp (..),
@@ -52,9 +52,9 @@ import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFGTyping
   ( TypeEnv,
     buildCallParamTypes,
-    inferProgramReturnTypes2,
-    lookupArrayElemType2,
-    recoverProcTypeEnv2,
+    inferProgramReturnTypes,
+    lookupArrayElemType,
+    recoverProcTypeEnv,
   )
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts (..),
@@ -64,14 +64,14 @@ import Language.Hydrangea.CodegenC
     cTypeName,
     celemTypeCType,
     celemTypeLetter,
-    codegenProgram2WithOptions,
+    codegenProgramWithOptions,
     defaultCodegenOptions,
     detectAtomicScatterAddLoop,
     inferArrayElemTypesFromStmts,
     isFloatArithBinOp,
     isMathFloatOp,
     pairStructName,
-    procReturnKinds2,
+    procReturnKinds,
     resolveExportSpec,
     sanitize,
     sanitizeExportName,
@@ -115,11 +115,11 @@ defaultMSLOptions =
 -- | Per-kernel analysis record.  Captures everything needed to generate the
 -- Metal kernel source and harness dispatch for one proc.
 data KernelAnalysis = KernelAnalysis
-  { kaProc :: C2.Proc,
+  { kaProc :: CFG.Proc,
     kaName :: CVar,
-    kaPreLoopStmts :: [C2.Stmt],
-    kaLoopSpec :: C2.LoopSpec,
-    kaLoopBody :: [C2.Stmt],
+    kaPreLoopStmts :: [CFG.Stmt],
+    kaLoopSpec :: CFG.LoopSpec,
+    kaLoopBody :: [CFG.Stmt],
     kaRetAtom :: Maybe Atom,
     kaTypeEnv :: TypeEnv,
     kaArrayElemTys :: Map CVar CType,
@@ -128,11 +128,11 @@ data KernelAnalysis = KernelAnalysis
     -- | Includes proc-param scalars
     kaScalarInputs :: [CVar],
     -- | preLoopStmts ++ inBodyHoisted
-    kaEffectivePreLoop :: [C2.Stmt],
+    kaEffectivePreLoop :: [CFG.Stmt],
     kaHoistedCallMap :: Map CVar CVar,
     kaPreLoopAliases :: [(CVar, CVar)],
     -- | Statements between kernel loop and return
-    kaPostLoopStmts :: [C2.Stmt],
+    kaPostLoopStmts :: [CFG.Stmt],
     -- | All proc params (for harness defaults)
     kaProcParams :: [CVar]
   }
@@ -146,12 +146,12 @@ data BufferOrigin
 -- ---------------------------------------------------------------------------
 -- Top-level entry point
 
--- | Translate a @C2.Program@ to Metal artifacts.
+-- | Translate a @CFG.Program@ to Metal artifacts.
 -- Uses multi-kernel dispatch when multiple zero-arg procs have parallelizable
 -- loops; falls back to single-kernel for explicit @--metal-kernel@ selection
 -- or when only one proc is GPU-eligible.
-codegenMSL :: MSLOptions -> C2.Program -> Either String MSLArtifacts
-codegenMSL opts prog@(C2.Program procs) =
+codegenMSL :: MSLOptions -> CFG.Program -> Either String MSLArtifacts
+codegenMSL opts prog@(CFG.Program procs) =
   case mslExportKernel opts of
     Just _ -> codegenMSLExport opts prog -- export-kernel mode
     Nothing ->
@@ -167,8 +167,8 @@ codegenMSL opts prog@(C2.Program procs) =
                     _ -> codegenMSLMulti prog gpuProcs
 
 -- | Multi-kernel code path: dispatch multiple GPU kernels in sequence.
-codegenMSLMulti :: C2.Program -> [C2.Proc] -> Either String MSLArtifacts
-codegenMSLMulti prog@(C2.Program procs) gpuProcs = do
+codegenMSLMulti :: CFG.Program -> [CFG.Proc] -> Either String MSLArtifacts
+codegenMSLMulti prog@(CFG.Program procs) gpuProcs = do
   -- Analyze each GPU-eligible proc; silently drop those that fail analysis
   let analyses = [ka | p <- gpuProcs, Right ka <- [analyzeOneKernel prog p]]
   case analyses of
@@ -178,8 +178,8 @@ codegenMSLMulti prog@(C2.Program procs) gpuProcs = do
       let gpuNames = Set.fromList [kaName ka | ka <- kas]
           bufOrigins = classifyBufferOrigins kas gpuNames
           gpuBufAliases = buildGPUBufferAliases kas gpuNames
-          retKinds = procReturnKinds2 prog
-          retTypes = inferProgramReturnTypes2 prog
+          retKinds = procReturnKinds prog
+          retTypes = inferProgramReturnTypes prog
       helperC <- genHelperC procs (kaName (last kas)) retKinds
       let kernelSrc = genMultiKernelMSL kas
           harnessSrc =
@@ -199,12 +199,12 @@ codegenMSLMulti prog@(C2.Program procs) gpuProcs = do
           }
 
 -- | Single-kernel code path (existing behaviour).
-codegenMSLSingle :: MSLOptions -> C2.Program -> Either String MSLArtifacts
-codegenMSLSingle opts prog@(C2.Program procs) = do
+codegenMSLSingle :: MSLOptions -> CFG.Program -> Either String MSLArtifacts
+codegenMSLSingle opts prog@(CFG.Program procs) = do
   kernelProc <- findKernelProc opts procs
   ka <- analyzeOneKernel prog kernelProc
-  let retKinds = procReturnKinds2 prog
-      retTypes = inferProgramReturnTypes2 prog
+  let retKinds = procReturnKinds prog
+      retTypes = inferProgramReturnTypes prog
   helperC <- genHelperC procs (kaName ka) retKinds
   let kernelSrc =
         genMSLKernelSrc
@@ -247,18 +247,18 @@ codegenMSLSingle opts prog@(C2.Program procs) = do
 -- ---------------------------------------------------------------------------
 
 -- | Export mode: generate a reusable Metal library with init/dispatch/cleanup.
-codegenMSLExport :: MSLOptions -> C2.Program -> Either String MSLArtifacts
-codegenMSLExport opts prog@(C2.Program procs) = do
+codegenMSLExport :: MSLOptions -> CFG.Program -> Either String MSLArtifacts
+codegenMSLExport opts prog@(CFG.Program procs) = do
   exportName <- case mslExportKernel opts of
     Just n -> Right n
     Nothing -> Left "MSL export: no kernel name specified"
   -- Find the proc to export
-  kp <- case filter (\p -> C2.procName p == exportName) procs of
+  kp <- case filter (\p -> CFG.procName p == exportName) procs of
     (p : _) -> Right p
     [] -> Left $ "MSL export: proc not found: " ++ BS.unpack exportName
   ka <- analyzeOneKernel prog kp
-  let retKinds = procReturnKinds2 prog
-      retTypes = inferProgramReturnTypes2 prog
+  let retKinds = procReturnKinds prog
+      retTypes = inferProgramReturnTypes prog
       callParamTys = buildCallParamTypes retTypes procs
   -- Resolve export spec (reuse CodegenC infrastructure)
   spec <- resolveExportSpec retKinds retTypes callParamTys procs exportName
@@ -271,7 +271,7 @@ codegenMSLExport opts prog@(C2.Program procs) = do
       inputArraySet = Set.fromList (kaInputArrays ka)
       cachedArrayBindings =
         [ (v, fn)
-        | C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
+        | CFG.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
           v `Set.member` inputArraySet, -- must be a kernel input array
           v `Set.notMember` procParamSet, -- not a proc param
           -- not derived from a proc param via RProj
@@ -309,10 +309,10 @@ codegenMSLExport opts prog@(C2.Program procs) = do
       }
 
 -- | Check if a variable derives from a proc parameter (e.g., via RProj).
-derivesFromParam :: Set CVar -> CVar -> C2.Stmt -> Bool
-derivesFromParam paramSet target (C2.SAssign v (RProj _ (AVar p))) =
+derivesFromParam :: Set CVar -> CVar -> CFG.Stmt -> Bool
+derivesFromParam paramSet target (CFG.SAssign v (RProj _ (AVar p))) =
   v == target && p `Set.member` paramSet
-derivesFromParam paramSet target (C2.SAssign v (RAtom (AVar p))) =
+derivesFromParam paramSet target (CFG.SAssign v (RAtom (AVar p))) =
   v == target && p `Set.member` paramSet
 derivesFromParam _ _ _ = False
 
@@ -388,7 +388,7 @@ genPairTypedef name =
 --   upload dynamic input arrays, create output/scalar buffers, dispatch, read back.
 -- * @hyd_metal_cleanup@: nil out persistent Metal objects.
 genExportObjCHarness ::
-  C2.Program ->
+  CFG.Program ->
   KernelAnalysis ->
   -- | Metal export spec (hyd_metal_ prefix)
   ExportSpec ->
@@ -610,12 +610,12 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
     -- Pre-loop line for export dispatch: like genPreLoopLine but:
     -- 1. Skips output array allocations (Metal buffers replace them)
     -- 2. For cached array RCalls: emits a shape-only stub (GPU buffer has data)
-    genExportPreLoopLine :: Set CVar -> Set CVar -> C2.Stmt -> [String]
+    genExportPreLoopLine :: Set CVar -> Set CVar -> CFG.Stmt -> [String]
     genExportPreLoopLine skipAlloc cachedVars stmt = case stmt of
-      C2.SAssign v (RArrayAlloc _)
+      CFG.SAssign v (RArrayAlloc _)
         | v `Set.member` skipAlloc ->
             [] -- output arrays: Metal buffer, skip CPU alloc
-      C2.SAssign v (RCall fn [])
+      CFG.SAssign v (RCall fn [])
         | v `Set.member` cachedVars ->
             -- Cached array: use shape stub so downstream shape accesses work
             [ "    // Cached array (GPU buffer): " ++ sanitize v,
@@ -625,7 +625,7 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
       _ -> genPreLoopLine typeEnv retKinds skipAlloc Set.empty stmt
 
     -- Grid size expression
-    gridSizeExpr = case C2.lsBounds (kaLoopSpec ka) of
+    gridSizeExpr = case CFG.lsBounds (kaLoopSpec ka) of
       [b] -> "(long)" ++ genMSLIndexExpr b
       bs -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
 
@@ -679,7 +679,7 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
       let elemTy = mslElemTy v
           outputAllocShapes =
             Map.fromList
-              [(ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
+              [(ov, shpAtom) | CFG.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
           sizeExpr = case Map.lookup v outputAllocShapes of
             Just shpAtom -> "hyd_shape_size(" ++ genCAtom shpAtom ++ ")"
             Nothing -> "_n"
@@ -712,11 +712,11 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
               sizeVar = "_outN" ++ show i
               outputAllocShapes =
                 Map.fromList
-                  [(ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
+                  [(ov, shpAtom) | CFG.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
               reshapeShape =
                 listToMaybe
                   [ shpAtom
-                  | C2.SAssign _ (RCall "hyd_array_reshape_view" [arrAtom, shpAtom]) <-
+                  | CFG.SAssign _ (RCall "hyd_array_reshape_view" [arrAtom, shpAtom]) <-
                       kaPostLoopStmts ka,
                     arrAtom == AVar v
                   ]
@@ -751,9 +751,9 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
 
     -- Generate post-loop statements needed before return (e.g., dummy array allocs).
     -- Skip RPairMake and reshape_view (handled by return construction / readback).
-    genPostLoopLine :: C2.Stmt -> [String]
-    genPostLoopLine (C2.SAssign _ (RPairMake {})) = [] -- handled by genReturnConstruction
-    genPostLoopLine (C2.SAssign _ (RCall "hyd_array_reshape_view" _)) = [] -- handled by readback
+    genPostLoopLine :: CFG.Stmt -> [String]
+    genPostLoopLine (CFG.SAssign _ (RPairMake {})) = [] -- handled by genReturnConstruction
+    genPostLoopLine (CFG.SAssign _ (RCall "hyd_array_reshape_view" _)) = [] -- handled by readback
     genPostLoopLine stmt = genPreLoopLine typeEnv retKinds Set.empty Set.empty stmt
 
     -- Construct the return value from post-loop RPairMake or output arrays.
@@ -763,7 +763,7 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
           outputSet = Set.fromList outputArrs
           pairMake =
             listToMaybe
-              [(a1, a2) | C2.SAssign _ (RPairMake _ _ a1 a2) <- kaPostLoopStmts ka]
+              [(a1, a2) | CFG.SAssign _ (RPairMake _ _ a1 a2) <- kaPostLoopStmts ka]
           atomToRetExpr (AVar v)
             | v `Set.member` outputSet = "_result_" ++ sanitize v
             | otherwise = sanitize v -- CPU-produced array
@@ -807,16 +807,16 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
               _ -> ["    return _result_" ++ sanitize (head outputArrs) ++ ";"]
 
 -- | Analyze a single proc for Metal kernel generation.
-analyzeOneKernel :: C2.Program -> C2.Proc -> Either String KernelAnalysis
-analyzeOneKernel prog@(C2.Program procs) kernelProc = do
-  let kernelName = C2.procName kernelProc
-      body = C2.procBody kernelProc
+analyzeOneKernel :: CFG.Program -> CFG.Proc -> Either String KernelAnalysis
+analyzeOneKernel prog@(CFG.Program procs) kernelProc = do
+  let kernelName = CFG.procName kernelProc
+      body = CFG.procBody kernelProc
   (preLoopStmts, mapLoopSpec, mapLoopBody, postLoopStmts, retAtom) <- analyzeKernelProc body
   () <- validateMSLLoopBody mapLoopBody
-  let retTypes = inferProgramReturnTypes2 prog
-      retKinds = procReturnKinds2 prog
+  let retTypes = inferProgramReturnTypes prog
+      retKinds = procReturnKinds prog
       callParamTys = buildCallParamTypes retTypes procs
-      typeEnv = recoverProcTypeEnv2 retTypes callParamTys kernelProc
+      typeEnv = recoverProcTypeEnv retTypes callParamTys kernelProc
       arrayElemTys =
         inferArrayElemTypesFromStmts
           retTypes
@@ -826,7 +826,7 @@ analyzeOneKernel prog@(C2.Program procs) kernelProc = do
         classifyKernelParams preLoopStmts mapLoopBody mapLoopSpec typeEnv retKinds
       effectivePreLoop = preLoopStmts ++ inBodyHoisted
       hoistedCallMap = buildHoistedCallMap inBodyHoisted
-      procParams' = C2.procParams kernelProc
+      procParams' = CFG.procParams kernelProc
       procParamScalars =
         [ v
         | v <- procParams',
@@ -838,7 +838,7 @@ analyzeOneKernel prog@(C2.Program procs) kernelProc = do
       procParamScalarsUsed =
         [ v
         | v <- procParamScalars,
-          v `Set.member` usedVarsStmts2 (effectivePreLoop ++ mapLoopBody)
+          v `Set.member` usedVarsStmts (effectivePreLoop ++ mapLoopBody)
         ]
       allScalarInputs = scalarInputs ++ procParamScalarsUsed
       inputArraySet = Set.fromList inputArrays
@@ -867,37 +867,37 @@ analyzeOneKernel prog@(C2.Program procs) kernelProc = do
 -- Analysis helpers
 
 -- | Find the proc to use as the Metal kernel.
-findKernelProc :: MSLOptions -> [C2.Proc] -> Either String C2.Proc
+findKernelProc :: MSLOptions -> [CFG.Proc] -> Either String CFG.Proc
 findKernelProc opts procs =
   case mslKernelToEmit opts of
     Just name ->
-      case filter (\p -> C2.procName p == name) procs of
+      case filter (\p -> CFG.procName p == name) procs of
         [] -> Left $ "MSL backend: kernel proc not found: " ++ BS.unpack name
         (p : _) -> Right p
     Nothing ->
-      let candidates = filter (procHasMapLoop . C2.procBody) procs
+      let candidates = filter (procHasMapLoop . CFG.procBody) procs
        in -- Prefer the "main" proc if it's a candidate; otherwise use last candidate
           -- (last is typically the final top-level binding, the program output)
           case candidates of
             [] -> Left "MSL backend: no proc with a map loop found in program"
-            _ -> case filter (\p -> C2.procName p == "main") candidates of
+            _ -> case filter (\p -> CFG.procName p == "main") candidates of
               (p : _) -> Right p
               [] -> Right (last candidates)
   where
     procHasMapLoop = any isKernelLoopStmt
-    isKernelLoopStmt (C2.SLoop spec _) =
-      C2.lsRole spec `elem` [C2.LoopMap, C2.LoopMapReduction]
-        || (case C2.lsExec spec of C2.Parallel _ -> True; _ -> False)
+    isKernelLoopStmt (CFG.SLoop spec _) =
+      CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
+        || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
     isKernelLoopStmt _ = False
 
 -- | Find all zero-arg procs with parallelizable loops (GPU-eligible).
 -- Returns procs in original definition order (callees before callers).
-findGPUEligibleProcs :: [C2.Proc] -> [C2.Proc]
+findGPUEligibleProcs :: [CFG.Proc] -> [CFG.Proc]
 findGPUEligibleProcs procs =
   [ p
   | p <- procs,
-    null (C2.procParams p), -- zero-arg only
-    gpuKernelCapturesAllWork (C2.procBody p)
+    null (CFG.procParams p), -- zero-arg only
+    gpuKernelCapturesAllWork (CFG.procBody p)
   ]
   where
     gpuKernelCapturesAllWork body =
@@ -914,28 +914,28 @@ findGPUEligibleProcs procs =
       let indexed = zip [0 ..] stmts
           candidates =
             [ (i, stmtCount lb)
-            | (i, C2.SLoop spec lb) <- indexed,
-              isKernelLoopStmt (C2.SLoop spec lb)
+            | (i, CFG.SLoop spec lb) <- indexed,
+              isKernelLoopStmt (CFG.SLoop spec lb)
             ]
           stmtCount = length . concatMap collectAllStmts
-          collectAllStmts (C2.SLoop _ b) = b ++ concatMap collectAllStmts b
-          collectAllStmts (C2.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
+          collectAllStmts (CFG.SLoop _ b) = b ++ concatMap collectAllStmts b
+          collectAllStmts (CFG.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
           collectAllStmts s = [s]
        in case candidates of
             [] -> Nothing
             _ -> Just (fst (maximumBy (\a b -> compare (snd a) (snd b)) candidates))
-    isKernelLoopStmt (C2.SLoop spec _) =
-      C2.lsRole spec `elem` [C2.LoopMap, C2.LoopMapReduction]
-        || (case C2.lsExec spec of C2.Parallel _ -> True; _ -> False)
+    isKernelLoopStmt (CFG.SLoop spec _) =
+      CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
+        || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
     isKernelLoopStmt _ = False
-    hasLoopNested (C2.SLoop _ _) = True
-    hasLoopNested (C2.SIf _ thn els) = any hasLoopNested thn || any hasLoopNested els
+    hasLoopNested (CFG.SLoop _ _) = True
+    hasLoopNested (CFG.SIf _ thn els) = any hasLoopNested thn || any hasLoopNested els
     hasLoopNested _ = False
 
 -- | Split proc body into (preLoopStmts, loopSpec, loopBody, postLoopStmts, retAtom).
 -- Selects the largest kernel-eligible loop (by body size) in the proc body,
 -- treating everything before and after it as pre-loop / post-loop CPU work.
-analyzeKernelProc :: [C2.Stmt] -> Either String ([C2.Stmt], C2.LoopSpec, [C2.Stmt], [C2.Stmt], Maybe Atom)
+analyzeKernelProc :: [CFG.Stmt] -> Either String ([CFG.Stmt], CFG.LoopSpec, [CFG.Stmt], [CFG.Stmt], Maybe Atom)
 analyzeKernelProc body = do
   let (bodyNoRet, retAtom) = splitFinalReturn body
   case findBestKernelLoop bodyNoRet of
@@ -950,12 +950,12 @@ analyzeKernelProc body = do
       let indexed = zip [0 ..] stmts
           candidates =
             [ (i, spec, lb)
-            | (i, C2.SLoop spec lb) <- indexed,
-              isKernelLoopStmt (C2.SLoop spec lb)
+            | (i, CFG.SLoop spec lb) <- indexed,
+              isKernelLoopStmt (CFG.SLoop spec lb)
             ]
           stmtCount = length . concatMap collectAllStmts
-          collectAllStmts (C2.SLoop _ b) = b ++ concatMap collectAllStmts b
-          collectAllStmts (C2.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
+          collectAllStmts (CFG.SLoop _ b) = b ++ concatMap collectAllStmts b
+          collectAllStmts (CFG.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
           collectAllStmts s = [s]
        in case candidates of
             [] -> Nothing
@@ -963,22 +963,22 @@ analyzeKernelProc body = do
               let best = maximumBy (\(_, _, b1) (_, _, b2) -> compare (stmtCount b1) (stmtCount b2)) candidates
                   (i, spec, lb) = best
                in Just (take i stmts, spec, lb, drop (i + 1) stmts)
-    isKernelLoopStmt (C2.SLoop spec _) =
-      C2.lsRole spec `elem` [C2.LoopMap, C2.LoopMapReduction]
-        || (case C2.lsExec spec of C2.Parallel _ -> True; _ -> False)
+    isKernelLoopStmt (CFG.SLoop spec _) =
+      CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
+        || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
     isKernelLoopStmt _ = False
 
 -- | Validation: reject unsupported MSL constructs in the kernel loop body.
-validateMSLLoopBody :: [C2.Stmt] -> Either String ()
+validateMSLLoopBody :: [CFG.Stmt] -> Either String ()
 validateMSLLoopBody stmts = mapM_ checkStmt stmts
   where
     checkStmt stmt = case stmt of
-      C2.SAssign _ rhs -> checkRHS rhs
-      C2.SArrayWrite {} -> Right ()
-      C2.SLoop _ body -> mapM_ checkStmt body
-      C2.SIf _ thn els -> mapM_ checkStmt thn >> mapM_ checkStmt els
-      C2.SReturn {} -> Right ()
-      C2.SBreak -> Right ()
+      CFG.SAssign _ rhs -> checkRHS rhs
+      CFG.SArrayWrite {} -> Right ()
+      CFG.SLoop _ body -> mapM_ checkStmt body
+      CFG.SIf _ thn els -> mapM_ checkStmt thn >> mapM_ checkStmt els
+      CFG.SReturn {} -> Right ()
+      CFG.SBreak -> Right ()
     checkRHS rhs = case rhs of
       RArrayAlloc {} ->
         Left "MSL backend: dynamic array allocation inside kernel loop not supported"
@@ -990,33 +990,33 @@ validateMSLLoopBody stmts = mapM_ checkStmt stmts
 -- that must be pre-fetched on CPU and passed as Metal buffers.
 classifyKernelParams ::
   -- | Pre-loop stmts
-  [C2.Stmt] ->
+  [CFG.Stmt] ->
   -- | Loop body
-  [C2.Stmt] ->
+  [CFG.Stmt] ->
   -- | Loop spec (for iterator names)
-  C2.LoopSpec ->
+  CFG.LoopSpec ->
   TypeEnv ->
   Map CVar VarKind ->
-  ([CVar], [CVar], [CVar], [C2.Stmt])
+  ([CVar], [CVar], [CVar], [CFG.Stmt])
 classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
-  let iterVars = Set.fromList (C2.lsIters loopSpec)
+  let iterVars = Set.fromList (CFG.lsIters loopSpec)
       -- Include variables from loop bounds (needed for multi-dim decomposition)
-      boundVars = Set.fromList [v | C2.IVar v <- C2.lsBounds loopSpec]
-      loopUsedVars = (usedVarsStmts2 loopBody `Set.union` boundVars) `Set.difference` iterVars
+      boundVars = Set.fromList [v | CFG.IVar v <- CFG.lsBounds loopSpec]
+      loopUsedVars = (usedVarsStmts loopBody `Set.union` boundVars) `Set.difference` iterVars
       -- Also scan for written arrays inside nested loops
       loopWrittenAll = collectWrittenArrays loopBody
       -- Input arrays: results of zero-arg RCall in pre-loop, or allocated and
       -- filled by earlier loops but only read (not written) in kernel loop.
       preLoopCallArrays =
         [ v
-        | C2.SAssign v (RCall _ []) <- preLoopStmts,
+        | CFG.SAssign v (RCall _ []) <- preLoopStmts,
           v `Set.member` loopUsedVars,
           isArrayVar v
         ]
       -- Arrays allocated in pre-loop, used in kernel loop but not written there
       preLoopAllocReadArrays =
         [ v
-        | C2.SAssign v (RArrayAlloc _) <- preLoopStmts,
+        | CFG.SAssign v (RArrayAlloc _) <- preLoopStmts,
           v `Set.member` loopUsedVars,
           v `Set.notMember` loopWrittenAll
         ]
@@ -1024,7 +1024,7 @@ classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
       -- those are handled by collectArrayAliases / #define in the kernel body).
       preLoopProjArrays =
         [ v
-        | C2.SAssign v (RProj _ _) <- preLoopStmts,
+        | CFG.SAssign v (RProj _ _) <- preLoopStmts,
           v `Set.member` loopUsedVars,
           v `Set.notMember` loopWrittenAll,
           isArrayVar v
@@ -1036,33 +1036,33 @@ classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
       allZeroArgCalls = collectZeroArgCalls loopBody
       inBodyHoistedAll =
         [ stmt
-        | stmt@(C2.SAssign v (RCall fn [])) <- allZeroArgCalls,
+        | stmt@(CFG.SAssign v (RCall fn [])) <- allZeroArgCalls,
           v `Set.notMember` Set.fromList preLoopInputArrays
         ]
       inBodyHoistedArrays =
         [ stmt
-        | stmt@(C2.SAssign v (RCall fn [])) <- inBodyHoistedAll,
+        | stmt@(CFG.SAssign v (RCall fn [])) <- inBodyHoistedAll,
           isArrayFn fn
         ]
       inBodyHoistedScalars =
         [ stmt
-        | stmt@(C2.SAssign v (RCall fn [])) <- inBodyHoistedAll,
+        | stmt@(CFG.SAssign v (RCall fn [])) <- inBodyHoistedAll,
           not (isArrayFn fn)
         ]
-      inBodyInputArrays = [v | C2.SAssign v (RCall _ []) <- inBodyHoistedArrays]
-      inBodyScalarVars = [v | C2.SAssign v (RCall _ []) <- inBodyHoistedScalars]
+      inBodyInputArrays = [v | CFG.SAssign v (RCall _ []) <- inBodyHoistedArrays]
+      inBodyScalarVars = [v | CFG.SAssign v (RCall _ []) <- inBodyHoistedScalars]
       inputArrays = preLoopInputArrays ++ inBodyInputArrays
       -- Output arrays: RArrayAlloc in pre-loop, written in loop
       outputArrays =
         [ v
-        | C2.SAssign v (RArrayAlloc _) <- preLoopStmts,
+        | CFG.SAssign v (RArrayAlloc _) <- preLoopStmts,
           v `Set.member` loopWrittenAll
         ]
       allArrVars = Set.fromList inputArrays `Set.union` Set.fromList outputArrays
       -- Scalar inputs: non-array pre-loop vars used in loop body
       preLoopScalarInputs =
         [ v
-        | C2.SAssign v _ <- preLoopStmts,
+        | CFG.SAssign v _ <- preLoopStmts,
           v `Set.member` loopUsedVars,
           v `Set.notMember` allArrVars,
           not (isArrayVar v)
@@ -1077,20 +1077,20 @@ classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
 
 -- | Recursively collect zero-arg RCall statements from a statement list.
 -- Returns one statement per unique function name (the first occurrence).
-collectZeroArgCalls :: [C2.Stmt] -> [C2.Stmt]
+collectZeroArgCalls :: [CFG.Stmt] -> [CFG.Stmt]
 collectZeroArgCalls stmts = Map.elems (Map.fromListWith (\_ first -> first) pairs)
   where
-    pairs = [(fn, stmt) | stmt@(C2.SAssign _ (RCall fn [])) <- allCalls stmts]
+    pairs = [(fn, stmt) | stmt@(CFG.SAssign _ (RCall fn [])) <- allCalls stmts]
     allCalls = concatMap go
-    go stmt@(C2.SAssign _ (RCall _ [])) = [stmt]
-    go (C2.SLoop _ body) = allCalls body
-    go (C2.SIf _ thn els) = allCalls thn ++ allCalls els
+    go stmt@(CFG.SAssign _ (RCall _ [])) = [stmt]
+    go (CFG.SLoop _ body) = allCalls body
+    go (CFG.SIf _ thn els) = allCalls thn ++ allCalls els
     go _ = []
 
 -- | Build a mapping from function name → canonical hoisted variable.
 -- Used to replace in-kernel zero-arg calls with the hoisted variable.
-buildHoistedCallMap :: [C2.Stmt] -> Map CVar CVar
-buildHoistedCallMap hoisted = Map.fromList [(fn, v) | C2.SAssign v (RCall fn []) <- hoisted]
+buildHoistedCallMap :: [CFG.Stmt] -> Map CVar CVar
+buildHoistedCallMap hoisted = Map.fromList [(fn, v) | CFG.SAssign v (RCall fn []) <- hoisted]
 
 -- | Classify which input arrays come from CPU helpers vs. prior GPU kernels.
 -- Also returns a map from consumer variable to the producing kernel's output
@@ -1108,7 +1108,7 @@ classifyBufferOrigins kernels gpuNames =
   Map.fromList
     [ (v, origin fn)
     | ka <- kernels,
-      C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
+      CFG.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
       v `elem` kaInputArrays ka
     ]
   where
@@ -1130,7 +1130,7 @@ buildGPUBufferAliases kernels gpuNames =
   Map.fromList
     [ (v, outVar)
     | ka <- kernels,
-      C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
+      CFG.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
       fn `Set.member` gpuNames,
       -- Find the producing kernel's output array.  For simple (single-array)
       -- returns the first output array is the result.
@@ -1143,19 +1143,19 @@ buildGPUBufferAliases kernels gpuNames =
 
 -- | Collect array alias assignments: v = RAtom (AVar arr) where arr is a known array.
 -- Returns (alias, original) pairs. Recursively follows alias chains.
-collectArrayAliases :: Set CVar -> [C2.Stmt] -> [(CVar, CVar)]
+collectArrayAliases :: Set CVar -> [CFG.Stmt] -> [(CVar, CVar)]
 collectArrayAliases knownArrays stmts = go knownArrays stmts []
   where
     go _known [] acc = acc
     go known (stmt : rest) acc = case stmt of
-      C2.SAssign v (RAtom (AVar src))
+      CFG.SAssign v (RAtom (AVar src))
         | src `Set.member` known ->
             go (Set.insert v known) rest ((v, src) : acc)
-      C2.SLoop _ body ->
+      CFG.SLoop _ body ->
         let inner = go known body []
             known' = known `Set.union` Set.fromList (map fst inner)
          in go known' rest (inner ++ acc)
-      C2.SIf _ thn els ->
+      CFG.SIf _ thn els ->
         let innerT = go known thn []
             innerE = go known els []
             known' =
@@ -1165,12 +1165,12 @@ collectArrayAliases knownArrays stmts = go knownArrays stmts []
          in go known' rest (innerT ++ innerE ++ acc)
       _ -> go known rest acc
 
-collectWrittenArrays :: [C2.Stmt] -> Set CVar
+collectWrittenArrays :: [CFG.Stmt] -> Set CVar
 collectWrittenArrays = foldMap go
   where
-    go (C2.SArrayWrite (AVar v) _ _) = Set.singleton v
-    go (C2.SLoop _ body) = collectWrittenArrays body
-    go (C2.SIf _ thn els) = collectWrittenArrays thn `Set.union` collectWrittenArrays els
+    go (CFG.SArrayWrite (AVar v) _ _) = Set.singleton v
+    go (CFG.SLoop _ body) = collectWrittenArrays body
+    go (CFG.SIf _ thn els) = collectWrittenArrays thn `Set.union` collectWrittenArrays els
     go _ = Set.empty
 
 -- ---------------------------------------------------------------------------
@@ -1178,7 +1178,7 @@ collectWrittenArrays = foldMap go
 
 -- | Collect all pair types from the typeEnv for variables assigned in the statement list.
 -- Returns pairs in dependency order (leaf types first).
-collectPairTypesFromEnv :: TypeEnv -> [C2.Stmt] -> [(CElemType, CElemType)]
+collectPairTypesFromEnv :: TypeEnv -> [CFG.Stmt] -> [(CElemType, CElemType)]
 collectPairTypesFromEnv typeEnv stmts =
   let allVars = collectAssignedVars stmts
       pairTypesRaw =
@@ -1265,9 +1265,9 @@ genMSLKernelSrc ::
   -- | Kernel proc name
   CVar ->
   -- | Map loop spec
-  C2.LoopSpec ->
+  CFG.LoopSpec ->
   -- | Map loop body
-  [C2.Stmt] ->
+  [CFG.Stmt] ->
   TypeEnv ->
   -- | Array element types
   Map CVar CType ->
@@ -1324,8 +1324,8 @@ mslSharedHeader pairDefs =
 -- | Generate a single @kernel void@ function (no shared header).
 genMSLKernelFunction ::
   CVar ->
-  C2.LoopSpec ->
-  [C2.Stmt] ->
+  CFG.LoopSpec ->
+  [CFG.Stmt] ->
   TypeEnv ->
   Map CVar CType ->
   [CVar] ->
@@ -1354,14 +1354,14 @@ genMSLKernelFunction
         [ "{"
         ]
       ++ iterDecompLines
-      ++ genMSLBody gidVar (C2.lsExec loopSpec) hoistedVarSet outputArrSet typeEnv arrayElemTys hoistedCallMap preLoopAliases loopBody
+      ++ genMSLBody gidVar (CFG.lsExec loopSpec) hoistedVarSet outputArrSet typeEnv arrayElemTys hoistedCallMap preLoopAliases loopBody
       ++ "}\n"
     where
       -- All hoisted vars (input arrays + scalar inputs): skip their in-body assignments
       hoistedVarSet = Set.fromList inputArrays `Set.union` Set.fromList scalarInputs
       outputArrSet = Set.fromList outputArrays
-      iters = C2.lsIters loopSpec
-      bounds = C2.lsBounds loopSpec
+      iters = CFG.lsIters loopSpec
+      bounds = CFG.lsBounds loopSpec
       -- For multi-dim loops, use a synthetic flat gid variable
       isMultiDim = length iters > 1
       gidVar = case iters of
@@ -1475,12 +1475,12 @@ genMultiKernelMSL kernels =
         (kaPreLoopAliases ka)
 
 -- | Collect all variables assigned in a statement list (recursively).
-collectAssignedVars :: [C2.Stmt] -> [CVar]
+collectAssignedVars :: [CFG.Stmt] -> [CVar]
 collectAssignedVars = nub . concatMap go
   where
-    go (C2.SAssign v _) = [v]
-    go (C2.SLoop _ body) = collectAssignedVars body
-    go (C2.SIf _ thn els) = collectAssignedVars thn ++ collectAssignedVars els
+    go (CFG.SAssign v _) = [v]
+    go (CFG.SLoop _ body) = collectAssignedVars body
+    go (CFG.SIf _ thn els) = collectAssignedVars thn ++ collectAssignedVars els
     go _ = []
 
 -- | Emit MSL body statements.
@@ -1490,7 +1490,7 @@ genMSLBody ::
   -- | Loop iterator (= gid in the kernel)
   CVar ->
   -- | Execution policy of the outermost loop
-  C2.ExecPolicy ->
+  CFG.ExecPolicy ->
   -- | Hoisted vars to skip in kernel body
   Set CVar ->
   -- | Output array vars
@@ -1501,7 +1501,7 @@ genMSLBody ::
   Map CVar CVar ->
   -- | Pre-loop array aliases (alias, source)
   [(CVar, CVar)] ->
-  [C2.Stmt] ->
+  [CFG.Stmt] ->
   String
 genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap preLoopAliases stmts =
   let -- Collect array aliases: only from actual array variables (not scalars in inArrs)
@@ -1569,9 +1569,9 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap pr
    in declLines ++ aliasDefLines ++ bodyLines
   where
     scatterStrategy = case execPolicy of
-      C2.Parallel p -> case C2.psStrategy p of
-        C2.ParallelScatterAtomicAddInt -> Just CTInt64
-        C2.ParallelScatterAtomicAddFloat -> Just CTDouble
+      CFG.Parallel p -> case CFG.psStrategy p of
+        CFG.ParallelScatterAtomicAddInt -> Just CTInt64
+        CFG.ParallelScatterAtomicAddFloat -> Just CTDouble
         _ -> Nothing
       _ -> Nothing
 
@@ -1621,27 +1621,27 @@ genMSLAtomicAdd depth iter inArrs typeEnv _arrayElemTys arrAtom idxAtom valAtom 
           -- Integer atomic add
           ind ++ "atomic_fetch_add_explicit((device atomic_int*)&" ++ arrName ++ "[" ++ idx ++ "], (int)(" ++ val ++ "), memory_order_relaxed);\n"
 
-genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar CVar -> Map CVar [Atom] -> C2.Stmt -> String
+genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar CVar -> Map CVar [Atom] -> CFG.Stmt -> String
 genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDefs stmt =
   let ind = replicate (depth * 4) ' '
       recurse = genMSLStmt (depth + 1) iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDefs
    in case stmt of
-        C2.SAssign v _
+        CFG.SAssign v _
           | v `Set.member` inArrs ->
               -- This is a hoisted Metal buffer/constant parameter; skip the call in the kernel.
               ""
         -- Zero-arg call whose function was hoisted: replace with canonical hoisted var
-        C2.SAssign v (RCall fn [])
+        CFG.SAssign v (RCall fn [])
           | Just canonVar <- Map.lookup fn hoistedCallMap,
             v /= canonVar ->
               ind ++ sanitize v ++ " = " ++ sanitize canonVar ++ ";\n"
-        C2.SAssign v rhs ->
+        CFG.SAssign v rhs ->
           ind
             ++ sanitize v
             ++ " = "
             ++ genMSLRHS v iter inArrs outArrs typeEnv arrayElemTys tupleDefs rhs
             ++ ";\n"
-        C2.SArrayWrite (AVar arr) idx val ->
+        CFG.SArrayWrite (AVar arr) idx val ->
           let suffix = sanitize arr ++ "_data"
            in ind
                 ++ suffix
@@ -1650,7 +1650,7 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDe
                 ++ "] = "
                 ++ genMSLAtom iter val
                 ++ ";\n"
-        C2.SArrayWrite arr idx val ->
+        CFG.SArrayWrite arr idx val ->
           -- Fallback: shouldn't happen for well-formed kernels
           ind
             ++ genMSLAtom iter arr
@@ -1659,17 +1659,17 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDe
             ++ "] = "
             ++ genMSLAtom iter val
             ++ ";\n"
-        C2.SLoop spec body ->
-          case (C2.lsIters spec, C2.lsBounds spec) of
+        CFG.SLoop spec body ->
+          case (CFG.lsIters spec, CFG.lsBounds spec) of
             ([i], [b]) ->
               let ci = sanitize i
-                  red = C2.lsRed spec
+                  red = CFG.lsRed spec
                   initLine = case red of
                     Just r ->
                       ind
-                        ++ sanitize (C2.rsAccVar r)
+                        ++ sanitize (CFG.rsAccVar r)
                         ++ " = "
-                        ++ genMSLIndexExpr (C2.rsInit r)
+                        ++ genMSLIndexExpr (CFG.rsInit r)
                         ++ ";\n"
                     Nothing -> ""
                   loopLine =
@@ -1703,8 +1703,8 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDe
                       ++ inner
                       ++ ind
                       ++ "}\n"
-               in foldr mkLoop bodyLines (zip (C2.lsIters spec) (C2.lsBounds spec))
-        C2.SIf cond thn els ->
+               in foldr mkLoop bodyLines (zip (CFG.lsIters spec) (CFG.lsBounds spec))
+        CFG.SIf cond thn els ->
           ind
             ++ "if ("
             ++ genMSLAtom iter cond
@@ -1719,11 +1719,11 @@ genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDe
                        ++ ind
                        ++ "}\n"
                )
-        C2.SReturn a ->
+        CFG.SReturn a ->
           -- In a kernel, SReturn means write to output; handled by SArrayWrite above.
           -- A scalar return at the top level of the kernel body is unusual but emit as comment.
           ind ++ "/* return " ++ genMSLAtom iter a ++ "; */\n"
-        C2.SBreak ->
+        CFG.SBreak ->
           ind ++ "break;\n"
 
 -- | MSL variable declaration type (excluding the variable name).
@@ -1734,12 +1734,12 @@ mslVarDecl v typeEnv = case Map.lookup v typeEnv of
 
 -- | Collect all @RTuple@ definitions from a statement list (recursively).
 -- Used to inline @RNdToFlat@ for known-arity tuples.
-collectTupleDefs :: [C2.Stmt] -> Map CVar [Atom]
+collectTupleDefs :: [CFG.Stmt] -> Map CVar [Atom]
 collectTupleDefs = foldMap go
   where
-    go (C2.SAssign v (RTuple atoms)) = Map.singleton v atoms
-    go (C2.SLoop _ body) = collectTupleDefs body
-    go (C2.SIf _ thn els) = collectTupleDefs thn <> collectTupleDefs els
+    go (CFG.SAssign v (RTuple atoms)) = Map.singleton v atoms
+    go (CFG.SLoop _ body) = collectTupleDefs body
+    go (CFG.SIf _ thn els) = collectTupleDefs thn <> collectTupleDefs els
     go _ = Map.empty
 
 -- | Generate MSL for a right-hand-side expression.
@@ -1836,23 +1836,23 @@ genMSLAtom iter atom = case atom of
   AVecVar v -> sanitize v
 
 -- | Generate MSL for an index expression.
-genMSLIndexExpr :: C2.IndexExpr -> String
-genMSLIndexExpr expr = case C2.simplifyIndexExpr expr of
-  C2.IVar v -> sanitize v
-  C2.IConst n -> show n
-  C2.IAdd a b -> "(" ++ genMSLIndexExpr a ++ " + " ++ genMSLIndexExpr b ++ ")"
-  C2.ISub a b -> "(" ++ genMSLIndexExpr a ++ " - " ++ genMSLIndexExpr b ++ ")"
-  C2.IMul a b -> "(" ++ genMSLIndexExpr a ++ " * " ++ genMSLIndexExpr b ++ ")"
-  C2.IDiv a b -> "(" ++ genMSLIndexExpr a ++ " / " ++ genMSLIndexExpr b ++ ")"
-  C2.ITuple es ->
+genMSLIndexExpr :: CFG.IndexExpr -> String
+genMSLIndexExpr expr = case CFG.simplifyIndexExpr expr of
+  CFG.IVar v -> sanitize v
+  CFG.IConst n -> show n
+  CFG.IAdd a b -> "(" ++ genMSLIndexExpr a ++ " + " ++ genMSLIndexExpr b ++ ")"
+  CFG.ISub a b -> "(" ++ genMSLIndexExpr a ++ " - " ++ genMSLIndexExpr b ++ ")"
+  CFG.IMul a b -> "(" ++ genMSLIndexExpr a ++ " * " ++ genMSLIndexExpr b ++ ")"
+  CFG.IDiv a b -> "(" ++ genMSLIndexExpr a ++ " / " ++ genMSLIndexExpr b ++ ")"
+  CFG.ITuple es ->
     let elems = intercalate ", " (map (\e -> "(long)(" ++ genMSLIndexExpr e ++ ")") es)
      in "(hyd_tuple_t){{" ++ elems ++ "}, " ++ show (length es) ++ "}"
-  C2.IProj i e -> "(" ++ genMSLIndexExpr e ++ ").elems[" ++ show i ++ "]"
-  C2.IFlatToNd flat shp ->
+  CFG.IProj i e -> "(" ++ genMSLIndexExpr e ++ ").elems[" ++ show i ++ "]"
+  CFG.IFlatToNd flat shp ->
     "hyd_flat_to_nd((long)(" ++ genMSLIndexExpr flat ++ "), " ++ genMSLIndexExpr shp ++ ")"
-  C2.INdToFlat nd shp ->
+  CFG.INdToFlat nd shp ->
     "hyd_nd_to_flat(" ++ genMSLIndexExpr nd ++ ", " ++ genMSLIndexExpr shp ++ ")"
-  C2.ICall _ _ -> "0"
+  CFG.ICall _ _ -> "0"
   _ -> "0"
 
 mslBinOp :: BinOp -> String
@@ -1909,21 +1909,21 @@ isVecRHS _ = False
 -- | Generate helper C code for all procs (including the kernel proc, since
 -- other procs may call it transitively). The harness main() uses the Metal
 -- version of the kernel and ignores the C version.
-genHelperC :: [C2.Proc] -> CVar -> Map CVar VarKind -> Either String String
+genHelperC :: [CFG.Proc] -> CVar -> Map CVar VarKind -> Either String String
 genHelperC procs _kernelName _retKinds =
   let helperOpts = defaultCodegenOptions {codegenEmitMain = False, codegenUseFloat = True}
-   in case codegenProgram2WithOptions helperOpts (C2.Program procs) of
+   in case codegenProgramWithOptions helperOpts (CFG.Program procs) of
         Right arts -> Right (codegenSource arts)
         Left err -> Left err
 
 -- | Generate the self-contained ObjC harness source.
 genObjCHarnessSrc ::
-  C2.Program ->
-  C2.Proc ->
+  CFG.Program ->
+  CFG.Proc ->
   CVar ->
   -- | Pre-loop stmts
-  [C2.Stmt] ->
-  C2.LoopSpec ->
+  [CFG.Stmt] ->
+  CFG.LoopSpec ->
   -- | Return atom (for output identification)
   Maybe Atom ->
   TypeEnv ->
@@ -2037,7 +2037,7 @@ genObjCHarnessSrc
              "}"
            ]
     where
-      iter = case C2.lsIters loopSpec of
+      iter = case CFG.lsIters loopSpec of
         (i:_) -> i
         []    -> error "internal error: genSingleKernelHarnessSrc: loop spec has no iterators"
       nInputArrays = length inputArrays
@@ -2059,7 +2059,7 @@ genObjCHarnessSrc
          in ["    " ++ cTy ++ " " ++ sanitize v ++ " = " ++ defVal ++ ";"]
 
       -- Grid size expression: product of all loop bounds
-      gridSizeExpr = case C2.lsBounds loopSpec of
+      gridSizeExpr = case CFG.lsBounds loopSpec of
         [b] -> "(long)" ++ genMSLIndexExpr b
         bs -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
 
@@ -2111,7 +2111,7 @@ genObjCHarnessSrc
       -- Map from output array name → shape variable used in its RArrayAlloc
       outputAllocShapes =
         Map.fromList
-          [(v, shpAtom) | C2.SAssign v (RArrayAlloc shpAtom) <- preLoopStmts]
+          [(v, shpAtom) | CFG.SAssign v (RArrayAlloc shpAtom) <- preLoopStmts]
       outputBufLines =
         concat
           [ [ "    // Output buffer " ++ show i ++ ": " ++ sanitize v,
@@ -2189,7 +2189,7 @@ genObjCHarnessSrc
 -- | Generate a harness that dispatches multiple GPU kernels in sequence.
 -- Intermediate buffers stay on GPU; only the last kernel's outputs are read back.
 genMultiKernelHarnessSrc ::
-  C2.Program ->
+  CFG.Program ->
   -- | Kernels in execution order
   [KernelAnalysis] ->
   -- | Buffer origin for each input array
@@ -2290,7 +2290,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
           gpuProducedVars =
             Set.fromList
               [ v
-              | C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
+              | CFG.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
                 case Map.lookup v bufferOrigins of
                   Just (GPUProduced _) -> True
                   _ -> False
@@ -2300,7 +2300,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
           gpuShapeExprs =
             Map.fromList
               [ (v, findProducerShapeVar fn)
-              | C2.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
+              | CFG.SAssign v (RCall fn []) <- kaEffectivePreLoop ka,
                 fn `Set.member` gpuKernelNames
               ]
        in ["", "    // ======== Kernel " ++ show ki ++ ": " ++ sanitize (kaName ka) ++ " ========"]
@@ -2327,7 +2327,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
             -- Dispatch
             genDispatch ki p ka (nInArrs * 2 + length outArrs + length scals)
 
-    gridSizeExprFor ka = case C2.lsBounds (kaLoopSpec ka) of
+    gridSizeExprFor ka = case CFG.lsBounds (kaLoopSpec ka) of
       [b] -> "(long)" ++ genMSLIndexExpr b
       bs -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
 
@@ -2379,7 +2379,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
           elemTy = mslElemTyFor ae te v
           outputAllocShapes =
             Map.fromList
-              [(ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
+              [(ov, shpAtom) | CFG.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
           sizeExpr = case Map.lookup v outputAllocShapes of
             Just shpAtom -> "hyd_shape_size(" ++ genCAtom shpAtom ++ ")"
             Nothing -> p ++ "n"
@@ -2407,12 +2407,12 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
     outputShapeInit ka v =
       let outputAllocShapes =
             Map.fromList
-              [(ov, shpAtom) | C2.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
+              [(ov, shpAtom) | CFG.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
           -- Check if the output array is reshaped in the post-loop before returning
           reshapeShape =
             listToMaybe
               [ shpAtom
-              | C2.SAssign _ (RCall "hyd_array_reshape_view" [arrAtom, shpAtom]) <-
+              | CFG.SAssign _ (RCall "hyd_array_reshape_view" [arrAtom, shpAtom]) <-
                   kaPostLoopStmts ka,
                 arrAtom == AVar v
               ]
@@ -2422,7 +2422,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
               Just shpAtom -> genCAtom shpAtom
               Nothing ->
                 -- Fallback: build from loop bounds
-                let bs = C2.lsBounds (kaLoopSpec ka)
+                let bs = CFG.lsBounds (kaLoopSpec ka)
                  in "hyd_tuple_make("
                       ++ show (length bs)
                       ++ ", "
@@ -2551,10 +2551,10 @@ genMultiPreLoopLine ::
   -- | GPU-produced var → shape expression
   Map CVar String ->
   Set CVar ->
-  C2.Stmt ->
+  CFG.Stmt ->
   [String]
 genMultiPreLoopLine typeEnv retKinds skipAlloc gpuProduced gpuShapeExprs preDeclared stmt = case stmt of
-  C2.SAssign v (RCall _ [])
+  CFG.SAssign v (RCall _ [])
     | v `Set.member` gpuProduced ->
         -- Emit a shape-only stub so v->shape is valid
         let shapeExpr = Map.findWithDefault "((hyd_tuple_t){0})" v gpuShapeExprs
@@ -2567,12 +2567,12 @@ genMultiPreLoopLine typeEnv retKinds skipAlloc gpuProduced gpuShapeExprs preDecl
 -- | Generate a single pre-loop C statement for the ObjC harness main.
 -- Returns empty list for output array allocations (replaced by Metal buffers).
 -- @preDeclared@ is the set of variables already declared (e.g. by an outer SIf).
-genPreLoopLine :: TypeEnv -> Map CVar VarKind -> Set CVar -> Set CVar -> C2.Stmt -> [String]
+genPreLoopLine :: TypeEnv -> Map CVar VarKind -> Set CVar -> Set CVar -> CFG.Stmt -> [String]
 genPreLoopLine typeEnv retKinds skipAlloc preDeclared stmt = case stmt of
-  C2.SAssign v (RArrayAlloc _)
+  CFG.SAssign v (RArrayAlloc _)
     | v `Set.member` skipAlloc ->
         [] -- output array: skip CPU alloc, will be Metal buffer
-  C2.SAssign v rhs
+  CFG.SAssign v rhs
     | v `Set.member` preDeclared ->
         [ "    "
             ++ sanitize v
@@ -2589,17 +2589,17 @@ genPreLoopLine typeEnv retKinds skipAlloc preDeclared stmt = case stmt of
             ++ genPreLoopRHS typeEnv retKinds v rhs
             ++ ";"
         ]
-  C2.SLoop spec body
+  CFG.SLoop spec body
     -- Skip pre-loop loops that only write to output arrays (Metal buffers)
     | let written = collectWrittenArrays body,
       not (Set.null written),
       written `Set.isSubsetOf` skipAlloc ->
         []
-  C2.SLoop spec body ->
+  CFG.SLoop spec body ->
     genPreLoopCLoop 1 typeEnv retKinds skipAlloc preDeclared spec body
-  C2.SArrayWrite arr idx val ->
+  CFG.SArrayWrite arr idx val ->
     ["    " ++ genPreLoopCArrayWrite arr idx val]
-  C2.SIf cond thn els ->
+  CFG.SIf cond thn els ->
     let -- Pre-declare all variables assigned inside the if branches
         ifVars = Set.fromList (collectAssignedVars thn ++ collectAssignedVars els)
         newDecls = ifVars `Set.difference` preDeclared
@@ -2625,25 +2625,25 @@ genPreLoopLine typeEnv retKinds skipAlloc preDeclared stmt = case stmt of
   _ -> []
 
 -- | Emit a C for-loop for pre-loop execution.
-genPreLoopCLoop :: Int -> TypeEnv -> Map CVar VarKind -> Set CVar -> Set CVar -> C2.LoopSpec -> [C2.Stmt] -> [String]
+genPreLoopCLoop :: Int -> TypeEnv -> Map CVar VarKind -> Set CVar -> Set CVar -> CFG.LoopSpec -> [CFG.Stmt] -> [String]
 genPreLoopCLoop depth typeEnv retKinds skipAlloc preDeclared spec body =
   let ind = replicate ((depth + 1) * 4) ' '
-      red = C2.lsRed spec
+      red = CFG.lsRed spec
       initLines = case red of
         Just r ->
-          let accTy = case Map.lookup (C2.rsAccVar r) typeEnv of
+          let accTy = case Map.lookup (CFG.rsAccVar r) typeEnv of
                 Just ct -> cTypeName ct
-                Nothing -> error ("genPreLoopCLoop: reduction accumulator type unknown for " ++ show (C2.rsAccVar r))
+                Nothing -> error ("genPreLoopCLoop: reduction accumulator type unknown for " ++ show (CFG.rsAccVar r))
            in [ ind
                   ++ accTy
                   ++ " "
-                  ++ sanitize (C2.rsAccVar r)
+                  ++ sanitize (CFG.rsAccVar r)
                   ++ " = "
-                  ++ genPreLoopCIndexExpr (C2.rsInit r)
+                  ++ genPreLoopCIndexExpr (CFG.rsInit r)
                   ++ ";"
               ]
         Nothing -> []
-      loopLines = case (C2.lsIters spec, C2.lsBounds spec) of
+      loopLines = case (CFG.lsIters spec, CFG.lsBounds spec) of
         ([i], [b]) ->
           [ ind
               ++ "for (int64_t "
@@ -2684,23 +2684,23 @@ genPreLoopCArrayWrite arr idx val =
   genCAtom arr ++ "[" ++ genCAtom idx ++ "] = " ++ genCAtom val ++ ";"
 
 -- | Render an IndexExpr as C code for pre-loop.
-genPreLoopCIndexExpr :: C2.IndexExpr -> String
-genPreLoopCIndexExpr expr = case C2.simplifyIndexExpr expr of
-  C2.IVar v -> sanitize v
-  C2.IConst n -> show n ++ "LL"
-  C2.IAdd a b -> "(" ++ genPreLoopCIndexExpr a ++ " + " ++ genPreLoopCIndexExpr b ++ ")"
-  C2.ISub a b -> "(" ++ genPreLoopCIndexExpr a ++ " - " ++ genPreLoopCIndexExpr b ++ ")"
-  C2.IMul a b -> "(" ++ genPreLoopCIndexExpr a ++ " * " ++ genPreLoopCIndexExpr b ++ ")"
-  C2.IDiv a b -> "(" ++ genPreLoopCIndexExpr a ++ " / " ++ genPreLoopCIndexExpr b ++ ")"
-  C2.INdToFlat nd shp -> "hyd_nd_to_flat(" ++ genPreLoopCIndexExpr nd ++ ", " ++ genPreLoopCIndexExpr shp ++ ")"
-  C2.IFlatToNd flat shp -> "hyd_flat_to_nd(" ++ genPreLoopCIndexExpr flat ++ ", " ++ genPreLoopCIndexExpr shp ++ ")"
-  C2.ITuple es ->
+genPreLoopCIndexExpr :: CFG.IndexExpr -> String
+genPreLoopCIndexExpr expr = case CFG.simplifyIndexExpr expr of
+  CFG.IVar v -> sanitize v
+  CFG.IConst n -> show n ++ "LL"
+  CFG.IAdd a b -> "(" ++ genPreLoopCIndexExpr a ++ " + " ++ genPreLoopCIndexExpr b ++ ")"
+  CFG.ISub a b -> "(" ++ genPreLoopCIndexExpr a ++ " - " ++ genPreLoopCIndexExpr b ++ ")"
+  CFG.IMul a b -> "(" ++ genPreLoopCIndexExpr a ++ " * " ++ genPreLoopCIndexExpr b ++ ")"
+  CFG.IDiv a b -> "(" ++ genPreLoopCIndexExpr a ++ " / " ++ genPreLoopCIndexExpr b ++ ")"
+  CFG.INdToFlat nd shp -> "hyd_nd_to_flat(" ++ genPreLoopCIndexExpr nd ++ ", " ++ genPreLoopCIndexExpr shp ++ ")"
+  CFG.IFlatToNd flat shp -> "hyd_flat_to_nd(" ++ genPreLoopCIndexExpr flat ++ ", " ++ genPreLoopCIndexExpr shp ++ ")"
+  CFG.ITuple es ->
     "hyd_tuple_make("
       ++ show (length es)
       ++ (if null es then "" else ", " ++ intercalate ", " (map (\e -> "(int64_t)" ++ genPreLoopCIndexExpr e) es))
       ++ ")"
-  C2.IProj i e -> genPreLoopCIndexExpr e ++ ".elems[" ++ show i ++ "]"
-  C2.ICall fn args -> sanitize fn ++ "(" ++ intercalate ", " (map genPreLoopCIndexExpr args) ++ ")"
+  CFG.IProj i e -> genPreLoopCIndexExpr e ++ ".elems[" ++ show i ++ "]"
+  CFG.ICall fn args -> sanitize fn ++ "(" ++ intercalate ", " (map genPreLoopCIndexExpr args) ++ ")"
   _ -> "0"
 
 -- | C type string for a pre-loop variable.
@@ -2728,7 +2728,7 @@ preLoopCType typeEnv retKinds v rhs =
       RUnOp op _
         | isMathFloatOp op -> "double"
         | otherwise -> "int64_t"
-      RArrayLoad arr _ -> case lookupArrayElemType2 typeEnv arr of
+      RArrayLoad arr _ -> case lookupArrayElemType typeEnv arr of
         Just eltTy -> cTypeName eltTy
         Nothing -> error ("preLoopCType: RArrayLoad element type unknown for array " ++ show arr)
       RFlatToNd {} -> "hyd_tuple_t"
@@ -2741,7 +2741,7 @@ preLoopCType typeEnv retKinds v rhs =
 
 -- | Determine the C type for a variable from typeEnv, falling back to scanning
 -- statements for an assignment to find the RHS-based type.
-preLoopCTypeVar :: TypeEnv -> Map CVar VarKind -> CVar -> [C2.Stmt] -> String
+preLoopCTypeVar :: TypeEnv -> Map CVar VarKind -> CVar -> [CFG.Stmt] -> String
 preLoopCTypeVar typeEnv retKinds v stmts =
   case Map.lookup v typeEnv of
     Just ct -> cTypeName ct
@@ -2754,9 +2754,9 @@ preLoopCTypeVar typeEnv retKinds v stmts =
     findAssignRHS target = go
       where
         go [] = Nothing
-        go (C2.SAssign v' rhs : _) | v' == target = Just rhs
-        go (C2.SIf _ thn els : rest) = go thn <|> go els <|> go rest
-        go (C2.SLoop _ body : rest) = go body <|> go rest
+        go (CFG.SAssign v' rhs : _) | v' == target = Just rhs
+        go (CFG.SIf _ thn els : rest) = go thn <|> go els <|> go rest
+        go (CFG.SLoop _ body : rest) = go body <|> go rest
         go (_ : rest) = go rest
 
 -- | C expression for a pre-loop RHS (used in ObjC harness main).

@@ -14,9 +14,9 @@
 -- * Lower array operations (map, generate, zipWith, reduce, scatter, …)
 --   into explicit 'SLoop' and 'RHS' forms.
 module Language.Hydrangea.Lowering
-  ( lowerDecs2
-  , lowerDecs2WithTypeEnv
-  , lowerDecs2WithTypeEnvAndRanks
+  ( lowerDecs
+  , lowerDecsWithTypeEnv
+  , lowerDecsWithTypeEnvAndRanks
   ) where
 
 import Control.Applicative ((<|>))
@@ -96,8 +96,8 @@ initStateWithTypeEnvAndRanks topEnv rankEnv =
 --
 -- Multi-argument function declarations are pre-registered so they can be
 -- inlined at call sites; each remaining declaration becomes a 'Proc'.
-lowerDecs2 :: [Dec Range] -> Program
-lowerDecs2 decs = evalState go initState
+lowerDecs :: [Dec Range] -> Program
+lowerDecs decs = evalState go initState
   where
     go = do
       mapM_ preRegister decs
@@ -108,8 +108,8 @@ lowerDecs2 decs = evalState go initState
 
 -- | Like 'lowerDecs2' but initialised with a top-level type environment
 -- from inference, enabling accurate 'CType' annotation for generated variables.
-lowerDecs2WithTypeEnv :: Map Var CType -> [Dec Range] -> Program
-lowerDecs2WithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
+lowerDecsWithTypeEnv :: Map Var CType -> [Dec Range] -> Program
+lowerDecsWithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
   where
     go = do
       mapM_ preRegister decs
@@ -121,8 +121,8 @@ lowerDecs2WithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
 -- | Like 'lowerDecs2WithTypeEnv' but also supplies an array-rank map that
 -- enables rank-aware optimisations during lowering (e.g. emitting a scalar
 -- accumulator instead of a 0-D output array for 1-D reductions).
-lowerDecs2WithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> [Dec Range] -> Program
-lowerDecs2WithTypeEnvAndRanks topEnv rankEnv decs =
+lowerDecsWithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> [Dec Range] -> Program
+lowerDecsWithTypeEnvAndRanks topEnv rankEnv decs =
   evalState go (initStateWithTypeEnvAndRanks topEnv rankEnv)
   where
     go = do
@@ -3291,14 +3291,6 @@ noteReadOnlyAtom :: Atom -> LowerM ()
 noteReadOnlyAtom (AVar v) =
   recordArrayFact v $ \fact -> fact { afReadOnly = True }
 noteReadOnlyAtom _ = pure ()
-
-emptyVectorAccessFact :: VectorAccessFact
-emptyVectorAccessFact = VectorAccessFact
-  { vxfDenseLinearIndexOf = Nothing
-  , vxfDenseRead = False
-  , vxfIndirectRead = False
-  , vxfContiguousWrite = False
-  }
 
 recordVectorAccessFact :: CVar -> (VectorAccessFact -> VectorAccessFact) -> LowerM ()
 recordVectorAccessFact v updateFact = modify' $ \st ->

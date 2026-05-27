@@ -40,29 +40,29 @@ module Language.Hydrangea.Polyhedral
   , ScheduledScop(..)
   , ScopRejectReason(..)
   , ScopDiagnostic(..)
-  , affineExprFromIndexExpr2
-  , bandsStructurallyCompatible2
-  , buildIdentitySchedule2
-  , collectProcScopDiagnostics2
-  , collectProgramScopDiagnostics2
-  , blockingScopDependences2
-  , collectScopDependences2
-  , collectScopDependenceRelations2
-  , collectScopProfitabilityFacts2
-  , chooseBandPermutation2
-  , extractProcScops2
-  , extractProgramScops2
-  , fusionLegalAtDepth2
-  , polyhedralProgram2
-  , polyhedralIdentityTileProgram2
-  , polyhedralTileProgram2
-  , reifyScheduledScop2
-  , suggestBandSkew2
-  , suggestCrossBandSkew2
-  , synthesizeScopSchedule2
-  , tileIdentityScop2
-  , tileScop2
-  , tryFuseBands2
+  , affineExprFromIndexExpr
+  , bandsStructurallyCompatible
+  , buildIdentitySchedule
+  , collectProcScopDiagnostics
+  , collectProgramScopDiagnostics
+  , blockingScopDependences
+  , collectScopDependences
+  , collectScopDependenceRelations
+  , collectScopProfitabilityFacts
+  , chooseBandPermutation
+  , extractProcScops
+  , extractProgramScops
+  , fusionLegalAtDepth
+  , polyhedralProgram
+  , polyhedralIdentityTileProgram
+  , polyhedralTileProgram
+  , reifyScheduledScop
+  , suggestBandSkew
+  , suggestCrossBandSkew
+  , synthesizeScopSchedule
+  , tileIdentityScop
+  , tileScop
+  , tryFuseBands
   , detectTemporalAlias
   , augmentWithTemporalDeps
   ) where
@@ -79,9 +79,9 @@ import Data.Maybe (fromMaybe, isJust, listToMaybe, maybeToList)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG
-import Language.Hydrangea.CFGAnalysis (definedVarsStmts2, usedVarsIndexExpr, usedVarsStmt2, usedVarsStmts2)
+import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsIndexExpr, usedVarsStmt, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
-import Language.Hydrangea.CFGOpt (substStmts2)
+import Language.Hydrangea.CFGOpt (substStmts)
 
 type StmtId = [Int]
 
@@ -372,35 +372,35 @@ type AffineEnv = Map CVar AffineValue
 type TileM = State (Set CVar, Int)
 type ProfitabilityFacts = Map CVar IteratorProfitability
 
-polyhedralProgram2 :: Program -> Program
-polyhedralProgram2 = scheduleProgram2 (specializeScheduledScop2 . synthesizeScopSchedule2)
+polyhedralProgram :: Program -> Program
+polyhedralProgram = scheduleProgram (specializeScheduledScop . synthesizeScopSchedule)
 
-polyhedralTileProgram2 :: Program -> Program
-polyhedralTileProgram2 = scheduleProgram2 tileScop2
+polyhedralTileProgram :: Program -> Program
+polyhedralTileProgram = scheduleProgram tileScop
 
-polyhedralIdentityTileProgram2 :: Program -> Program
-polyhedralIdentityTileProgram2 = scheduleProgram2 tileIdentityScop2
+polyhedralIdentityTileProgram :: Program -> Program
+polyhedralIdentityTileProgram = scheduleProgram tileIdentityScop
 
-scheduleProgram2 :: (Scop -> ScheduledScop) -> Program -> Program
-scheduleProgram2 mkSchedule (Program procs) = Program (map rewriteProc procs)
+scheduleProgram :: (Scop -> ScheduledScop) -> Program -> Program
+scheduleProgram mkSchedule (Program procs) = Program (map rewriteProc procs)
   where
     rewriteProc proc =
       foldl applyScheduled proc scheduledScops
       where
         scheduledScops =
           reverse . sortOn (scRootPath . ssOriginal) $
-            map mkSchedule (extractProcScops2 proc)
+            map mkSchedule (extractProcScops proc)
 
         applyScheduled acc scheduled =
-          fromMaybe acc (applyScheduledScopToProc2 scheduled acc)
+          fromMaybe acc (applyScheduledScopToProc scheduled acc)
 
-buildIdentitySchedule2 :: Scop -> ScheduledScop
-buildIdentitySchedule2 scop =
-  buildScheduledScop2 scop (scAffineSchedule scop) (scSchedule scop)
+buildIdentitySchedule :: Scop -> ScheduledScop
+buildIdentitySchedule scop =
+  buildScheduledScop scop (scAffineSchedule scop) (scSchedule scop)
 
-synthesizeScopSchedule2 :: Scop -> ScheduledScop
-synthesizeScopSchedule2 scop =
-  let (affineSchedule, fusionRenames) = synthesizeAffineSchedule2 scop
+synthesizeScopSchedule :: Scop -> ScheduledScop
+synthesizeScopSchedule scop =
+  let (affineSchedule, fusionRenames) = synthesizeAffineSchedule scop
       renamedScop
         | M.null fusionRenames = scop
         | otherwise =
@@ -408,47 +408,47 @@ synthesizeScopSchedule2 scop =
             in  scop
                   { scStatements =
                       map
-                        (\ps -> ps { psStmt = case substStmts2 substEnv [psStmt ps] of { s : _ -> s; [] -> psStmt ps } })
+                        (\ps -> ps { psStmt = case substStmts substEnv [psStmt ps] of { s : _ -> s; [] -> psStmt ps } })
                         (scStatements scop)
                   }
-  in  buildScheduledScop2 renamedScop affineSchedule (scheduleTreeFromAffineSchedule2 affineSchedule)
+  in  buildScheduledScop renamedScop affineSchedule (scheduleTreeFromAffineSchedule affineSchedule)
 
-tileScop2 :: Scop -> ScheduledScop
-tileScop2 =
-  tileScheduledScop2 . synthesizeScopSchedule2
+tileScop :: Scop -> ScheduledScop
+tileScop =
+  tileScheduledScop . synthesizeScopSchedule
 
-tileIdentityScop2 :: Scop -> ScheduledScop
-tileIdentityScop2 =
-  tileScheduledScop2 . buildIdentitySchedule2
+tileIdentityScop :: Scop -> ScheduledScop
+tileIdentityScop =
+  tileScheduledScop . buildIdentitySchedule
 
-tileScheduledScop2 :: ScheduledScop -> ScheduledScop
-tileScheduledScop2 scheduled =
+tileScheduledScop :: ScheduledScop -> ScheduledScop
+tileScheduledScop scheduled =
   case ssReplacement specialized of
     Just {} -> specialized
-    Nothing -> fromMaybe generic (buildBlockedMapReductionScop2 generic)
+    Nothing -> fromMaybe generic (buildBlockedMapReductionScop generic)
   where
-    specialized = specializeTiledScheduledScop2 scheduled
+    specialized = specializeTiledScheduledScop scheduled
     scop = ssOriginal specialized
-    profitability = collectScopProfitabilityFacts2 scop
-    relations = collectScopDependenceRelations2 scop
+    profitability = collectScopProfitabilityFacts scop
+    relations = collectScopDependenceRelations scop
     generic =
       specialized
         { ssSchedule =
             evalState
-              (tileScheduleTree2 profitability relations 0 (ssSchedule specialized))
+              (tileScheduleTree profitability relations 0 (ssSchedule specialized))
               (collectScopNames scop, 0)
         }
 
-specializeScheduledScop2 :: ScheduledScop -> ScheduledScop
-specializeScheduledScop2 scheduled =
-  fromMaybe scheduled (buildWavefrontScop2 scheduled)
+specializeScheduledScop :: ScheduledScop -> ScheduledScop
+specializeScheduledScop scheduled =
+  fromMaybe scheduled (buildWavefrontScop scheduled)
 
-specializeTiledScheduledScop2 :: ScheduledScop -> ScheduledScop
-specializeTiledScheduledScop2 scheduled =
-  fromMaybe scheduled (buildTiledWavefrontScop2 scheduled)
+specializeTiledScheduledScop :: ScheduledScop -> ScheduledScop
+specializeTiledScheduledScop scheduled =
+  fromMaybe scheduled (buildTiledWavefrontScop scheduled)
 
-buildScheduledScop2 :: Scop -> AffineSchedule -> ScheduleTree -> ScheduledScop
-buildScheduledScop2 scop affineSchedule scheduleTree =
+buildScheduledScop :: Scop -> AffineSchedule -> ScheduleTree -> ScheduledScop
+buildScheduledScop scop affineSchedule scheduleTree =
   ScheduledScop
     { ssOriginal = scop
     , ssAffineSchedule = affineSchedule
@@ -459,8 +459,8 @@ buildScheduledScop2 scop affineSchedule scheduleTree =
     , ssVectorAccessFactOverrides = M.empty
     }
 
-affineScheduleFromScheduleTree2 :: ScheduleTree -> AffineSchedule
-affineScheduleFromScheduleTree2 scheduleTree =
+affineScheduleFromScheduleTree :: ScheduleTree -> AffineSchedule
+affineScheduleFromScheduleTree scheduleTree =
   AffineSchedule
     { asRoot = go scheduleTree
     , asStmtOrder = scheduleStmtOrder scheduleTree
@@ -485,8 +485,8 @@ affineScheduleFromScheduleTree2 scheduleTree =
       ScheduleStmtRef stmtId ->
         AffineScheduleStmtRef stmtId
 
-scheduleTreeFromAffineSchedule2 :: AffineSchedule -> ScheduleTree
-scheduleTreeFromAffineSchedule2 = go . asRoot
+scheduleTreeFromAffineSchedule :: AffineSchedule -> ScheduleTree
+scheduleTreeFromAffineSchedule = go . asRoot
   where
     go sched = case sched of
       AffineScheduleSequence xs ->
@@ -506,18 +506,18 @@ scheduleTreeFromAffineSchedule2 = go . asRoot
       AffineScheduleStmtRef stmtId ->
         ScheduleStmtRef stmtId
 
-synthesizeAffineSchedule2 :: Scop -> (AffineSchedule, Map CVar CVar)
-synthesizeAffineSchedule2 scop =
-  let relations = collectScopDependenceRelations2 scop
-      profitability = collectScopProfitabilityFacts2 scop
+synthesizeAffineSchedule :: Scop -> (AffineSchedule, Map CVar CVar)
+synthesizeAffineSchedule scop =
+  let relations = collectScopDependenceRelations scop
+      profitability = collectScopProfitabilityFacts scop
       (root', fusionRenames) =
         runState
-          (synthesizeAffineScheduleTree2 profitability 0 relations (asRoot (scAffineSchedule scop)))
+          (synthesizeAffineScheduleTree profitability 0 relations (asRoot (scAffineSchedule scop)))
           M.empty
       schedule =
         AffineSchedule
           { asRoot = root'
-          , asStmtOrder = affineScheduleStmtOrder2 root'
+          , asStmtOrder = affineScheduleStmtOrder root'
           }
   in  (schedule, fusionRenames)
 
@@ -539,8 +539,8 @@ mergeIteratorProfitability lhs rhs =
     , ipInvariantReadHits = ipInvariantReadHits lhs + ipInvariantReadHits rhs
     }
 
-collectScopProfitabilityFacts2 :: Scop -> ProfitabilityFacts
-collectScopProfitabilityFacts2 scop =
+collectScopProfitabilityFacts :: Scop -> ProfitabilityFacts
+collectScopProfitabilityFacts scop =
   foldl' collectStmt M.empty (scStatements scop)
   where
     collectStmt facts stmt =
@@ -613,25 +613,25 @@ collectScopProfitabilityFacts2 scop =
       | otherwise =
           facts
 
-synthesizeAffineScheduleTree2
+synthesizeAffineScheduleTree
   :: ProfitabilityFacts
   -> Int
   -> [PolyhedralDependenceRelation]
   -> AffineScheduleTree
   -> FusionM AffineScheduleTree
-synthesizeAffineScheduleTree2 profitability bandDepth relations sched = case sched of
+synthesizeAffineScheduleTree profitability bandDepth relations sched = case sched of
   AffineScheduleSequence xs -> do
-    synthesized <- mapM (synthesizeAffineScheduleTree2 profitability bandDepth relations) xs
-    fused <- greedyFuse2M bandDepth relations synthesized
+    synthesized <- mapM (synthesizeAffineScheduleTree profitability bandDepth relations) xs
+    fused <- greedyFuseM bandDepth relations synthesized
     pure (AffineScheduleSequence fused)
   AffineScheduleStmtRef stmtId ->
     pure (AffineScheduleStmtRef stmtId)
   AffineScheduleLoopBand band -> do
     let dims' =
           applyPermutation
-            (chooseBandPermutation2 profitability bandDepth (albDims band) relations)
+            (chooseBandPermutation profitability bandDepth (albDims band) relations)
             (albDims band)
-    body' <- synthesizeAffineScheduleTree2 profitability (bandDepth + 1) relations (albBody band)
+    body' <- synthesizeAffineScheduleTree profitability (bandDepth + 1) relations (albBody band)
     let body'' = case albRole band of
           LoopIterate ->
             case body' of
@@ -648,15 +648,15 @@ synthesizeAffineScheduleTree2 profitability bandDepth relations sched = case sch
       , albBody = body''
       }
 
-chooseBandPermutation2
+chooseBandPermutation
   :: ProfitabilityFacts
   -> Int
   -> [ScheduleDim]
   -> [PolyhedralDependenceRelation]
   -> [Int]
-chooseBandPermutation2 _ _ dims _
+chooseBandPermutation _ _ dims _
   | length dims <= 1 = [0 .. length dims - 1]
-chooseBandPermutation2 profitability bandDepth dims relations =
+chooseBandPermutation profitability bandDepth dims relations =
   fromMaybe identityPermutation (listToMaybe orderedPermutations)
   where
     identityPermutation = [0 .. length dims - 1]
@@ -664,20 +664,20 @@ chooseBandPermutation2 profitability bandDepth dims relations =
     allPermutations = permutations identityPermutation
     legalPermutations =
       filter
-        (\perm -> perm == identityPermutation || all (relationAllowsPermutation2 bandDepth bandIters perm) relations)
+        (\perm -> perm == identityPermutation || all (relationAllowsPermutation bandDepth bandIters perm) relations)
         allPermutations
-    orderedPermutations = sortOn (permutationScore2 profitability bandDepth dims relations) legalPermutations
+    orderedPermutations = sortOn (permutationScore profitability bandDepth dims relations) legalPermutations
 
-relationAllowsPermutation2 :: Int -> [CVar] -> [Int] -> PolyhedralDependenceRelation -> Bool
-relationAllowsPermutation2 bandDepth bandIters permutation relation =
-  case prefixBandStatus2 bandDepth relation of
+relationAllowsPermutation :: Int -> [CVar] -> [Int] -> PolyhedralDependenceRelation -> Bool
+relationAllowsPermutation bandDepth bandIters permutation relation =
+  case prefixBandStatus bandDepth relation of
     PrefixNonZero -> True
     PrefixUnknown -> False
     PrefixZero ->
-      case currentBandCarryForDepth2 bandDepth relation of
+      case currentBandCarryForDepth bandDepth relation of
         Nothing -> True
         Just bandCarry ->
-          case classifyBandCarry2 (permuteBandCarryInfo2 permutedBandIters bandCarry) of
+          case classifyBandCarry (permuteBandCarryInfo permutedBandIters bandCarry) of
             PolyBandBackward -> False
             PolyBandUnknown -> False
             PolyBandForward -> True
@@ -688,8 +688,8 @@ relationAllowsPermutation2 bandDepth bandIters permutation relation =
 data PrefixDistanceStatus = PrefixZero | PrefixNonZero | PrefixUnknown
   deriving (Eq, Show)
 
-prefixBandStatus2 :: Int -> PolyhedralDependenceRelation -> PrefixDistanceStatus
-prefixBandStatus2 bandDepth relation =
+prefixBandStatus :: Int -> PolyhedralDependenceRelation -> PrefixDistanceStatus
+prefixBandStatus bandDepth relation =
   foldl step PrefixZero (take bandDepth (pdrBandCarry relation))
   where
     step PrefixNonZero _ = PrefixNonZero
@@ -700,14 +700,14 @@ prefixBandStatus2 bandDepth relation =
       PolyBandBackward -> PrefixNonZero
       PolyBandUnknown -> PrefixUnknown
 
-permutationScore2
+permutationScore
   :: ProfitabilityFacts
   -> Int
   -> [ScheduleDim]
   -> [PolyhedralDependenceRelation]
   -> [Int]
   -> [(Int, Int, Int, Int, Int, Int, Int, Int, Int)]
-permutationScore2 profitability bandDepth dims relations permutation =
+permutationScore profitability bandDepth dims relations permutation =
   map scoreDim (zip [0 :: Int ..] permutedDims)
   where
     permutedDims = applyPermutation permutation dims
@@ -715,8 +715,8 @@ permutationScore2 profitability bandDepth dims relations permutation =
     scoringRelations =
       [ relation
       | relation <- relations
-      , prefixBandStatus2 bandDepth relation /= PrefixUnknown
-      , hasCurrentBandCarry2 bandDepth relation
+      , prefixBandStatus bandDepth relation /= PrefixUnknown
+      , hasCurrentBandCarry bandDepth relation
       ]
     scoreDim (position, dim) =
       ( negativeCount dim
@@ -733,27 +733,27 @@ permutationScore2 profitability bandDepth dims relations permutation =
       length
         [ ()
         | relation <- scoringRelations
-        , Just distance <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        , Just distance <- [currentBandDistanceForIter bandDepth relation (sdIter dim)]
         , distance < 0
         ]
     carriedCount dim =
       length
         [ ()
         | relation <- scoringRelations
-        , Just distance <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        , Just distance <- [currentBandDistanceForIter bandDepth relation (sdIter dim)]
         , distance /= 0
         ]
     unknownCount dim =
       length
         [ ()
         | relation <- scoringRelations
-        , Nothing <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        , Nothing <- [currentBandDistanceForIter bandDepth relation (sdIter dim)]
         ]
     independentCount dim =
       length
         [ ()
         | relation <- scoringRelations
-        , Just 0 <- [currentBandDistanceForIter2 bandDepth relation (sdIter dim)]
+        , Just 0 <- [currentBandDistanceForIter bandDepth relation (sdIter dim)]
         ]
     accessPositionPenalty position dim =
       let targetHits =
@@ -765,7 +765,7 @@ permutationScore2 profitability bandDepth dims relations permutation =
     unitStrideLastHits dim =
       ipUnitStrideLastHits (M.findWithDefault emptyIteratorProfitability (sdIter dim) profitability)
     reuseInnerPenalty position dim =
-      iteratorReuseSignal2 (iteratorProfitabilityFor2 profitability (sdIter dim)) * (innermostPos - position)
+      iteratorReuseSignal (iteratorProfitabilityFor profitability (sdIter dim)) * (innermostPos - position)
     parallelOuterReward position dim =
       negate (parallelFreedom dim * outerParallelWeight position * constantTripCountScore (sdBound dim))
     parallelFreedom dim
@@ -773,12 +773,12 @@ permutationScore2 profitability bandDepth dims relations permutation =
       | otherwise = independentCount dim
     outerParallelWeight position = innermostPos - position + 1
 
-iteratorProfitabilityFor2 :: ProfitabilityFacts -> CVar -> IteratorProfitability
-iteratorProfitabilityFor2 profitability iter =
+iteratorProfitabilityFor :: ProfitabilityFacts -> CVar -> IteratorProfitability
+iteratorProfitabilityFor profitability iter =
   M.findWithDefault emptyIteratorProfitability iter profitability
 
-iteratorReuseSignal2 :: IteratorProfitability -> Int
-iteratorReuseSignal2 info =
+iteratorReuseSignal :: IteratorProfitability -> Int
+iteratorReuseSignal info =
   ipInvariantReadHits info + max 0 (ipReadTouchHits info - 1)
 
 constantTripCountScore :: IndexExpr -> Int
@@ -795,18 +795,18 @@ applyPermutation permutation xs =
   , Just x <- [atMay xs ix]
   ]
 
-affineScheduleStmtOrder2 :: AffineScheduleTree -> [StmtId]
-affineScheduleStmtOrder2 sched = case sched of
-  AffineScheduleSequence xs -> foldMap affineScheduleStmtOrder2 xs
-  AffineScheduleLoopBand band -> affineScheduleStmtOrder2 (albBody band)
+affineScheduleStmtOrder :: AffineScheduleTree -> [StmtId]
+affineScheduleStmtOrder sched = case sched of
+  AffineScheduleSequence xs -> foldMap affineScheduleStmtOrder xs
+  AffineScheduleLoopBand band -> affineScheduleStmtOrder (albBody band)
   AffineScheduleStmtRef stmtId -> [stmtId]
 
 -- ---------------------------------------------------------------------------
 -- Fusion helpers
 -- ---------------------------------------------------------------------------
 
-bandsStructurallyCompatible2 :: AffineLoopBand -> AffineLoopBand -> Bool
-bandsStructurallyCompatible2 b1 b2 =
+bandsStructurallyCompatible :: AffineLoopBand -> AffineLoopBand -> Bool
+bandsStructurallyCompatible b1 b2 =
   length (albDims b1) == length (albDims b2)
     && albRole b1 == albRole b2
     && map sdBound (albDims b1) == map sdBound (albDims b2)
@@ -822,11 +822,11 @@ renameAffineExpr renaming ae =
 -- iterator names, apply the iter renaming (B2 iters → B1 iters) to the target
 -- access index and re-analyze.  Returns True (safe) iff the effective distance
 -- is ≤ 0 (reads from the past or same iteration in the fused loop).
-crossSiblingDepSafe2 :: Map CVar CVar -> PolyhedralDependenceRelation -> Bool
-crossSiblingDepSafe2 renaming rel =
+crossSiblingDepSafe :: Map CVar CVar -> PolyhedralDependenceRelation -> Bool
+crossSiblingDepSafe renaming rel =
   let renamedTgt = map (renameAffineExpr renaming) (pdrTgtIndex rel)
       allIters = M.keys (M.unions (map aeTerms (pdrSrcIndex rel) ++ map aeTerms renamedTgt))
-      analysis = analyzeAccessDistance2 allIters (pdrSrcIndex rel) renamedTgt
+      analysis = analyzeAccessDistance allIters (pdrSrcIndex rel) renamedTgt
   in not (any positiveCarry (adaCarryInfo analysis))
   where
     positiveCarry info = case pciStatus info of
@@ -838,18 +838,18 @@ crossSiblingDepSafe2 renaming rel =
 -- at the given depth.  @renaming@ maps B2 iterator names to B1 iterator names
 -- and is used when the standard band-carry analysis cannot determine the carry
 -- (because the two bands use different iterator variable names).
-fusionLegalAtDepth2
+fusionLegalAtDepth
   :: Int
   -> Set StmtId
   -> Set StmtId
   -> Map CVar CVar
   -> PolyhedralDependenceRelation
   -> Bool
-fusionLegalAtDepth2 bandDepth stmtsA stmtsB renaming rel
+fusionLegalAtDepth bandDepth stmtsA stmtsB renaming rel
   | pdrClassification rel == PolyDepClassReductionLike = True
   | not crossBands = True
-  | otherwise = case currentBandCarryForDepth2 bandDepth rel of
-      Nothing -> crossSiblingDepSafe2 renaming rel
+  | otherwise = case currentBandCarryForDepth bandDepth rel of
+      Nothing -> crossSiblingDepSafe renaming rel
       Just bc -> pbcStatus bc /= PolyBandBackward && pbcStatus bc /= PolyBandUnknown
   where
     srcA = pdrSourceStmt rel `S.member` stmtsA
@@ -861,24 +861,24 @@ fusionLegalAtDepth2 bandDepth stmtsA stmtsB renaming rel
 -- | Pure check: are two bands compatible for fusion?  Returns the fused tree
 -- (using b1's iterator names) without accumulating any renaming.  Exported
 -- for unit tests.
-tryFuseBands2
+tryFuseBands
   :: Int
   -> [PolyhedralDependenceRelation]
   -> AffineScheduleTree
   -> AffineScheduleTree
   -> Maybe AffineScheduleTree
-tryFuseBands2 bandDepth relations t1 t2 =
-  fst <$> tryFuseBands2Internal bandDepth relations t1 t2
+tryFuseBands bandDepth relations t1 t2 =
+  fst <$> tryFuseBandsInternal bandDepth relations t1 t2
 
-tryFuseBands2Internal
+tryFuseBandsInternal
   :: Int
   -> [PolyhedralDependenceRelation]
   -> AffineScheduleTree
   -> AffineScheduleTree
   -> Maybe (AffineScheduleTree, Map CVar CVar)
-tryFuseBands2Internal bandDepth relations (AffineScheduleLoopBand b1) (AffineScheduleLoopBand b2)
-  | bandsStructurallyCompatible2 b1 b2
-  , all (fusionLegalAtDepth2 bandDepth stmts1 stmts2 renaming) relations =
+tryFuseBandsInternal bandDepth relations (AffineScheduleLoopBand b1) (AffineScheduleLoopBand b2)
+  | bandsStructurallyCompatible b1 b2
+  , all (fusionLegalAtDepth bandDepth stmts1 stmts2 renaming) relations =
       Just
         ( AffineScheduleLoopBand b1
             { albBody =
@@ -891,36 +891,36 @@ tryFuseBands2Internal bandDepth relations (AffineScheduleLoopBand b1) (AffineSch
         )
   where
     renaming = M.fromList (zip (map sdIter (albDims b2)) (map sdIter (albDims b1)))
-    stmts1 = S.fromList (affineScheduleStmtOrder2 (AffineScheduleLoopBand b1))
-    stmts2 = S.fromList (affineScheduleStmtOrder2 (AffineScheduleLoopBand b2))
-tryFuseBands2Internal _ _ _ _ = Nothing
+    stmts1 = S.fromList (affineScheduleStmtOrder (AffineScheduleLoopBand b1))
+    stmts2 = S.fromList (affineScheduleStmtOrder (AffineScheduleLoopBand b2))
+tryFuseBandsInternal _ _ _ _ = Nothing
 
 type FusionM = State (Map CVar CVar)
 
-greedyFuse2M
+greedyFuseM
   :: Int
   -> [PolyhedralDependenceRelation]
   -> [AffineScheduleTree]
   -> FusionM [AffineScheduleTree]
-greedyFuse2M _ _ [] = pure []
-greedyFuse2M _ _ [x] = pure [x]
-greedyFuse2M bandDepth relations (x : y : rest) =
-  case tryFuseBands2Internal bandDepth relations x y of
+greedyFuseM _ _ [] = pure []
+greedyFuseM _ _ [x] = pure [x]
+greedyFuseM bandDepth relations (x : y : rest) =
+  case tryFuseBandsInternal bandDepth relations x y of
     Just (fused, renaming) -> do
       modify (M.union renaming)
-      greedyFuse2M bandDepth relations (fused : rest)
-    Nothing -> (x :) <$> greedyFuse2M bandDepth relations (y : rest)
+      greedyFuseM bandDepth relations (fused : rest)
+    Nothing -> (x :) <$> greedyFuseM bandDepth relations (y : rest)
 
 -- ---------------------------------------------------------------------------
 -- Skewing helpers
 -- ---------------------------------------------------------------------------
 
-suggestBandSkew2
+suggestBandSkew
   :: Int
   -> [ScheduleDim]
   -> [PolyhedralDependenceRelation]
   -> Maybe SkewSpec
-suggestBandSkew2 bandDepth dims relations
+suggestBandSkew bandDepth dims relations
   | length dims < 2 = Nothing
   | otherwise = listToMaybe
       [ SkewSpec
@@ -931,21 +931,21 @@ suggestBandSkew2 bandDepth dims relations
       | (outerDim, innerDim) <- zip dims (drop 1 dims)
       , let outerIter = sdIter outerDim
             innerIter = sdIter innerDim
-      , coeff <- maybeToList (skewCoeffForBand2 bandDepth outerIter innerIter relations)
+      , coeff <- maybeToList (skewCoeffForBand bandDepth outerIter innerIter relations)
       ]
 
-skewCoeffForBand2
+skewCoeffForBand
   :: Int
   -> CVar
   -> CVar
   -> [PolyhedralDependenceRelation]
   -> Maybe Integer
-skewCoeffForBand2 bandDepth outerIter innerIter relations =
+skewCoeffForBand bandDepth outerIter innerIter relations =
   case
     [ coeff
     | rel <- relations
-    , Just innerDist <- [currentBandDistanceForIter2 bandDepth rel innerIter]
-    , Just outerDist <- [currentBandDistanceForIter2 bandDepth rel outerIter]
+    , Just innerDist <- [currentBandDistanceForIter bandDepth rel innerIter]
+    , Just outerDist <- [currentBandDistanceForIter bandDepth rel outerIter]
     , innerDist < 0
     , outerDist > 0
     , let coeff = ((-innerDist) + outerDist - 1) `div` outerDist
@@ -959,13 +959,13 @@ skewCoeffForBand2 bandDepth outerIter innerIter relations =
 -- skew target is an inner iterator; the source is an outer iterator.  This
 -- differs from 'suggestBandSkew2' which operates on adjacents dims /within/
 -- a single band.
-suggestCrossBandSkew2
+suggestCrossBandSkew
   :: Int              -- ^ outer band depth
   -> [CVar]           -- ^ outer band iterators
   -> [CVar]           -- ^ inner band iterators
   -> [PolyhedralDependenceRelation]
   -> [SkewSpec]
-suggestCrossBandSkew2 outerDepth outerIters innerIters relations
+suggestCrossBandSkew outerDepth outerIters innerIters relations
   | null outerIters || null innerIters = []
   | otherwise =
       maybeToList $
@@ -977,23 +977,23 @@ suggestCrossBandSkew2 outerDepth outerIters innerIters relations
               }
           | innerIter <- innerIters
           , outerIter <- outerIters
-          , coeff <- maybeToList (crossSkewCoeff2 outerDepth outerIter innerIter relations)
+          , coeff <- maybeToList (crossSkewCoeff outerDepth outerIter innerIter relations)
           ]
 
 -- | Compute the required skew coefficient for a cross-band dependence where
 -- the outer iterator has positive distance and the inner iterator has
 -- negative distance.  Returns @ceil(-innerDist \/ outerDist)@.
-crossSkewCoeff2
+crossSkewCoeff
   :: Int
   -> CVar
   -> CVar
   -> [PolyhedralDependenceRelation]
   -> Maybe Integer
-crossSkewCoeff2 outerDepth outerIter innerIter relations =
+crossSkewCoeff outerDepth outerIter innerIter relations =
   case [ coeff
        | rel <- relations
-       , Just innerDist <- [currentBandDistanceForIter2 (outerDepth + 1) rel innerIter]
-       , Just outerDist <- [currentBandDistanceForIter2 outerDepth rel outerIter]
+       , Just innerDist <- [currentBandDistanceForIter (outerDepth + 1) rel innerIter]
+       , Just outerDist <- [currentBandDistanceForIter outerDepth rel outerIter]
        , innerDist < 0
        , outerDist > 0
        , let coeff = ((-innerDist) + outerDist - 1) `div` outerDist
@@ -1001,17 +1001,17 @@ crossSkewCoeff2 outerDepth outerIter innerIter relations =
     [] -> Nothing
     coeffs -> Just (maximum coeffs)
 
-strictCrossSkewCoeff2
+strictCrossSkewCoeff
   :: Int
   -> CVar
   -> CVar
   -> [PolyhedralDependenceRelation]
   -> Maybe Integer
-strictCrossSkewCoeff2 outerDepth outerIter innerIter relations =
+strictCrossSkewCoeff outerDepth outerIter innerIter relations =
   case [ coeff
        | rel <- relations
-       , Just innerDist <- [currentBandDistanceForIter2 (outerDepth + 1) rel innerIter]
-       , Just outerDist <- [currentBandDistanceForIter2 outerDepth rel outerIter]
+       , Just innerDist <- [currentBandDistanceForIter (outerDepth + 1) rel innerIter]
+       , Just outerDist <- [currentBandDistanceForIter outerDepth rel outerIter]
        , innerDist < 0
        , outerDist > 0
        , let coeff = ((-innerDist) `div` outerDist) + 1
@@ -1019,8 +1019,8 @@ strictCrossSkewCoeff2 outerDepth outerIter innerIter relations =
     [] -> Nothing
     coeffs -> Just (maximum coeffs)
 
-loopBandOriginsFromSkews2 :: [SkewSpec] -> [CVar] -> [IndexExpr]
-loopBandOriginsFromSkews2 skews bandIters =
+loopBandOriginsFromSkews :: [SkewSpec] -> [CVar] -> [IndexExpr]
+loopBandOriginsFromSkews skews bandIters =
   let iterToOrigin = M.fromList
         [ (skewTarget s, IMul (IConst (skewCoeff s)) (IVar (skewSource s)))
         | s <- skews
@@ -1048,7 +1048,7 @@ applyCrossBandSkewToInner
   -> [PolyhedralDependenceRelation]
   -> AffineScheduleTree
 applyCrossBandSkewToInner outerDepth outerIters inner relations =
-  let skews = suggestCrossBandSkew2 outerDepth outerIters (map sdIter (albDims inner)) relations
+  let skews = suggestCrossBandSkew outerDepth outerIters (map sdIter (albDims inner)) relations
   in case skews of
     [] -> AffineScheduleLoopBand inner
     _ ->
@@ -1066,7 +1066,7 @@ applyCrossBandSkewToSeq
 applyCrossBandSkewToSeq outerDepth outerIters xs relations =
   case span (not . isLoopMapBand) xs of
     (before, AffineScheduleLoopBand inner : after) ->
-      let skews = suggestCrossBandSkew2 outerDepth outerIters (map sdIter (albDims inner)) relations
+      let skews = suggestCrossBandSkew outerDepth outerIters (map sdIter (albDims inner)) relations
           inner' = case skews of
             [] -> inner
             _  -> inner { albSkew = skews ++ albSkew inner, albOrigins = crossBandOrigins skews inner }
@@ -1076,22 +1076,22 @@ applyCrossBandSkewToSeq outerDepth outerIters xs relations =
     isLoopMapBand (AffineScheduleLoopBand b) = albRole b == LoopMap
     isLoopMapBand _ = False
 
-extractProgramScops2 :: Program -> [Scop]
-extractProgramScops2 (Program procs) = foldMap extractProcScops2 procs
+extractProgramScops :: Program -> [Scop]
+extractProgramScops (Program procs) = foldMap extractProcScops procs
 
-extractProcScops2 :: Proc -> [Scop]
-extractProcScops2 = foldMap onlyScop . collectProcScopDiagnostics2
+extractProcScops :: Proc -> [Scop]
+extractProcScops = foldMap onlyScop . collectProcScopDiagnostics
   where
     onlyScop diag = case diag of
       ScopExtracted scop -> [scop]
       ScopRejected {} -> []
 
-collectProgramScopDiagnostics2 :: Program -> [ScopDiagnostic]
-collectProgramScopDiagnostics2 (Program procs) =
-  foldMap collectProcScopDiagnostics2 procs
+collectProgramScopDiagnostics :: Program -> [ScopDiagnostic]
+collectProgramScopDiagnostics (Program procs) =
+  foldMap collectProcScopDiagnostics procs
 
-collectProcScopDiagnostics2 :: Proc -> [ScopDiagnostic]
-collectProcScopDiagnostics2 proc = go [] (procBody proc)
+collectProcScopDiagnostics :: Proc -> [ScopDiagnostic]
+collectProcScopDiagnostics proc = go [] (procBody proc)
   where
     go basePath stmts =
       concatMap (\(i, stmt) -> goStmt (basePath ++ [i]) stmt) (zip [0 ..] stmts)
@@ -1107,12 +1107,12 @@ collectProcScopDiagnostics2 proc = go [] (procBody proc)
       _ ->
         []
 
-collectScopDependences2 :: Scop -> [PolyhedralDependence]
-collectScopDependences2 =
-  map relationToLegacyDependence2 . collectScopDependenceRelations2
+collectScopDependences :: Scop -> [PolyhedralDependence]
+collectScopDependences =
+  map relationToLegacyDependence . collectScopDependenceRelations
 
-collectScopDependenceRelations2 :: Scop -> [PolyhedralDependenceRelation]
-collectScopDependenceRelations2 scop =
+collectScopDependenceRelations :: Scop -> [PolyhedralDependenceRelation]
+collectScopDependenceRelations scop =
   let baseDeps =
         [ mkRelation srcStmt tgtStmt srcAccess tgtAccess depKind accessAnalysis
         | (srcPos, srcStmt) <- orderedStmts
@@ -1123,7 +1123,7 @@ collectScopDependenceRelations2 scop =
         , paArray srcAccess == paArray tgtAccess
         , Just depKind <- [dependenceKindFromAccesses srcAccess tgtAccess]
         , let accessAnalysis =
-                analyzeAccessDistance2 (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
+                analyzeAccessDistance (scIterators scop) (paIndex srcAccess) (paIndex tgtAccess)
         ]
   in  case outerIterateInfo (scSchedule scop) of
         Just (iterT, _arrNext) ->
@@ -1137,14 +1137,14 @@ collectScopDependenceRelations2 scop =
        | (pos, stmtId) <- zip [0 :: Int ..] (scheduleStmtOrder (scSchedule scop))
        , Just stmt <- [M.lookup stmtId stmtMap]
        ]
-    stmtContexts = stmtLoopContexts2 (scSchedule scop)
+    stmtContexts = stmtLoopContexts (scSchedule scop)
     mkRelation srcStmt tgtStmt srcAccess tgtAccess depKind accessAnalysis =
       let srcCtx = M.findWithDefault [] (psPath srcStmt) stmtContexts
           tgtCtx = M.findWithDefault [] (psPath tgtStmt) stmtContexts
-          bandCarry = dependenceBandCarry2 srcCtx tgtCtx accessAnalysis
-          depClass = dependenceClassFor2 bandCarry
-          isLoopCarried = accessIsLoopCarried2 accessAnalysis
-          isBlocking = dependenceIsBlocking2 bandCarry accessAnalysis depClass
+          bandCarry = dependenceBandCarry srcCtx tgtCtx accessAnalysis
+          depClass = dependenceClassFor bandCarry
+          isLoopCarried = accessIsLoopCarried accessAnalysis
+          isBlocking = dependenceIsBlocking bandCarry accessAnalysis depClass
       in  PolyhedralDependenceRelation
             { pdrKind = depKind
             , pdrArray = paArray srcAccess
@@ -1152,7 +1152,7 @@ collectScopDependenceRelations2 scop =
             , pdrTargetStmt = psPath tgtStmt
             , pdrDirection = adaDirection accessAnalysis
             , pdrIsLoopCarried = isLoopCarried
-            , pdrDistance = accessDistanceVector2 accessAnalysis
+            , pdrDistance = accessDistanceVector accessAnalysis
             , pdrCarryInfo = adaCarryInfo accessAnalysis
             , pdrBandCarry = bandCarry
             , pdrClassification = depClass
@@ -1190,7 +1190,7 @@ detectTemporalAlias stmts = case reverse stmts of
 -- | Augment dependence relations from a LoopIterate scop with the temporal
 -- dimension.  For every dep that is carried purely within spatial (non-iterate)
 -- bands, prepend an outer LoopIterate band carry of distance +1.  This makes
--- the WAR deps from stencil reads visible to @suggestBandSkew2@.
+-- the WAR deps from stencil reads visible to @suggestBandSkew@.
 --
 -- In a @LoopIterate@ body the polyhedral analysis treats reads and writes as
 -- occurring in the *same* temporal iteration (iter_t distance = 0).  But the
@@ -1198,7 +1198,7 @@ detectTemporalAlias stmts = case reverse stmts of
 -- written at body[iter_t-1].  For a WAR dep (read-before-write, same array)
 -- with zero iter_t distance and at least one negative spatial distance, we
 -- bump the iter_t component from 0 to +1 to expose the true cross-iteration
--- nature of the dependence so that @suggestBandSkew2@ can fire.
+-- nature of the dependence so that @suggestBandSkew@ can fire.
 augmentWithTemporalDeps
   :: CVar                          -- ^ iter_t: the LoopIterate iterator
   -> [PolyhedralDependenceRelation]
@@ -1266,7 +1266,7 @@ augmentWithTemporalDeps iterT = map augmentOne
         }
 
     recomputeBandStatus carryInfo =
-      case traverse carryDistance2 carryInfo of
+      case traverse carryDistance carryInfo of
         Just distances
           | all (== 0) distances -> PolyBandIndependent
           | otherwise ->
@@ -1276,8 +1276,8 @@ augmentWithTemporalDeps iterT = map augmentOne
                 PolyDepUnknown -> PolyBandUnknown
         Nothing -> PolyBandUnknown
 
-relationToLegacyDependence2 :: PolyhedralDependenceRelation -> PolyhedralDependence
-relationToLegacyDependence2 relation =
+relationToLegacyDependence :: PolyhedralDependenceRelation -> PolyhedralDependence
+relationToLegacyDependence relation =
   PolyhedralDependence
     { pdKind = pdrKind relation
     , pdArray = pdrArray relation
@@ -1288,17 +1288,17 @@ relationToLegacyDependence2 relation =
     , pdDistance = pdrDistance relation
     }
 
-blockingScopDependences2 :: Scop -> [PolyhedralDependence]
-blockingScopDependences2 =
-  map relationToLegacyDependence2 . filter pdrIsBlocking . collectScopDependenceRelations2
+blockingScopDependences :: Scop -> [PolyhedralDependence]
+blockingScopDependences =
+  map relationToLegacyDependence . filter pdrIsBlocking . collectScopDependenceRelations
 
 data LoopContext = LoopContext
   { lcIters :: [CVar]
   , lcRole :: LoopRole
   }
 
-stmtLoopContexts2 :: ScheduleTree -> Map StmtId [LoopContext]
-stmtLoopContexts2 = go []
+stmtLoopContexts :: ScheduleTree -> Map StmtId [LoopContext]
+stmtLoopContexts = go []
   where
     go stack sched = case sched of
       ScheduleSequence xs ->
@@ -1313,9 +1313,9 @@ stmtLoopContexts2 = go []
     enterBand stack band =
       go (LoopContext (lbIters band) (lbRole band) : stack) (lbBody band)
 
-dependenceBandCarry2 :: [LoopContext] -> [LoopContext] -> AccessDistanceAnalysis -> [PolyhedralBandCarry]
-dependenceBandCarry2 srcCtx tgtCtx accessAnalysis =
-  map mkBandCarry (commonLoopPrefix2 srcCtx tgtCtx)
+dependenceBandCarry :: [LoopContext] -> [LoopContext] -> AccessDistanceAnalysis -> [PolyhedralBandCarry]
+dependenceBandCarry srcCtx tgtCtx accessAnalysis =
+  map mkBandCarry (commonLoopPrefix srcCtx tgtCtx)
   where
     carryMap = M.fromList [(pciIter info, info) | info <- adaCarryInfo accessAnalysis]
     mkBandCarry loopCtx =
@@ -1326,13 +1326,13 @@ dependenceBandCarry2 srcCtx tgtCtx accessAnalysis =
       in  PolyhedralBandCarry
             { pbcIters = lcIters loopCtx
             , pbcRole = lcRole loopCtx
-            , pbcStatus = classifyBandCarry2 carryInfo
+            , pbcStatus = classifyBandCarry carryInfo
             , pbcCarryInfo = carryInfo
             }
 
-classifyBandCarry2 :: [PolyhedralCarryInfo] -> PolyhedralBandCarryStatus
-classifyBandCarry2 carryInfo =
-  case traverse carryDistance2 carryInfo of
+classifyBandCarry :: [PolyhedralCarryInfo] -> PolyhedralBandCarryStatus
+classifyBandCarry carryInfo =
+  case traverse carryDistance carryInfo of
     Just distances
       | all (== 0) distances ->
           PolyBandIndependent
@@ -1347,46 +1347,46 @@ classifyBandCarry2 carryInfo =
       | otherwise ->
           PolyBandUnknown
 
-dependenceClassFor2 :: [PolyhedralBandCarry] -> PolyhedralDependenceClass
-dependenceClassFor2 bandCarry
+dependenceClassFor :: [PolyhedralBandCarry] -> PolyhedralDependenceClass
+dependenceClassFor bandCarry
   | any isReductionBand bandCarry && not (any isBlockingRegularBand bandCarry) =
       PolyDepClassReductionLike
   | otherwise =
       PolyDepClassRegular
   where
     isReductionBand band =
-      isReductionRole2 (pbcRole band) && pbcStatus band /= PolyBandIndependent
+      isReductionRole (pbcRole band) && pbcStatus band /= PolyBandIndependent
     isBlockingRegularBand band =
-      not (isReductionRole2 (pbcRole band)) && bandStatusBlocks2 (pbcStatus band)
+      not (isReductionRole (pbcRole band)) && bandStatusBlocks (pbcStatus band)
 
-dependenceIsBlocking2
+dependenceIsBlocking
   :: [PolyhedralBandCarry]
   -> AccessDistanceAnalysis
   -> PolyhedralDependenceClass
   -> Bool
-dependenceIsBlocking2 bandCarry accessAnalysis depClass
-  | any (\band -> not (isReductionRole2 (pbcRole band)) && bandStatusBlocks2 (pbcStatus band)) bandCarry =
+dependenceIsBlocking bandCarry accessAnalysis depClass
+  | any (\band -> not (isReductionRole (pbcRole band)) && bandStatusBlocks (pbcStatus band)) bandCarry =
       True
   | depClass == PolyDepClassReductionLike =
       False
   | otherwise =
-      accessIsLoopCarried2 accessAnalysis && adaDirection accessAnalysis /= PolyDepForward
+      accessIsLoopCarried accessAnalysis && adaDirection accessAnalysis /= PolyDepForward
 
-isReductionRole2 :: LoopRole -> Bool
-isReductionRole2 role =
+isReductionRole :: LoopRole -> Bool
+isReductionRole role =
   role == LoopReduction || role == LoopReductionWrapper || role == LoopMapReduction
 
-bandStatusBlocks2 :: PolyhedralBandCarryStatus -> Bool
-bandStatusBlocks2 status = case status of
+bandStatusBlocks :: PolyhedralBandCarryStatus -> Bool
+bandStatusBlocks status = case status of
   PolyBandBackward -> True
   PolyBandUnknown -> True
   _ -> False
 
-commonLoopPrefix2 :: [LoopContext] -> [LoopContext] -> [LoopContext]
-commonLoopPrefix2 (x : xs) (y : ys)
+commonLoopPrefix :: [LoopContext] -> [LoopContext] -> [LoopContext]
+commonLoopPrefix (x : xs) (y : ys)
   | lcIters x == lcIters y && lcRole x == lcRole y =
-      x : commonLoopPrefix2 xs ys
-commonLoopPrefix2 _ _ = []
+      x : commonLoopPrefix xs ys
+commonLoopPrefix _ _ = []
 
 buildScop :: CVar -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
 buildScop procName rootPath spec body = do
@@ -1401,7 +1401,7 @@ buildScop procName rootPath spec body = do
            { scProcName = procName
            , scRootPath = rootPath
            , scSchedule = schedule
-           , scAffineSchedule = affineScheduleFromScheduleTree2 schedule
+           , scAffineSchedule = affineScheduleFromScheduleTree schedule
            , scStatements = stmts
            , scIterators = iterators
            , scParameters = params
@@ -1481,17 +1481,17 @@ scheduleStmtOrder sched = case sched of
   ScheduleStripMine band _ -> scheduleStmtOrder (lbBody band)
   ScheduleStmtRef stmtId -> [stmtId]
 
-tileScheduleTree2 :: ProfitabilityFacts -> [PolyhedralDependenceRelation] -> Int -> ScheduleTree -> TileM ScheduleTree
-tileScheduleTree2 profitability relations depth sched = case sched of
+tileScheduleTree :: ProfitabilityFacts -> [PolyhedralDependenceRelation] -> Int -> ScheduleTree -> TileM ScheduleTree
+tileScheduleTree profitability relations depth sched = case sched of
   ScheduleSequence xs ->
-    ScheduleSequence <$> mapM (tileScheduleTree2 profitability relations depth) xs
+    ScheduleSequence <$> mapM (tileScheduleTree profitability relations depth) xs
   ScheduleStmtRef stmtId ->
     pure (ScheduleStmtRef stmtId)
   ScheduleStripMine band plans -> do
-    body' <- tileScheduleTree2 profitability relations (depth + 1) (lbBody band)
+    body' <- tileScheduleTree profitability relations (depth + 1) (lbBody band)
     pure (ScheduleStripMine band { lbBody = body' } plans)
   ScheduleLoopBand band -> do
-    body' <- tileScheduleTree2 profitability relations (depth + 1) (lbBody band)
+    body' <- tileScheduleTree profitability relations (depth + 1) (lbBody band)
     let band' = band { lbBody = body' }
         shouldTile = shouldTileBand depth band'
     if not shouldTile
@@ -1508,7 +1508,7 @@ shouldTileBand depth band =
     && lbRole band /= LoopReductionWrapper
     && lbRole band /= LoopFold
     && lbRole band /= LoopIterate
-    && loopRoleSupportsTiling2 band
+    && loopRoleSupportsTiling band
     && boundsAreIteratorIndependent band
     && all (supportsAtomBound . simplifyIndexExpr) (lbBounds band)
     && ( depth > 0
@@ -1517,8 +1517,8 @@ shouldTileBand depth band =
       || lbRole band == LoopReduction
        )
 
-loopRoleSupportsTiling2 :: LoopBand -> Bool
-loopRoleSupportsTiling2 band = case lbRole band of
+loopRoleSupportsTiling :: LoopBand -> Bool
+loopRoleSupportsTiling band = case lbRole band of
   LoopMap ->
     hasNestedBand (lbBody band) || length (lbIters band) > 1
   _ ->
@@ -1548,7 +1548,7 @@ buildStripMinePlans
   -> LoopBand
   -> TileM [StripMinePlan]
 buildStripMinePlans cfg profitability relations depth band
-  | shouldSkipBandTilingForProfitability2 profitability relations depth band =
+  | shouldSkipBandTilingForProfitability profitability relations depth band =
       pure [StripKeep iter bound | (iter, bound) <- zip (lbIters band) (lbBounds band)]
   | otherwise =
       mapM buildOne (zip3 [0 :: Int ..] (lbIters band) (lbBounds band))
@@ -1556,7 +1556,7 @@ buildStripMinePlans cfg profitability relations depth band
     innermostPos = length (lbIters band) - 1
 
     buildOne (position, iter, bound)
-      | shouldKeepDimUntiledForProfitability2 profitability band innermostPos position iter =
+      | shouldKeepDimUntiledForProfitability profitability band innermostPos position iter =
           pure (StripKeep iter bound)
       | otherwise =
           buildTiledPlan iter bound
@@ -1586,47 +1586,47 @@ buildStripMinePlans cfg profitability relations depth band
             , smdBoundAtom = boundAtom
             })
 
-shouldSkipBandTilingForProfitability2
+shouldSkipBandTilingForProfitability
   :: ProfitabilityFacts
   -> [PolyhedralDependenceRelation]
   -> Int
   -> LoopBand
   -> Bool
-shouldSkipBandTilingForProfitability2 profitability relations depth band =
-  bandRoleUsesReuseHeuristics2 band
-    && bandFullyIndependent2 depth relations
-    && all ((== 0) . iteratorReuseSignal2 . iteratorProfitabilityFor2 profitability) (lbIters band)
+shouldSkipBandTilingForProfitability profitability relations depth band =
+  bandRoleUsesReuseHeuristics band
+    && bandFullyIndependent depth relations
+    && all ((== 0) . iteratorReuseSignal . iteratorProfitabilityFor profitability) (lbIters band)
 
-shouldKeepDimUntiledForProfitability2
+shouldKeepDimUntiledForProfitability
   :: ProfitabilityFacts
   -> LoopBand
   -> Int
   -> Int
   -> CVar
   -> Bool
-shouldKeepDimUntiledForProfitability2 profitability band innermostPos position iter =
-  bandRoleUsesReuseHeuristics2 band
+shouldKeepDimUntiledForProfitability profitability band innermostPos position iter =
+  bandRoleUsesReuseHeuristics band
     && position == innermostPos
     && ipUnitStrideLastHits info > 0
-    && iteratorReuseSignal2 info == 0
+    && iteratorReuseSignal info == 0
   where
-    info = iteratorProfitabilityFor2 profitability iter
+    info = iteratorProfitabilityFor profitability iter
 
-bandRoleUsesReuseHeuristics2 :: LoopBand -> Bool
-bandRoleUsesReuseHeuristics2 band =
+bandRoleUsesReuseHeuristics :: LoopBand -> Bool
+bandRoleUsesReuseHeuristics band =
   lbRole band == LoopPlain || lbRole band == LoopMap
 
-bandFullyIndependent2 :: Int -> [PolyhedralDependenceRelation] -> Bool
-bandFullyIndependent2 depth relations =
+bandFullyIndependent :: Int -> [PolyhedralDependenceRelation] -> Bool
+bandFullyIndependent depth relations =
   all relationIndependent relevantRelations
   where
     relevantRelations =
       [ relation
       | relation <- relations
-      , prefixBandStatus2 depth relation /= PrefixUnknown
-      , hasCurrentBandCarry2 depth relation
+      , prefixBandStatus depth relation /= PrefixUnknown
+      , hasCurrentBandCarry depth relation
       ]
-    relationIndependent relation = case currentBandCarryForDepth2 depth relation of
+    relationIndependent relation = case currentBandCarryForDepth depth relation of
       Nothing -> True
       Just bandCarry -> pbcStatus bandCarry == PolyBandIndependent
 
@@ -1702,8 +1702,8 @@ freshLike base suffix =
 
 collectScopNames :: Scop -> Set CVar
 collectScopNames scop =
-  usedVarsStmts2 stmts
-    `S.union` definedVarsStmts2 stmts
+  usedVarsStmts stmts
+    `S.union` definedVarsStmts stmts
     `S.union` collectScheduleNames (scSchedule scop)
   where
     stmts = map psStmt (scStatements scop)
@@ -1764,7 +1764,7 @@ extractLoopWithAlias
 extractLoopWithAlias inheritedAlias loopPath domain env spec body
   | not (isPolyhedralCompatibleExec (lsExec spec)) = Left (RejectNonSerialExec (lsExec spec))
   | otherwise = do
-      bounds <- case mapM supportedBoundExprFromIndexExpr2 (lsBounds spec) of
+      bounds <- case mapM supportedBoundExprFromIndexExpr (lsBounds spec) of
         Just ok -> Right ok
         Nothing -> case firstUnsupportedBound (lsBounds spec) of
           Just bad -> Left (RejectUnsupportedBound bad)
@@ -1858,7 +1858,7 @@ extractStmtListWithAlias aliasMap basePath domain env stmts = go env [] [] (zip 
 
 firstUnsupportedBound :: [IndexExpr] -> Maybe IndexExpr
 firstUnsupportedBound =
-  find (\bound -> supportedBoundExprFromIndexExpr2 bound == Nothing)
+  find (\bound -> supportedBoundExprFromIndexExpr bound == Nothing)
 
 loopDomainConstraints :: LoopSpec -> [IndexExpr] -> [AffineConstraint]
 loopDomainConstraints spec bounds =
@@ -2028,8 +2028,8 @@ affineFlatIndexFromAdd env rowOffsetAtom colAtom = do
     _ ->
       Nothing
 
-supportedBoundExprFromIndexExpr2 :: IndexExpr -> Maybe IndexExpr
-supportedBoundExprFromIndexExpr2 expr
+supportedBoundExprFromIndexExpr :: IndexExpr -> Maybe IndexExpr
+supportedBoundExprFromIndexExpr expr
   | boundExprSupported simple = Just simple
   | otherwise = Nothing
   where
@@ -2050,8 +2050,8 @@ boundExprSupported expr = case expr of
     isConstExpr IConst {} = True
     isConstExpr _ = False
 
-affineExprFromIndexExpr2 :: IndexExpr -> Maybe AffineExpr
-affineExprFromIndexExpr2 = go . simplifyIndexExpr
+affineExprFromIndexExpr :: IndexExpr -> Maybe AffineExpr
+affineExprFromIndexExpr = go . simplifyIndexExpr
   where
     go expr = case expr of
       IVar v -> Just (affineVar v)
@@ -2160,12 +2160,12 @@ data AccessDistanceAnalysis = AccessDistanceAnalysis
   , adaCarryInfo :: [PolyhedralCarryInfo]
   }
 
-analyzeAccessDistance2
+analyzeAccessDistance
   :: [CVar]
   -> [AffineExpr]
   -> [AffineExpr]
   -> AccessDistanceAnalysis
-analyzeAccessDistance2 iterators srcIdx tgtIdx
+analyzeAccessDistance iterators srcIdx tgtIdx
   | length srcIdx /= length tgtIdx =
       AccessDistanceAnalysis
         { adaDirection = PolyDepUnknown
@@ -2174,7 +2174,7 @@ analyzeAccessDistance2 iterators srcIdx tgtIdx
   | otherwise =
       let carryInfo = foldl step initialCarryInfo (zip srcIdx tgtIdx)
           direction =
-            case traverse carryDistance2 carryInfo of
+            case traverse carryDistance carryInfo of
               Just distances -> classifyDistance distances
               Nothing -> PolyDepUnknown
       in  AccessDistanceAnalysis
@@ -2190,10 +2190,10 @@ analyzeAccessDistance2 iterators srcIdx tgtIdx
         DimUnknown ->
           map (\info -> info { pciStatus = PolyCarryUnknown }) carryInfo
         DimShift iter distance ->
-          map (mergeCarryInfo2 iter distance) carryInfo
+          map (mergeCarryInfo iter distance) carryInfo
 
-mergeCarryInfo2 :: CVar -> Integer -> PolyhedralCarryInfo -> PolyhedralCarryInfo
-mergeCarryInfo2 iter distance info
+mergeCarryInfo :: CVar -> Integer -> PolyhedralCarryInfo -> PolyhedralCarryInfo
+mergeCarryInfo iter distance info
   | pciIter info /= iter = info
   | otherwise =
       info
@@ -2206,12 +2206,12 @@ mergeCarryInfo2 iter distance info
               PolyCarryUnknown
         }
 
-accessDistanceVector2 :: AccessDistanceAnalysis -> Maybe [Integer]
-accessDistanceVector2 = traverse carryDistance2 . adaCarryInfo
+accessDistanceVector :: AccessDistanceAnalysis -> Maybe [Integer]
+accessDistanceVector = traverse carryDistance . adaCarryInfo
 
-accessIsLoopCarried2 :: AccessDistanceAnalysis -> Bool
-accessIsLoopCarried2 analysis =
-  case accessDistanceVector2 analysis of
+accessIsLoopCarried :: AccessDistanceAnalysis -> Bool
+accessIsLoopCarried analysis =
+  case accessDistanceVector analysis of
     Just distances -> any (/= 0) distances
     Nothing ->
       any
@@ -2222,33 +2222,33 @@ accessIsLoopCarried2 analysis =
         )
         (adaCarryInfo analysis)
 
-carryDistance2 :: PolyhedralCarryInfo -> Maybe Integer
-carryDistance2 info = case pciStatus info of
+carryDistance :: PolyhedralCarryInfo -> Maybe Integer
+carryDistance info = case pciStatus info of
   PolyCarryIndependent -> Just 0
   PolyCarryDistance distance -> Just distance
   PolyCarryUnknown -> Nothing
 
-currentBandCarryForDepth2 :: Int -> PolyhedralDependenceRelation -> Maybe PolyhedralBandCarry
-currentBandCarryForDepth2 bandDepth relation =
+currentBandCarryForDepth :: Int -> PolyhedralDependenceRelation -> Maybe PolyhedralBandCarry
+currentBandCarryForDepth bandDepth relation =
   atMay (pdrBandCarry relation) bandDepth
 
-hasCurrentBandCarry2 :: Int -> PolyhedralDependenceRelation -> Bool
-hasCurrentBandCarry2 bandDepth =
-  maybe False (const True) . currentBandCarryForDepth2 bandDepth
+hasCurrentBandCarry :: Int -> PolyhedralDependenceRelation -> Bool
+hasCurrentBandCarry bandDepth =
+  maybe False (const True) . currentBandCarryForDepth bandDepth
 
-permuteBandCarryInfo2 :: [CVar] -> PolyhedralBandCarry -> [PolyhedralCarryInfo]
-permuteBandCarryInfo2 bandIters bandCarry =
+permuteBandCarryInfo :: [CVar] -> PolyhedralBandCarry -> [PolyhedralCarryInfo]
+permuteBandCarryInfo bandIters bandCarry =
   [ M.findWithDefault (PolyhedralCarryInfo iter PolyCarryUnknown) iter carryInfoByIter
   | iter <- bandIters
   ]
   where
     carryInfoByIter = M.fromList [(pciIter info, info) | info <- pbcCarryInfo bandCarry]
 
-currentBandDistanceForIter2 :: Int -> PolyhedralDependenceRelation -> CVar -> Maybe Integer
-currentBandDistanceForIter2 bandDepth relation iter = do
-  bandCarry <- currentBandCarryForDepth2 bandDepth relation
+currentBandDistanceForIter :: Int -> PolyhedralDependenceRelation -> CVar -> Maybe Integer
+currentBandDistanceForIter bandDepth relation iter = do
+  bandCarry <- currentBandCarryForDepth bandDepth relation
   carryInfo <- find ((== iter) . pciIter) (pbcCarryInfo bandCarry)
-  carryDistance2 carryInfo
+  carryDistance carryInfo
 
 data DimDistance
   = DimExact
@@ -2287,8 +2287,8 @@ classifyDistance distances =
       | d < 0 -> PolyDepBackward
       | otherwise -> PolyDepUnknown
 
-reifyScheduledScop2 :: ScheduledScop -> Maybe [Stmt]
-reifyScheduledScop2 scheduled =
+reifyScheduledScop :: ScheduledScop -> Maybe [Stmt]
+reifyScheduledScop scheduled =
   case ssReplacement scheduled of
     Just replacement -> Just replacement
     Nothing -> reifyScheduleTree stmtMap (ssSchedule scheduled)
@@ -2302,8 +2302,8 @@ reifyScheduledScop2 scheduled =
 -- | For a loop band with skew specs, rename the target iterators to skewed
 -- names and produce prelude assignments that recover the original iterator
 -- value: @orig = skewed - coeff * source@.
-applyBandSkew2 :: [CVar] -> [SkewSpec] -> ([CVar], [Stmt])
-applyBandSkew2 iters skews =
+applyBandSkew :: [CVar] -> [SkewSpec] -> ([CVar], [Stmt])
+applyBandSkew iters skews =
   let skewMap = M.fromList [(skewTarget s, s) | s <- skews]
       renameIter iter = case M.lookup iter skewMap of
         Just _ -> iter <> "__s"
@@ -2407,7 +2407,7 @@ reifyScheduleTree stmtMap sched = case sched of
         StripTile td -> IVar (smdTileLen td)
   ScheduleLoopBand band -> do
     body <- reifyScheduleTree stmtMap (lbBody band)
-    let (iters', skewPreludes) = applyBandSkew2 (lbIters band) (lbSkew band)
+    let (iters', skewPreludes) = applyBandSkew (lbIters band) (lbSkew band)
     pure
       [ SLoop
           LoopSpec
@@ -2461,16 +2461,16 @@ minLenSetup td =
       [SAssign (smdTileLen td) (RAtom (AInt (smdTileSize td)))]
   ]
 
-applyScheduledScopToProc2 :: ScheduledScop -> Proc -> Maybe Proc
-applyScheduledScopToProc2 scheduled proc
+applyScheduledScopToProc :: ScheduledScop -> Proc -> Maybe Proc
+applyScheduledScopToProc scheduled proc
   | procName proc /= scProcName (ssOriginal scheduled) = Nothing
   | otherwise = do
-      replacement <- reifyScheduledScop2 scheduled
+      replacement <- reifyScheduledScop scheduled
       body' <- replaceStmtRangeAtPath (scRootPath (ssOriginal scheduled)) replacement (procBody proc)
       let vectorFacts =
-            deriveVectorAccessFacts2
+            deriveVectorAccessFacts
               body'
-              ( scheduledVectorAccessFacts2
+              ( scheduledVectorAccessFacts
                   scheduled
                   (M.union (ssVectorAccessFactOverrides scheduled) (procVectorAccessFacts proc))
               )
@@ -2484,85 +2484,85 @@ applyScheduledScopToProc2 scheduled proc
           , procVectorAccessFacts = vectorFacts
           }
 
-buildWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
-buildWavefrontScop2 = buildTiledWavefrontScop2
+buildWavefrontScop :: ScheduledScop -> Maybe ScheduledScop
+buildWavefrontScop = buildTiledWavefrontScop
 
-buildTiledWavefrontScop2 :: ScheduledScop -> Maybe ScheduledScop
-buildTiledWavefrontScop2 scheduled = do
-  let strengthened = strengthenWavefrontScheduled2 scheduled
+buildTiledWavefrontScop :: ScheduledScop -> Maybe ScheduledScop
+buildTiledWavefrontScop scheduled = do
+  let strengthened = strengthenWavefrontScheduled scheduled
       scop = ssOriginal strengthened
       stmtMap =
         M.fromList
           [ (psPath stmt, psStmt stmt)
           | stmt <- scStatements scop
           ]
-  kernel <- matchWavefrontKernel2 strengthened
+  kernel <- matchWavefrontKernel strengthened
   fallback <- reifyScheduleTree stmtMap (ssSchedule strengthened)
   replacement <-
     evalState
-      (buildTiledWavefrontReplacement2 kernel fallback)
+      (buildTiledWavefrontReplacement kernel fallback)
       (collectScopNames scop, 0)
   pure strengthened { ssReplacement = Just replacement }
 
-strengthenWavefrontScheduled2 :: ScheduledScop -> ScheduledScop
-strengthenWavefrontScheduled2 scheduled =
-  scheduled { ssSchedule = strengthenWavefrontScheduleTree2 relations 0 (ssSchedule scheduled) }
+strengthenWavefrontScheduled :: ScheduledScop -> ScheduledScop
+strengthenWavefrontScheduled scheduled =
+  scheduled { ssSchedule = strengthenWavefrontScheduleTree relations 0 (ssSchedule scheduled) }
   where
-    relations = collectScopDependenceRelations2 (ssOriginal scheduled)
+    relations = collectScopDependenceRelations (ssOriginal scheduled)
 
-strengthenWavefrontScheduleTree2
+strengthenWavefrontScheduleTree
   :: [PolyhedralDependenceRelation]
   -> Int
   -> ScheduleTree
   -> ScheduleTree
-strengthenWavefrontScheduleTree2 relations depth sched = case sched of
+strengthenWavefrontScheduleTree relations depth sched = case sched of
   ScheduleSequence xs ->
-    ScheduleSequence (map (strengthenWavefrontScheduleTree2 relations depth) xs)
+    ScheduleSequence (map (strengthenWavefrontScheduleTree relations depth) xs)
   ScheduleStmtRef {} ->
     sched
   ScheduleStripMine band plans ->
     ScheduleStripMine
-      band { lbBody = strengthenWavefrontScheduleTree2 relations (depth + 1) (lbBody band) }
+      band { lbBody = strengthenWavefrontScheduleTree relations (depth + 1) (lbBody band) }
       plans
   ScheduleLoopBand band ->
-    let body' = strengthenWavefrontScheduleTree2 relations (depth + 1) (lbBody band)
+    let body' = strengthenWavefrontScheduleTree relations (depth + 1) (lbBody band)
         band' = band { lbBody = body' }
     in case lbRole band of
          LoopIterate ->
-           ScheduleLoopBand band' { lbBody = strengthenWavefrontInnerSchedule2 relations depth (lbIters band') body' }
+           ScheduleLoopBand band' { lbBody = strengthenWavefrontInnerSchedule relations depth (lbIters band') body' }
          _ ->
            ScheduleLoopBand band'
 
-strengthenWavefrontInnerSchedule2
+strengthenWavefrontInnerSchedule
   :: [PolyhedralDependenceRelation]
   -> Int
   -> [CVar]
   -> ScheduleTree
   -> ScheduleTree
-strengthenWavefrontInnerSchedule2 relations outerDepth outerIters sched = case sched of
+strengthenWavefrontInnerSchedule relations outerDepth outerIters sched = case sched of
   ScheduleLoopBand inner
     | lbRole inner == LoopMap ->
-        let skews = strengthenWavefrontSkews2 relations outerDepth outerIters (lbSkew inner)
+        let skews = strengthenWavefrontSkews relations outerDepth outerIters (lbSkew inner)
         in ScheduleLoopBand inner
              { lbSkew = skews
-             , lbOrigins = loopBandOriginsFromSkews2 skews (lbIters inner)
+             , lbOrigins = loopBandOriginsFromSkews skews (lbIters inner)
              }
   ScheduleSequence xs ->
-    case span (not . isWavefrontLoopMapTree2) xs of
+    case span (not . isWavefrontLoopMapTree) xs of
       (before, target : after) ->
-        ScheduleSequence (before ++ strengthenWavefrontInnerSchedule2 relations outerDepth outerIters target : after)
+        ScheduleSequence (before ++ strengthenWavefrontInnerSchedule relations outerDepth outerIters target : after)
       _ ->
         sched
   _ ->
     sched
 
-strengthenWavefrontSkews2
+strengthenWavefrontSkews
   :: [PolyhedralDependenceRelation]
   -> Int
   -> [CVar]
   -> [SkewSpec]
   -> [SkewSpec]
-strengthenWavefrontSkews2 relations outerDepth outerIters skews =
+strengthenWavefrontSkews relations outerDepth outerIters skews =
   map strengthenOne skews
   where
     strengthenOne skew =
@@ -2572,28 +2572,28 @@ strengthenWavefrontSkews2 relations outerDepth outerIters skews =
               : [ coeff
                 | outerIter <- outerIters
                 , outerIter == skewSource skew
-                , coeff <- maybeToList (strictCrossSkewCoeff2 outerDepth outerIter (skewTarget skew) relations)
+                , coeff <- maybeToList (strictCrossSkewCoeff outerDepth outerIter (skewTarget skew) relations)
                 ]
               )
       in skew { skewCoeff = strictCoeff }
 
-isWavefrontLoopMapTree2 :: ScheduleTree -> Bool
-isWavefrontLoopMapTree2 sched = case sched of
+isWavefrontLoopMapTree :: ScheduleTree -> Bool
+isWavefrontLoopMapTree sched = case sched of
   ScheduleLoopBand band -> lbRole band == LoopMap
   _ -> False
 
-matchWavefrontKernel2 :: ScheduledScop -> Maybe WavefrontKernel
-matchWavefrontKernel2 scheduled = do
+matchWavefrontKernel :: ScheduledScop -> Maybe WavefrontKernel
+matchWavefrontKernel scheduled = do
   reified <- reifyScheduleTree stmtMap (ssSchedule scheduled)
   [SLoop outerSpec outerBody] <- Just reified
   guard (lsRole outerSpec == LoopIterate)
   [iterT] <- pure (lsIters outerSpec)
   [outerBound] <- pure (map simplifyIndexExpr (lsBounds outerSpec))
   (prefix, innerStmt, suffix) <-
-    splitFirstMatching2 isWavefrontInnerLoop2 outerBody
+    splitFirstMatching isWavefrontInnerLoop outerBody
   SLoop innerSpec innerBody <- Just innerStmt
-  coeff <- wavefrontSkewCoeffForLoop2 iterT innerSpec
-  (stageSuffix, curVar, nextVar, preallocatedNext0) <- matchWavefrontTail2 suffix
+  coeff <- wavefrontSkewCoeffForLoop iterT innerSpec
+  (stageSuffix, curVar, nextVar, preallocatedNext0) <- matchWavefrontTail suffix
   -- The polyhedral scheduler may hoist buffer-rotation assignments for
   -- nextVar into the prefix (before the inner loop), splitting the usual
   -- three-statement ping-pong across the prefix and suffix. Detect this and
@@ -2602,7 +2602,7 @@ matchWavefrontKernel2 scheduled = do
   --
   -- We match only non-alloc assignments (RAtom, RBinOp, etc.) so that a
   -- plain SAssign nextVar (RArrayAlloc ...) in the prefix is still handled
-  -- by removeWavefrontAlloc2, not incorrectly stripped as a rotation.
+  -- by removeWavefrontAlloc, not incorrectly stripped as a rotation.
   let nextVarInPrefix =
         not preallocatedNext0
           && any
@@ -2620,7 +2620,7 @@ matchWavefrontKernel2 scheduled = do
             filter (\s -> case s of SAssign v _ -> v /= nextVar; _ -> True) prefix
         | otherwise = prefix
   (allocShape, prefixWithoutAlloc) <-
-    case removeWavefrontAlloc2 nextVar prefixForMatch of
+    case removeWavefrontAlloc nextVar prefixForMatch of
       Just matched ->
         Just matched
       Nothing
@@ -2628,18 +2628,18 @@ matchWavefrontKernel2 scheduled = do
             Just (AVar "__wavefront_prealloc_shape", prefixForMatch)
       Nothing ->
         Nothing
-  guard (all hoistableWavefrontStmt2 prefixWithoutAlloc)
+  guard (all hoistableWavefrontStmt prefixWithoutAlloc)
   guard
     ( preallocatedNext
-        || shapePreservingWavefrontPrelude2 curVar prefixWithoutAlloc allocShape
+        || shapePreservingWavefrontPrelude curVar prefixWithoutAlloc allocShape
     )
-  guard (not (usesVar2 iterT prefixWithoutAlloc))
-  guard (not (usesVar2 nextVar prefixWithoutAlloc))
-  guard (all (\iter -> not (usesVar2 iter stageSuffix)) (lsIters innerSpec))
-  stageWidth <- chooseWavefrontStageWidth2 outerBound innerSpec
-  let headIter = wavefrontHeadIter2 innerSpec
+  guard (not (usesVar iterT prefixWithoutAlloc))
+  guard (not (usesVar nextVar prefixWithoutAlloc))
+  guard (all (\iter -> not (usesVar iter stageSuffix)) (lsIters innerSpec))
+  stageWidth <- chooseWavefrontStageWidth outerBound innerSpec
+  let headIter = wavefrontHeadIter innerSpec
       stageExec =
-        if wavefrontParallelLegal2 (collectScopDependenceRelations2 (ssOriginal scheduled)) iterT headIter coeff
+        if wavefrontParallelLegal (collectScopDependenceRelations (ssOriginal scheduled)) iterT headIter coeff
           then Workshare
                  ParallelSpec
                     { psStrategy = ParallelGeneric
@@ -2674,50 +2674,50 @@ matchWavefrontKernel2 scheduled = do
         | stmt <- scStatements (ssOriginal scheduled)
         ]
 
-wavefrontParallelLegal2
+wavefrontParallelLegal
   :: [PolyhedralDependenceRelation]
   -> CVar
   -> CVar
   -> Integer
   -> Bool
-wavefrontParallelLegal2 relations iterT headIter coeff =
+wavefrontParallelLegal relations iterT headIter coeff =
   all relationSafe relevantRelations
   where
     relevantRelations =
       [ rel
       | rel <- relations
       , pdrClassification rel /= PolyDepClassReductionLike
-      , Just outerDist <- [findCarryDistanceByIter2 iterT (pdrCarryInfo rel)]
-      , Just _ <- [findCarryDistanceByIter2 headIter (pdrCarryInfo rel)]
+      , Just outerDist <- [findCarryDistanceByIter iterT (pdrCarryInfo rel)]
+      , Just _ <- [findCarryDistanceByIter headIter (pdrCarryInfo rel)]
       , outerDist > 0
       ]
     relationSafe rel =
-      case ( findCarryDistanceByIter2 iterT (pdrCarryInfo rel)
-           , findCarryDistanceByIter2 headIter (pdrCarryInfo rel)
+      case ( findCarryDistanceByIter iterT (pdrCarryInfo rel)
+           , findCarryDistanceByIter headIter (pdrCarryInfo rel)
            ) of
         (Just outerDist, Just headDist) ->
           coeff * outerDist + headDist > 0
         _ ->
           False
 
-findCarryDistanceByIter2 :: CVar -> [PolyhedralCarryInfo] -> Maybe Integer
-findCarryDistanceByIter2 iter infos =
-  find ((== iter) . pciIter) infos >>= carryDistance2
+findCarryDistanceByIter :: CVar -> [PolyhedralCarryInfo] -> Maybe Integer
+findCarryDistanceByIter iter infos =
+  find ((== iter) . pciIter) infos >>= carryDistance
 
-chooseWavefrontStageWidth2 :: IndexExpr -> LoopSpec -> Maybe Integer
-chooseWavefrontStageWidth2 iterBound innerSpec = do
+chooseWavefrontStageWidth :: IndexExpr -> LoopSpec -> Maybe Integer
+chooseWavefrontStageWidth iterBound innerSpec = do
   let tripCap =
         case simplifyIndexExpr iterBound of
           IConst n -> max 1 (min defaultWavefrontBlockWidth n)
           _ -> defaultWavefrontBlockWidth
-      footprintCap = wavefrontFootprintWidthCap2 innerSpec
+      footprintCap = wavefrontFootprintWidthCap innerSpec
       stageWidth = min tripCap footprintCap
   guard (stageWidth >= 2)
   pure stageWidth
 
-wavefrontFootprintWidthCap2 :: LoopSpec -> Integer
-wavefrontFootprintWidthCap2 innerSpec =
-  case constantWavefrontFootprint2 innerSpec of
+wavefrontFootprintWidthCap :: LoopSpec -> Integer
+wavefrontFootprintWidthCap innerSpec =
+  case constantWavefrontFootprint innerSpec of
     Nothing ->
       defaultWavefrontBlockWidth
     Just footprint
@@ -2729,32 +2729,32 @@ wavefrontFootprintWidthCap2 innerSpec =
                then 1
                else min defaultWavefrontBlockWidth (1 + extraCap)
 
-constantWavefrontFootprint2 :: LoopSpec -> Maybe Integer
-constantWavefrontFootprint2 innerSpec =
-  case traverse constantIndexExpr2 (map simplifyIndexExpr (lsBounds innerSpec)) of
+constantWavefrontFootprint :: LoopSpec -> Maybe Integer
+constantWavefrontFootprint innerSpec =
+  case traverse constantIndexExpr (map simplifyIndexExpr (lsBounds innerSpec)) of
     Just bounds -> Just (product bounds)
     Nothing -> Nothing
 
-constantIndexExpr2 :: IndexExpr -> Maybe Integer
-constantIndexExpr2 expr = case simplifyIndexExpr expr of
+constantIndexExpr :: IndexExpr -> Maybe Integer
+constantIndexExpr expr = case simplifyIndexExpr expr of
   IConst n -> Just n
   _ -> Nothing
 
 minWavefrontFrontierParallelWork :: Integer
 minWavefrontFrontierParallelWork = 512
 
-data WavefrontProfitability2
+data WavefrontProfitability
   = WavefrontProfitReject
   | WavefrontProfitAccept
   | WavefrontProfitGuard [Stmt] Atom
 
-wavefrontProfitabilityForTiledPath2 :: WavefrontKernel -> TileM WavefrontProfitability2
-wavefrontProfitabilityForTiledPath2 kernel =
+wavefrontProfitabilityForTiledPath :: WavefrontKernel -> TileM WavefrontProfitability
+wavefrontProfitabilityForTiledPath kernel =
   case map simplifyIndexExpr (drop 1 (lsBounds (wfkInnerSpec kernel))) of
     [] ->
       pure WavefrontProfitAccept
     tailBounds ->
-      case traverse constantIndexExpr2 tailBounds of
+      case traverse constantIndexExpr tailBounds of
         Just bounds
           | product bounds >= minWavefrontFrontierParallelWork ->
               pure WavefrontProfitAccept
@@ -2763,7 +2763,7 @@ wavefrontProfitabilityForTiledPath2 kernel =
         Nothing
           | all supportsAtomBound tailBounds -> do
               (boundStmts, boundAtoms) <- fmap unzip (mapM indexExprToAtom tailBounds)
-              (prodStmts, prodAtom) <- multiplyAtoms2 boundAtoms
+              (prodStmts, prodAtom) <- multiplyAtoms boundAtoms
               profitable <- freshLike "__wf_frontier_profitable" ""
               pure $
                 WavefrontProfitGuard
@@ -2775,30 +2775,30 @@ wavefrontProfitabilityForTiledPath2 kernel =
           | otherwise ->
               pure WavefrontProfitAccept
 
-multiplyAtoms2 :: [Atom] -> TileM ([Stmt], Atom)
-multiplyAtoms2 [] = pure ([], AInt 1)
-multiplyAtoms2 (a : as) = foldM step ([], a) as
+multiplyAtoms :: [Atom] -> TileM ([Stmt], Atom)
+multiplyAtoms [] = pure ([], AInt 1)
+multiplyAtoms (a : as) = foldM step ([], a) as
   where
     step (stmts, acc) next = do
       prod <- freshLike "__wf_frontier_work" ""
       pure (stmts ++ [SAssign prod (RBinOp CMul acc next)], AVar prod)
 
-buildTiledWavefrontReplacement2 :: WavefrontKernel -> [Stmt] -> TileM (Maybe [Stmt])
-buildTiledWavefrontReplacement2 kernel fallback = do
-  profitability <- wavefrontProfitabilityForTiledPath2 kernel
+buildTiledWavefrontReplacement :: WavefrontKernel -> [Stmt] -> TileM (Maybe [Stmt])
+buildTiledWavefrontReplacement kernel fallback = do
+  profitability <- wavefrontProfitabilityForTiledPath kernel
   case profitability of
     WavefrontProfitReject ->
       pure Nothing
     WavefrontProfitAccept ->
-      Just <$> buildWavefrontBody2 kernel
+      Just <$> buildWavefrontBody kernel
     WavefrontProfitGuard guardStmts guardAtom -> do
-      wavefrontBody <- buildWavefrontBody2 kernel
+      wavefrontBody <- buildWavefrontBody kernel
       pure (Just (guardStmts ++ [SIf guardAtom wavefrontBody fallback]))
 
-buildWavefrontBody2 :: WavefrontKernel -> TileM [Stmt]
-buildWavefrontBody2 kernel = do
-  timeBlock <- buildForcedStripDim2 (wfkIterT kernel) (wfkIterBound kernel) (wfkStageWidth kernel)
-  diagIter <- freshLike (wavefrontHeadIter2 (wfkInnerSpec kernel)) "__wavefront"
+buildWavefrontBody :: WavefrontKernel -> TileM [Stmt]
+buildWavefrontBody kernel = do
+  timeBlock <- buildForcedStripDim (wfkIterT kernel) (wfkIterBound kernel) (wfkStageWidth kernel)
+  diagIter <- freshLike (wavefrontHeadIter (wfkInnerSpec kernel)) "__wavefront"
   stageIter <- freshLike (wfkIterT kernel) "__wf_stage"
   stageTimeVars <-
     mapM
@@ -2809,9 +2809,9 @@ buildWavefrontBody2 kernel = do
       (\n -> freshLike (wfkNextArray kernel) ("__wf_ring" <> BS.pack (show n)))
       [2 .. wfkStageWidth kernel]
   let stageBuffers = [wfkCurArray kernel, wfkNextArray kernel] ++ extraBuffers
-  rotations <- buildWavefrontRotation2 stageBuffers (smdTileLen timeBlock)
+  rotations <- buildWavefrontRotation stageBuffers (smdTileLen timeBlock)
   (stageSelection, curStageBuf, nextStageBuf, stageTimeVar) <-
-    buildWavefrontStageSelection2 kernel stageIter stageBuffers stageTimeVars
+    buildWavefrontStageSelection kernel stageIter stageBuffers stageTimeVars
   let allocTargets =
         if wfkPreallocatedNext kernel
           then extraBuffers
@@ -2831,24 +2831,24 @@ buildWavefrontBody2 kernel = do
           , (wfkIterT kernel, AVar stageTimeVar)
           ]
       innerBody =
-        collapseWavefrontInnerLoop2
-          (wavefrontFrontierInnerExec2 kernel)
+        collapseWavefrontInnerLoop
+          (wavefrontFrontierInnerExec kernel)
           diagIter
           (wfkInnerSpec kernel)
-          (substStmts2 substEnv (wfkInnerBody kernel))
-      suffixBody = substStmts2 substEnv (wfkStageSuffix kernel)
+          (substStmts substEnv (wfkInnerBody kernel))
+      suffixBody = substStmts substEnv (wfkStageSuffix kernel)
       cleanupTargets =
         if wfkPreallocatedNext kernel
           then extraBuffers
           else drop 1 stageBuffers
-  guardedInner <- buildWavefrontInnerGuard2 kernel diagIter stageTimeVar innerBody
+  guardedInner <- buildWavefrontInnerGuard kernel diagIter stageTimeVar innerBody
   let frontierLoop =
         SLoop
           LoopSpec
             { lsIters = [diagIter]
-            , lsBounds = [wavefrontDiagBound2 kernel (smdTileLen timeBlock)]
+            , lsBounds = [wavefrontDiagBound kernel (smdTileLen timeBlock)]
             , lsOrigins = []
-            , lsExec = wavefrontFrontierOuterExec2 kernel
+            , lsExec = wavefrontFrontierOuterExec kernel
              , lsRed = Nothing
              , lsRole = LoopPlain
              }
@@ -2880,11 +2880,11 @@ buildWavefrontBody2 kernel = do
               ++ [stageLoop]
               ++ rotations
           )
-  cleanup <- fmap concat (mapM (buildWavefrontCleanup2 kernel) cleanupTargets)
+  cleanup <- fmap concat (mapM (buildWavefrontCleanup kernel) cleanupTargets)
   pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
 
-buildWavefrontCleanup2 :: WavefrontKernel -> CVar -> TileM [Stmt]
-buildWavefrontCleanup2 kernel arr = do
+buildWavefrontCleanup :: WavefrontKernel -> CVar -> TileM [Stmt]
+buildWavefrontCleanup kernel arr = do
   notCurVar <- freshLike arr "__wf_free_not_cur"
   case wfkInitTracker kernel of
     Nothing ->
@@ -2902,8 +2902,8 @@ buildWavefrontCleanup2 kernel arr = do
         , SIf (AVar freeVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
         ]
 
-matchWavefrontTail2 :: [Stmt] -> Maybe ([Stmt], CVar, CVar, Bool)
-matchWavefrontTail2 suffix = case reverse suffix of
+matchWavefrontTail :: [Stmt] -> Maybe ([Stmt], CVar, CVar, Bool)
+matchWavefrontTail suffix = case reverse suffix of
   ( SAssign _tmpOut (RAtom (AVar cur2))
     : SAssign next1 (RAtom (AVar _tmpIn))
     : SAssign cur1 (RAtom (AVar next))
@@ -2916,23 +2916,23 @@ matchWavefrontTail2 suffix = case reverse suffix of
   _ ->
     Nothing
 
-wavefrontDiagBound2 :: WavefrontKernel -> CVar -> IndexExpr
-wavefrontDiagBound2 kernel blockLenVar =
+wavefrontDiagBound :: WavefrontKernel -> CVar -> IndexExpr
+wavefrontDiagBound kernel blockLenVar =
   simplifyIndexExpr $
     IAdd
-      (wavefrontHeadBound2 (wfkInnerSpec kernel))
+      (wavefrontHeadBound (wfkInnerSpec kernel))
       ( IMul
           (IConst (wfkSkewCoeff kernel))
           (ISub (IVar blockLenVar) (IConst 1))
       )
 
-buildWavefrontStageSelection2
+buildWavefrontStageSelection
   :: WavefrontKernel
   -> CVar
   -> [CVar]
   -> [CVar]
   -> TileM ([Stmt], CVar, CVar, CVar)
-buildWavefrontStageSelection2 kernel stageIter stageBuffers stageTimeVars = do
+buildWavefrontStageSelection kernel stageIter stageBuffers stageTimeVars = do
   curStageBuf <- freshLike (wfkCurArray kernel) "__wf_stage_cur"
   nextStageBuf <- freshLike (wfkNextArray kernel) "__wf_stage_next"
   stageTimeVar <- freshLike (wfkIterT kernel) "__wf_stage_time"
@@ -2955,12 +2955,12 @@ buildWavefrontStageSelection2 kernel stageIter stageBuffers stageTimeVars = do
   selection <- fmap concat (mapM buildOne (zip3 [0 :: Integer ..] stageBuffers stageTimeVars))
   pure (selection, curStageBuf, nextStageBuf, stageTimeVar)
 
-buildWavefrontInnerGuard2 :: WavefrontKernel -> CVar -> CVar -> [Stmt] -> TileM [Stmt]
-buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody = do
+buildWavefrontInnerGuard :: WavefrontKernel -> CVar -> CVar -> [Stmt] -> TileM [Stmt]
+buildWavefrontInnerGuard kernel diagIter timeVar innerBody = do
   let originExpr =
         simplifyIndexExpr $
           IMul (IConst (wfkSkewCoeff kernel)) (IVar timeVar)
-      headBound = wavefrontHeadBound2 (wfkInnerSpec kernel)
+      headBound = wavefrontHeadBound (wfkInnerSpec kernel)
   (lowerSetup, lowerAtom) <- indexExprToAtom originExpr
   -- Reuse lowerAtom for the upper bound to avoid recomputing the skew offset.
   (headSetup, headAtom) <- indexExprToAtom headBound
@@ -2980,8 +2980,8 @@ buildWavefrontInnerGuard2 kernel diagIter timeVar innerBody = do
            ]
     )
 
-buildWavefrontRotation2 :: [CVar] -> CVar -> TileM [Stmt]
-buildWavefrontRotation2 ringVars blockLenVar = do
+buildWavefrontRotation :: [CVar] -> CVar -> TileM [Stmt]
+buildWavefrontRotation ringVars blockLenVar = do
   tempVars <- mapM (`freshLike` "__wf_tmp") ringVars
   eqVars <- mapM (`freshLike` "__wf_rot_eq") [blockLenVar <> "_" <> BS.pack (show i) | i <- [1 .. length ringVars - 1]]
   let saved =
@@ -3000,16 +3000,16 @@ buildWavefrontRotation2 ringVars blockLenVar = do
         ]
   pure (saved ++ concat (zipWith oneRotation [1 .. ringCount - 1] eqVars))
 
-wavefrontFrontierOuterExec2 :: WavefrontKernel -> ExecPolicy
-wavefrontFrontierOuterExec2 kernel =
+wavefrontFrontierOuterExec :: WavefrontKernel -> ExecPolicy
+wavefrontFrontierOuterExec kernel =
   case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
     (Workshare p, _ : _ : _) -> Parallel p
     (Parallel p, _ : _ : _) -> Parallel p
     (execPolicy, [_]) -> execPolicy
     _ -> Serial
 
-wavefrontFrontierInnerExec2 :: WavefrontKernel -> ExecPolicy
-wavefrontFrontierInnerExec2 kernel =
+wavefrontFrontierInnerExec :: WavefrontKernel -> ExecPolicy
+wavefrontFrontierInnerExec kernel =
   case (wfkStageExec kernel, lsIters (wfkInnerSpec kernel)) of
     (Workshare {}, _ : _ : []) ->
       Vector (VectorSpec wavefrontFrontierSimdLen TailMask)
@@ -3021,8 +3021,8 @@ wavefrontFrontierInnerExec2 kernel =
 wavefrontFrontierSimdLen :: Int
 wavefrontFrontierSimdLen = 4
 
-collapseWavefrontInnerLoop2 :: ExecPolicy -> CVar -> LoopSpec -> [Stmt] -> [Stmt]
-collapseWavefrontInnerLoop2 frontierExec diagIter innerSpec innerBody =
+collapseWavefrontInnerLoop :: ExecPolicy -> CVar -> LoopSpec -> [Stmt] -> [Stmt]
+collapseWavefrontInnerLoop frontierExec diagIter innerSpec innerBody =
   case lsIters innerSpec of
     [] ->
       innerBody
@@ -3041,7 +3041,7 @@ collapseWavefrontInnerLoop2 frontierExec diagIter innerSpec innerBody =
              -- (e.g., skew-prelude assignments like `i = i_s - skew*time`) out
              -- of the j-loop so they don't execute once per j iteration.
              let tailIterVars = S.fromList tailIters
-                 isInvariant s = S.null (usedVarsStmt2 s `S.intersection` tailIterVars)
+                 isInvariant s = S.null (usedVarsStmt s `S.intersection` tailIterVars)
                  (hoistable, dependent) = span isInvariant innerBody
              in fixedLead
                   ++ hoistable
@@ -3055,15 +3055,15 @@ collapseWavefrontInnerLoop2 frontierExec diagIter innerSpec innerBody =
                         dependent
                     ]
 
-isWavefrontInnerLoop2 :: Stmt -> Bool
-isWavefrontInnerLoop2 stmt = case stmt of
+isWavefrontInnerLoop :: Stmt -> Bool
+isWavefrontInnerLoop stmt = case stmt of
   SLoop spec _ ->
     lsRole spec == LoopMap || lsRole spec == LoopPlain
   _ ->
     False
 
-wavefrontSkewCoeffForLoop2 :: CVar -> LoopSpec -> Maybe Integer
-wavefrontSkewCoeffForLoop2 iterT spec = do
+wavefrontSkewCoeffForLoop :: CVar -> LoopSpec -> Maybe Integer
+wavefrontSkewCoeffForLoop iterT spec = do
   origin <- listToMaybe (lsOrigins spec ++ [IConst 0])
   case simplifyIndexExpr origin of
     IVar v
@@ -3078,8 +3078,8 @@ wavefrontSkewCoeffForLoop2 iterT spec = do
     _ ->
       Nothing
 
-removeWavefrontAlloc2 :: CVar -> [Stmt] -> Maybe (Atom, [Stmt])
-removeWavefrontAlloc2 nextVar = go []
+removeWavefrontAlloc :: CVar -> [Stmt] -> Maybe (Atom, [Stmt])
+removeWavefrontAlloc nextVar = go []
   where
     go _ [] = Nothing
     go prefixRev (stmt : rest) = case stmt of
@@ -3089,21 +3089,21 @@ removeWavefrontAlloc2 nextVar = go []
       _ ->
         go (stmt : prefixRev) rest
 
-hoistableWavefrontStmt2 :: Stmt -> Bool
-hoistableWavefrontStmt2 stmt = case stmt of
-  SAssign _ rhs -> wavefrontHoistableRHS2 rhs
+hoistableWavefrontStmt :: Stmt -> Bool
+hoistableWavefrontStmt stmt = case stmt of
+  SAssign _ rhs -> wavefrontHoistableRHS rhs
   _ -> False
 
-wavefrontHoistableRHS2 :: RHS -> Bool
-wavefrontHoistableRHS2 rhs = case rhs of
+wavefrontHoistableRHS :: RHS -> Bool
+wavefrontHoistableRHS rhs = case rhs of
   RArrayAlloc {} -> False
   RArrayFree {} -> False
   RCall {} -> False
   _ -> True
 
-shapePreservingWavefrontPrelude2 :: CVar -> [Stmt] -> Atom -> Bool
-shapePreservingWavefrontPrelude2 curVar prefix allocShape =
-  case resolveWavefrontShape2 rhsMap allocShape of
+shapePreservingWavefrontPrelude :: CVar -> [Stmt] -> Atom -> Bool
+shapePreservingWavefrontPrelude curVar prefix allocShape =
+  case resolveWavefrontShape rhsMap allocShape of
     Just shapeVar ->
       any
         (\stmt -> case stmt of
@@ -3120,8 +3120,8 @@ shapePreservingWavefrontPrelude2 curVar prefix allocShape =
         | SAssign v rhs <- prefix
         ]
 
-resolveWavefrontShape2 :: Map CVar RHS -> Atom -> Maybe CVar
-resolveWavefrontShape2 rhsMap atom = case atom of
+resolveWavefrontShape :: Map CVar RHS -> Atom -> Maybe CVar
+resolveWavefrontShape rhsMap atom = case atom of
   AVar v -> resolveVar v
   _ -> Nothing
   where
@@ -3130,23 +3130,23 @@ resolveWavefrontShape2 rhsMap atom = case atom of
       Just (RArrayShape (AVar _)) -> Just v
       _ -> Just v
 
-wavefrontHeadIter2 :: LoopSpec -> CVar
-wavefrontHeadIter2 spec = case lsIters spec of
+wavefrontHeadIter :: LoopSpec -> CVar
+wavefrontHeadIter spec = case lsIters spec of
   iter : _ -> iter
   [] -> error "wavefront loop requires at least one iterator"
 
-wavefrontHeadBound2 :: LoopSpec -> IndexExpr
-wavefrontHeadBound2 spec = case lsBounds spec of
+wavefrontHeadBound :: LoopSpec -> IndexExpr
+wavefrontHeadBound spec = case lsBounds spec of
   bound : _ -> bound
   [] -> error "wavefront loop requires at least one bound"
 
-buildBlockedMapReductionScop2 :: ScheduledScop -> Maybe ScheduledScop
-buildBlockedMapReductionScop2 scheduled = do
-  kernel <- matchBlockedMapReductionKernel2 scop
+buildBlockedMapReductionScop :: ScheduledScop -> Maybe ScheduledScop
+buildBlockedMapReductionScop scheduled = do
+  kernel <- matchBlockedMapReductionKernel scop
   let replacement =
-        evalState (buildBlockedMapReductionBody2 kernel) (collectScopNames scop, 0)
+        evalState (buildBlockedMapReductionBody kernel) (collectScopNames scop, 0)
       typeOverrides =
-        M.singleton (bmrOutputArray kernel) (CTArray (blockedMapReductionElemType2 kernel))
+        M.singleton (bmrOutputArray kernel) (CTArray (blockedMapReductionElemType kernel))
       scopedArrayOverrides =
         M.singleton
           (bmrOutputArray kernel)
@@ -3166,21 +3166,21 @@ buildBlockedMapReductionScop2 scheduled = do
   where
     scop = ssOriginal scheduled
 
-matchBlockedMapReductionKernel2 :: Scop -> Maybe BlockedMapReductionKernel
-matchBlockedMapReductionKernel2 scop = do
-  [SLoop outerSpec outerBody] <- reifyScheduledScop2 (buildIdentitySchedule2 scop)
+matchBlockedMapReductionKernel :: Scop -> Maybe BlockedMapReductionKernel
+matchBlockedMapReductionKernel scop = do
+  [SLoop outerSpec outerBody] <- reifyScheduledScop (buildIdentitySchedule scop)
   [outerI, outerJ] <- pure (lsIters outerSpec)
   [outerIBound, outerJBound] <- pure (lsBounds outerSpec)
   if lsRole outerSpec /= LoopMap
     then Nothing
     else do
-      (outerBeforeWrite, finalWrite) <- unsnoc2 outerBody
+      (outerBeforeWrite, finalWrite) <- unsnoc outerBody
       SArrayWrite (AVar outArr) outIdx (AVar outAcc) <- Just finalWrite
-      (beforeWrapper, wrapperStmt, afterWrapper) <- splitFirstMatching2 isReductionWrapperStmt2 outerBeforeWrite
-      (outerSetupPrefix, accInitStmt) <- unsnoc2 beforeWrapper
+      (beforeWrapper, wrapperStmt, afterWrapper) <- splitFirstMatching isReductionWrapperStmt outerBeforeWrite
+      (outerSetupPrefix, accInitStmt) <- unsnoc beforeWrapper
       SAssign accVar (RAtom initAtom) <- Just accInitStmt
       if outAcc /= accVar
-           || usesVar2 accVar (outerSetupPrefix ++ afterWrapper)
+           || usesVar accVar (outerSetupPrefix ++ afterWrapper)
         then Nothing
         else do
           SLoop wrapperSpec wrapperBody <- Just wrapperStmt
@@ -3188,8 +3188,8 @@ matchBlockedMapReductionKernel2 scop = do
             then Nothing
             else do
               [wrapperIter] <- pure (lsIters wrapperSpec)
-              (wrapperSetup, reductionStmt) <- unsnoc2 wrapperBody
-              if usesVar2 accVar wrapperSetup
+              (wrapperSetup, reductionStmt) <- unsnoc wrapperBody
+              if usesVar accVar wrapperSetup
                 then Nothing
                 else do
                   SLoop reductionSpec reductionBody <- Just reductionStmt
@@ -3208,12 +3208,12 @@ matchBlockedMapReductionKernel2 scop = do
                                 )
                         then Nothing
                         else do
-                          (reductionSetup, accUpdateStmt) <- unsnoc2 reductionBody
-                          if usesVar2 accVar reductionSetup
+                          (reductionSetup, accUpdateStmt) <- unsnoc reductionBody
+                          if usesVar accVar reductionSetup
                             then Nothing
                             else do
                               SAssign accDst (RBinOp updateOp updateLhs updateRhs) <- Just accUpdateStmt
-                              if accDst /= accVar || not (atomRefsVar2 accVar updateLhs || atomRefsVar2 accVar updateRhs)
+                              if accDst /= accVar || not (atomRefsVar accVar updateLhs || atomRefsVar accVar updateRhs)
                                 then Nothing
                                 else
                                   Just
@@ -3237,11 +3237,11 @@ matchBlockedMapReductionKernel2 scop = do
                                       , bmrUpdateRhs = updateRhs
                                       }
 
-buildBlockedMapReductionBody2 :: BlockedMapReductionKernel -> TileM [Stmt]
-buildBlockedMapReductionBody2 kernel = do
-  iTile <- buildForcedStripDim2 (bmrOuterIterI kernel) (bmrOuterIBound kernel) (tcDefaultTile defaultTileConfig)
-  jTile <- buildForcedStripDim2 (bmrOuterIterJ kernel) (bmrOuterJBound kernel) (tcDefaultTile defaultTileConfig)
-  kTile <- buildForcedStripDim2 (bmrReductionIter kernel) (bmrReductionBound kernel) (tcReductionTile defaultTileConfig)
+buildBlockedMapReductionBody :: BlockedMapReductionKernel -> TileM [Stmt]
+buildBlockedMapReductionBody kernel = do
+  iTile <- buildForcedStripDim (bmrOuterIterI kernel) (bmrOuterIBound kernel) (tcDefaultTile defaultTileConfig)
+  jTile <- buildForcedStripDim (bmrOuterIterJ kernel) (bmrOuterJBound kernel) (tcDefaultTile defaultTileConfig)
+  kTile <- buildForcedStripDim (bmrReductionIter kernel) (bmrReductionBound kernel) (tcReductionTile defaultTileConfig)
   cVal <- freshLike (bmrAccVar kernel) "_tile_acc"
   cNext <- freshLike (bmrAccVar kernel) "_tile_next"
   -- When the reduction setup contains the pattern:
@@ -3252,12 +3252,12 @@ buildBlockedMapReductionBody2 kernel = do
   let reductionSetup =
         case findReductionNdProjection (bmrReductionIter kernel) (bmrReductionSetup kernel) of
           Just projVar ->
-            substStmts2
+            substStmts
               (M.singleton projVar (AVar (bmrReductionIter kernel)))
               (bmrReductionSetup kernel)
           Nothing -> bmrReductionSetup kernel
   let (reductionPrelude, outerSetup) =
-        extractReductionPrelude2
+        extractReductionPrelude
           (usedVarsIndexExpr (bmrReductionBound kernel))
           [bmrOuterIterI kernel, bmrOuterIterJ kernel]
           (bmrOuterSetup kernel)
@@ -3268,22 +3268,22 @@ buildBlockedMapReductionBody2 kernel = do
           cNext
           ( RBinOp
               (bmrUpdateOp kernel)
-              (replaceAccAtom2 (bmrAccVar kernel) cVal (bmrUpdateLhs kernel))
-              (replaceAccAtom2 (bmrAccVar kernel) cVal (bmrUpdateRhs kernel))
+              (replaceAccAtom (bmrAccVar kernel) cVal (bmrUpdateLhs kernel))
+              (replaceAccAtom (bmrAccVar kernel) cVal (bmrUpdateRhs kernel))
           )
       storeOutput = SArrayWrite outputArr (bmrOutputIndex kernel) (AVar cNext)
       initJLoop =
-        localLoop2
+        localLoop
           jTile
           LoopMap
           (outerSetup ++ [SArrayWrite outputArr (bmrOutputIndex kernel) (bmrInitAtom kernel)])
       initILoop =
-        localLoop2
+        localLoop
           iTile
           LoopPlain
           [initJLoop]
       computeJLoop =
-        localLoop2
+        localLoop
           jTile
           LoopMap
           ( outerSetup
@@ -3291,7 +3291,7 @@ buildBlockedMapReductionBody2 kernel = do
               ++ [loadOutput, updateOutput, storeOutput]
           )
       computeKLoop =
-        localLoop2
+        localLoop
           kTile
           LoopPlain
           [computeJLoop]
@@ -3307,13 +3307,13 @@ buildBlockedMapReductionBody2 kernel = do
             }
           (bmrWrapperSetup kernel ++ [computeKLoop])
       computeILoop =
-        localLoop2
+        localLoop
           iTile
           LoopPlain
           [wrapperLoop]
-      kkLoop = tileLoop2 kTile LoopPlain [computeILoop]
-      jjLoop = tileLoop2 jTile LoopPlain [initILoop, kkLoop]
-      iiLoop = tileLoop2 iTile LoopPlain [jjLoop]
+      kkLoop = tileLoop kTile LoopPlain [computeILoop]
+      jjLoop = tileLoop jTile LoopPlain [initILoop, kkLoop]
+      iiLoop = tileLoop iTile LoopPlain [jjLoop]
       tilePrelude =
         reductionPrelude
           ++ smdBoundPrelude iTile
@@ -3321,8 +3321,8 @@ buildBlockedMapReductionBody2 kernel = do
           ++ smdBoundPrelude kTile
   pure (tilePrelude ++ [iiLoop])
 
-buildForcedStripDim2 :: CVar -> IndexExpr -> Integer -> TileM StripMinedDim
-buildForcedStripDim2 iter bound tileSize = do
+buildForcedStripDim :: CVar -> IndexExpr -> Integer -> TileM StripMinedDim
+buildForcedStripDim iter bound tileSize = do
   (prelude, boundAtom) <- indexExprToAtom bound
   tileIter <- freshLike iter "_tile"
   tileStart <- freshLike iter "_tile_start"
@@ -3345,8 +3345,8 @@ buildForcedStripDim2 iter bound tileSize = do
       , smdBoundAtom = boundAtom
       }
 
-tileLoop2 :: StripMinedDim -> LoopRole -> [Stmt] -> Stmt
-tileLoop2 td role body =
+tileLoop :: StripMinedDim -> LoopRole -> [Stmt] -> Stmt
+tileLoop td role body =
     SLoop
      LoopSpec
        { lsIters = [smdTileIter td]
@@ -3358,8 +3358,8 @@ tileLoop2 td role body =
        }
      (setupStripDim td ++ body)
 
-localLoop2 :: StripMinedDim -> LoopRole -> [Stmt] -> Stmt
-localLoop2 td role body =
+localLoop :: StripMinedDim -> LoopRole -> [Stmt] -> Stmt
+localLoop td role body =
     SLoop
      LoopSpec
        { lsIters = [smdLocalIter td]
@@ -3371,32 +3371,32 @@ localLoop2 td role body =
        }
      (assignOrigIter td : body)
 
-unsnoc2 :: [a] -> Maybe ([a], a)
-unsnoc2 xs = case reverse xs of
+unsnoc :: [a] -> Maybe ([a], a)
+unsnoc xs = case reverse xs of
   [] -> Nothing
   y : ys -> Just (reverse ys, y)
 
-splitFirstMatching2 :: (a -> Bool) -> [a] -> Maybe ([a], a, [a])
-splitFirstMatching2 matches xs =
+splitFirstMatching :: (a -> Bool) -> [a] -> Maybe ([a], a, [a])
+splitFirstMatching matches xs =
   case break matches xs of
     (prefix, target : suffix) -> Just (prefix, target, suffix)
     _ -> Nothing
 
-isReductionWrapperStmt2 :: Stmt -> Bool
-isReductionWrapperStmt2 stmt = case stmt of
+isReductionWrapperStmt :: Stmt -> Bool
+isReductionWrapperStmt stmt = case stmt of
   SLoop spec _ -> lsRole spec == LoopReductionWrapper
   _ -> False
 
-usesVar2 :: CVar -> [Stmt] -> Bool
-usesVar2 v = S.member v . usedVarsStmts2
+usesVar :: CVar -> [Stmt] -> Bool
+usesVar v = S.member v . usedVarsStmts
 
-atomRefsVar2 :: CVar -> Atom -> Bool
-atomRefsVar2 v atom = case atom of
+atomRefsVar :: CVar -> Atom -> Bool
+atomRefsVar v atom = case atom of
   AVar v' -> v == v'
   _ -> False
 
-replaceAccAtom2 :: CVar -> CVar -> Atom -> Atom
-replaceAccAtom2 old new atom = case atom of
+replaceAccAtom :: CVar -> CVar -> Atom -> Atom
+replaceAccAtom old new atom = case atom of
   AVar v | v == old -> AVar new
   _ -> atom
 
@@ -3416,8 +3416,8 @@ findReductionNdProjection reductionIter stmts = do
                              , a == AVar ndIdx]
   pure projVar
 
-extractReductionPrelude2 :: Set CVar -> [CVar] -> [Stmt] -> ([Stmt], [Stmt])
-extractReductionPrelude2 needed forbidden stmts =
+extractReductionPrelude :: Set CVar -> [CVar] -> [Stmt] -> ([Stmt], [Stmt])
+extractReductionPrelude needed forbidden stmts =
   (selected, remaining)
   where
     forbiddenSet = S.fromList forbidden
@@ -3431,8 +3431,8 @@ extractReductionPrelude2 needed forbidden stmts =
       | otherwise =
           (neededNow, picked, stmt : kept)
       where
-        defs = definedVarsStmts2 [stmt]
-        uses = usedVarsStmts2 [stmt]
+        defs = definedVarsStmts [stmt]
+        uses = usedVarsStmts [stmt]
     (_, selected, remaining) =
       foldr step (needed, [], []) stmts
 
@@ -3440,8 +3440,8 @@ data DenseValueInfo
   = DenseScalarInfo CVar
   | DenseTupleInfo [Maybe CVar]
 
-deriveVectorAccessFacts2 :: [Stmt] -> Map CVar VectorAccessFact -> Map CVar VectorAccessFact
-deriveVectorAccessFacts2 stmts baseFacts = snd (deriveStmtFacts2 env0 baseFacts stmts)
+deriveVectorAccessFacts :: [Stmt] -> Map CVar VectorAccessFact -> Map CVar VectorAccessFact
+deriveVectorAccessFacts stmts baseFacts = snd (deriveStmtFacts env0 baseFacts stmts)
   where
     env0 =
       M.fromList
@@ -3450,32 +3450,32 @@ deriveVectorAccessFacts2 stmts baseFacts = snd (deriveStmtFacts2 env0 baseFacts 
         , Just iter <- [vxfDenseLinearIndexOf fact]
         ]
 
-deriveStmtFacts2
+deriveStmtFacts
   :: Map CVar DenseValueInfo
   -> Map CVar VectorAccessFact
   -> [Stmt]
   -> (Map CVar DenseValueInfo, Map CVar VectorAccessFact)
-deriveStmtFacts2 env facts [] = (env, facts)
-deriveStmtFacts2 env facts (stmt : rest) =
-  deriveStmtFacts2 env' facts' rest
+deriveStmtFacts env facts [] = (env, facts)
+deriveStmtFacts env facts (stmt : rest) =
+  deriveStmtFacts env' facts' rest
   where
-    (env', facts') = deriveOneStmtFacts2 env facts stmt
+    (env', facts') = deriveOneStmtFacts env facts stmt
 
-deriveOneStmtFacts2
+deriveOneStmtFacts
   :: Map CVar DenseValueInfo
   -> Map CVar VectorAccessFact
   -> Stmt
   -> (Map CVar DenseValueInfo, Map CVar VectorAccessFact)
-deriveOneStmtFacts2 env facts stmt = case stmt of
+deriveOneStmtFacts env facts stmt = case stmt of
   SAssign v rhs ->
-    case inferDenseValueInfo2 env rhs of
+    case inferDenseValueInfo env rhs of
       Just info ->
         ( M.insert v info env
         , case info of
             DenseScalarInfo iter ->
               M.insert
                 v
-                ((M.findWithDefault emptyVectorAccessFact2 v facts) { vxfDenseLinearIndexOf = Just iter })
+                ((M.findWithDefault emptyVectorAccessFact v facts) { vxfDenseLinearIndexOf = Just iter })
                 facts
             DenseTupleInfo {} ->
               facts
@@ -3487,23 +3487,23 @@ deriveOneStmtFacts2 env facts stmt = case stmt of
           M.union
             (M.fromList [(iter, DenseScalarInfo iter) | iter <- lsIters spec])
             env
-        (envBody, factsBody) = deriveStmtFacts2 loopEnv facts body
+        (envBody, factsBody) = deriveStmtFacts loopEnv facts body
     in  (M.union envBody env, factsBody)
   SIf _ thn els ->
-    let (envThn, factsThn) = deriveStmtFacts2 env facts thn
-        (envEls, factsEls) = deriveStmtFacts2 env factsThn els
+    let (envThn, factsThn) = deriveStmtFacts env facts thn
+        (envEls, factsEls) = deriveStmtFacts env factsThn els
     in  (M.union envEls envThn, factsEls)
   _ ->
     (env, facts)
 
-inferDenseValueInfo2 :: Map CVar DenseValueInfo -> RHS -> Maybe DenseValueInfo
-inferDenseValueInfo2 env rhs = case rhs of
+inferDenseValueInfo :: Map CVar DenseValueInfo -> RHS -> Maybe DenseValueInfo
+inferDenseValueInfo env rhs = case rhs of
   RAtom atom ->
-    DenseScalarInfo <$> atomDenseOrigin2 env atom
+    DenseScalarInfo <$> atomDenseOrigin env atom
   RBinOp op a b ->
-    DenseScalarInfo <$> inferDenseBinOpOrigin2 env op a b
+    DenseScalarInfo <$> inferDenseBinOpOrigin env op a b
   RTuple atoms ->
-    let comps = map (atomDenseOrigin2 env) atoms
+    let comps = map (atomDenseOrigin env) atoms
     in  if any isJust comps then Just (DenseTupleInfo comps) else Nothing
   RProj i (AVar src) ->
     case M.lookup src env of
@@ -3518,14 +3518,14 @@ inferDenseValueInfo2 env rhs = case rhs of
       _ -> Nothing
   RFlatToNd atom shape ->
     do
-      iter <- atomDenseOrigin2 env atom
-      rank <- atomTupleArity2 env shape
+      iter <- atomDenseOrigin env atom
+      rank <- atomTupleArity env shape
       pure (DenseTupleInfo (replicate (rank - 1) Nothing ++ [Just iter]))
   _ ->
     Nothing
 
-atomDenseOrigin2 :: Map CVar DenseValueInfo -> Atom -> Maybe CVar
-atomDenseOrigin2 env atom = case atom of
+atomDenseOrigin :: Map CVar DenseValueInfo -> Atom -> Maybe CVar
+atomDenseOrigin env atom = case atom of
   AVar v ->
     case M.lookup v env of
       Just (DenseScalarInfo iter) -> Just iter
@@ -3533,8 +3533,8 @@ atomDenseOrigin2 env atom = case atom of
   _ ->
     Nothing
 
-atomTupleArity2 :: Map CVar DenseValueInfo -> Atom -> Maybe Int
-atomTupleArity2 env atom = case atom of
+atomTupleArity :: Map CVar DenseValueInfo -> Atom -> Maybe Int
+atomTupleArity env atom = case atom of
   AVar v ->
     case M.lookup v env of
       Just (DenseTupleInfo comps) -> Just (length comps)
@@ -3542,22 +3542,22 @@ atomTupleArity2 env atom = case atom of
   _ ->
     Nothing
 
-inferDenseBinOpOrigin2 :: Map CVar DenseValueInfo -> BinOp -> Atom -> Atom -> Maybe CVar
-inferDenseBinOpOrigin2 env op a b = case op of
+inferDenseBinOpOrigin :: Map CVar DenseValueInfo -> BinOp -> Atom -> Atom -> Maybe CVar
+inferDenseBinOpOrigin env op a b = case op of
   CAdd ->
-    case (atomDenseOrigin2 env a, atomDenseOrigin2 env b) of
+    case (atomDenseOrigin env a, atomDenseOrigin env b) of
       (Just iter, Nothing) -> Just iter
       (Nothing, Just iter) -> Just iter
       _ -> Nothing
   CSub ->
-    case (atomDenseOrigin2 env a, atomDenseOrigin2 env b) of
+    case (atomDenseOrigin env a, atomDenseOrigin env b) of
       (Just iter, Nothing) -> Just iter
       _ -> Nothing
   _ ->
     Nothing
 
-blockedMapReductionElemType2 :: BlockedMapReductionKernel -> CType
-blockedMapReductionElemType2 kernel = case bmrUpdateOp kernel of
+blockedMapReductionElemType :: BlockedMapReductionKernel -> CType
+blockedMapReductionElemType kernel = case bmrUpdateOp kernel of
   CAddF -> CTDouble
   CSubF -> CTDouble
   CMulF -> CTDouble
@@ -3567,63 +3567,54 @@ blockedMapReductionElemType2 kernel = case bmrUpdateOp kernel of
       AFloat {} -> CTDouble
       _ -> CTInt64
 
-scheduledVectorAccessFacts2
+scheduledVectorAccessFacts
   :: ScheduledScop
   -> Map CVar VectorAccessFact
   -> Map CVar VectorAccessFact
-scheduledVectorAccessFacts2 scheduled facts =
+scheduledVectorAccessFacts scheduled facts =
   M.union generatedIterFacts adjustedFacts
   where
     scopNames = collectScopNames (ssOriginal scheduled)
-    iterRebindings = collectStripMineIterRebindings2 (ssSchedule scheduled)
+    iterRebindings = collectStripMineIterRebindings (ssSchedule scheduled)
     adjustedFacts =
       M.mapWithKey adjustFact facts
     adjustFact v fact
       | v `S.member` scopNames =
-          remapDenseLinearOrigin2 iterRebindings fact
+          remapDenseLinearOrigin iterRebindings fact
       | otherwise =
           fact
     generatedIterFacts =
       M.fromList
         [ ( iter
-          , (M.findWithDefault emptyVectorAccessFact2 iter facts)
+          , (M.findWithDefault emptyVectorAccessFact iter facts)
               { vxfDenseLinearIndexOf = Just localIter
               }
           )
         | (iter, localIter) <- M.toList iterRebindings
         ]
 
-emptyVectorAccessFact2 :: VectorAccessFact
-emptyVectorAccessFact2 =
-  VectorAccessFact
-    { vxfDenseLinearIndexOf = Nothing
-    , vxfDenseRead = False
-    , vxfIndirectRead = False
-    , vxfContiguousWrite = False
-    }
-
-remapDenseLinearOrigin2 :: Map CVar CVar -> VectorAccessFact -> VectorAccessFact
-remapDenseLinearOrigin2 iterRebindings fact =
+remapDenseLinearOrigin :: Map CVar CVar -> VectorAccessFact -> VectorAccessFact
+remapDenseLinearOrigin iterRebindings fact =
   fact
     { vxfDenseLinearIndexOf =
         fmap (\iter -> M.findWithDefault iter iter iterRebindings) (vxfDenseLinearIndexOf fact)
     }
 
-collectStripMineIterRebindings2 :: ScheduleTree -> Map CVar CVar
-collectStripMineIterRebindings2 sched = case sched of
+collectStripMineIterRebindings :: ScheduleTree -> Map CVar CVar
+collectStripMineIterRebindings sched = case sched of
   ScheduleSequence xs ->
-    M.unions (map collectStripMineIterRebindings2 xs)
+    M.unions (map collectStripMineIterRebindings xs)
   ScheduleStmtRef {} ->
     M.empty
   ScheduleLoopBand band ->
-    collectStripMineIterRebindings2 (lbBody band)
+    collectStripMineIterRebindings (lbBody band)
   ScheduleStripMine band plans ->
     M.unions
       [ M.fromList
           [ (smdOrigIter td, smdLocalIter td)
           | StripTile td <- plans
           ]
-      , collectStripMineIterRebindings2 (lbBody band)
+      , collectStripMineIterRebindings (lbBody band)
       ]
 
 replaceStmtRangeAtPath :: StmtId -> [Stmt] -> [Stmt] -> Maybe [Stmt]

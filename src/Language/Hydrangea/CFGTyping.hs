@@ -22,10 +22,10 @@
 -- arithmetic alone.
 module Language.Hydrangea.CFGTyping
   ( TypeEnv
-  , inferAtomType2
-  , lookupArrayElemType2
-  , recoverProcTypeEnv2
-  , inferProgramReturnTypes2
+  , inferAtomType
+  , lookupArrayElemType
+  , recoverProcTypeEnv
+  , inferProgramReturnTypes
   , buildCallParamTypes
   , CallParamTypes
   ) where
@@ -72,8 +72,8 @@ bindAtomType atom ct typeEnv = case atom of
   AVar v -> bindVarType v ct typeEnv
   _ -> typeEnv
 
-inferAtomType2 :: TypeEnv -> Atom -> Maybe CType
-inferAtomType2 typeEnv atom = case atom of
+inferAtomType :: TypeEnv -> Atom -> Maybe CType
+inferAtomType typeEnv atom = case atom of
   AVar v -> M.lookup v typeEnv
   AInt {} -> Just CTInt64
   AFloat {} -> Just CTDouble
@@ -82,8 +82,8 @@ inferAtomType2 typeEnv atom = case atom of
   AString {} -> Just CTInt64
   AVecVar {} -> Nothing
 
-lookupArrayElemType2 :: TypeEnv -> Atom -> Maybe CType
-lookupArrayElemType2 typeEnv atom = case atom of
+lookupArrayElemType :: TypeEnv -> Atom -> Maybe CType
+lookupArrayElemType typeEnv atom = case atom of
   AVar v -> case M.lookup v typeEnv of
     Just (CTArray eltTy) -> Just eltTy
     _ -> Nothing
@@ -188,7 +188,7 @@ inferStmtTypes callTypes callParamTypes typeEnv stmt = case stmt of
   SAssign v rhs -> inferAssignTypes callTypes callParamTypes typeEnv v rhs
   SArrayWrite arr _ val ->
     -- Derive the array element type from the written value.
-    case (arr, inferAtomType2 typeEnv val) of
+    case (arr, inferAtomType typeEnv val) of
       (AVar arrV, Just eltTy) -> M.insert arrV (CTArray eltTy) typeEnv
       _ -> typeEnv
   SLoop _ body ->
@@ -209,7 +209,7 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RAtom atom ->
     -- For pair copies (e.g., fold accumulator init), merge types bidirectionally
     -- so that correct types from fold bodies can flow back to initializers.
-    case (inferAtomType2 typeEnv atom, M.lookup v typeEnv) of
+    case (inferAtomType typeEnv atom, M.lookup v typeEnv) of
       (Just sct@(CTPair _ _), Just dct@(CTPair _ _)) ->
         let merged = mergeCType sct dct
         in bindAtomType atom merged (M.insert v merged typeEnv)
@@ -230,7 +230,7 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RUnOp op a ->
     case op of
       CNeg ->
-        case inferAtomType2 typeEnv a <|> M.lookup v typeEnv of
+        case inferAtomType typeEnv a <|> M.lookup v typeEnv of
           Just ct@CTDouble -> bindAtomType a ct (bindVarType v ct typeEnv)
           Just ct@CTInt64  -> bindAtomType a ct (bindVarType v ct typeEnv)
           _ -> typeEnv
@@ -244,7 +244,7 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RArrayCopy {} ->
     typeEnv
   C.RArrayLoad arr _ ->
-    case lookupArrayElemType2 typeEnv arr of
+    case lookupArrayElemType typeEnv arr of
       Just eltTy ->
         bindVarType v eltTy typeEnv
       Nothing ->
@@ -256,7 +256,7 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   C.RProj i src ->
     -- Tuple projections yield CTInt64 (tuples hold shape/index integers).
     -- Pair projections are re-derived from the current pair element types.
-    case inferAtomType2 typeEnv src of
+    case inferAtomType typeEnv src of
       Just CTTuple             -> bindVarType v CTInt64 typeEnv
       Just (CTPair ct1 ct2)    -> M.insert v (if i == 0 then ct1 else ct2) typeEnv
       _ -> typeEnv
@@ -267,7 +267,7 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
     -- Instead, when atom types are incomplete, check whether the result
     -- variable already has a pair type from context (e.g., fold accumulator
     -- back-propagation through RAtom) and use that to fill in missing types.
-    case (inferAtomType2 typeEnv a1, inferAtomType2 typeEnv a2) of
+    case (inferAtomType typeEnv a1, inferAtomType typeEnv a2) of
       (Just ct1, Just ct2) ->
         bindAtomType a1 ct1 (bindAtomType a2 ct2 (M.insert v (CTPair ct1 ct2) typeEnv))
       (mct1, mct2) ->
@@ -278,11 +278,11 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
             in bindAtomType a1 aCt1 (bindAtomType a2 aCt2 (M.insert v (CTPair aCt1 aCt2) typeEnv))
           _ -> typeEnv
   C.RPairFst _ct a ->
-    case inferAtomType2 typeEnv a of
+    case inferAtomType typeEnv a of
       Just (CTPair ct1 _) -> M.insert v ct1 typeEnv
       _ -> typeEnv
   C.RPairSnd _ct a ->
-    case inferAtomType2 typeEnv a of
+    case inferAtomType typeEnv a of
       Just (CTPair _ ct2) -> M.insert v ct2 typeEnv
       _ -> typeEnv
   C.RShapeSize _ ->
@@ -363,12 +363,12 @@ inferProcReturnType callTypes proc = do
   atom <- case collectReturnAtoms (procBody proc) of
     [retAtom] -> Just retAtom
     _ -> Nothing
-  inferAtomType2 typeEnv atom
+  inferAtomType typeEnv atom
   where
     typeEnv = inferStmtListTypes callTypes M.empty (procTypeEnv proc) (procBody proc)
 
-inferProgramReturnTypes2 :: Program -> Map CVar CType
-inferProgramReturnTypes2 (Program procs) = foldl addProc M.empty procs
+inferProgramReturnTypes :: Program -> Map CVar CType
+inferProgramReturnTypes (Program procs) = foldl addProc M.empty procs
   where
     addProc callTypes proc =
       case inferProcReturnType callTypes proc of
@@ -389,6 +389,6 @@ buildCallParamTypes retTypes procs = M.fromList
 
 -- | Recover a richer per-procedure type environment from CFG structure,
 -- a map of direct-call return types, and a map of callee parameter types.
-recoverProcTypeEnv2 :: Map CVar CType -> CallParamTypes -> Proc -> TypeEnv
-recoverProcTypeEnv2 callTypes callParamTypes proc =
+recoverProcTypeEnv :: Map CVar CType -> CallParamTypes -> Proc -> TypeEnv
+recoverProcTypeEnv callTypes callParamTypes proc =
   inferStmtListTypes callTypes callParamTypes (procTypeEnv proc) (procBody proc)

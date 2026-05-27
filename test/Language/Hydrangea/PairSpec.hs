@@ -230,7 +230,7 @@ spec = do
           csrc `shouldSatisfy` isInfixOf "((hyd_pair_ii_t*)(void*)"
           csrc `shouldSatisfy` isInfixOf ".snd"
 
-    -- Regression test for the procReturnKinds2 / retKindOf bug where a
+    -- Regression test for the procReturnKinds / retKindOf bug where a
     -- function returning (snd param, fresh_array) got a wrong return-type
     -- declaration (hyd_pair_ia_t) that disagreed with the body
     -- (hyd_pair_aa_t).  Root cause: retKindOf used
@@ -254,7 +254,7 @@ spec = do
         Right ds -> do
           csrc <- compileToCOptIO False ds
           -- Return type must be hyd_pair_aa_t, not hyd_pair_ia_t.
-          -- Before the fix, procReturnKinds2 would incorrectly classify the
+          -- Before the fix, procReturnKinds would incorrectly classify the
           -- return as (CEInt, CEArray) because procTypeEnv was left-biased
           -- over the type recovery fixpoint result.
           csrc `shouldSatisfy`    isInfixOf "hyd_pair_aa_t step"

@@ -5,10 +5,10 @@
 --
 -- Native C code generation backend for CFG.
 module Language.Hydrangea.CodegenC
-  ( codegenProgram2,
-    codegenProgram2Prune,
-    codegenProgram2WithOptions,
-    codegenProgram2WithOptionsPrune,
+  ( codegenProgram,
+    codegenProgramPrune,
+    codegenProgramWithOptions,
+    codegenProgramWithOptionsPrune,
     CodegenArtifacts (..),
     CodegenOptions (..),
     BenchmarkConfig (..),
@@ -28,13 +28,13 @@ module Language.Hydrangea.CodegenC
     allAssignedVars,
     assignedRHSMap,
     typeEnvToVarSets,
-    classifyVarKinds2,
-    arrayVarsProc2,
-    tupleVarsProc2,
-    pairVarsProc2,
+    classifyVarKinds,
+    arrayVarsProc,
+    tupleVarsProc,
+    pairVarsProc,
     inferArrayElemTypesFromStmts,
     detectAtomicScatterAddLoop,
-    procReturnKinds2,
+    procReturnKinds,
     isFloatArithBinOp,
     isMathFloatOp,
     genAtom,
@@ -56,10 +56,10 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
-import Language.Hydrangea.CFG qualified as C2
-import Language.Hydrangea.CFGAnalysis (usedVarsAtom2, usedVarsStmts2)
+import Language.Hydrangea.CFG qualified as CFG
+import Language.Hydrangea.CFGAnalysis (usedVarsAtom, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom (..), BinOp (..), CElemType (..), CType (..), CVar, RHS (..), Redop (..), UnOp (..), ctypeToElemType)
-import Language.Hydrangea.CFGTyping (CallParamTypes, TypeEnv, buildCallParamTypes, inferProgramReturnTypes2, recoverProcTypeEnv2)
+import Language.Hydrangea.CFGTyping (CallParamTypes, TypeEnv, buildCallParamTypes, inferProgramReturnTypes, recoverProcTypeEnv)
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Text.PrettyPrint.HughesPJClass
 import Prelude hiding ((<>))
@@ -151,7 +151,7 @@ data CodegenEnv = CodegenEnv
     ceInsideParallelRegion :: Bool
   }
 
--- | Derive the classification sets/maps used by genStmts2 from a type environment.
+-- | Derive the classification sets/maps used by genStmts from a type environment.
 -- Returns (arrVars, tupVars, pairVars, recordVars, floatVars, floatArrVars).
 typeEnvToVarSets ::
   Map CVar CType ->
@@ -171,10 +171,10 @@ typeEnvToVarSets env = Map.foldlWithKey' go (S.empty, S.empty, Map.empty, Map.em
       _ -> acc
 
 -- | Render a CFG program as C source code.
-codegenProgram2 :: C2.Program -> String
-codegenProgram2 prog =
+codegenProgram :: CFG.Program -> String
+codegenProgram prog =
   codegenSource $
-    case codegenProgram2WithOptions defaultCodegenOptions prog of
+    case codegenProgramWithOptions defaultCodegenOptions prog of
       Right artifacts -> artifacts
       Left err -> error err
 
@@ -182,48 +182,48 @@ codegenProgram2 prog =
 -- top-level procs that are not reachable from zero-arg entry procs via
 -- direct RCall edges. If the program uses indirect calls via "__apply",
 -- pruning is skipped conservatively.
-codegenProgram2Prune :: Bool -> C2.Program -> String
-codegenProgram2Prune prune prog =
+codegenProgramPrune :: Bool -> CFG.Program -> String
+codegenProgramPrune prune prog =
   codegenSource $
-    case codegenProgram2WithOptionsPrune defaultCodegenOptions prune prog of
+    case codegenProgramWithOptionsPrune defaultCodegenOptions prune prog of
       Right artifacts -> artifacts
       Left err -> error err
 
-codegenProgram2WithOptions :: CodegenOptions -> C2.Program -> Either String CodegenArtifacts
-codegenProgram2WithOptions opts = codegenProgram2WithOptionsPrune opts False
+codegenProgramWithOptions :: CodegenOptions -> CFG.Program -> Either String CodegenArtifacts
+codegenProgramWithOptions opts = codegenProgramWithOptionsPrune opts False
 
-codegenProgram2WithOptionsPrune :: CodegenOptions -> Bool -> C2.Program -> Either String CodegenArtifacts
-codegenProgram2WithOptionsPrune opts prune prog = do
+codegenProgramWithOptionsPrune :: CodegenOptions -> Bool -> CFG.Program -> Either String CodegenArtifacts
+codegenProgramWithOptionsPrune opts prune prog = do
   let prepared = pruneProgram opts prune prog
-  genProgram2 opts prepared
+  genProgram opts prepared
 
-pruneProgram :: CodegenOptions -> Bool -> C2.Program -> C2.Program
+pruneProgram :: CodegenOptions -> Bool -> CFG.Program -> CFG.Program
 pruneProgram _ False prog = prog
-pruneProgram opts True prog@(C2.Program procs) =
-  if usesApply then prog else C2.Program keptProcs
+pruneProgram opts True prog@(CFG.Program procs) =
+  if usesApply then prog else CFG.Program keptProcs
   where
     -- detect any use of the dynamic apply operator; if present, skip pruning
     usesApply = any procUsesApply procs
-    procNames = S.fromList [C2.procName p | p <- procs]
+    procNames = S.fromList [CFG.procName p | p <- procs]
 
-    procUsesApply (C2.Proc {C2.procBody = body}) = any stmtUsesApply body
+    procUsesApply (CFG.Proc {CFG.procBody = body}) = any stmtUsesApply body
     stmtUsesApply st = case st of
-      C2.SAssign _ rhs -> rhsUsesApply rhs
-      C2.SLoop _ body' -> any stmtUsesApply body'
-      C2.SIf _ thn els -> any stmtUsesApply thn || any stmtUsesApply els
+      CFG.SAssign _ rhs -> rhsUsesApply rhs
+      CFG.SLoop _ body' -> any stmtUsesApply body'
+      CFG.SIf _ thn els -> any stmtUsesApply thn || any stmtUsesApply els
       _ -> False
     rhsUsesApply (RCall fn _) = fn == "__apply"
     rhsUsesApply _ = False
 
     -- build direct call graph (ignore __apply as handled above)
-    callEdges = Map.fromList [(C2.procName p, calledByProc p) | p <- procs]
+    callEdges = Map.fromList [(CFG.procName p, calledByProc p) | p <- procs]
 
-    calledByProc (C2.Proc {C2.procBody = body}) = foldMap stmtCalledNames body
+    calledByProc (CFG.Proc {CFG.procBody = body}) = foldMap stmtCalledNames body
 
     stmtCalledNames st = case st of
-      C2.SAssign _ rhs -> rhsCalledNames rhs
-      C2.SLoop _ body' -> foldMap stmtCalledNames body'
-      C2.SIf _ thn els -> foldMap stmtCalledNames thn `S.union` foldMap stmtCalledNames els
+      CFG.SAssign _ rhs -> rhsCalledNames rhs
+      CFG.SLoop _ body' -> foldMap stmtCalledNames body'
+      CFG.SIf _ thn els -> foldMap stmtCalledNames thn `S.union` foldMap stmtCalledNames els
       _ -> S.empty
 
     rhsCalledNames (RCall fn _) = if fn == "__apply" then S.empty else S.singleton fn
@@ -241,13 +241,13 @@ pruneProgram opts True prog@(C2.Program procs) =
           )
     explicitRoots = explicitRootCandidates `S.intersection` procNames
     rootNames
-      | S.null explicitRoots = S.fromList [C2.procName p | p <- procs, null (C2.procParams p)]
+      | S.null explicitRoots = S.fromList [CFG.procName p | p <- procs, null (CFG.procParams p)]
       | otherwise = explicitRoots
 
     -- traverse call graph to find reachable procs
     reachable = closure callEdges rootNames
 
-    keptProcs = [p | p <- procs, C2.procName p `S.member` reachable]
+    keptProcs = [p | p <- procs, CFG.procName p `S.member` reachable]
 
     closure edges roots = go roots S.empty
       where
@@ -260,17 +260,17 @@ pruneProgram opts True prog@(C2.Program procs) =
                   new = succs `S.difference` visited'
                 in go (rest `S.union` new) visited'
 
-procCallEdges :: [C2.Proc] -> Map CVar (Set CVar)
-procCallEdges procs = Map.fromList [(C2.procName p, calledByProc p) | p <- procs]
+procCallEdges :: [CFG.Proc] -> Map CVar (Set CVar)
+procCallEdges procs = Map.fromList [(CFG.procName p, calledByProc p) | p <- procs]
   where
-    procNames = S.fromList (map C2.procName procs)
-    calledByProc (C2.Proc {C2.procBody = body}) = foldMap (stmtCalledNames procNames) body
+    procNames = S.fromList (map CFG.procName procs)
+    calledByProc (CFG.Proc {CFG.procBody = body}) = foldMap (stmtCalledNames procNames) body
 
-stmtCalledNames :: Set CVar -> C2.Stmt -> Set CVar
+stmtCalledNames :: Set CVar -> CFG.Stmt -> Set CVar
 stmtCalledNames procNames st = case st of
-  C2.SAssign _ rhs -> rhsCalledNames procNames rhs
-  C2.SLoop _ body' -> foldMap (stmtCalledNames procNames) body'
-  C2.SIf _ thn els -> foldMap (stmtCalledNames procNames) thn `S.union` foldMap (stmtCalledNames procNames) els
+  CFG.SAssign _ rhs -> rhsCalledNames procNames rhs
+  CFG.SLoop _ body' -> foldMap (stmtCalledNames procNames) body'
+  CFG.SIf _ thn els -> foldMap (stmtCalledNames procNames) thn `S.union` foldMap (stmtCalledNames procNames) els
   _ -> S.empty
 
 rhsCalledNames :: Set CVar -> RHS -> Set CVar
@@ -278,13 +278,13 @@ rhsCalledNames procNames rhs = case rhs of
   RCall fn _ | fn `S.member` procNames && fn /= "__apply" -> S.singleton fn
   _ -> S.empty
 
-procUsesIO :: [C2.Stmt] -> Bool
+procUsesIO :: [CFG.Stmt] -> Bool
 procUsesIO = any stmtUsesIO
   where
     stmtUsesIO st = case st of
-      C2.SAssign _ rhs -> rhsUsesIO rhs
-      C2.SLoop _ body' -> procUsesIO body'
-      C2.SIf _ thn els -> procUsesIO thn || procUsesIO els
+      CFG.SAssign _ rhs -> rhsUsesIO rhs
+      CFG.SLoop _ body' -> procUsesIO body'
+      CFG.SIf _ thn els -> procUsesIO thn || procUsesIO els
       _ -> False
     rhsUsesIO (RCall fn _) =
       fn == "hyd_read_array_csv"
@@ -293,13 +293,13 @@ procUsesIO = any stmtUsesIO
         || fn == "hyd_write_array_csv_float"
     rhsUsesIO _ = False
 
-stripBenchmarkIOStmts :: [C2.Stmt] -> [C2.Stmt]
+stripBenchmarkIOStmts :: [CFG.Stmt] -> [CFG.Stmt]
 stripBenchmarkIOStmts = mapMaybe stripStmt
   where
     stripStmt st = case st of
-      C2.SAssign _ rhs | rhsIsBenchmarkIO rhs -> Nothing
-      C2.SLoop spec body -> Just (C2.SLoop spec (stripBenchmarkIOStmts body))
-      C2.SIf cond thn els -> Just (C2.SIf cond (stripBenchmarkIOStmts thn) (stripBenchmarkIOStmts els))
+      CFG.SAssign _ rhs | rhsIsBenchmarkIO rhs -> Nothing
+      CFG.SLoop spec body -> Just (CFG.SLoop spec (stripBenchmarkIOStmts body))
+      CFG.SIf cond thn els -> Just (CFG.SIf cond (stripBenchmarkIOStmts thn) (stripBenchmarkIOStmts els))
       _ -> Just st
 
     rhsIsBenchmarkIO (RCall fn _) =
@@ -318,15 +318,15 @@ reachableClosure edges roots = go roots S.empty
               new = succs `S.difference` visited'
            in go (rest `S.union` new) visited'
 
-genProgram2 :: CodegenOptions -> C2.Program -> Either String CodegenArtifacts
-genProgram2 opts prog@(C2.Program procs) = do
-  let retKinds = procReturnKinds2 prog
-      retTypes = inferProgramReturnTypes2 prog
+genProgram :: CodegenOptions -> CFG.Program -> Either String CodegenArtifacts
+genProgram opts prog@(CFG.Program procs) = do
+  let retKinds = procReturnKinds prog
+      retTypes = inferProgramReturnTypes prog
       callParamTypes = buildCallParamTypes retTypes procs
       callEdges = procCallEdges procs
       missingArrayElemVars = collectMissingArrayElemVars retTypes callParamTypes procs
-      needsOmp = any (\(C2.Proc {C2.procBody = body}) -> hasParallelStmt2 body) procs
-      needsMath = any (\(C2.Proc {C2.procBody = body}) -> hasMathOp body) procs
+      needsOmp = any (\(CFG.Proc {CFG.procBody = body}) -> hasParallelStmt body) procs
+      needsMath = any (\(CFG.Proc {CFG.procBody = body}) -> hasMathOp body) procs
       ompInclude = if needsOmp then text "#include <omp.h>" else empty
       mathInclude = if needsMath then text "#include <math.h>" else empty
       mBench = codegenBenchmark opts
@@ -334,7 +334,7 @@ genProgram2 opts prog@(C2.Program procs) = do
         Nothing -> empty
         Just _ -> text "#include <time.h>"
       benchReachable = fmap (\bc -> reachableClosure callEdges (S.singleton (bcKernelName bc))) mBench
-      recoveredEnvs = map (recoverProcTypeEnv2 retTypes callParamTypes) procs
+      recoveredEnvs = map (recoverProcTypeEnv retTypes callParamTypes) procs
       pairStructs = genPairStructDefs opts prog recoveredEnvs
       recordStructs = genRecordStructDefs prog
       structuredArrayPrints = genStructuredArrayPrintDefs retTypes
@@ -365,7 +365,7 @@ genProgram2 opts prog@(C2.Program procs) = do
   () <- case mBench of
     Just bc ->
       let benchName = bcKernelName bc
-          zeroArgProcNames = [C2.procName p | p <- procs, null (C2.procParams p)]
+          zeroArgProcNames = [CFG.procName p | p <- procs, null (CFG.procParams p)]
        in if benchName `notElem` zeroArgProcNames
             then
               Left
@@ -388,10 +388,10 @@ genProgram2 opts prog@(C2.Program procs) = do
           $$ structuredArrayPrints
           $$ text ""
           $$ benchCacheGlobal
-          $$ vcat (punctuate (text "") (map (genProc2 opts benchReachable retKinds retTypes callParamTypes) procs))
+          $$ vcat (punctuate (text "") (map (genProc opts benchReachable retKinds retTypes callParamTypes) procs))
           $$ maybe empty (\spec -> text "" $$ genExportWrapper spec) exportSpec
           $$ if codegenEmitMain opts
-            then text "" $$ genMain2 mBench retKinds retTypes procs
+            then text "" $$ genMain mBench retKinds retTypes procs
             else empty
       headerDoc = fmap (genHeader pairStructs recordStructs) exportSpec
   pure
@@ -400,13 +400,13 @@ genProgram2 opts prog@(C2.Program procs) = do
         codegenHeader = render <$> headerDoc
       }
 
-resolveExportSpec :: Map CVar VarKind -> Map CVar CType -> CallParamTypes -> [C2.Proc] -> CVar -> Either String ExportSpec
+resolveExportSpec :: Map CVar VarKind -> Map CVar CType -> CallParamTypes -> [CFG.Proc] -> CVar -> Either String ExportSpec
 resolveExportSpec retKinds retTypes callParamTypes procs kernelName =
-  case filter (\proc -> C2.procName proc == kernelName) procs of
+  case filter (\proc -> CFG.procName proc == kernelName) procs of
     [] ->
       Left $ "Unknown exported kernel: " ++ BS.unpack kernelName
     proc : _ ->
-      let typeEnv = recoverProcTypeEnv2 retTypes callParamTypes proc
+      let typeEnv = recoverProcTypeEnv retTypes callParamTypes proc
           (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, _) = typeEnvToVarSets typeEnv
           resolveParamType p
             | p `S.member` floatVarsTE = "double"
@@ -415,13 +415,13 @@ resolveExportSpec retKinds retTypes callParamTypes procs kernelName =
             | Just (ct1, ct2) <- Map.lookup p pairVarsTE = pairStructName ct1 ct2
             | Just fields <- Map.lookup p recordVarsTE = recordStructName fields
             | otherwise = "int64_t"
-          params = [(sanitize p, resolveParamType p) | p <- C2.procParams proc]
+          params = [(sanitize p, resolveParamType p) | p <- CFG.procParams proc]
        in pure
             ExportSpec
               { exportKernelName = kernelName,
-                exportProcName = sanitize (C2.procName proc),
+                exportProcName = sanitize (CFG.procName proc),
                 exportWrapperName = "hyd_export_" ++ sanitizeExportName kernelName,
-                exportReturnType = procReturnTypeName retKinds retTypes (C2.procName proc),
+                exportReturnType = procReturnTypeName retKinds retTypes (CFG.procName proc),
                 exportParams = params
               }
 
@@ -490,20 +490,20 @@ exportHeaderGuard :: ExportSpec -> String
 exportHeaderGuard spec =
   "HYDRANGEA_EXPORT_" ++ map toUpper (sanitizeExportName (exportKernelName spec)) ++ "_H"
 
-genMain2 :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> [C2.Proc] -> Doc
-genMain2 mBench retKinds retTypes procs =
+genMain :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> [CFG.Proc] -> Doc
+genMain mBench retKinds retTypes procs =
   text "int main(void) {"
     $$ nest 4 body
     $$ nest 4 (text "return 0;")
     $$ text "}"
   where
-    zeroArgProcs = filter (\(C2.Proc {C2.procParams = params}) -> null params) procs
+    zeroArgProcs = filter (\(CFG.Proc {CFG.procParams = params}) -> null params) procs
 
     body = case mBench of
       Nothing -> vcat (map callAndPrint zeroArgProcs)
       Just bc ->
         let benchName = bcKernelName bc
-            benchAndAfter = dropWhile (\p -> C2.procName p /= benchName) zeroArgProcs
+            benchAndAfter = dropWhile (\p -> CFG.procName p /= benchName) zeroArgProcs
          in case benchAndAfter of
                -- Fallback if kernel not found among zero-arg procs (should have been caught earlier).
                [] -> vcat (map callAndPrint zeroArgProcs)
@@ -514,7 +514,7 @@ genMain2 mBench retKinds retTypes procs =
 
     -- Generate warmup + measure loops + stats report + final call-and-print.
     benchScaffold bc proc =
-      let name = C2.procName proc
+      let name = CFG.procName proc
           cName = sanitize name
           bsName = BS.unpack name
           warmupStr = show (bcWarmupIters bc)
@@ -604,7 +604,7 @@ genMain2 mBench retKinds retTypes procs =
           KArray -> text "hyd_print_array(" <> text varName <> text ");"
           _ -> text "(void)" <> parens (text varName) <> text ";"
 
-    callAndPrint (C2.Proc {C2.procName = name}) =
+    callAndPrint (CFG.Proc {CFG.procName = name}) =
       let cName = sanitize name
           kind = Map.findWithDefault KScalar name retKinds
           result = cName ++ "_result"
@@ -639,19 +639,19 @@ genMain2 mBench retKinds retTypes procs =
               KFloat -> invoke "double" (text "hyd_print_double" <> parens (text result) <> text ";")
               KScalar -> invoke "int64_t" (text "hyd_print_int" <> parens (text result) <> text ";")
 
-genProc2 :: CodegenOptions -> Maybe (Set CVar) -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> C2.Proc -> Doc
-genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2.procName = name, C2.procParams = params, C2.procBody = body}) =
+genProc :: CodegenOptions -> Maybe (Set CVar) -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> CFG.Proc -> Doc
+genProc opts mBenchReachable retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = name, CFG.procParams = params, CFG.procBody = body}) =
   let mBench = codegenBenchmark opts
-      typeEnv = recoverProcTypeEnv2 retTypes callParamTypes proc
+      typeEnv = recoverProcTypeEnv retTypes callParamTypes proc
       -- Authoritative classification from the recovered type environment.
       (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) = typeEnvToVarSets typeEnv
       arrayElemTypes = inferArrayElemTypesFromStmts retTypes body (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
       -- Fallback heuristic classification for optimizer-introduced temporaries
       -- not present in the type env.
-      arrVarsH = arrayVarsProc2 proc
-      tupVarsH = tupleVarsProc2 proc
-      pairVarsH = pairVarsProc2 proc
-      (floatVarsH, floatArrVarsH) = classifyVarKinds2 retKinds body
+      arrVarsH = arrayVarsProc proc
+      tupVarsH = tupleVarsProc proc
+      pairVarsH = pairVarsProc proc
+      (floatVarsH, floatArrVarsH) = classifyVarKinds retKinds body
       -- Merge: type env entries take priority (left-biased union for maps).
       arrVars = arrVarsTE `S.union` arrVarsH
       tupVars = tupVarsTE `S.union` tupVarsH
@@ -704,7 +704,7 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
       benchCacheVar = text "__bench_cache_" <> text cName
       benchmarkBody = if isBenchKernel then stripBenchmarkIOStmts body else body
       (bodyWithoutReturn, finalReturn) = splitFinalReturn benchmarkBody
-      localArrayVars = localArrayVarsProc2 typeEnv proc
+      localArrayVars = localArrayVarsProc typeEnv proc
       vecVars = classifyVecVars (codegenSimdWidth opts) body
       tupleDefs = collectTupleDefs body
       env =
@@ -734,7 +734,7 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
             aliasedToReturn = case retAtom of
               AVar retVar -> S.fromList
                 [ src
-                | C2.SAssign tgt (RAtom (AVar src)) <- bodyWithoutReturn
+                | CFG.SAssign tgt (RAtom (AVar src)) <- bodyWithoutReturn
                 , tgt == retVar
                 , case Map.lookup src typeEnv of
                     Just (CTArray _) -> True
@@ -756,31 +756,31 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
       procBodyMemo =
         case finalReturn of
           Just retAtom ->
-            genStmts2 env S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
+            genStmts env S.empty (usedVarsAtom retAtom) bodyWithoutReturn
               $$ cleanupDoc retAtom
               $$ cacheVar
               <+> text "="
               <+> genAtom retAtom
               <> text ";"
           Nothing ->
-            genStmts2 env S.empty S.empty body
+            genStmts env S.empty S.empty body
       -- Body for scalar-memoized proc: compute once, cache in static variable.
       procBodyScalarMemo =
         case finalReturn of
           Just retAtom ->
-            genStmts2 env S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
+            genStmts env S.empty (usedVarsAtom retAtom) bodyWithoutReturn
               $$ cleanupDoc retAtom
               $$ scalarCacheVar <+> text "=" <+> genAtom retAtom <> text ";"
           Nothing ->
-            genStmts2 env S.empty S.empty body
+            genStmts env S.empty S.empty body
       procBodyNormal =
         case finalReturn of
           Just retAtom ->
-            genStmts2 env S.empty (usedVarsAtom2 retAtom) bodyWithoutReturn
+            genStmts env S.empty (usedVarsAtom retAtom) bodyWithoutReturn
               $$ cleanupDoc retAtom
               $$ returnDoc retAtom
           Nothing ->
-            genStmts2 env S.empty S.empty body
+            genStmts env S.empty S.empty body
    in if isBenchKernel && retType == "hyd_array_t*"
         then
           -- Benchmark kernel: check the file-scope cache (set after the timing loop
@@ -861,40 +861,40 @@ genProc2 opts mBenchReachable retKinds retTypes callParamTypes proc@(C2.Proc {C2
                   $$ nest 4 procBodyNormal
                   $$ text "}"
 
-genStmts2 :: CodegenEnv -> Set CVar -> Set CVar -> [C2.Stmt] -> Doc
-genStmts2 env declared liveAfter stmts =
+genStmts :: CodegenEnv -> Set CVar -> Set CVar -> [CFG.Stmt] -> Doc
+genStmts env declared liveAfter stmts =
   case stmts of
     [] -> empty
     stmt : rest ->
-      let stmtLiveAfter = usedVarsStmts2 rest `S.union` liveAfter
-          doc = genStmt2 env declared stmtLiveAfter stmt
+      let stmtLiveAfter = usedVarsStmts rest `S.union` liveAfter
+          doc = genStmt env declared stmtLiveAfter stmt
           declared' = case stmt of
-            C2.SAssign _ (RVecStore _ _ _) -> declared
-            C2.SAssign _ (RArrayFree _) -> declared
-            C2.SAssign v _ -> S.insert v declared
-            C2.SLoop spec body ->
+            CFG.SAssign _ (RVecStore _ _ _) -> declared
+            CFG.SAssign _ (RArrayFree _) -> declared
+            CFG.SAssign v _ -> S.insert v declared
+            CFG.SLoop spec body ->
               let declaredWithHoists = declared `S.union` memoizedZeroArgArrayCallVars (ceRetKinds env) (ceRetTypes env) body
-               in case C2.lsRed spec of
-                    Just r -> S.insert (C2.rsAccVar r) declaredWithHoists
+               in case CFG.lsRed spec of
+                    Just r -> S.insert (CFG.rsAccVar r) declaredWithHoists
                     Nothing -> declaredWithHoists
-            C2.SParallelRegion body ->
+            CFG.SParallelRegion body ->
               let regionVars = allAssignedVars body `S.intersection` stmtLiveAfter
               in declared `S.union` regionVars
-            C2.SIf _ thn els ->
+            CFG.SIf _ thn els ->
               let branchVars = allAssignedVars (thn ++ els) `S.intersection` stmtLiveAfter
                in declared `S.union` branchVars
             _ -> declared
-       in doc $$ genStmts2 env declared' liveAfter rest
+       in doc $$ genStmts env declared' liveAfter rest
 
-genStmt2 :: CodegenEnv -> Set CVar -> Set CVar -> C2.Stmt -> Doc
-genStmt2 env declared liveAfter stmt = case stmt of
-  C2.SAssign _ (RArrayFree a) -> text "hyd_array_free(" <> genAtom a <> text ");"
-  C2.SAssign _ rhs@(RVecStore _ _ val) ->
+genStmt :: CodegenEnv -> Set CVar -> Set CVar -> CFG.Stmt -> Doc
+genStmt env declared liveAfter stmt = case stmt of
+  CFG.SAssign _ (RArrayFree a) -> text "hyd_array_free(" <> genAtom a <> text ");"
+  CFG.SAssign _ rhs@(RVecStore _ _ val) ->
     let mw = case val of
           AVecVar vv -> Map.lookup vv (ceVecVars env)
           _ -> Nothing
      in genRHS (ceArrayElemTypes env) (ceFloatArrVars env) mw (ceTupleDefs env) rhs <> text ";"
-  C2.SAssign v rhs
+  CFG.SAssign v rhs
     | v `S.member` declared ->
         -- When a declared pair-of-arrays variable is overwritten, free the old
         -- array components first to prevent a heap leak.
@@ -923,7 +923,7 @@ genStmt2 env declared liveAfter stmt = case stmt of
         RProj 0 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".fst"
         RProj 1 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".snd"
         _ -> genRHS (ceArrayElemTypes env) (ceFloatArrVars env) (Map.lookup v (ceVecVars env)) (ceTupleDefs env) assignedRhs
-  C2.SArrayWrite arr idx val
+  CFG.SArrayWrite arr idx val
     | AVar arrV <- arr,
       Just eltTy <- Map.lookup arrV (ceArrayElemTypes env) ->
         genArrayAccess eltTy arr idx <+> text "=" <+> genAtom val <> text ";"
@@ -932,8 +932,8 @@ genStmt2 env declared liveAfter stmt = case stmt of
         text "hyd_array_set_float(" <> genAtom arr <> text "," <+> genAtom idx <> text "," <+> genAtom val <> text ");"
     | otherwise ->
         genAtom arr <> text "->data[" <> genAtom idx <> text "]" <+> text "=" <+> genAtom val <> text ";"
-  C2.SLoop spec body -> genLoop2 env declared spec body
-  C2.SParallelRegion body ->
+  CFG.SLoop spec body -> genLoop env declared spec body
+  CFG.SParallelRegion body ->
     let branchRHS = assignedRHSMap body
         branchVars =
           S.toList ((allAssignedVars body `S.intersection` liveAfter) `S.difference` declared)
@@ -950,9 +950,9 @@ genStmt2 env declared liveAfter stmt = case stmt of
      in preDecls
           $$ text "#pragma omp parallel"
           $$ text "{"
-          $$ nest 4 (genStmts2 regionEnv declared' liveAfter body)
+          $$ nest 4 (genStmts regionEnv declared' liveAfter body)
           $$ text "}"
-  C2.SIf cond thn els ->
+  CFG.SIf cond thn els ->
     let branchRHS = assignedRHSMap (thn ++ els)
         branchVars =
           S.toList ((allAssignedVars (thn ++ els) `S.intersection` liveAfter) `S.difference` declared)
@@ -969,67 +969,67 @@ genStmt2 env declared liveAfter stmt = case stmt of
           $$ text "if ("
           <> genAtom cond
           <> text ") {"
-          $$ nest 4 (genStmts2 env declared' liveAfter thn)
+          $$ nest 4 (genStmts env declared' liveAfter thn)
           $$ case els of
             [] -> text "}"
             _ ->
               text "} else {"
-                $$ nest 4 (genStmts2 env declared' liveAfter els)
+                $$ nest 4 (genStmts env declared' liveAfter els)
                 $$ text "}"
-  C2.SReturn a -> text "return" <+> genAtom a <> text ";"
-  C2.SBreak -> text "break;"
+  CFG.SReturn a -> text "return" <+> genAtom a <> text ";"
+  CFG.SBreak -> text "break;"
 
-genLoop2 :: CodegenEnv -> Set CVar -> C2.LoopSpec -> [C2.Stmt] -> Doc
-genLoop2 env declared spec body =
-  let iters = C2.lsIters spec
-      bounds = C2.lsBounds spec
-      red = C2.lsRed spec
-      role = C2.lsRole spec
+genLoop :: CodegenEnv -> Set CVar -> CFG.LoopSpec -> [CFG.Stmt] -> Doc
+genLoop env declared spec body =
+  let iters = CFG.lsIters spec
+      bounds = CFG.lsBounds spec
+      red = CFG.lsRed spec
+      role = CFG.lsRole spec
       (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls (ceRetKinds env) (ceRetTypes env) body
       hoistedMemoVars =
-        S.fromList [v | C2.SAssign v (RCall _ args) <- hoistedMemoCalls, isZeroArgCallArgs args]
+        S.fromList [v | CFG.SAssign v (RCall _ args) <- hoistedMemoCalls, isZeroArgCallArgs args]
       declaredWithHoisted = declared `S.union` hoistedMemoVars
       hoistedMemoDoc =
-        genStmts2 env declared (usedVarsStmts2 loopBody) hoistedMemoCalls
-      bodyDoc d = genStmts2 env d S.empty loopBody
-      parallelPolicyClause = case C2.lsExec spec of
-        C2.Parallel p ->
-          let strategyComment = case C2.psStrategy p of
-                C2.ParallelGeneric -> empty
-                C2.ParallelScatterDirect -> text " /* scatter-direct */"
-                C2.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
-                C2.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
-                C2.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
-           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (C2.psPolicy p)
-        C2.Workshare p ->
-          let strategyComment = case C2.psStrategy p of
-                C2.ParallelGeneric -> empty
-                C2.ParallelScatterDirect -> text " /* scatter-direct */"
-                C2.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
-                C2.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
-                C2.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
-           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (C2.psPolicy p)
+        genStmts env declared (usedVarsStmts loopBody) hoistedMemoCalls
+      bodyDoc d = genStmts env d S.empty loopBody
+      parallelPolicyClause = case CFG.lsExec spec of
+        CFG.Parallel p ->
+          let strategyComment = case CFG.psStrategy p of
+                CFG.ParallelGeneric -> empty
+                CFG.ParallelScatterDirect -> text " /* scatter-direct */"
+                CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
+                CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
+                CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
+        CFG.Workshare p ->
+          let strategyComment = case CFG.psStrategy p of
+                CFG.ParallelGeneric -> empty
+                CFG.ParallelScatterDirect -> text " /* scatter-direct */"
+                CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
+                CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
+                CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
         _ -> empty
-      origins = C2.lsOrigins spec
+      origins = CFG.lsOrigins spec
       collapseClause
         | length iters > 1 = space <> text "collapse(" <> int (length iters) <> text ")"
         | otherwise = empty
-      originFor i = case drop i (origins ++ repeat (C2.IConst 0)) of
+      originFor i = case drop i (origins ++ repeat (CFG.IConst 0)) of
         (o : _) -> o
-        [] -> C2.IConst 0
+        [] -> CFG.IConst 0
       originDoc i = case originFor i of
-        C2.IConst 0 -> text "0"
+        CFG.IConst 0 -> text "0"
         o           -> genIndexExpr o
       parallelPragma extraClauses =
-        let simdClause = case C2.lsExec spec of
-              C2.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
-              C2.Workshare p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (C2.psSimdLen p)
+        let simdClause = case CFG.lsExec spec of
+              CFG.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (CFG.psSimdLen p)
+              CFG.Workshare p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (CFG.psSimdLen p)
               _             -> empty
             schedClause
-              | role == C2.LoopSegRedOuter = text " schedule(dynamic)"
+              | role == CFG.LoopSegRedOuter = text " schedule(dynamic)"
               | otherwise                  = empty
-            basePragma = case C2.lsExec spec of
-              C2.Workshare {} ->
+            basePragma = case CFG.lsExec spec of
+              CFG.Workshare {} ->
                 if ceInsideParallelRegion env
                   then text "#pragma omp for"
                   else text "#pragma omp parallel for"
@@ -1038,30 +1038,30 @@ genLoop2 env declared spec body =
         in basePragma <> simdClause <> schedClause <> parallelPolicyClause <> collapseClause <> extraClauses
       simdPragma extraClauses = text "#pragma omp simd simdlen(" <> int defaultSimdLen <> text ")" <> extraClauses
       roleComment = case role of
-        C2.LoopPlain -> text "loop"
-        C2.LoopFold -> text "fold loop"
-        C2.LoopMap -> text "map loop"
-        C2.LoopReductionWrapper -> text "reduction wrapper loop"
-        C2.LoopReduction -> text "reduction loop"
-        C2.LoopMapReduction -> text "map-reduction outer loop"
-        C2.LoopIterate -> text "iterate temporal loop"
-        C2.LoopSegRedOuter -> text "segmented-reduce outer loop"
-      defaultSimdLen = case C2.lsExec spec of
-        C2.Vector v -> C2.vsWidth v
+        CFG.LoopPlain -> text "loop"
+        CFG.LoopFold -> text "fold loop"
+        CFG.LoopMap -> text "map loop"
+        CFG.LoopReductionWrapper -> text "reduction wrapper loop"
+        CFG.LoopReduction -> text "reduction loop"
+        CFG.LoopMapReduction -> text "map-reduction outer loop"
+        CFG.LoopIterate -> text "iterate temporal loop"
+        CFG.LoopSegRedOuter -> text "segmented-reduce outer loop"
+      defaultSimdLen = case CFG.lsExec spec of
+        CFG.Vector v -> CFG.vsWidth v
         _ -> 1
       minSimdTripCount = 4
-      constantTripCount ie = case C2.simplifyIndexExpr ie of
-        C2.IConst n -> Just n
+      constantTripCount ie = case CFG.simplifyIndexExpr ie of
+        CFG.IConst n -> Just n
         _ -> Nothing
       shouldEmitSimd ie = maybe True (>= minSimdTripCount) (constantTripCount ie)
       atomicScatterBodyDoc elemTy declared' =
         case detectAtomicScatterAddLoop loopBody of
           Just (prefix, mGuard, arr, idx, val) ->
             let prefixLiveAfter =
-                  maybe S.empty usedVarsAtom2 mGuard
-                    `S.union` usedVarsAtom2 arr
-                    `S.union` usedVarsAtom2 idx
-                    `S.union` usedVarsAtom2 val
+                  maybe S.empty usedVarsAtom mGuard
+                    `S.union` usedVarsAtom arr
+                    `S.union` usedVarsAtom idx
+                    `S.union` usedVarsAtom val
                 atomicUpdate =
                   text "#pragma omp atomic update"
                     $$ genArrayAccess elemTy arr idx
@@ -1077,7 +1077,7 @@ genLoop2 env declared spec body =
                         <> text ") {"
                         $$ nest 4 atomicUpdate
                         $$ text "}"
-             in genStmts2 env declared' prefixLiveAfter prefix $$ guardedUpdate
+             in genStmts env declared' prefixLiveAfter prefix $$ guardedUpdate
           Nothing ->
             bodyDoc declared'
       privatizedScatterLoopDoc declared' iter bound =
@@ -1087,10 +1087,10 @@ genLoop2 env declared spec body =
                   AVar arrV -> sanitize arrV
                   _ -> "scatter"
                 prefixLiveAfter =
-                  maybe S.empty usedVarsAtom2 mGuard
-                    `S.union` usedVarsAtom2 arr
-                    `S.union` usedVarsAtom2 idx
-                    `S.union` usedVarsAtom2 val
+                  maybe S.empty usedVarsAtom mGuard
+                    `S.union` usedVarsAtom arr
+                    `S.union` usedVarsAtom idx
+                    `S.union` usedVarsAtom val
                 sizeVar = text ("__hyd_priv_size_" ++ arrStem)
                 privVar = text ("__hyd_priv_buf_" ++ arrStem)
                 mergeIxName = "__hyd_priv_merge_" ++ arrStem
@@ -1147,7 +1147,7 @@ genLoop2 env declared spec body =
                         <> text "++) {"
                         $$ nest
                           4
-                          ( genStmts2 env declared' prefixLiveAfter prefix
+                          ( genStmts env declared' prefixLiveAfter prefix
                               $$ guardedPrivUpdate
                           )
                         $$ text "}"
@@ -1187,17 +1187,17 @@ genLoop2 env declared spec body =
               <> text "++) {"
               $$ nest 4 (bodyDoc declared')
               $$ text "}"
-   in hoistedMemoDoc $$ case (C2.lsExec spec, red, iters, bounds) of
-        (C2.Serial, Just r, [i], [b]) ->
-          let cacc = sanitize (C2.rsAccVar r)
+   in hoistedMemoDoc $$ case (CFG.lsExec spec, red, iters, bounds) of
+        (CFG.Serial, Just r, [i], [b]) ->
+          let cacc = sanitize (CFG.rsAccVar r)
               ci = sanitize i
-              declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
-              alreadyDeclared = C2.rsAccVar r `S.member` declared
-              accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
+              declared' = S.insert (CFG.rsAccVar r) declaredWithHoisted
+              alreadyDeclared = CFG.rsAccVar r `S.member` declared
+              accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
                 if alreadyDeclared
                   then empty
-                  else text "/* acc */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+                  else text "/* acc */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (CFG.rsInit r) <> text ";"
            in accInit
                 $$ text "for (int64_t"
                 <+> text ci
@@ -1211,18 +1211,18 @@ genLoop2 env declared spec body =
                 $$ nest 4 (bodyDoc declared')
                 $$ text "}"
         (execPolicy, Just r, [i], [b]) | isOmpLoopExec execPolicy ->
-          let cacc = sanitize (C2.rsAccVar r)
+          let cacc = sanitize (CFG.rsAccVar r)
               ci = sanitize i
-              declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
-              alreadyDeclared = C2.rsAccVar r `S.member` declared
-              redClause = case C2.rsRedop r of
+              declared' = S.insert (CFG.rsAccVar r) declaredWithHoisted
+              alreadyDeclared = CFG.rsAccVar r `S.member` declared
+              redClause = case CFG.rsRedop r of
                 RAdd -> text "reduction(+:" <> text cacc <> text ")"
                 RMul -> text "reduction(*:" <> text cacc <> text ")"
-              accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
+              accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
                 if alreadyDeclared
                   then empty
-                  else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+                  else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (CFG.rsInit r) <> text ";"
            in accInit
                 $$ parallelPragma (space <> redClause)
                 $$ text "for (int64_t"
@@ -1237,35 +1237,35 @@ genLoop2 env declared spec body =
                 $$ nest 4 (bodyDoc declared')
                 $$ text "}"
         (execPolicy, Just r, _, _) | isOmpLoopExec execPolicy ->
-          let cacc = sanitize (C2.rsAccVar r)
-              declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
-              alreadyDeclared = C2.rsAccVar r `S.member` declared
-              redClause = case C2.rsRedop r of
+          let cacc = sanitize (CFG.rsAccVar r)
+              declared' = S.insert (CFG.rsAccVar r) declaredWithHoisted
+              alreadyDeclared = CFG.rsAccVar r `S.member` declared
+              redClause = case CFG.rsRedop r of
                 RAdd -> text "reduction(+:" <> text cacc <> text ")"
                 RMul -> text "reduction(*:" <> text cacc <> text ")"
-              accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
+              accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
                 if alreadyDeclared
                   then empty
-                  else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
+                  else text "/* parallel reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (CFG.rsInit r) <> text ";"
            in accInit
                 $$ parallelPragma (space <> redClause)
                  $$ genNestedLoops iters bounds origins (bodyDoc declared')
-        (C2.Vector v, Just r, [i], [b]) ->
+        (CFG.Vector v, Just r, [i], [b]) ->
           let ci = sanitize i
-              cacc = sanitize (C2.rsAccVar r)
-              declared' = S.insert (C2.rsAccVar r) declaredWithHoisted
-              redClause = case C2.rsRedop r of
+              cacc = sanitize (CFG.rsAccVar r)
+              declared' = S.insert (CFG.rsAccVar r) declaredWithHoisted
+              redClause = case CFG.rsRedop r of
                 RAdd -> text " reduction(+:" <> text cacc <> text ")"
                 RMul -> text " reduction(*:" <> text cacc <> text ")"
-              accCType = if C2.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
+              accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
-                if C2.rsAccVar r `S.member` declared
+                if CFG.rsAccVar r `S.member` declared
                   then empty
-                  else text "/* simd reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (C2.rsInit r) <> text ";"
-              vecComment = case C2.vsTail v of
-                C2.TailNone -> text "/* vectorized reduction loop, width =" <+> int (C2.vsWidth v) <> text " */"
-                _ -> text "/* vectorized reduction loop, width =" <+> int (C2.vsWidth v) <+> text "(compiler handles tail) */"
+                  else text "/* simd reduction */" $$ text accCType <+> text cacc <+> text "=" <+> genIndexExpr (CFG.rsInit r) <> text ";"
+              vecComment = case CFG.vsTail v of
+                CFG.TailNone -> text "/* vectorized reduction loop, width =" <+> int (CFG.vsWidth v) <> text " */"
+                _ -> text "/* vectorized reduction loop, width =" <+> int (CFG.vsWidth v) <+> text "(compiler handles tail) */"
            in if shouldEmitSimd b
                 then
                   accInit
@@ -1296,11 +1296,11 @@ genLoop2 env declared spec body =
                     <> text "++) {"
                     $$ nest 4 (bodyDoc declared')
                     $$ text "}"
-        (C2.Vector v, _, [i], [b]) ->
+        (CFG.Vector v, _, [i], [b]) ->
           let ci = sanitize i
-              vecComment = case C2.vsTail v of
-                C2.TailNone -> text "/* vectorized loop, width =" <+> int (C2.vsWidth v) <> text " */"
-                _ -> text "/* vectorized loop, width =" <+> int (C2.vsWidth v) <+> text "(compiler handles tail) */"
+              vecComment = case CFG.vsTail v of
+                CFG.TailNone -> text "/* vectorized loop, width =" <+> int (CFG.vsWidth v) <> text " */"
+                _ -> text "/* vectorized loop, width =" <+> int (CFG.vsWidth v) <+> text "(compiler handles tail) */"
            in if shouldEmitSimd b
                 then
                   vecComment
@@ -1331,7 +1331,7 @@ genLoop2 env declared spec body =
                     $$ text "}"
         (execPolicy, _, [i], [b])
           | Just p <- ompLoopParallelSpec execPolicy
-          , C2.psStrategy p == C2.ParallelScatterPrivatizedIntAdd ->
+          , CFG.psStrategy p == CFG.ParallelScatterPrivatizedIntAdd ->
               privatizedScatterLoopDoc declaredWithHoisted i b
         (execPolicy, _, [i], [b]) | isOmpLoopExec execPolicy ->
           let ci = sanitize i
@@ -1350,10 +1350,10 @@ genLoop2 env declared spec body =
                 <> text "++) {"
                 $$ nest
                   4
-                  ( case C2.lsExec spec of
-                      C2.Parallel p
+                  ( case CFG.lsExec spec of
+                      CFG.Parallel p
                         | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
-                      C2.Workshare p
+                      CFG.Workshare p
                         | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
                       _ -> bodyDoc declaredWithHoisted
                   )
@@ -1367,26 +1367,26 @@ genLoop2 env declared spec body =
               iters
               bounds
               origins
-              ( case C2.lsExec spec of
-                  C2.Parallel p
+              ( case CFG.lsExec spec of
+                  CFG.Parallel p
                     | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
-                  C2.Workshare p
+                  CFG.Workshare p
                     | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
                   _ -> bodyDoc declaredWithHoisted
               )
         (_, _, _, _) -> genNestedLoops iters bounds origins (bodyDoc declaredWithHoisted)
   where
     isOmpLoopExec execPolicy = case execPolicy of
-      C2.Parallel {} -> True
-      C2.Workshare {} -> True
+      CFG.Parallel {} -> True
+      CFG.Workshare {} -> True
       _ -> False
 
     ompLoopParallelSpec execPolicy = case execPolicy of
-      C2.Parallel p -> Just p
-      C2.Workshare p -> Just p
+      CFG.Parallel p -> Just p
+      CFG.Workshare p -> Just p
       _ -> Nothing
 
-hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> Map CVar CType -> [C2.Stmt] -> ([C2.Stmt], [C2.Stmt])
+hoistMemoizedZeroArgArrayCalls :: Map CVar VarKind -> Map CVar CType -> [CFG.Stmt] -> ([CFG.Stmt], [CFG.Stmt])
 hoistMemoizedZeroArgArrayCalls retKinds retTypes = go
   where
     go [] = ([], [])
@@ -1397,25 +1397,25 @@ hoistMemoizedZeroArgArrayCalls retKinds retTypes = go
 
     step stmt
       | isMemoizedZeroArgArrayCall retKinds retTypes stmt = ([stmt], [])
-    step (C2.SLoop spec body) =
+    step (CFG.SLoop spec body) =
       let (hoistedBody, keptBody) = go body
-       in (hoistedBody, [C2.SLoop spec keptBody])
-    step (C2.SParallelRegion body) =
+       in (hoistedBody, [CFG.SLoop spec keptBody])
+    step (CFG.SParallelRegion body) =
       let (hoistedBody, keptBody) = go body
-       in ([], [C2.SParallelRegion (hoistedBody ++ keptBody)])
-    step (C2.SIf cond thn els) =
+       in ([], [CFG.SParallelRegion (hoistedBody ++ keptBody)])
+    step (CFG.SIf cond thn els) =
       let (hoistedThn, keptThn) = go thn
           (hoistedEls, keptEls) = go els
-       in ([], [C2.SIf cond (hoistedThn ++ keptThn) (hoistedEls ++ keptEls)])
+       in ([], [CFG.SIf cond (hoistedThn ++ keptThn) (hoistedEls ++ keptEls)])
     step other = ([], [other])
 
-memoizedZeroArgArrayCallVars :: Map CVar VarKind -> Map CVar CType -> [C2.Stmt] -> Set CVar
+memoizedZeroArgArrayCallVars :: Map CVar VarKind -> Map CVar CType -> [CFG.Stmt] -> Set CVar
 memoizedZeroArgArrayCallVars retKinds retTypes body =
-  S.fromList [v | C2.SAssign v (RCall _ args) <- fst (hoistMemoizedZeroArgArrayCalls retKinds retTypes body), isZeroArgCallArgs args]
+  S.fromList [v | CFG.SAssign v (RCall _ args) <- fst (hoistMemoizedZeroArgArrayCalls retKinds retTypes body), isZeroArgCallArgs args]
 
-isMemoizedZeroArgArrayCall :: Map CVar VarKind -> Map CVar CType -> C2.Stmt -> Bool
+isMemoizedZeroArgArrayCall :: Map CVar VarKind -> Map CVar CType -> CFG.Stmt -> Bool
 isMemoizedZeroArgArrayCall retKinds retTypes stmt = case stmt of
-  C2.SAssign _ (RCall f args)
+  CFG.SAssign _ (RCall f args)
     | isZeroArgCallArgs args ->
     case Map.findWithDefault KScalar f retKinds of
       KArray -> True
@@ -1428,13 +1428,13 @@ isMemoizedZeroArgArrayCall retKinds retTypes stmt = case stmt of
 isZeroArgCallArgs :: [Atom] -> Bool
 isZeroArgCallArgs args = null args || all (== AUnit) args
 
-genNestedLoops :: [CVar] -> [C2.IndexExpr] -> [C2.IndexExpr] -> Doc -> Doc
+genNestedLoops :: [CVar] -> [CFG.IndexExpr] -> [CFG.IndexExpr] -> Doc -> Doc
 genNestedLoops iters bounds origins body =
-  foldr mk body (zip3 (map sanitize iters) bounds (origins ++ repeat (C2.IConst 0)))
+  foldr mk body (zip3 (map sanitize iters) bounds (origins ++ repeat (CFG.IConst 0)))
   where
     mk (ci, b, o) inner =
       let startDoc = case o of
-            C2.IConst _ -> text "0"
+            CFG.IConst _ -> text "0"
             _           -> genIndexExpr o
       in text "for (int64_t"
         <+> text ci
@@ -1443,17 +1443,17 @@ genNestedLoops iters bounds origins body =
         <> text ";"
         <+> text ci
         <+> text "<"
-        <+> genIndexExpr (C2.simplifyIndexExpr (C2.IAdd o b))
+        <+> genIndexExpr (CFG.simplifyIndexExpr (CFG.IAdd o b))
         <> text ";"
         <+> text ci
         <> text "++) {"
         $$ nest 4 inner
         $$ text "}"
 
-detectAtomicScatterAddLoop :: [C2.Stmt] -> Maybe ([C2.Stmt], Maybe Atom, Atom, Atom, Atom)
+detectAtomicScatterAddLoop :: [CFG.Stmt] -> Maybe ([CFG.Stmt], Maybe Atom, Atom, Atom, Atom)
 detectAtomicScatterAddLoop body =
   case reverse body of
-    (C2.SIf cond thn [] : revPrefix) -> do
+    (CFG.SIf cond thn [] : revPrefix) -> do
       (branchPrefix, arrWrite, idxWrite, val) <- detectAtomicScatterAddCore thn
       pure (reverse revPrefix ++ branchPrefix, Just cond, arrWrite, idxWrite, val)
     _ -> do
@@ -1462,9 +1462,9 @@ detectAtomicScatterAddLoop body =
   where
     detectAtomicScatterAddCore stmts =
       case reverse stmts of
-        ( C2.SArrayWrite arrWrite idxWrite (AVar newVar)
-            : C2.SAssign newVar' (RBinOp op a b)
-            : C2.SAssign oldVar (RArrayLoad arrRead idxRead)
+        ( CFG.SArrayWrite arrWrite idxWrite (AVar newVar)
+            : CFG.SAssign newVar' (RBinOp op a b)
+            : CFG.SAssign oldVar (RArrayLoad arrRead idxRead)
             : revPrefix
           )
             | newVar == newVar',
@@ -1485,81 +1485,81 @@ detectAtomicScatterAddLoop body =
       CAddF -> True
       _ -> False
 
-atomicScatterElemType :: C2.ParallelSpec -> Maybe CType
-atomicScatterElemType p = case C2.psStrategy p of
-  C2.ParallelScatterAtomicAddInt -> Just CTInt64
-  C2.ParallelScatterAtomicAddFloat -> Just CTDouble
+atomicScatterElemType :: CFG.ParallelSpec -> Maybe CType
+atomicScatterElemType p = case CFG.psStrategy p of
+  CFG.ParallelScatterAtomicAddInt -> Just CTInt64
+  CFG.ParallelScatterAtomicAddFloat -> Just CTDouble
   _ -> Nothing
 
-genIndexExpr :: C2.IndexExpr -> Doc
-genIndexExpr expr = case C2.simplifyIndexExpr expr of
-  C2.IVar v -> text (sanitize v)
-  C2.IConst n -> text (show n ++ "LL")
-  C2.IAdd a b -> parens (genIndexExpr a <+> text "+" <+> genIndexExpr b)
-  C2.ISub a b -> parens (genIndexExpr a <+> text "-" <+> genIndexExpr b)
-  C2.IMul a b -> parens (genIndexExpr a <+> text "*" <+> genIndexExpr b)
-  C2.IDiv a b -> parens (genIndexExpr a <+> text "/" <+> genIndexExpr b)
-  C2.INdToFlat nd shp -> text "hyd_nd_to_flat(" <> genIndexExpr nd <> text "," <+> genIndexExpr shp <> text ")"
-  C2.ICall _ _ -> text "0LL"
+genIndexExpr :: CFG.IndexExpr -> Doc
+genIndexExpr expr = case CFG.simplifyIndexExpr expr of
+  CFG.IVar v -> text (sanitize v)
+  CFG.IConst n -> text (show n ++ "LL")
+  CFG.IAdd a b -> parens (genIndexExpr a <+> text "+" <+> genIndexExpr b)
+  CFG.ISub a b -> parens (genIndexExpr a <+> text "-" <+> genIndexExpr b)
+  CFG.IMul a b -> parens (genIndexExpr a <+> text "*" <+> genIndexExpr b)
+  CFG.IDiv a b -> parens (genIndexExpr a <+> text "/" <+> genIndexExpr b)
+  CFG.INdToFlat nd shp -> text "hyd_nd_to_flat(" <> genIndexExpr nd <> text "," <+> genIndexExpr shp <> text ")"
+  CFG.ICall _ _ -> text "0LL"
   _ -> text "0LL"
 
-hasParallelStmt2 :: [C2.Stmt] -> Bool
-hasParallelStmt2 = any go
+hasParallelStmt :: [CFG.Stmt] -> Bool
+hasParallelStmt = any go
   where
     go st = case st of
-      C2.SLoop spec body -> case C2.lsExec spec of
-        C2.Parallel _ -> True
-        C2.Workshare _ -> True
-        _ -> hasParallelStmt2 body
-      C2.SParallelRegion body -> hasParallelStmt2 body
-      C2.SIf _ thn els -> hasParallelStmt2 thn || hasParallelStmt2 els
+      CFG.SLoop spec body -> case CFG.lsExec spec of
+        CFG.Parallel _ -> True
+        CFG.Workshare _ -> True
+        _ -> hasParallelStmt body
+      CFG.SParallelRegion body -> hasParallelStmt body
+      CFG.SIf _ thn els -> hasParallelStmt thn || hasParallelStmt els
       _ -> False
 
 -- | Returns True when any statement in the body uses a math-library UnOp
 -- (CSqrt, CExpF, CLog, etc.) so we can conditionally emit @#include \<math.h\>@.
-hasMathOp :: [C2.Stmt] -> Bool
+hasMathOp :: [CFG.Stmt] -> Bool
 hasMathOp = any go
   where
     go st = case st of
-      C2.SAssign _ rhs -> rhsHasMath rhs
-      C2.SArrayWrite _ _ a -> atomHasMath a
-      C2.SLoop _ body -> hasMathOp body
-      C2.SIf _ thn els -> hasMathOp thn || hasMathOp els
+      CFG.SAssign _ rhs -> rhsHasMath rhs
+      CFG.SArrayWrite _ _ a -> atomHasMath a
+      CFG.SLoop _ body -> hasMathOp body
+      CFG.SIf _ thn els -> hasMathOp thn || hasMathOp els
       _ -> False
     rhsHasMath (RUnOp op _) = isMathOp op
     rhsHasMath _ = False
     atomHasMath _ = False
     isMathOp op = op `elem` [CSqrt, CExpF, CLog, CSin, CCos, CAbsF, CFloorF, CCeilF, CErf]
 
-findReturnVar2 :: [C2.Stmt] -> Maybe CVar
-findReturnVar2 [] = Nothing
-findReturnVar2 stmts = case last stmts of
-  C2.SReturn (AVar v) -> Just v
+findReturnVar :: [CFG.Stmt] -> Maybe CVar
+findReturnVar [] = Nothing
+findReturnVar stmts = case last stmts of
+  CFG.SReturn (AVar v) -> Just v
   _ -> Nothing
 
-splitFinalReturn :: [C2.Stmt] -> ([C2.Stmt], Maybe Atom)
+splitFinalReturn :: [CFG.Stmt] -> ([CFG.Stmt], Maybe Atom)
 splitFinalReturn stmts = case reverse stmts of
-  (C2.SReturn a : rest) -> (reverse rest, Just a)
+  (CFG.SReturn a : rest) -> (reverse rest, Just a)
   _ -> (stmts, Nothing)
 
 -- | True when a proc body ends with a direct float-literal return,
 -- i.e. the body is just `SReturn (AFloat _)` with no intermediate variable.
 -- This handles top-level float constants like `let g = 6.674e-11`.
-isDirectFloatReturn :: [C2.Stmt] -> Bool
+isDirectFloatReturn :: [CFG.Stmt] -> Bool
 isDirectFloatReturn stmts = case stmts of
-  [C2.SReturn (AFloat _)] -> True
+  [CFG.SReturn (AFloat _)] -> True
   _ -> False
 
-arrayVarsProc2 :: C2.Proc -> Set CVar
-arrayVarsProc2 (C2.Proc {C2.procBody = body}) = arrayVarsStmts2 body
+arrayVarsProc :: CFG.Proc -> Set CVar
+arrayVarsProc (CFG.Proc {CFG.procBody = body}) = arrayVarsStmts body
 
-localArrayVarsProc2 :: Map CVar CType -> C2.Proc -> Set CVar
-localArrayVarsProc2 typeEnv (C2.Proc {C2.procBody = body}) =
+localArrayVarsProc :: Map CVar CType -> CFG.Proc -> Set CVar
+localArrayVarsProc typeEnv (CFG.Proc {CFG.procBody = body}) =
   rawLocals `S.difference` consumedByArrayPair `S.difference` explicitlyFreedLocals
   where
     rawLocals =
       S.fromList
-        [v | C2.SAssign v rhs <- body, isLocalArray v, ownsArrayHeader rhs]
+        [v | CFG.SAssign v rhs <- body, isLocalArray v, ownsArrayHeader rhs]
     isLocalArray v = case Map.lookup v typeEnv of
       Just (CTArray _) -> True
       _ -> False
@@ -1574,21 +1574,21 @@ localArrayVarsProc2 typeEnv (C2.Proc {C2.procBody = body}) =
     consumedByArrayPair =
       S.fromList
         [ v
-        | C2.SAssign _ (RPairMake ct1 ct2 a1 a2) <- body,
+        | CFG.SAssign _ (RPairMake ct1 ct2 a1 a2) <- body,
           (ct, a) <- [(ct1, a1), (ct2, a2)],
           ct == CEArray,
           AVar v <- [a]
         ]
     explicitlyFreedLocals =
-      rawLocals `S.intersection` explicitlyFreedArrayVarsStmts2 body
+      rawLocals `S.intersection` explicitlyFreedArrayVarsStmts body
 
-explicitlyFreedArrayVarsStmts2 :: [C2.Stmt] -> Set CVar
-explicitlyFreedArrayVarsStmts2 = foldMap go
+explicitlyFreedArrayVarsStmts :: [CFG.Stmt] -> Set CVar
+explicitlyFreedArrayVarsStmts = foldMap go
   where
     go stmt = case stmt of
-      C2.SAssign "__hyd_discard" (RArrayFree (AVar v)) -> S.singleton v
-      C2.SLoop _ inner -> explicitlyFreedArrayVarsStmts2 inner
-      C2.SIf _ thn els -> explicitlyFreedArrayVarsStmts2 thn `S.union` explicitlyFreedArrayVarsStmts2 els
+      CFG.SAssign "__hyd_discard" (RArrayFree (AVar v)) -> S.singleton v
+      CFG.SLoop _ inner -> explicitlyFreedArrayVarsStmts inner
+      CFG.SIf _ thn els -> explicitlyFreedArrayVarsStmts thn `S.union` explicitlyFreedArrayVarsStmts els
       _ -> S.empty
 
 -- | Emit frees for the non-returned array component(s) of any pair-of-arrays
@@ -1596,85 +1596,85 @@ explicitlyFreedArrayVarsStmts2 = foldMap go
 -- where a foldl accumulator of type (Array, Array) has its snd (or fst)
 -- extracted as the return value — the other component must be freed to avoid
 -- a post-loop heap leak.
-discardedArrayPairComponentDoc :: [C2.Stmt] -> Atom -> Map CVar (CElemType, CElemType) -> Doc
+discardedArrayPairComponentDoc :: [CFG.Stmt] -> Atom -> Map CVar (CElemType, CElemType) -> Doc
 discardedArrayPairComponentDoc stmts retAtom pairVars =
   case retAtom of
     AVar retVar -> vcat (fstFrees ++ sndFrees)
       where
         fstFrees =
           [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".fst);"
-          | C2.SAssign rv (RPairSnd _ (AVar pairVar)) <- stmts,
+          | CFG.SAssign rv (RPairSnd _ (AVar pairVar)) <- stmts,
             rv == retVar,
             Just (CEArray, _) <- [Map.lookup pairVar pairVars]
           ]
         sndFrees =
           [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".snd);"
-          | C2.SAssign rv (RPairFst _ (AVar pairVar)) <- stmts,
+          | CFG.SAssign rv (RPairFst _ (AVar pairVar)) <- stmts,
             rv == retVar,
             Just (_, CEArray) <- [Map.lookup pairVar pairVars]
           ]
     _ -> empty
 
-arrayVarsStmts2 :: [C2.Stmt] -> Set CVar
-arrayVarsStmts2 = foldMap arrayVarsStmt2
+arrayVarsStmts :: [CFG.Stmt] -> Set CVar
+arrayVarsStmts = foldMap arrayVarsStmt
 
-arrayVarsStmt2 :: C2.Stmt -> Set CVar
-arrayVarsStmt2 st = case st of
-  C2.SAssign v rhs -> case rhs of
+arrayVarsStmt :: CFG.Stmt -> Set CVar
+arrayVarsStmt st = case st of
+  CFG.SAssign v rhs -> case rhs of
     RArrayAlloc {} -> S.singleton v
     RArrayCopy {} -> S.singleton v
     RCall fn _ | fn == "hyd_read_array_csv" -> S.singleton v
     RCall fn _ | fn == "hyd_read_float_array_csv" -> S.singleton v
     _ -> S.empty
-  C2.SLoop _ body -> arrayVarsStmts2 body
-  C2.SIf _ thn els -> arrayVarsStmts2 thn `S.union` arrayVarsStmts2 els
+  CFG.SLoop _ body -> arrayVarsStmts body
+  CFG.SIf _ thn els -> arrayVarsStmts thn `S.union` arrayVarsStmts els
   _ -> S.empty
 
 cleanupArrayVarsDoc :: Set CVar -> Doc
 cleanupArrayVarsDoc vars =
   vcat [text "hyd_array_free(" <> text (sanitize v) <> text ");" | v <- S.toList vars]
 
-tupleVarsProc2 :: C2.Proc -> Set CVar
-tupleVarsProc2 (C2.Proc {C2.procBody = body}) = tupleVarsStmts2 body
+tupleVarsProc :: CFG.Proc -> Set CVar
+tupleVarsProc (CFG.Proc {CFG.procBody = body}) = tupleVarsStmts body
 
-tupleVarsStmts2 :: [C2.Stmt] -> Set CVar
-tupleVarsStmts2 = foldMap tupleVarsStmt2
+tupleVarsStmts :: [CFG.Stmt] -> Set CVar
+tupleVarsStmts = foldMap tupleVarsStmt
 
-tupleVarsStmt2 :: C2.Stmt -> Set CVar
-tupleVarsStmt2 st = case st of
-  C2.SAssign v rhs -> case rhs of
+tupleVarsStmt :: CFG.Stmt -> Set CVar
+tupleVarsStmt st = case st of
+  CFG.SAssign v rhs -> case rhs of
     RTuple {} -> S.singleton v
     RArrayShape {} -> S.singleton v
     RShapeInit {} -> S.singleton v
     RFlatToNd {} -> S.singleton v
     _ -> S.empty
-  C2.SLoop _ body -> tupleVarsStmts2 body
-  C2.SIf _ thn els -> tupleVarsStmts2 thn `S.union` tupleVarsStmts2 els
+  CFG.SLoop _ body -> tupleVarsStmts body
+  CFG.SIf _ thn els -> tupleVarsStmts thn `S.union` tupleVarsStmts els
   _ -> S.empty
 
 -- | Collect the variables that hold pair values and their element types.
-pairVarsProc2 :: C2.Proc -> Map CVar (CElemType, CElemType)
-pairVarsProc2 (C2.Proc {C2.procBody = body}) = pairVarsStmts2 Map.empty body
+pairVarsProc :: CFG.Proc -> Map CVar (CElemType, CElemType)
+pairVarsProc (CFG.Proc {CFG.procBody = body}) = pairVarsStmts Map.empty body
 
 -- | Forward-propagating pass: process statements in order, accumulating
 -- the map of known pair-typed variables. Propagates pair type through
 -- plain @RAtom (AVar src)@ copies (e.g. the foldl accumulator init).
-pairVarsStmts2 :: Map CVar (CElemType, CElemType) -> [C2.Stmt] -> Map CVar (CElemType, CElemType)
-pairVarsStmts2 known = foldl pairVarsStmt2 known
+pairVarsStmts :: Map CVar (CElemType, CElemType) -> [CFG.Stmt] -> Map CVar (CElemType, CElemType)
+pairVarsStmts known = foldl pairVarsStmt known
 
-pairVarsStmt2 :: Map CVar (CElemType, CElemType) -> C2.Stmt -> Map CVar (CElemType, CElemType)
-pairVarsStmt2 known st = case st of
-  C2.SAssign v (RPairMake cty1 cty2 _ _) -> Map.insert v (cty1, cty2) known
+pairVarsStmt :: Map CVar (CElemType, CElemType) -> CFG.Stmt -> Map CVar (CElemType, CElemType)
+pairVarsStmt known st = case st of
+  CFG.SAssign v (RPairMake cty1 cty2 _ _) -> Map.insert v (cty1, cty2) known
   -- Propagate pair type through plain copies (e.g. foldl acc initialisation).
-  C2.SAssign v (RAtom (AVar src))
+  CFG.SAssign v (RAtom (AVar src))
     | Just tys <- Map.lookup src known -> Map.insert v tys known
   -- RPairFst/RPairSnd carrying a pair CElemType yield another pair variable.
-  C2.SAssign v (RPairFst (CEPair ct1 ct2) _) -> Map.insert v (ct1, ct2) known
-  C2.SAssign v (RPairSnd (CEPair ct1 ct2) _) -> Map.insert v (ct1, ct2) known
-  C2.SLoop _ body -> pairVarsStmts2 known body
-  C2.SIf _ thn els ->
-    let k1 = pairVarsStmts2 known thn
-        k2 = pairVarsStmts2 known els
+  CFG.SAssign v (RPairFst (CEPair ct1 ct2) _) -> Map.insert v (ct1, ct2) known
+  CFG.SAssign v (RPairSnd (CEPair ct1 ct2) _) -> Map.insert v (ct1, ct2) known
+  CFG.SLoop _ body -> pairVarsStmts known body
+  CFG.SIf _ thn els ->
+    let k1 = pairVarsStmts known thn
+        k2 = pairVarsStmts known els
      in Map.union k1 k2
   _ -> known
 
@@ -1700,17 +1700,17 @@ isFloatAtom _ (AFloat _) = True
 isFloatAtom fv (AVar v) = v `S.member` fv
 isFloatAtom _ _ = False
 
-classifyVarKinds2 :: Map CVar VarKind -> [C2.Stmt] -> (Set CVar, Set CVar)
-classifyVarKinds2 retKinds stmts = fixpoint S.empty (initFloatArrays stmts)
+classifyVarKinds :: Map CVar VarKind -> [CFG.Stmt] -> (Set CVar, Set CVar)
+classifyVarKinds retKinds stmts = fixpoint S.empty (initFloatArrays stmts)
   where
     isFloatArrayCall fn =
       fn == "hyd_read_float_array_csv"
         || Map.lookup fn retKinds == Just KFloatArray
     initFloatArrays = foldMap initFloatArray
     initFloatArray st = case st of
-      C2.SAssign v (RCall fn _) | isFloatArrayCall fn -> S.singleton v
-      C2.SLoop _ body -> foldMap initFloatArray body
-      C2.SIf _ thn els -> foldMap initFloatArray thn `S.union` foldMap initFloatArray els
+      CFG.SAssign v (RCall fn _) | isFloatArrayCall fn -> S.singleton v
+      CFG.SLoop _ body -> foldMap initFloatArray body
+      CFG.SIf _ thn els -> foldMap initFloatArray thn `S.union` foldMap initFloatArray els
       _ -> S.empty
 
     fixpoint fv fa =
@@ -1720,7 +1720,7 @@ classifyVarKinds2 retKinds stmts = fixpoint S.empty (initFloatArrays stmts)
 
     collectFloatVars fv fa = foldMap (floatVarStmt fv fa)
     floatVarStmt fv fa st = case st of
-      C2.SAssign v rhs ->
+      CFG.SAssign v rhs ->
         let isFloat = case rhs of
               RAtom a -> isFloatAtom fv a
               RBinOp op _ _ -> isFloatArithBinOp op
@@ -1744,19 +1744,19 @@ classifyVarKinds2 retKinds stmts = fixpoint S.empty (initFloatArrays stmts)
               RUnOp CNeg a | isFloatAtom fv a -> atomVars a
               _ -> S.empty
          in (if isFloat then S.singleton v else S.empty) `S.union` usedAsFloat
-      C2.SLoop _ body -> collectFloatVars fv fa body
-      C2.SIf _ thn els -> collectFloatVars fv fa thn `S.union` collectFloatVars fv fa els
+      CFG.SLoop _ body -> collectFloatVars fv fa body
+      CFG.SIf _ thn els -> collectFloatVars fv fa thn `S.union` collectFloatVars fv fa els
       _ -> S.empty
 
     collectFloatArrayVars fv = foldMap (floatArrayVarStmt fv)
     floatArrayVarStmt fv st = case st of
-      C2.SAssign v (RCall fn _) | isFloatArrayCall fn -> S.singleton v
-      C2.SArrayWrite (AVar arr) _ val | isFloatAtom fv val -> S.singleton arr
-      C2.SLoop _ body -> collectFloatArrayVars fv body
-      C2.SIf _ thn els -> collectFloatArrayVars fv thn `S.union` collectFloatArrayVars fv els
+      CFG.SAssign v (RCall fn _) | isFloatArrayCall fn -> S.singleton v
+      CFG.SArrayWrite (AVar arr) _ val | isFloatAtom fv val -> S.singleton arr
+      CFG.SLoop _ body -> collectFloatArrayVars fv body
+      CFG.SIf _ thn els -> collectFloatArrayVars fv thn `S.union` collectFloatArrayVars fv els
       _ -> S.empty
 
-classifyVecVars :: Int -> [C2.Stmt] -> Map CVar Int
+classifyVecVars :: Int -> [CFG.Stmt] -> Map CVar Int
 classifyVecVars defaultW stmts = fixpoint Map.empty stmts
   where
     fixpoint vv body =
@@ -1766,45 +1766,45 @@ classifyVecVars defaultW stmts = fixpoint Map.empty stmts
     collectVecVars known w = foldMap (goStmt known w)
 
     goStmt known w st = case st of
-      C2.SAssign v rhs -> case rhs of
+      CFG.SAssign v rhs -> case rhs of
         RVecLoad {} -> Map.singleton v w
         RVecBinOp {} -> Map.singleton v w
         RVecUnOp {} -> Map.singleton v w
         RVecSplat {} -> Map.singleton v w
         RAtom (AVecVar src) | Just sw <- Map.lookup src known -> Map.singleton v sw
         _ -> Map.empty
-      C2.SLoop spec body ->
-        let w' = case C2.lsExec spec of
-              C2.Vector vs -> C2.vsWidth vs
+      CFG.SLoop spec body ->
+        let w' = case CFG.lsExec spec of
+              CFG.Vector vs -> CFG.vsWidth vs
               _ -> w
          in collectVecVars known w' body
-      C2.SIf _ thn els ->
+      CFG.SIf _ thn els ->
         collectVecVars known w thn `Map.union` collectVecVars known w els
       _ -> Map.empty
 
-procReturnKinds2 :: C2.Program -> Map CVar VarKind
+procReturnKinds :: CFG.Program -> Map CVar VarKind
 -- Build return-kind map incrementally so callees are known when their callers
 -- are classified. Procs are emitted in definition order (callees before callers),
 -- so a left fold accumulates enough context by the time each proc is processed.
-procReturnKinds2 prog@(C2.Program procs) = foldl addProc Map.empty procs
+procReturnKinds prog@(CFG.Program procs) = foldl addProc Map.empty procs
   where
-    callTypes = inferProgramReturnTypes2 prog
+    callTypes = inferProgramReturnTypes prog
     callParamTypes = buildCallParamTypes callTypes procs
-    addProc rk proc@(C2.Proc {C2.procName = name}) = Map.insert name (retKindOf rk proc) rk
-    retKindOf rk proc@(C2.Proc {C2.procBody = body}) =
-      let recoveredTypeEnv = recoverProcTypeEnv2 callTypes callParamTypes proc
+    addProc rk proc@(CFG.Proc {CFG.procName = name}) = Map.insert name (retKindOf rk proc) rk
+    retKindOf rk proc@(CFG.Proc {CFG.procBody = body}) =
+      let recoveredTypeEnv = recoverProcTypeEnv callTypes callParamTypes proc
           (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) =
             -- Use recoveredTypeEnv directly: it corrects stale lowering-time types
             -- (e.g. RPairMake tags that defaulted to CEInt).
             typeEnvToVarSets recoveredTypeEnv
-          arrVars = arrVarsTE `S.union` arrayVarsProc2 proc
-          tupVars = tupVarsTE `S.union` tupleVarsProc2 proc
-          pairVars = pairVarsTE `Map.union` pairVarsProc2 proc
+          arrVars = arrVarsTE `S.union` arrayVarsProc proc
+          tupVars = tupVarsTE `S.union` tupleVarsProc proc
+          pairVars = pairVarsTE `Map.union` pairVarsProc proc
           recordVars = recordVarsTE
-          (floatVarsH, floatArrVarsH) = classifyVarKinds2 rk body
+          (floatVarsH, floatArrVarsH) = classifyVarKinds rk body
           floatVars = floatVarsTE `S.union` floatVarsH
           floatArrVars = floatArrVarsTE `S.union` floatArrVarsH
-       in case findReturnVar2 body of
+       in case findReturnVar body of
             Just rv | rv `S.member` floatArrVars -> KFloatArray
             Just rv | rv `S.member` arrVars -> KArray
             Just rv | rv `S.member` tupVars -> KTuple
@@ -1961,8 +1961,8 @@ collectPairTypesFromCType _ = []
 -- parameters/return values that never appear in a make statement), and the
 -- recovered type environments (which may include pair types discovered by
 -- backward type inference not present at lowering time).
-genPairStructDefs :: CodegenOptions -> C2.Program -> [TypeEnv] -> Doc
-genPairStructDefs opts (C2.Program procs) recoveredEnvs =
+genPairStructDefs :: CodegenOptions -> CFG.Program -> [TypeEnv] -> Doc
+genPairStructDefs opts (CFG.Program procs) recoveredEnvs =
   let allPairs = concatMap transitivePairTypes topLevelTypes
       ordered = nubBy (\a b -> fst a == fst b && snd a == snd b) allPairs
    in if null ordered
@@ -1970,7 +1970,7 @@ genPairStructDefs opts (C2.Program procs) recoveredEnvs =
         else text "" $$ vcat (map (uncurry (genPairStructDef opts)) ordered)
   where
     topLevelTypes = concatMap collectPairTypesProc (zip procs recoveredEnvs)
-    collectPairKinds (C2.Proc {C2.procBody = body, C2.procTypeEnv = tenv}, recEnv) =
+    collectPairKinds (CFG.Proc {CFG.procBody = body, CFG.procTypeEnv = tenv}, recEnv) =
       collectPairKindsStmts body
         `S.union` collectPairKindsTypeEnv tenv
         `S.union` collectPairKindsTypeEnv recEnv
@@ -1978,9 +1978,9 @@ genPairStructDefs opts (C2.Program procs) recoveredEnvs =
     -- Collect pairs from RPairMake in the body.
     collectPairKindsStmts = foldMap collectPairKindsStmt
     collectPairKindsStmt st = case st of
-      C2.SAssign _ (RPairMake ct1 ct2 _ _) -> S.singleton (ct1, ct2)
-      C2.SLoop _ body -> collectPairKindsStmts body
-      C2.SIf _ thn els -> collectPairKindsStmts thn `S.union` collectPairKindsStmts els
+      CFG.SAssign _ (RPairMake ct1 ct2 _ _) -> S.singleton (ct1, ct2)
+      CFG.SLoop _ body -> collectPairKindsStmts body
+      CFG.SIf _ thn els -> collectPairKindsStmts thn `S.union` collectPairKindsStmts els
       _ -> S.empty
     -- Collect pairs from the type environment (covers pair params/returns).
     collectPairKindsTypeEnv tenv =
@@ -2005,13 +2005,13 @@ genRecordStructDef fields =
     <+> text (recordStructName fields)
     <> text ";"
 
-genRecordStructDefs :: C2.Program -> Doc
-genRecordStructDefs (C2.Program procs) =
+genRecordStructDefs :: CFG.Program -> Doc
+genRecordStructDefs (CFG.Program procs) =
   let allRecords = concatMap collectProcRecords procs
       ordered = nub allRecords
    in if null ordered then empty else text "" $$ vcat (map genRecordStructDef ordered)
   where
-    collectProcRecords (C2.Proc {C2.procTypeEnv = tenv}) =
+    collectProcRecords (CFG.Proc {CFG.procTypeEnv = tenv}) =
       concatMap transitiveRecordTypes (Map.elems tenv)
 
 isStructuredPrintableArrayElem :: CType -> Bool
@@ -2151,12 +2151,12 @@ varDecl env v rhs
 
 -- | Collect all RTuple definitions from a statement list (pre-pass).
 -- Used for inlining RNdToFlat with known-arity tuples.
-collectTupleDefs :: [C2.Stmt] -> Map CVar [Atom]
+collectTupleDefs :: [CFG.Stmt] -> Map CVar [Atom]
 collectTupleDefs = foldMap go
   where
-    go (C2.SAssign v (RTuple atoms)) = Map.singleton v atoms
-    go (C2.SLoop _ body) = collectTupleDefs body
-    go (C2.SIf _ thn els) = collectTupleDefs thn `Map.union` collectTupleDefs els
+    go (CFG.SAssign v (RTuple atoms)) = Map.singleton v atoms
+    go (CFG.SLoop _ body) = collectTupleDefs body
+    go (CFG.SIf _ thn els) = collectTupleDefs thn `Map.union` collectTupleDefs els
     go _ = Map.empty
 
 genRHS :: Map CVar CType -> Set CVar -> Maybe Int -> Map CVar [Atom] -> RHS -> Doc
@@ -2280,7 +2280,7 @@ genArrayAccess :: CType -> Atom -> Atom -> Doc
 genArrayAccess eltTy arr idx =
   text "(((" <> text (cTypeName eltTy) <> text "*)(void*)" <> genAtom arr <> text "->data)[" <> genAtom idx <> text "])"
 
-inferArrayElemTypesFromStmts :: Map CVar CType -> [C2.Stmt] -> Map CVar CType -> Map CVar CType
+inferArrayElemTypesFromStmts :: Map CVar CType -> [CFG.Stmt] -> Map CVar CType -> Map CVar CType
 inferArrayElemTypesFromStmts retTypes stmts initial = go initial
   where
     go known =
@@ -2288,41 +2288,41 @@ inferArrayElemTypesFromStmts retTypes stmts initial = go initial
        in if known' == known then known else go known'
 
     step known stmt = case stmt of
-      C2.SAssign v (RCall fn _)
+      CFG.SAssign v (RCall fn _)
         | Just (CTArray eltTy) <- Map.lookup fn retTypes -> Map.insert v eltTy known
-      C2.SAssign v (RAtom (AVar src))
+      CFG.SAssign v (RAtom (AVar src))
         | Just eltTy <- Map.lookup src known -> Map.insert v eltTy known
-      C2.SAssign v (RArrayCopy (AVar src))
+      CFG.SAssign v (RArrayCopy (AVar src))
         | Just eltTy <- Map.lookup src known -> Map.insert v eltTy known
-      C2.SLoop _ body -> inferArrayElemTypesFromStmts retTypes body known
-      C2.SIf _ thn els ->
+      CFG.SLoop _ body -> inferArrayElemTypesFromStmts retTypes body known
+      CFG.SIf _ thn els ->
         let knownThn = inferArrayElemTypesFromStmts retTypes thn known
             knownEls = inferArrayElemTypesFromStmts retTypes els known
          in Map.union knownThn knownEls
       _ -> known
 
-collectMissingArrayElemVars :: Map CVar CType -> CallParamTypes -> [C2.Proc] -> [String]
+collectMissingArrayElemVars :: Map CVar CType -> CallParamTypes -> [CFG.Proc] -> [String]
 collectMissingArrayElemVars retTypes callParamTypes procs =
   map BS.unpack (S.toList (foldMap missingForProc procs))
   where
     missingForProc proc =
-      let typeEnv = recoverProcTypeEnv2 retTypes callParamTypes proc
-          arrayElemTypes = inferArrayElemTypesFromStmts retTypes (C2.procBody proc) (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
-       in missingArrayVarsInStmts arrayElemTypes (C2.procBody proc)
+      let typeEnv = recoverProcTypeEnv retTypes callParamTypes proc
+          arrayElemTypes = inferArrayElemTypesFromStmts retTypes (CFG.procBody proc) (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
+       in missingArrayVarsInStmts arrayElemTypes (CFG.procBody proc)
 
     missingArrayVarsInStmts known = foldMap go
       where
         go stmt = case stmt of
-          C2.SAssign _ (RArrayLoad (AVar arr) _) ->
+          CFG.SAssign _ (RArrayLoad (AVar arr) _) ->
             if Map.member arr known then S.empty else S.singleton arr
-          C2.SAssign _ (RVecLoad (AVar arr) _) ->
+          CFG.SAssign _ (RVecLoad (AVar arr) _) ->
             if Map.member arr known then S.empty else S.singleton arr
-          C2.SAssign _ (RVecStore (AVar arr) _ _) ->
+          CFG.SAssign _ (RVecStore (AVar arr) _ _) ->
             if Map.member arr known then S.empty else S.singleton arr
-          C2.SArrayWrite (AVar arr) _ _ ->
+          CFG.SArrayWrite (AVar arr) _ _ ->
             if Map.member arr known then S.empty else S.singleton arr
-          C2.SLoop _ body -> missingArrayVarsInStmts known body
-          C2.SIf _ thn els -> missingArrayVarsInStmts known thn `S.union` missingArrayVarsInStmts known els
+          CFG.SLoop _ body -> missingArrayVarsInStmts known body
+          CFG.SIf _ thn els -> missingArrayVarsInStmts known thn `S.union` missingArrayVarsInStmts known els
           _ -> S.empty
 
 genAtom :: Atom -> Doc
@@ -2396,19 +2396,19 @@ genUnOp CIntOf = text "(int64_t)"
 -- | Collect all variables assigned anywhere in a list of statements,
 -- including inside nested SIf and SLoop bodies. Used to hoist variable
 -- declarations before if-blocks to avoid C scoping issues.
-allAssignedVars :: [C2.Stmt] -> Set CVar
+allAssignedVars :: [CFG.Stmt] -> Set CVar
 allAssignedVars = foldMap go
   where
-    go (C2.SAssign v _) = S.singleton v
-    go (C2.SIf _ thn els) = allAssignedVars thn `S.union` allAssignedVars els
-    go (C2.SLoop _ body) = allAssignedVars body
+    go (CFG.SAssign v _) = S.singleton v
+    go (CFG.SIf _ thn els) = allAssignedVars thn `S.union` allAssignedVars els
+    go (CFG.SLoop _ body) = allAssignedVars body
     go _ = S.empty
 
-assignedRHSMap :: [C2.Stmt] -> Map CVar RHS
+assignedRHSMap :: [CFG.Stmt] -> Map CVar RHS
 assignedRHSMap = foldr go Map.empty
   where
     go stmt acc = case stmt of
-      C2.SAssign v rhs -> Map.insertWith (\_ existing -> existing) v rhs acc
-      C2.SIf _ thn els -> assignedRHSMap thn `Map.union` assignedRHSMap els `Map.union` acc
-      C2.SLoop _ body -> assignedRHSMap body `Map.union` acc
+      CFG.SAssign v rhs -> Map.insertWith (\_ existing -> existing) v rhs acc
+      CFG.SIf _ thn els -> assignedRHSMap thn `Map.union` assignedRHSMap els `Map.union` acc
+      CFG.SLoop _ body -> assignedRHSMap body `Map.union` acc
       _ -> acc

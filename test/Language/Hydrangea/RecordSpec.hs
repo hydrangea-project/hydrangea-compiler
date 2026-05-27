@@ -51,7 +51,7 @@ lowerFromSource src =
   case readDecs (fromString src) of
     Left err -> fail $ "Parse error: " ++ err
     Right ds -> do
-      prog@(Program procs) <- lowerToCFG2WithTypes ds
+      prog@(Program procs) <- lowerToCFGWithTypes ds
       case procs of
         proc:_ -> pure (prog, proc)
         [] -> fail "Expected at least one proc"

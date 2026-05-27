@@ -36,11 +36,11 @@
 -- * the shared recovery logic lives in 'Language.Hydrangea.CFGTyping' so
 --   CFG-level passes can reuse one conservative typing story.
 module Language.Hydrangea.Vectorize
-  ( vectorizeProc2
-  , vectorizeProgram2
-  , vectorizeProgram2WithWidth
-  , vectorizeProgram2WithWidthAndExplicit
-  , vectorizeStmts2
+  ( vectorizeProc
+  , vectorizeProgram
+  , vectorizeProgramWithWidth
+  , vectorizeProgramWithWidthAndExplicit
+  , vectorizeStmts
   , defaultVectorWidth
   ) where
 
@@ -49,15 +49,15 @@ import Data.Map.Strict qualified as M
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..))
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
-import Language.Hydrangea.CFGAnalysis (LoopBound2(..), analyzeLoop2, isVectorizableLoop2)
-import Language.Hydrangea.CFGTyping (TypeEnv, inferProgramReturnTypes2, lookupArrayElemType2, recoverProcTypeEnv2)
+import Language.Hydrangea.CFGAnalysis (LoopBound(..), analyzeLoop, isVectorizableLoop)
+import Language.Hydrangea.CFGTyping (TypeEnv, inferProgramReturnTypes, lookupArrayElemType, recoverProcTypeEnv)
 import Language.Hydrangea.Dependence
-  ( AccessType2(..)
-  , ArrayAccess2(..)
-  , DependenceDirection2(..)
-  , depDirection2
-  , depIsLoopCarried2
-  , findDependences2
+  ( AccessType(..)
+  , ArrayAccess(..)
+  , DependenceDirection(..)
+  , depDirection
+  , depIsLoopCarried
+  , findDependences
   )
 
 data VectorContext = VectorContext
@@ -74,17 +74,17 @@ type AccessFacts = Map CVar VectorAccessFact
 defaultVectorWidth :: Int
 defaultVectorWidth = 4
 
-extractAccesses2 :: [Stmt] -> [ArrayAccess2]
-extractAccesses2 = goSeq 0
+extractAccesses :: [Stmt] -> [ArrayAccess]
+extractAccesses = goSeq 0
   where
     goSeq _ [] = []
     goSeq n (stmt:rest) = goStmt n stmt ++ goSeq (n + 1) rest
 
     goStmt n stmt = case stmt of
       SArrayWrite (AVar arr) idxAtom _ ->
-        [ArrayAccess2 arr (atomToIndexExpr idxAtom) Write2 n]
+        [ArrayAccess arr (atomToIndexExpr idxAtom) Write n]
       SAssign _ (C.RArrayLoad (AVar arr) idxAtom) ->
-        [ArrayAccess2 arr (atomToIndexExpr idxAtom) Read2 n]
+        [ArrayAccess arr (atomToIndexExpr idxAtom) Read n]
       SIf _ thn els ->
         goSeq n thn ++ goSeq (n + length thn + 1) els
       SLoop {} ->
@@ -107,13 +107,13 @@ containsNestedLoop = any go
 hasSupportedBounds :: LoopSpec -> Bool
 hasSupportedBounds spec = all (supportedBound . classifyBound) (lsBounds spec)
   where
-    classifyBound (IConst n) = LB2Constant n
-    classifyBound (IVar v) = LB2Var v
-    classifyBound ie = LB2IndexExpr ie
+    classifyBound (IConst n) = LBConstant n
+    classifyBound (IVar v) = LBVar v
+    classifyBound ie = LBIndexExpr ie
 
-    supportedBound LB2Constant {} = True
-    supportedBound LB2Var {} = True
-    supportedBound (LB2IndexExpr ie) = isSimpleIndexExpr ie
+    supportedBound LBConstant {} = True
+    supportedBound LBVar {} = True
+    supportedBound (LBIndexExpr ie) = isSimpleIndexExpr ie
 
     isSimpleIndexExpr expr = case simplifyIndexExpr expr of
       IVar {} -> True
@@ -127,13 +127,13 @@ hasSupportedBounds spec = all (supportedBound . classifyBound) (lsBounds spec)
 isLegalVectorize :: [Stmt] -> Bool
 isLegalVectorize body = not hasBlocking
   where
-    accesses = extractAccesses2 body
-    deps = findDependences2 accesses
-    hasBlocking = any (\d -> depIsLoopCarried2 d && depDirection2 d /= DDForward) deps
+    accesses = extractAccesses body
+    deps = findDependences accesses
+    hasBlocking = any (\d -> depIsLoopCarried d && depDirection d /= DDForward) deps
 
 chooseVectorWidthWith :: Int -> LoopSpec -> Int
-chooseVectorWidthWith w spec = case analyzeLoop2 (SLoop spec []) of
-  Just info -> if isVectorizableLoop2 info then w else 1
+chooseVectorWidthWith w spec = case analyzeLoop (SLoop spec []) of
+  Just info -> if isVectorizableLoop info then w else 1
   Nothing   -> 1
 
 vectorCandidate :: Int -> VectorContext -> LoopSpec -> [Stmt] -> Maybe LoopSpec
@@ -206,8 +206,8 @@ bodyUsesOnlyDoubleArrays :: TypeEnv -> [Stmt] -> Bool
 bodyUsesOnlyDoubleArrays typeEnv = all (go typeEnv)
   where
     go env stmt = case stmt of
-      SAssign _ (C.RArrayLoad arr _) -> lookupArrayElemType2 env arr == Just CTDouble
-      SArrayWrite arr _ _ -> lookupArrayElemType2 env arr == Just CTDouble
+      SAssign _ (C.RArrayLoad arr _) -> lookupArrayElemType env arr == Just CTDouble
+      SArrayWrite arr _ _ -> lookupArrayElemType env arr == Just CTDouble
       SIf _ thn els -> bodyUsesOnlyDoubleArrays env thn && bodyUsesOnlyDoubleArrays env els
       SLoop {} -> True
       _ -> True
@@ -321,12 +321,12 @@ contiguousVectorIndex accessFacts iter base idx =
 
 arrayAllowsExplicitLoad :: TypeEnv -> AccessFacts -> Atom -> Bool
 arrayAllowsExplicitLoad typeEnv accessFacts arr =
-  lookupArrayElemType2 typeEnv arr == Just CTDouble
+  lookupArrayElemType typeEnv arr == Just CTDouble
     && maybe True (not . vxfIndirectRead) (atomAccessFact accessFacts arr)
 
 arrayAllowsExplicitWrite :: TypeEnv -> AccessFacts -> Atom -> Bool
 arrayAllowsExplicitWrite typeEnv accessFacts arr =
-  lookupArrayElemType2 typeEnv arr == Just CTDouble
+  lookupArrayElemType typeEnv arr == Just CTDouble
     && maybe True vxfContiguousWrite (atomAccessFact accessFacts arr)
 
 atomAccessFact :: AccessFacts -> Atom -> Maybe VectorAccessFact
@@ -505,11 +505,11 @@ planVectorLoop allowExplicit typeEnv accessFacts spec body
 
 vectorizeProcWithCalls :: Int -> Bool -> Map CVar CType -> Proc -> Proc
 vectorizeProcWithCalls w allowExplicit callTypes proc =
-  proc { procBody = rewriteStmts2With defaultContext enterLoop rewriteStmt (procBody proc) }
+  proc { procBody = rewriteStmtsWith defaultContext enterLoop rewriteStmt (procBody proc) }
   where
     defaultContext = VectorContext False
     enterLoop _ = VectorContext True
-    typeEnv = recoverProcTypeEnv2 callTypes M.empty proc
+    typeEnv = recoverProcTypeEnv callTypes M.empty proc
     accessFacts = procVectorAccessFacts proc
 
     rewriteStmt :: VectorContext -> Stmt -> [Stmt]
@@ -529,31 +529,31 @@ vectorizeProcWithCalls w allowExplicit callTypes proc =
 --
 -- This is useful for unit tests and for callers that do not have whole-program
 -- call information available.
-vectorizeProc2 :: Proc -> Proc
-vectorizeProc2 = vectorizeProcWithCalls defaultVectorWidth True M.empty
+vectorizeProc :: Proc -> Proc
+vectorizeProc = vectorizeProcWithCalls defaultVectorWidth True M.empty
 
 -- | Vectorize a whole program using the given SIMD lane width, optionally
 -- enabling explicit vector lowering.
-vectorizeProgram2WithWidthAndExplicit :: Int -> Bool -> Program -> Program
-vectorizeProgram2WithWidthAndExplicit w allowExplicit (Program procs) =
-  let callTypes = inferProgramReturnTypes2 (Program procs)
+vectorizeProgramWithWidthAndExplicit :: Int -> Bool -> Program -> Program
+vectorizeProgramWithWidthAndExplicit w allowExplicit (Program procs) =
+  let callTypes = inferProgramReturnTypes (Program procs)
   in Program (map (vectorizeProcWithCalls w allowExplicit callTypes) procs)
 
 -- | Vectorize a whole program using the given SIMD lane width.
-vectorizeProgram2WithWidth :: Int -> Program -> Program
-vectorizeProgram2WithWidth w = vectorizeProgram2WithWidthAndExplicit w True
+vectorizeProgramWithWidth :: Int -> Program -> Program
+vectorizeProgramWithWidth w = vectorizeProgramWithWidthAndExplicit w True
 
 -- | Vectorize a whole program.
 --
 -- This is the preferred entrypoint for the real compiler pipeline: it first
 -- computes return types for direct calls between procedures, then uses those
 -- facts to enrich per-procedure legality checks for explicit vector lowering.
-vectorizeProgram2 :: Program -> Program
-vectorizeProgram2 = vectorizeProgram2WithWidth defaultVectorWidth
+vectorizeProgram :: Program -> Program
+vectorizeProgram = vectorizeProgramWithWidth defaultVectorWidth
 
 -- | Backwards-compatible statement-list helper used in tests.
 --
 -- Without procedure-level or program-level type information, this helper may be
 -- more conservative than 'vectorizeProgram2'.
-vectorizeStmts2 :: [Stmt] -> [Stmt]
-vectorizeStmts2 = procBody . vectorizeProc2 . mkProc "vectorize_stmts2" []
+vectorizeStmts :: [Stmt] -> [Stmt]
+vectorizeStmts = procBody . vectorizeProc . mkProc "vectorize_stmts2" []

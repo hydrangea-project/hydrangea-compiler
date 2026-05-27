@@ -22,7 +22,7 @@ lowerFromSource :: BS.ByteString -> IO Program
 lowerFromSource src =
   case parseSource src of
     Left err -> fail $ "Parse error: " ++ err
-    Right decs -> pure $ lowerDecs2 decs
+    Right decs -> pure $ lowerDecs decs
 
 parseSource :: BS.ByteString -> Either String [Dec Range]
 parseSource str = runAlex str parseDecs
@@ -263,7 +263,7 @@ spec = do
         case parseSource src of
           Left _ -> return False
           Right decs -> do
-            let Program procs = lowerDecs2 decs
+            let Program procs = lowerDecs decs
             return $ length procs >= 0  -- Should not crash
 
   describe "Lowering - Scatter" $ do
@@ -380,12 +380,12 @@ spec = do
       -- We just verify it lowers successfully (type env completeness is incremental)
       length procs2 `shouldSatisfy` (>= 1)
 
-    it "lowerDecs2WithTypeEnv populates procTypeEnv from top-level types" $ do
+    it "lowerDecsWithTypeEnv populates procTypeEnv from top-level types" $ do
       let src = "let main = (2.0, 3)"
       case parseSource src of
         Left err -> expectationFailure $ "Parse error: " ++ err
         Right decs -> do
-          let prog = lowerDecs2WithTypeEnv Map.empty decs
+          let prog = lowerDecsWithTypeEnv Map.empty decs
           let Program procs = prog
           let Proc { procTypeEnv = tenv } = head procs
           -- Should have pair types in type env

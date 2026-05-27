@@ -20,20 +20,20 @@
 -- Passes are composed and iterated to a fixpoint by 'optimizeProgram2'.
 module Language.Hydrangea.CFGOpt
   ( -- * Entry points
-    optimizeStmts2
-  , optimizeProgram2
+    optimizeStmts
+  , optimizeProgram
   , inlineProgram
     -- * Individual passes (exported for testing)
-  , copyProp2
-  , deadAssignElim2
-  , loopInvariantCodeMotion2
-  , unswitchLoopInvariantIf2
-  , removeNoOps2
-  , hoistIterateAllocs2
+  , copyProp
+  , deadAssignElim
+  , loopInvariantCodeMotion
+  , unswitchLoopInvariantIf
+  , removeNoOps
+  , hoistIterateAllocs
     -- * Atom/statement substitution utilities
-  , substAtom2
-  , substRHS2
-  , substStmts2
+  , substAtom
+  , substRHS
+  , substStmts
   ) where
 
 import Control.Monad (guard)
@@ -48,10 +48,10 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..))
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis
-  ( definedVarsStmts2
-  , usedVarsAtom2
-  , usedVarsRHS2
-  , usedVarsStmts2
+  ( definedVarsStmts
+  , usedVarsAtom
+  , usedVarsRHS
+  , usedVarsStmts
   , usedVarsIndexExpr
   )
 
@@ -63,8 +63,8 @@ import Language.Hydrangea.CFGAnalysis
 -- observable side effects and may therefore be removed if the defined
 -- variable is dead.  Array and vector stores ('RArrayStore', 'RVecStore')
 -- and procedure calls ('RCall') are conservatively treated as impure.
-rhsIsPure2 :: RHS -> Bool
-rhsIsPure2 rhs = case rhs of
+rhsIsPure :: RHS -> Bool
+rhsIsPure rhs = case rhs of
   RAtom{}       -> True
   RBinOp{}      -> True
   RUnOp{}       -> True
@@ -99,8 +99,8 @@ rhsIsPure2 rhs = case rhs of
 -- For 'AVar', any binding in the map is applied.  For 'AVecVar', only
 -- bindings that resolve to another 'AVecVar' are applied, preserving the
 -- vector-variable invariant.
-substAtom2 :: Map ByteString Atom -> Atom -> Atom
-substAtom2 env a = case a of
+substAtom :: Map ByteString Atom -> Atom -> Atom
+substAtom env a = case a of
   AVar    v -> M.findWithDefault a v env
   AVecVar v -> case M.lookup v env of
                  Just (AVecVar v') -> AVecVar v'
@@ -110,9 +110,9 @@ substAtom2 env a = case a of
 -- | Substitute all 'Atom' occurrences inside an 'RHS'.  Structural
 -- information (operators, field names, type tags) is preserved; only
 -- leaf variable references are replaced.
-substRHS2 :: Map ByteString Atom -> RHS -> RHS
-substRHS2 env rhs =
-  let sub = substAtom2 env
+substRHS :: Map ByteString Atom -> RHS -> RHS
+substRHS env rhs =
+  let sub = substAtom env
   in case rhs of
     RAtom a                 -> RAtom (sub a)
     RBinOp op a1 a2         -> RBinOp op (sub a1) (sub a2)
@@ -142,25 +142,25 @@ substRHS2 env rhs =
 
 -- | Apply a variable-to-atom substitution map throughout a list of
 -- statements, replacing every 'AVar' leaf that appears in the map.
-substStmts2 :: Map ByteString Atom -> [Stmt] -> [Stmt]
-substStmts2 env = map go
+substStmts :: Map ByteString Atom -> [Stmt] -> [Stmt]
+substStmts env = map go
   where
-    go (SAssign v rhs)              = SAssign v (substRHS2 env rhs)
+    go (SAssign v rhs)              = SAssign v (substRHS env rhs)
     go (SArrayWrite arr idx val)    =
-      SArrayWrite (substAtom2 env arr) (substAtom2 env idx) (substAtom2 env val)
-    go (SLoop spec body)            = SLoop spec (substStmts2 env body)
-    go (SParallelRegion body)       = SParallelRegion (substStmts2 env body)
+      SArrayWrite (substAtom env arr) (substAtom env idx) (substAtom env val)
+    go (SLoop spec body)            = SLoop spec (substStmts env body)
+    go (SParallelRegion body)       = SParallelRegion (substStmts env body)
     go (SIf cond thn els)           =
-      SIf (substAtom2 env cond) (substStmts2 env thn) (substStmts2 env els)
-    go (SReturn a)                  = SReturn (substAtom2 env a)
+      SIf (substAtom env cond) (substStmts env thn) (substStmts env els)
+    go (SReturn a)                  = SReturn (substAtom env a)
     go s                            = s
 
 -- | Substitute variables appearing in an 'IndexExpr' using the copy-prop
 -- environment.  Integer atom bindings are folded to constants so loop bounds
 -- can become static trip counts.
-substIndexExpr2 :: Map ByteString Atom -> IndexExpr -> IndexExpr
-substIndexExpr2 env ie =
-  let go = substIndexExpr2 env
+substIndexExpr :: Map ByteString Atom -> IndexExpr -> IndexExpr
+substIndexExpr env ie =
+  let go = substIndexExpr env
   in simplifyIndexExpr $ case ie of
        IVar v -> case M.lookup v env of
          Just (AInt n) -> IConst n
@@ -203,8 +203,8 @@ substIndexExpr2 env ie =
 -- * /Roundtrip elimination/: @nd_to_flat(flat_to_nd(k, s), s) == k@ — when
 --   both the @RFlatToNd@ and @RNdToFlat@ use the same shape atom, the
 --   round-trip is replaced by the original flat index @k@.
-copyProp2 :: [Stmt] -> [Stmt]
-copyProp2 = go M.empty M.empty M.empty M.empty M.empty
+copyProp :: [Stmt] -> [Stmt]
+copyProp = go M.empty M.empty M.empty M.empty M.empty
   where
     -- env        : copy/constant propagation (variable → atom)
     -- tupEnv     : tuple-content tracking (variable → [atoms])
@@ -220,7 +220,7 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
     go _   _        _       _        _           []             = []
     go env tupEnv callEnv shapeEnv flatToNdEnv (stmt : rest) = case stmt of
       SAssign x (RAtom a) ->
-        let a' = substAtom2 env a
+        let a' = substAtom env a
             (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
               killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
             env1
@@ -230,7 +230,7 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
 
       -- Track RTuple assignments for downstream shape-folding.
       SAssign x (RTuple atoms) ->
-        let atoms' = map (substAtom2 env) atoms
+        let atoms' = map (substAtom env) atoms
             (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
               killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  SAssign x (RTuple atoms')
@@ -292,7 +292,7 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
 
       -- Shape CSE: deduplicate arr->shape reads for the same array pointer.
       SAssign x (RArrayShape a) ->
-        let a' = substAtom2 env a
+        let a' = substAtom env a
             (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
               killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  case a' of
@@ -309,8 +309,8 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
 
       -- Track flat→nd conversions for roundtrip elimination below.
       SAssign x (RFlatToNd ka sa) ->
-        let ka' = substAtom2 env ka
-            sa' = substAtom2 env sa
+        let ka' = substAtom env ka
+            sa' = substAtom env sa
             (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
               killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  SAssign x (RFlatToNd ka' sa')
@@ -318,8 +318,8 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
 
       -- Roundtrip elimination: nd_to_flat(flat_to_nd(k, s), s) == k.
       SAssign x (RNdToFlat a sa) ->
-        let a'  = substAtom2 env a
-            sa' = substAtom2 env sa
+        let a'  = substAtom env a
+            sa' = substAtom env sa
             (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
               killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
         in  case a' of
@@ -336,9 +336,9 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
       SAssign x rhs ->
         let (env0, tupEnv0, callEnv0, shapeEnv0, flatToNdEnv0) =
               killAssignedVar x env tupEnv callEnv shapeEnv flatToNdEnv
-        in  SAssign x (substRHS2 env rhs) : go env0 tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
+        in  SAssign x (substRHS env rhs) : go env0 tupEnv0 callEnv0 shapeEnv0 flatToNdEnv0 rest
       SArrayWrite a1 a2 a3 ->
-        SArrayWrite (substAtom2 env a1) (substAtom2 env a2) (substAtom2 env a3)
+        SArrayWrite (substAtom env a1) (substAtom env a2) (substAtom env a3)
           : go env tupEnv callEnv shapeEnv flatToNdEnv rest
 
       -- Single-iteration serial loop: substitute the iterator to 0 and
@@ -359,10 +359,10 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
       SLoop spec body ->
         let spec' =
               spec
-                { lsBounds = map (substIndexExpr2 env) (lsBounds spec)
-                , lsRed = fmap (\r -> r { rsInit = substIndexExpr2 env (rsInit r) }) (lsRed spec)
+                { lsBounds = map (substIndexExpr env) (lsBounds spec)
+                , lsRed = fmap (\r -> r { rsInit = substIndexExpr env (rsInit r) }) (lsRed spec)
                 }
-            defs     = S.toList (definedVarsStmts2 body)
+            defs     = S.toList (definedVarsStmts body)
             evicted  = lsIters spec ++ defs
             env'     = foldr M.delete env evicted
             tupEnv'  = foldr M.delete tupEnv evicted
@@ -375,16 +375,16 @@ copyProp2 = go M.empty M.empty M.empty M.empty M.empty
             body'    = go env' tupEnv' callEnv shapeEnv flatToNdEnv body
         in  SLoop spec' body' : go env' tupEnv' callEnv shapeEnv flatToNdEnv rest
       SIf cond thn els ->
-        let cond'             = substAtom2 env cond
+        let cond'             = substAtom env cond
             thn'              = go env tupEnv callEnv shapeEnv flatToNdEnv thn
             els'              = go env tupEnv callEnv shapeEnv flatToNdEnv els
-            definedInBranches = definedVarsStmts2 (thn ++ els)
+            definedInBranches = definedVarsStmts (thn ++ els)
             evicted           = S.toList definedInBranches
             env'              = foldr M.delete env evicted
             tupEnv'           = foldr M.delete tupEnv evicted
         in  SIf cond' thn' els' : go env' tupEnv' callEnv shapeEnv flatToNdEnv rest
       SReturn a ->
-        SReturn (substAtom2 env a) : go env tupEnv callEnv shapeEnv flatToNdEnv rest
+        SReturn (substAtom env a) : go env tupEnv callEnv shapeEnv flatToNdEnv rest
       SBreak ->
         SBreak : go env tupEnv callEnv shapeEnv flatToNdEnv rest
 
@@ -458,24 +458,24 @@ daeBackwards liveAfter (stmt : rest) =
   in case stmt of
        SAssign x rhs
          | x `S.member` live ->
-             (stmt : rest', live `S.union` usedVarsRHS2 rhs)
-         | rhsIsPure2 rhs ->
+             (stmt : rest', live `S.union` usedVarsRHS rhs)
+         | rhsIsPure rhs ->
              -- Dead pure assignment: safe to discard.
              (rest', live)
          | otherwise ->
              -- Dead impure assignment: retain for side effects but do not
              -- add the defined variable to the live set.
-             (stmt : rest', live `S.union` usedVarsRHS2 rhs)
+             (stmt : rest', live `S.union` usedVarsRHS rhs)
        SArrayWrite arr idx val ->
          ( stmt : rest'
-         , S.unions [live, usedVarsAtom2 arr, usedVarsAtom2 idx, usedVarsAtom2 val]
+         , S.unions [live, usedVarsAtom arr, usedVarsAtom idx, usedVarsAtom val]
          )
        SLoop spec body ->
          let iterVars  = S.fromList (lsIters spec)
              boundVars = S.unions (map usedVarsIndexExpr (lsBounds spec))
-             carried   = usedVarsStmts2 body `S.intersection` definedVarsStmts2 body
+             carried   = usedVarsStmts body `S.intersection` definedVarsStmts body
              (body', _) = daeLoopBody carried body
-             bodyUsed   = usedVarsStmts2 body'
+             bodyUsed   = usedVarsStmts body'
              -- Iterator variables are loop-local and must not leak into the
              -- surrounding live set.
              liveBefore = S.unions [live, bodyUsed, boundVars] `S.difference` iterVars
@@ -489,10 +489,10 @@ daeBackwards liveAfter (stmt : rest) =
          -- branch, since control flow merges at the join point.
          let (thn', thnLive) = daeBackwards live thn
              (els', elsLive) = daeBackwards live els
-             liveBefore      = S.unions [live, thnLive, elsLive, usedVarsAtom2 cond]
+             liveBefore      = S.unions [live, thnLive, elsLive, usedVarsAtom cond]
          in  (SIf cond thn' els' : rest', liveBefore)
        SReturn a ->
-         (stmt : rest', usedVarsAtom2 a)
+         (stmt : rest', usedVarsAtom a)
        SBreak ->
          (stmt : rest', live)
 
@@ -506,23 +506,23 @@ daeLoopBody loopCarried (stmt : rest) =
        SAssign x rhs
          | x `S.member` loopCarried ->
              -- Loop-carried: the next iteration reads this variable.
-             (stmt : rest', S.unions [live, usedVarsRHS2 rhs, S.singleton x])
+             (stmt : rest', S.unions [live, usedVarsRHS rhs, S.singleton x])
          | x `S.member` live ->
-             (stmt : rest', live `S.union` usedVarsRHS2 rhs)
-         | rhsIsPure2 rhs ->
+             (stmt : rest', live `S.union` usedVarsRHS rhs)
+         | rhsIsPure rhs ->
              (rest', live)
          | otherwise ->
-             (stmt : rest', live `S.union` usedVarsRHS2 rhs)
+             (stmt : rest', live `S.union` usedVarsRHS rhs)
        SArrayWrite arr idx val ->
          ( stmt : rest'
-         , S.unions [live, usedVarsAtom2 arr, usedVarsAtom2 idx, usedVarsAtom2 val]
+         , S.unions [live, usedVarsAtom arr, usedVarsAtom idx, usedVarsAtom val]
          )
        SLoop spec body ->
          let iterVars  = S.fromList (lsIters spec)
              boundVars = S.unions (map usedVarsIndexExpr (lsBounds spec))
-             carried   = usedVarsStmts2 body `S.intersection` definedVarsStmts2 body
+             carried   = usedVarsStmts body `S.intersection` definedVarsStmts body
              (body', _) = daeLoopBody carried body
-             bodyUsed   = usedVarsStmts2 body'
+             bodyUsed   = usedVarsStmts body'
              liveBefore = S.unions [live, bodyUsed, boundVars] `S.difference` iterVars
          in  (SLoop spec body' : rest', liveBefore)
        SParallelRegion body ->
@@ -534,16 +534,16 @@ daeLoopBody loopCarried (stmt : rest) =
          let liveAtEnd       = live `S.union` loopCarried
              (thn', thnLive) = daeBackwards liveAtEnd thn
              (els', elsLive) = daeBackwards liveAtEnd els
-             liveBefore      = S.unions [live, thnLive, elsLive, usedVarsAtom2 cond]
+             liveBefore      = S.unions [live, thnLive, elsLive, usedVarsAtom cond]
          in  (SIf cond thn' els' : rest', liveBefore)
        SReturn a ->
-         (stmt : rest', usedVarsAtom2 a)
+         (stmt : rest', usedVarsAtom a)
        SBreak ->
          (stmt : rest', live)
 
 -- | Remove dead pure assignments from a statement list.
-deadAssignElim2 :: [Stmt] -> [Stmt]
-deadAssignElim2 stmts = fst (daeBackwards S.empty stmts)
+deadAssignElim :: [Stmt] -> [Stmt]
+deadAssignElim stmts = fst (daeBackwards S.empty stmts)
 
 ------------------------------------------------------------------------
 -- Loop-invariant code motion (LICM)
@@ -559,29 +559,29 @@ deadAssignElim2 stmts = fst (daeBackwards S.empty stmts)
 --
 -- The pass recurses into nested loops and conditionals before hoisting
 -- from the outer loop, so inner invariants are exposed first.
-loopInvariantCodeMotion2 :: [Stmt] -> [Stmt]
-loopInvariantCodeMotion2 = concatMap goStmt
+loopInvariantCodeMotion :: [Stmt] -> [Stmt]
+loopInvariantCodeMotion = concatMap goStmt
   where
     goStmt :: Stmt -> [Stmt]
     goStmt (SLoop spec body) =
-      let body'    = loopInvariantCodeMotion2 body
+      let body'    = loopInvariantCodeMotion body
           iterDefs = S.fromList (lsIters spec)
-          bodyDefs = definedVarsStmts2 body'
+          bodyDefs = definedVarsStmts body'
           loopDeps = iterDefs <> bodyDefs
           body'' = concatMap (hoistCommonBranchPrefix loopDeps) body'
           defCounts = countAssignedVars body''
           (hoisted, kept) = partition (isHoistable iterDefs loopDeps defCounts) body''
       in  hoisted ++ [SLoop spec kept]
     goStmt (SIf cond thn els) =
-      [SIf cond (loopInvariantCodeMotion2 thn) (loopInvariantCodeMotion2 els)]
+      [SIf cond (loopInvariantCodeMotion thn) (loopInvariantCodeMotion els)]
     goStmt stmt = [stmt]
 
     isHoistable :: Set ByteString -> Set ByteString -> Map ByteString Int -> Stmt -> Bool
     isHoistable iterDefs loopDeps defCounts (SAssign x rhs) =
       not (x `S.member` iterDefs)
       && M.findWithDefault 0 x defCounts == 1
-      && (rhsIsPure2 rhs || isZeroArgCall rhs)
-      && S.null (usedVarsRHS2 rhs `S.intersection` loopDeps)
+      && (rhsIsPure rhs || isZeroArgCall rhs)
+      && S.null (usedVarsRHS rhs `S.intersection` loopDeps)
       where isZeroArgCall (RCall _ []) = True
             isZeroArgCall _            = False
     isHoistable _ _ _ _ = False
@@ -602,8 +602,8 @@ loopInvariantCodeMotion2 = concatMap goStmt
 
     isBranchHoistable :: Set ByteString -> Stmt -> Bool
     isBranchHoistable loopDeps (SAssign _ rhs) =
-      (rhsIsPure2 rhs || (case rhs of RCall _ [] -> True; _ -> False))
-      && S.null (usedVarsRHS2 rhs `S.intersection` loopDeps)
+      (rhsIsPure rhs || (case rhs of RCall _ [] -> True; _ -> False))
+      && S.null (usedVarsRHS rhs `S.intersection` loopDeps)
     isBranchHoistable _ _ = False
 
     countAssignedVars :: [Stmt] -> Map ByteString Int
@@ -627,17 +627,17 @@ loopInvariantCodeMotion2 = concatMap goStmt
 -- iterate loop per branch so later passes can see branch-free loop bodies.
 -- Nested case chains are handled by the surrounding optimize-to-fixpoint
 -- driver, which can expose and hoist the next conditional on a later pass.
-unswitchLoopInvariantIf2 :: [Stmt] -> [Stmt]
-unswitchLoopInvariantIf2 = concatMap goStmt
+unswitchLoopInvariantIf :: [Stmt] -> [Stmt]
+unswitchLoopInvariantIf = concatMap goStmt
   where
     goStmt :: Stmt -> [Stmt]
     goStmt (SLoop spec body) =
-      let body' = unswitchLoopInvariantIf2 body
+      let body' = unswitchLoopInvariantIf body
       in case unswitchIterateInvariantIf spec body' of
            Just replacement -> replacement
            Nothing -> [SLoop spec body']
     goStmt (SIf cond thn els) =
-      [SIf cond (unswitchLoopInvariantIf2 thn) (unswitchLoopInvariantIf2 els)]
+      [SIf cond (unswitchLoopInvariantIf thn) (unswitchLoopInvariantIf els)]
     goStmt stmt = [stmt]
 
     unswitchIterateInvariantIf :: LoopSpec -> [Stmt] -> Maybe [Stmt]
@@ -651,7 +651,7 @@ unswitchLoopInvariantIf2 = concatMap goStmt
     splitInvariantIf spec body = go [] S.empty body
       where
         iterDefs = S.fromList (lsIters spec)
-        bodyDefs = definedVarsStmts2 body
+        bodyDefs = definedVarsStmts body
         defCounts = countAssignedVars body
 
         go :: [Stmt] -> Set ByteString -> [Stmt] -> Maybe ([Stmt], Atom, [Stmt], [Stmt], [Stmt])
@@ -675,14 +675,14 @@ unswitchLoopInvariantIf2 = concatMap goStmt
           SAssign x rhs ->
             not (x `S.member` iterDefs)
               && M.findWithDefault 0 x defCounts == 1
-              && (rhsIsPure2 rhs || isZeroArgCall rhs)
-              && S.null (usedVarsRHS2 rhs `S.intersection` disallowed hoistedDefs)
+              && (rhsIsPure rhs || isZeroArgCall rhs)
+              && S.null (usedVarsRHS rhs `S.intersection` disallowed hoistedDefs)
           _ ->
             False
 
         invariantCond :: Set ByteString -> Atom -> Bool
         invariantCond hoistedDefs cond =
-          S.null (usedVarsAtom2 cond `S.intersection` disallowed hoistedDefs)
+          S.null (usedVarsAtom cond `S.intersection` disallowed hoistedDefs)
 
         disallowed :: Set ByteString -> Set ByteString
         disallowed hoistedDefs =
@@ -715,8 +715,8 @@ unswitchLoopInvariantIf2 = concatMap goStmt
 -- * self-assignments like @x = x@
 -- * loops whose body becomes empty
 -- * conditionals whose branches both become empty
-removeNoOps2 :: [Stmt] -> [Stmt]
-removeNoOps2 = concatMap goStmt
+removeNoOps :: [Stmt] -> [Stmt]
+removeNoOps = concatMap goStmt
   where
     goStmt :: Stmt -> [Stmt]
     goStmt stmt = case stmt of
@@ -724,11 +724,11 @@ removeNoOps2 = concatMap goStmt
         | x == y ->
             []
       SLoop spec body ->
-        let body' = removeNoOps2 body
+        let body' = removeNoOps body
         in if null body' then [] else [SLoop spec body']
       SIf cond thn els ->
-        let thn' = removeNoOps2 thn
-            els' = removeNoOps2 els
+        let thn' = removeNoOps thn
+            els' = removeNoOps els
         in if null thn' && null els'
              then []
              else [SIf cond thn' els']
@@ -761,8 +761,8 @@ removeNoOps2 = concatMap goStmt
 -- >   tmp = arr_cur
 --
 -- This avoids re-allocating every temporal iteration.
-hoistIterateAllocs2 :: [Stmt] -> [Stmt]
-hoistIterateAllocs2 = go
+hoistIterateAllocs :: [Stmt] -> [Stmt]
+hoistIterateAllocs = go
   where
     go :: [Stmt] -> [Stmt]
     go [] = []
@@ -770,10 +770,10 @@ hoistIterateAllocs2 = go
       | lsRole spec == LoopIterate =
           case restructureIterateBody spec body of
             Just replacement -> replacement ++ go rest
-            Nothing -> SLoop spec (hoistIterateAllocs2 body) : go rest
-      | otherwise = SLoop spec (hoistIterateAllocs2 body) : go rest
+            Nothing -> SLoop spec (hoistIterateAllocs body) : go rest
+      | otherwise = SLoop spec (hoistIterateAllocs body) : go rest
     go (SIf c t e : rest) =
-      SIf c (hoistIterateAllocs2 t) (hoistIterateAllocs2 e) : go rest
+      SIf c (hoistIterateAllocs t) (hoistIterateAllocs e) : go rest
     go (s : rest) = s : go rest
 
 -- | Given a @LoopIterate@ body, try to hoist the initial @alloc+shape@
@@ -894,8 +894,8 @@ canonicalAtomPair a b
 
 -- | Reorder arguments of commutative binary operations into a canonical
 -- form.  All other RHS forms are returned unchanged.
-canonicalizeRHS2 :: RHS -> RHS
-canonicalizeRHS2 rhs = case rhs of
+canonicalizeRHS :: RHS -> RHS
+canonicalizeRHS rhs = case rhs of
   RBinOp op a b | commutativeBinOp op ->
     let (a', b') = canonicalAtomPair a b in RBinOp op a' b'
   RVecBinOp op a b | commutativeBinOp op ->
@@ -904,9 +904,9 @@ canonicalizeRHS2 rhs = case rhs of
 
 -- | Compute the CSE lookup key for a pure 'RHS' after canonicalization,
 -- or 'Nothing' if the RHS is not eligible (e.g. has side effects).
-rhsCSEKey2 :: RHS -> Maybe ByteString
-rhsCSEKey2 rhs
-  | rhsIsPure2 rhs = Just (BS.pack (show (canonicalizeRHS2 rhs)))
+rhsCSEKey :: RHS -> Maybe ByteString
+rhsCSEKey rhs
+  | rhsIsPure rhs = Just (BS.pack (show (canonicalizeRHS rhs)))
   | otherwise      = Nothing
 
 -- | Remove @v@'s entry from the CSE environment, along with any entry
@@ -928,21 +928,21 @@ invalidateVarsCSE vars env = foldr invalidateVarCSE env vars
 -- ('SArrayWrite') flushes the entire CSE environment, since without
 -- alias information we cannot determine which cached array loads remain
 -- valid.
-cseStmts2 :: [Stmt] -> [Stmt]
-cseStmts2 = go M.empty
+cseStmts :: [Stmt] -> [Stmt]
+cseStmts = go M.empty
   where
     go :: CSEEnv -> [Stmt] -> [Stmt]
     go _   []             = []
     go env (stmt : rest) = case stmt of
       SAssign x rhs ->
-        let rhs'       = canonicalizeRHS2 rhs
+        let rhs'       = canonicalizeRHS rhs
             envCleared = invalidateVarCSE x env
-        in case rhsCSEKey2 rhs' of
+        in case rhsCSEKey rhs' of
              Just key
                | Just entry <- M.lookup key env ->
                    SAssign x (RAtom (AVar (cseVar entry))) : go envCleared rest
                | otherwise ->
-                   let env' = M.insert key (CSEEntry x (usedVarsRHS2 rhs')) envCleared
+                   let env' = M.insert key (CSEEntry x (usedVarsRHS rhs')) envCleared
                    in  SAssign x rhs' : go env' rest
              Nothing ->
                SAssign x rhs' : go envCleared rest
@@ -951,18 +951,18 @@ cseStmts2 = go M.empty
         -- flush the entire CSE environment conservatively.
         SArrayWrite arr idx val : go M.empty rest
       SLoop spec body ->
-        let loopVars = lsIters spec ++ S.toList (definedVarsStmts2 body)
+        let loopVars = lsIters spec ++ S.toList (definedVarsStmts body)
             envLoop  = invalidateVarsCSE loopVars env
             body'    = go envLoop body
         in  SLoop spec body' : go envLoop rest
       SParallelRegion body ->
         let body' = go env body
-            env' = invalidateVarsCSE (S.toList (definedVarsStmts2 body)) env
+            env' = invalidateVarsCSE (S.toList (definedVarsStmts body)) env
         in SParallelRegion body' : go env' rest
       SIf cond thn els ->
         let thn'              = go env thn
             els'              = go env els
-            definedInBranches = S.toList (definedVarsStmts2 (thn ++ els))
+            definedInBranches = S.toList (definedVarsStmts (thn ++ els))
             env'              = invalidateVarsCSE definedInBranches env
         in  SIf cond thn' els' : go env' rest
       SReturn a ->
@@ -1040,11 +1040,11 @@ scalarizeZeroDimArrayRoundtrips = rewriteBlock
           , SAssign valVar (RArrayLoad (AVar arrLoad) loadIdx) <- s4
           , arrLoad == arr
           , isMatchingLoadIdx loadIdx offVar
-          , arr `S.notMember` usedVarsStmts2 accPrefix
-          , not (arr `S.member` definedVarsStmts2 accPrefix)
+          , arr `S.notMember` usedVarsStmts accPrefix
+          , not (arr `S.member` definedVarsStmts accPrefix)
           = Just (accPrefix ++ [SAssign valVar (RAtom writeVal)], suffix)
         findPattern accPrefix (x : xs) =
-          if arr `S.member` usedVarsStmts2 [x] || arr `S.member` definedVarsStmts2 [x]
+          if arr `S.member` usedVarsStmts [x] || arr `S.member` definedVarsStmts [x]
             then Nothing
             else findPattern (accPrefix ++ [x]) xs
 
@@ -1100,14 +1100,14 @@ inlineCall Proc { procParams = params, procBody = body } args =
   let paramMap = M.fromList (zip params args)
   in  map (substStmt paramMap) body
   where
-    substStmt env (SAssign v rhs)           = SAssign v (substRHS2 env rhs)
+    substStmt env (SAssign v rhs)           = SAssign v (substRHS env rhs)
     substStmt env (SArrayWrite arr idx val)  =
-      SArrayWrite (substAtom2 env arr) (substAtom2 env idx) (substAtom2 env val)
+      SArrayWrite (substAtom env arr) (substAtom env idx) (substAtom env val)
     substStmt env (SLoop spec loopBody)     = SLoop spec (map (substStmt env) loopBody)
     substStmt env (SParallelRegion body)    = SParallelRegion (map (substStmt env) body)
     substStmt env (SIf cond thn els)        =
-      SIf (substAtom2 env cond) (map (substStmt env) thn) (map (substStmt env) els)
-    substStmt env (SReturn a)               = SReturn (substAtom2 env a)
+      SIf (substAtom env cond) (map (substStmt env) thn) (map (substStmt env) els)
+    substStmt env (SReturn a)               = SReturn (substAtom env a)
     substStmt _   SBreak                    = SBreak
 
 -- | Inline all calls to inlineable procedures throughout a statement list.
@@ -1162,12 +1162,12 @@ inlineProgram (Program procs) = go 50 procs
 -- CSE-introduced @x = y@ assignments.
 optimizeOnce :: [Stmt] -> [Stmt]
 optimizeOnce =
-    loopInvariantCodeMotion2
-  . deadAssignElim2
+    loopInvariantCodeMotion
+  . deadAssignElim
   . scalarizeZeroDimArrayRoundtrips
-  . copyProp2
-  . cseStmts2
-  . copyProp2
+  . copyProp
+  . cseStmts
+  . copyProp
 
 -- | Run 'optimizeOnce' to a fixpoint (or until the iteration limit of
 -- 100 is reached).  In practice the pipeline usually converges in only
@@ -1182,12 +1182,12 @@ optimizeFixpoint = go 100
       in  if stmts' == stmts then stmts else go (n - 1) stmts'
 
 -- | Optimize a statement list to a fixpoint.
-optimizeStmts2 :: [Stmt] -> [Stmt]
-optimizeStmts2 = optimizeFixpoint
+optimizeStmts :: [Stmt] -> [Stmt]
+optimizeStmts = optimizeFixpoint
 
 -- | Optimize a full program: inline small procedures, then run the
 -- scalar optimization pipeline over every procedure body.
-optimizeProgram2 :: Program -> Program
-optimizeProgram2 prog =
+optimizeProgram :: Program -> Program
+optimizeProgram prog =
   let Program procs = inlineProgram prog
-  in  Program [p { procBody = optimizeStmts2 (procBody p) } | p <- procs]
+  in  Program [p { procBody = optimizeStmts (procBody p) } | p <- procs]

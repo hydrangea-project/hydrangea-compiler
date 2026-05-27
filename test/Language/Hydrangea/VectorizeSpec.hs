@@ -5,7 +5,7 @@ module Language.Hydrangea.VectorizeSpec (spec) where
 import Data.Map.Strict qualified as Map
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGCore qualified as C
-import Language.Hydrangea.Vectorize (vectorizeProc2, vectorizeStmts2)
+import Language.Hydrangea.Vectorize (vectorizeProc, vectorizeStmts)
 import Test.Hspec
 
 hasRHS :: (C.RHS -> Bool) -> [Stmt] -> Bool
@@ -40,13 +40,13 @@ hasLoop p = any go
 vectorizeWithTypes :: [(C.CVar, C.CType)] -> [Stmt] -> [Stmt]
 vectorizeWithTypes bindings body =
   procBody $
-    vectorizeProc2 $
+    vectorizeProc $
       (mkProc "p" [] body) {procTypeEnv = Map.fromList bindings}
 
 vectorizeWithFacts :: [(C.CVar, C.CType)] -> [(C.CVar, VectorAccessFact)] -> [Stmt] -> [Stmt]
 vectorizeWithFacts typeBindings factBindings body =
   procBody $
-    vectorizeProc2 $
+    vectorizeProc $
       (mkProc "p" [] body)
         { procTypeEnv = Map.fromList typeBindings
         , procVectorAccessFacts = Map.fromList factBindings
@@ -78,7 +78,7 @@ spec = describe "Vectorize" $ do
           SLoop
             (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopReductionWrapper [])
             [SAssign "x" (C.RAtom (C.AFloat 1.0))]
-    case vectorizeStmts2 [wrapper] of
+    case vectorizeStmts [wrapper] of
       [SLoop wrapperSpec _] -> lsExec wrapperSpec `shouldBe` Serial
       other -> expectationFailure ("unexpected wrapper lowering: " <> show other)
 
@@ -288,7 +288,7 @@ spec = describe "Vectorize" $ do
             , SAssign "y" (C.RBinOp C.CAdd (C.AVar "x") (C.AInt 1))
             , SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "y")
             ]
-    case vectorizeStmts2 [loop] of
+    case vectorizeStmts [loop] of
       [SLoop loweredSpec loweredBody] -> do
         lsExec loweredSpec `shouldBe` Vector (VectorSpec 4 TailNone)
         hasRHS (\rhs -> case rhs of C.RVecLoad {} -> True; _ -> False) loweredBody `shouldBe` False

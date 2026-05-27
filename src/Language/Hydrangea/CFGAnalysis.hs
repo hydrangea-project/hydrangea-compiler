@@ -12,24 +12,24 @@
 -- that later passes use to decide safe transformations.
 module Language.Hydrangea.CFGAnalysis
   ( -- * Loop Info
-    LoopInfo2(..)
-  , LoopBound2(..)
-  , TripCount2(..)
-  , isConstantTripCount2
-  , isParallelTripCount2
-  , loopTripCount2
-  , tripCountValue2
+    LoopInfo(..)
+  , LoopBound(..)
+  , TripCount(..)
+  , isConstantTripCount
+  , isParallelTripCount
+  , loopTripCount
+  , tripCountValue
     -- * Analysis
-  , analyzeLoop2
-  , analyzeStmts2
-  , isVectorizableLoop2
+  , analyzeLoop
+  , analyzeStmts
+  , isVectorizableLoop
     -- * Variable Analysis (re-exported for optimization passes)
-  , definedVarsStmt2
-  , definedVarsStmts2
-  , usedVarsAtom2
-  , usedVarsRHS2
-  , usedVarsStmt2
-  , usedVarsStmts2
+  , definedVarsStmt
+  , definedVarsStmts
+  , usedVarsAtom
+  , usedVarsRHS
+  , usedVarsStmt
+  , usedVarsStmts
   , usedVarsIndexExpr
   ) where
 
@@ -42,173 +42,173 @@ import Language.Hydrangea.CFG
 
 -- | Classification of a loop bound extracted from an @IndexExpr@.
 --
--- * @LB2Constant n@ — constant trip count @n@.
--- * @LB2Var v@ — a variable-provided bound (e.g. function parameter).
--- * @LB2IndexExpr ie@ — a general index expression that requires further
+-- * @LBConstant n@ — constant trip count @n@.
+-- * @LBVar v@ — a variable-provided bound (e.g. function parameter).
+-- * @LBIndexExpr ie@ — a general index expression that requires further
 --   analysis to extract trip-count structure.
-data LoopBound2
-  = LB2Constant Integer
-  | LB2Var ByteString
-  | LB2IndexExpr IndexExpr
+data LoopBound
+  = LBConstant Integer
+  | LBVar ByteString
+  | LBIndexExpr IndexExpr
   deriving (Eq, Show)
 
 -- | Structured representation of a trip-count. The structure mirrors the
 -- subset of @IndexExpr@ that can be interpreted as a (possibly
 -- parametric) integer trip-count.
-data TripCount2
-  = TC2Unknown
-  | TC2Constant Integer
-  | TC2Var ByteString
-  | TC2Mul TripCount2 TripCount2
-  | TC2Add TripCount2 TripCount2
+data TripCount
+  = TCUnknown
+  | TCConstant Integer
+  | TCVar ByteString
+  | TCMul TripCount TripCount
+  | TCAdd TripCount TripCount
   deriving (Eq, Show)
 
 -- | Light-weight summary of an analyzed loop.
 --
--- @li2LoopVar@ is the first iterator name for the loop nest (most loops
--- use the first iterator as the primary induction variable). @li2Bounds@
--- records the per-dimension bounds as @LoopBound2@. @li2TripCount@ is a
--- derived trip-count for the (first) bound when possible. @li2DefinedVars@
--- and @li2UsedVars@ are the sets of variables defined/used in the loop
+-- @liLoopVar@ is the first iterator name for the loop nest (most loops
+-- use the first iterator as the primary induction variable). @liBounds@
+-- records the per-dimension bounds as @LoopBound@. @liTripCount@ is a
+-- derived trip-count for the (first) bound when possible. @liDefinedVars@
+-- and @liUsedVars@ are the sets of variables defined/used in the loop
 -- body and are used by optimisation passes.
-data LoopInfo2 = LoopInfo2
-  { li2LoopVar :: ByteString
-  , li2Bounds :: [LoopBound2]
-  , li2TripCount :: TripCount2
-  , li2Body :: [Stmt]
-  , li2DefinedVars :: Set ByteString
-  , li2UsedVars :: Set ByteString
-  , li2ExecPolicy :: ExecPolicy
+data LoopInfo = LoopInfo
+  { liLoopVar :: ByteString
+  , liBounds :: [LoopBound]
+  , liTripCount :: TripCount
+  , liBody :: [Stmt]
+  , liDefinedVars :: Set ByteString
+  , liUsedVars :: Set ByteString
+  , liExecPolicy :: ExecPolicy
   } deriving (Eq, Show)
 
-classifyBound2 :: IndexExpr -> LoopBound2
-classifyBound2 (IConst n) = LB2Constant n
-classifyBound2 (IVar v) = LB2Var v
-classifyBound2 ie = LB2IndexExpr ie
+classifyBound :: IndexExpr -> LoopBound
+classifyBound (IConst n) = LBConstant n
+classifyBound (IVar v) = LBVar v
+classifyBound ie = LBIndexExpr ie
 
-computeTripCount2 :: LoopBound2 -> TripCount2
-computeTripCount2 (LB2Constant n) = TC2Constant n
-computeTripCount2 (LB2Var v) = TC2Var v
-computeTripCount2 (LB2IndexExpr ie) = tripCountFromIndexExpr ie
+computeTripCount :: LoopBound -> TripCount
+computeTripCount (LBConstant n) = TCConstant n
+computeTripCount (LBVar v) = TCVar v
+computeTripCount (LBIndexExpr ie) = tripCountFromIndexExpr ie
 
--- | Attempt to extract a @TripCount2@ from an @IndexExpr@ when the
+-- | Attempt to extract a @TripCount@ from an @IndexExpr@ when the
 -- expression is formed from the simple arithmetic subset we recognise.
-tripCountFromIndexExpr :: IndexExpr -> TripCount2
+tripCountFromIndexExpr :: IndexExpr -> TripCount
 tripCountFromIndexExpr = go . simplifyIndexExpr
   where
     go expr = case expr of
-      IConst n -> TC2Constant n
-      IVar v -> TC2Var v
-      IMul a b -> mulTripCounts2 (go a) (go b)
-      IAdd a b -> addTripCounts2 (go a) (go b)
+      IConst n -> TCConstant n
+      IVar v -> TCVar v
+      IMul a b -> mulTripCounts (go a) (go b)
+      IAdd a b -> addTripCounts (go a) (go b)
       IDiv a b ->
-        case (tripCountValue2 (go a), tripCountValue2 (go b)) of
-          (Just x, Just y) | y /= 0 -> TC2Constant (x `div` y)
+        case (tripCountValue (go a), tripCountValue (go b)) of
+          (Just x, Just y) | y /= 0 -> TCConstant (x `div` y)
           -- Variable dividend divided by a positive constant (e.g. tile loop bounds
           -- like (n + 31) / 32): the quotient is still variable-sized.
-          (Nothing, Just y) | y > 0, go a /= TC2Unknown -> go a
-          _ -> TC2Unknown
-      _ -> TC2Unknown
+          (Nothing, Just y) | y > 0, go a /= TCUnknown -> go a
+          _ -> TCUnknown
+      _ -> TCUnknown
 
-addTripCounts2 :: TripCount2 -> TripCount2 -> TripCount2
-addTripCounts2 a b = fromMaybe (TC2Add a b) $ do
-  x <- tripCountValue2 a
-  y <- tripCountValue2 b
-  pure (TC2Constant (x + y))
+addTripCounts :: TripCount -> TripCount -> TripCount
+addTripCounts a b = fromMaybe (TCAdd a b) $ do
+  x <- tripCountValue a
+  y <- tripCountValue b
+  pure (TCConstant (x + y))
 
-mulTripCounts2 :: TripCount2 -> TripCount2 -> TripCount2
-mulTripCounts2 a b = fromMaybe (TC2Mul a b) $ do
-  x <- tripCountValue2 a
-  y <- tripCountValue2 b
-  pure (TC2Constant (x * y))
+mulTripCounts :: TripCount -> TripCount -> TripCount
+mulTripCounts a b = fromMaybe (TCMul a b) $ do
+  x <- tripCountValue a
+  y <- tripCountValue b
+  pure (TCConstant (x * y))
 
 -- | Predicate: is the trip-count statically a compile-time constant?
-isConstantTripCount2 :: TripCount2 -> Bool
-isConstantTripCount2 TC2Constant {} = True
-isConstantTripCount2 (TC2Mul l r) = isConstantTripCount2 l && isConstantTripCount2 r
-isConstantTripCount2 (TC2Add l r) = isConstantTripCount2 l && isConstantTripCount2 r
-isConstantTripCount2 _ = False
+isConstantTripCount :: TripCount -> Bool
+isConstantTripCount TCConstant {} = True
+isConstantTripCount (TCMul l r) = isConstantTripCount l && isConstantTripCount r
+isConstantTripCount (TCAdd l r) = isConstantTripCount l && isConstantTripCount r
+isConstantTripCount _ = False
 
 -- | If the trip-count can be evaluated to an integer, return it.
--- This recursively evaluates @TC2Add@ / @TC2Mul@ when both sides are
+-- This recursively evaluates @TCAdd@ / @TCMul@ when both sides are
 -- constant; otherwise returns @Nothing@.
-tripCountValue2 :: TripCount2 -> Maybe Integer
-tripCountValue2 (TC2Constant n) = Just n
-tripCountValue2 (TC2Mul l r) = do
-  a <- tripCountValue2 l
-  b <- tripCountValue2 r
+tripCountValue :: TripCount -> Maybe Integer
+tripCountValue (TCConstant n) = Just n
+tripCountValue (TCMul l r) = do
+  a <- tripCountValue l
+  b <- tripCountValue r
   Just (a * b)
-tripCountValue2 (TC2Add l r) = do
-  a <- tripCountValue2 l
-  b <- tripCountValue2 r
+tripCountValue (TCAdd l r) = do
+  a <- tripCountValue l
+  b <- tripCountValue r
   Just (a + b)
-tripCountValue2 _ = Nothing
+tripCountValue _ = Nothing
 
-loopTripCount2 :: LoopSpec -> TripCount2
-loopTripCount2 spec =
-  foldr mulTripCounts2 (TC2Constant 1) (map tripCountFromIndexExpr (lsBounds spec))
+loopTripCount :: LoopSpec -> TripCount
+loopTripCount spec =
+  foldr mulTripCounts (TCConstant 1) (map tripCountFromIndexExpr (lsBounds spec))
 
-isParallelTripCount2 :: TripCount2 -> Bool
-isParallelTripCount2 tc = case tripCountValue2 tc of
+isParallelTripCount :: TripCount -> Bool
+isParallelTripCount tc = case tripCountValue tc of
   Just n -> n >= 4
   Nothing -> case tc of
-    TC2Var {} -> True
-    TC2Add {} -> True
-    TC2Mul {} -> True
+    TCVar {} -> True
+    TCAdd {} -> True
+    TCMul {} -> True
     _ -> False
 
 -- | Collect variables that are defined (assigned) by a statement.
-definedVarsStmt2 :: Stmt -> Set ByteString
-definedVarsStmt2 stmt = case stmt of
+definedVarsStmt :: Stmt -> Set ByteString
+definedVarsStmt stmt = case stmt of
   SAssign v _ -> S.singleton v
   SArrayWrite (AVar arr) _ _ -> S.singleton arr
-  SLoop _ body -> S.unions (map definedVarsStmt2 body)
-  SParallelRegion body -> S.unions (map definedVarsStmt2 body)
-  SIf _ thn els -> S.unions (map definedVarsStmt2 (thn ++ els))
+  SLoop _ body -> S.unions (map definedVarsStmt body)
+  SParallelRegion body -> S.unions (map definedVarsStmt body)
+  SIf _ thn els -> S.unions (map definedVarsStmt (thn ++ els))
   SReturn (AVar v) -> S.singleton v
   _ -> S.empty
 
 -- | Defined variables across a sequence of statements.
-definedVarsStmts2 :: [Stmt] -> Set ByteString
-definedVarsStmts2 = S.unions . map definedVarsStmt2
+definedVarsStmts :: [Stmt] -> Set ByteString
+definedVarsStmts = S.unions . map definedVarsStmt
 
 -- | Variables used by an @Atom@.
-usedVarsAtom2 :: Atom -> Set ByteString
-usedVarsAtom2 (AVar v) = S.singleton v
-usedVarsAtom2 (AVecVar v) = S.singleton v
-usedVarsAtom2 _ = S.empty
+usedVarsAtom :: Atom -> Set ByteString
+usedVarsAtom (AVar v) = S.singleton v
+usedVarsAtom (AVecVar v) = S.singleton v
+usedVarsAtom _ = S.empty
 
 -- | Variables referenced by a right-hand-side expression.
-usedVarsRHS2 :: RHS -> Set ByteString
-usedVarsRHS2 rhs = case rhs of
-  RAtom a -> usedVarsAtom2 a
-  RBinOp _ a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
-  RUnOp _ a -> usedVarsAtom2 a
-  RTuple as -> S.unions (map usedVarsAtom2 as)
-  RProj _ a -> usedVarsAtom2 a
-  RRecord fields -> S.unions (map (usedVarsAtom2 . snd) fields)
-  RRecordProj _ a -> usedVarsAtom2 a
-  RArrayLoad a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
-  RArrayAlloc a -> usedVarsAtom2 a
-  RArrayCopy a -> usedVarsAtom2 a
-  RArrayShape a -> usedVarsAtom2 a
-  RShapeSize a -> usedVarsAtom2 a
-  RShapeInit a -> usedVarsAtom2 a
-  RShapeLast a -> usedVarsAtom2 a
-  RFlatToNd a shp -> usedVarsAtom2 a `S.union` usedVarsAtom2 shp
-  RNdToFlat a shp -> usedVarsAtom2 a `S.union` usedVarsAtom2 shp
-  R2DToFlat a w -> usedVarsAtom2 a `S.union` usedVarsAtom2 w
-  RCall _ args -> S.unions (map usedVarsAtom2 args)
-  RVecLoad a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
-  RVecStore a1 a2 a3 -> S.unions [usedVarsAtom2 a1, usedVarsAtom2 a2, usedVarsAtom2 a3]
-  RVecBinOp _ a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
-  RVecUnOp _ a -> usedVarsAtom2 a
-  RVecSplat a -> usedVarsAtom2 a
-  RVecReduce _ a -> usedVarsAtom2 a
-  RPairMake _ _ a1 a2 -> S.union (usedVarsAtom2 a1) (usedVarsAtom2 a2)
-  RPairFst _ a -> usedVarsAtom2 a
-  RPairSnd _ a -> usedVarsAtom2 a
-  RArrayFree a -> usedVarsAtom2 a
+usedVarsRHS :: RHS -> Set ByteString
+usedVarsRHS rhs = case rhs of
+  RAtom a -> usedVarsAtom a
+  RBinOp _ a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
+  RUnOp _ a -> usedVarsAtom a
+  RTuple as -> S.unions (map usedVarsAtom as)
+  RProj _ a -> usedVarsAtom a
+  RRecord fields -> S.unions (map (usedVarsAtom . snd) fields)
+  RRecordProj _ a -> usedVarsAtom a
+  RArrayLoad a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
+  RArrayAlloc a -> usedVarsAtom a
+  RArrayCopy a -> usedVarsAtom a
+  RArrayShape a -> usedVarsAtom a
+  RShapeSize a -> usedVarsAtom a
+  RShapeInit a -> usedVarsAtom a
+  RShapeLast a -> usedVarsAtom a
+  RFlatToNd a shp -> usedVarsAtom a `S.union` usedVarsAtom shp
+  RNdToFlat a shp -> usedVarsAtom a `S.union` usedVarsAtom shp
+  R2DToFlat a w -> usedVarsAtom a `S.union` usedVarsAtom w
+  RCall _ args -> S.unions (map usedVarsAtom args)
+  RVecLoad a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
+  RVecStore a1 a2 a3 -> S.unions [usedVarsAtom a1, usedVarsAtom a2, usedVarsAtom a3]
+  RVecBinOp _ a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
+  RVecUnOp _ a -> usedVarsAtom a
+  RVecSplat a -> usedVarsAtom a
+  RVecReduce _ a -> usedVarsAtom a
+  RPairMake _ _ a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
+  RPairFst _ a -> usedVarsAtom a
+  RPairSnd _ a -> usedVarsAtom a
+  RArrayFree a -> usedVarsAtom a
 
 -- | Collect variables referenced by an 'IndexExpr'
 usedVarsIndexExpr :: IndexExpr -> Set ByteString
@@ -226,60 +226,60 @@ usedVarsIndexExpr ie = case ie of
   ICall _ es -> S.unions (map usedVarsIndexExpr es)
 
 -- | Variables referenced by a statement (reads + bounds used in loops).
-usedVarsStmt2 :: Stmt -> Set ByteString
-usedVarsStmt2 stmt = case stmt of
-  SAssign _ rhs -> usedVarsRHS2 rhs
-  SArrayWrite arr idx val -> S.unions [usedVarsAtom2 arr, usedVarsAtom2 idx, usedVarsAtom2 val]
+usedVarsStmt :: Stmt -> Set ByteString
+usedVarsStmt stmt = case stmt of
+  SAssign _ rhs -> usedVarsRHS rhs
+  SArrayWrite arr idx val -> S.unions [usedVarsAtom arr, usedVarsAtom idx, usedVarsAtom val]
   SLoop spec body ->
-    let bodyVars = S.unions (map usedVarsStmt2 body)
+    let bodyVars = S.unions (map usedVarsStmt body)
         boundVars = S.unions (map usedVarsIndexExpr (lsBounds spec))
     in bodyVars `S.union` boundVars
-  SParallelRegion body -> usedVarsStmts2 body
-  SIf cond thn els -> S.union (usedVarsAtom2 cond) (S.unions (map usedVarsStmt2 (thn ++ els)))
-  SReturn a -> usedVarsAtom2 a
+  SParallelRegion body -> usedVarsStmts body
+  SIf cond thn els -> S.union (usedVarsAtom cond) (S.unions (map usedVarsStmt (thn ++ els)))
+  SReturn a -> usedVarsAtom a
   SBreak -> S.empty
 
 -- | Variables referenced across a sequence of statements.
-usedVarsStmts2 :: [Stmt] -> Set ByteString
-usedVarsStmts2 = S.unions . map usedVarsStmt2
+usedVarsStmts :: [Stmt] -> Set ByteString
+usedVarsStmts = S.unions . map usedVarsStmt
 
--- | Analyse a single @SLoop@ statement and return a @LoopInfo2@ summary.
+-- | Analyse a single @SLoop@ statement and return a @LoopInfo@ summary.
 -- Returns @Nothing@ for non-loop statements.
-analyzeLoop2 :: Stmt -> Maybe LoopInfo2
-analyzeLoop2 (SLoop spec body) = case lsIters spec of
+analyzeLoop :: Stmt -> Maybe LoopInfo
+analyzeLoop (SLoop spec body) = case lsIters spec of
   [] -> Nothing
-  (iter:_) -> Just $ LoopInfo2
-    { li2LoopVar = iter
-    , li2Bounds = map classifyBound2 (lsBounds spec)
-    , li2TripCount = case lsBounds spec of
-        (b:_) -> computeTripCount2 (classifyBound2 b)
-        [] -> TC2Unknown
-    , li2Body = body
-    , li2DefinedVars = definedVarsStmts2 body
-    , li2UsedVars = usedVarsStmts2 body
-    , li2ExecPolicy = lsExec spec
+  (iter:_) -> Just $ LoopInfo
+    { liLoopVar = iter
+    , liBounds = map classifyBound (lsBounds spec)
+    , liTripCount = case lsBounds spec of
+        (b:_) -> computeTripCount (classifyBound b)
+        [] -> TCUnknown
+    , liBody = body
+    , liDefinedVars = definedVarsStmts body
+    , liUsedVars = usedVarsStmts body
+    , liExecPolicy = lsExec spec
     }
-analyzeLoop2 _ = Nothing
+analyzeLoop _ = Nothing
 
--- | Recursively collect @LoopInfo2@ for all loops in a statement list.
+-- | Recursively collect @LoopInfo@ for all loops in a statement list.
 -- This explores nested loops and `if` branches.
-analyzeStmts2 :: [Stmt] -> [LoopInfo2]
-analyzeStmts2 = concatMap go
+analyzeStmts :: [Stmt] -> [LoopInfo]
+analyzeStmts = concatMap go
   where
-    go stmt = case analyzeLoop2 stmt of
-      Just info -> info : analyzeStmts2 (li2Body info)
+    go stmt = case analyzeLoop stmt of
+      Just info -> info : analyzeStmts (liBody info)
       Nothing -> case stmt of
-        SParallelRegion body -> analyzeStmts2 body
-        SIf _ thn els -> analyzeStmts2 thn ++ analyzeStmts2 els
+        SParallelRegion body -> analyzeStmts body
+        SIf _ thn els -> analyzeStmts thn ++ analyzeStmts els
         _ -> []
 
 -- | Conservative predicate: is this loop a candidate for vectorisation?
 -- The heuristic accepts fixed small-arity loops (constant trip counts >=4)
 -- or parametric loops (variables) and some composed trip-count forms.
-isVectorizableLoop2 :: LoopInfo2 -> Bool
-isVectorizableLoop2 info = case li2TripCount info of
-  TC2Constant n -> n >= 4
-  TC2Var {} -> True
-  TC2Mul l r -> isConstantTripCount2 l || isConstantTripCount2 r
-  TC2Add l r -> isConstantTripCount2 l || isConstantTripCount2 r
-  TC2Unknown -> False
+isVectorizableLoop :: LoopInfo -> Bool
+isVectorizableLoop info = case liTripCount info of
+  TCConstant n -> n >= 4
+  TCVar {} -> True
+  TCMul l r -> isConstantTripCount l || isConstantTripCount r
+  TCAdd l r -> isConstantTripCount l || isConstantTripCount r
+  TCUnknown -> False

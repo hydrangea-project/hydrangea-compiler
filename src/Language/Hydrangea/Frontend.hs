@@ -20,25 +20,25 @@ import Language.Hydrangea.ErrorFormat (formatTypeError, formatEvalError)
 import Language.Hydrangea.Fusion
 import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, normalizeShapesDecs)
 import Language.Hydrangea.Uniquify
-import Language.Hydrangea.CFG qualified as C2
+import Language.Hydrangea.CFG qualified as CFG
 import Language.Hydrangea.CFGCore (CType(..))
-import Language.Hydrangea.Lowering (lowerDecs2, lowerDecs2WithTypeEnv, lowerDecs2WithTypeEnvAndRanks)
+import Language.Hydrangea.Lowering (lowerDecs, lowerDecsWithTypeEnv, lowerDecsWithTypeEnvAndRanks)
 import Language.Hydrangea.CFGPipeline
   ( PipelineOptions(..)
-  , metalPipeline2
+  , metalPipeline
   , metalPipelineWithTiling
-  , parallelPipeline2
+  , parallelPipeline
   , parallelPipelineWithWidth
   , pipelineWithOptions
-  , vectorizePipeline2
+  , vectorizePipeline
   , vectorizePipelineWithWidth
   )
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
   , CodegenOptions(..)
-  , codegenProgram2
-  , codegenProgram2Prune
-  , codegenProgram2WithOptionsPrune
+  , codegenProgram
+  , codegenProgramPrune
+  , codegenProgramWithOptionsPrune
   )
 
 -- | Options controlling the high-level frontend preprocessing pipeline.
@@ -193,51 +193,51 @@ fuseExpAfterTypeCheckWithOptions opts e = do
       Right _ -> Right (fuseExp (normalizeShapesExp (uniquifyExp e)))
 
 -- | Lower declarations directly to canonical CFG IR.
-lowerToCFG2 :: [Dec Range] -> C2.Program
-lowerToCFG2 = lowerDecs2
+lowerToCFG :: [Dec Range] -> CFG.Program
+lowerToCFG = lowerDecs
 
-lowerToCFG2WithConcreteTypes :: Map.Map Var CType -> [Dec Range] -> C2.Program
-lowerToCFG2WithConcreteTypes typeEnv = lowerDecs2WithTypeEnv typeEnv . preprocessDecs
+lowerToCFGWithConcreteTypes :: Map.Map Var CType -> [Dec Range] -> CFG.Program
+lowerToCFGWithConcreteTypes typeEnv = lowerDecsWithTypeEnv typeEnv . preprocessDecs
 
-inferAndLowerToCFG2 :: InferOptions -> [Dec Range] -> IO C2.Program
-inferAndLowerToCFG2 = inferAndLowerToCFG2WithFrontendOptions defaultFrontendOptions
+inferAndLowerToCFG :: InferOptions -> [Dec Range] -> IO CFG.Program
+inferAndLowerToCFG = inferAndLowerToCFGWithFrontendOptions defaultFrontendOptions
 
-inferAndLowerToCFG2WithFrontendOptions :: FrontendOptions -> InferOptions -> [Dec Range] -> IO C2.Program
-inferAndLowerToCFG2WithFrontendOptions frontOpts opts decs = do
+inferAndLowerToCFGWithFrontendOptions :: FrontendOptions -> InferOptions -> [Dec Range] -> IO CFG.Program
+inferAndLowerToCFGWithFrontendOptions frontOpts opts decs = do
   (typeEnv, rankEnv) <- inferTopLevelTypesAndRanksWithOptions opts decs
   let pre = preprocessDecsWithOptions frontOpts decs
-  let prog = lowerDecs2WithTypeEnvAndRanks typeEnv rankEnv pre
+  let prog = lowerDecsWithTypeEnvAndRanks typeEnv rankEnv pre
   pure prog
 
 -- | Lower declarations to CFG using inferred top-level concrete types.
-lowerToCFG2WithTypes :: [Dec Range] -> IO C2.Program
-lowerToCFG2WithTypes = lowerToCFG2WithTypesWithOptions defaultInferOptions
+lowerToCFGWithTypes :: [Dec Range] -> IO CFG.Program
+lowerToCFGWithTypes = lowerToCFGWithTypesWithOptions defaultInferOptions
 
-lowerToCFG2WithTypesWithOptions :: InferOptions -> [Dec Range] -> IO C2.Program
-lowerToCFG2WithTypesWithOptions = inferAndLowerToCFG2
+lowerToCFGWithTypesWithOptions :: InferOptions -> [Dec Range] -> IO CFG.Program
+lowerToCFGWithTypesWithOptions = inferAndLowerToCFG
 
 -- | Lower declarations to CFG with the optimization/vectorization pipeline.
-lowerToCFG2Opt :: [Dec Range] -> C2.Program
-lowerToCFG2Opt = optimizeCFG2 . lowerToCFG2
+lowerToCFGOpt :: [Dec Range] -> CFG.Program
+lowerToCFGOpt = optimizeCFG . lowerToCFG
 
 -- | Lower declarations with the same preprocessing used by optimized C emission,
 -- then run the CFG optimization pipeline.
-lowerToCFG2OptWithTypes :: [Dec Range] -> IO C2.Program
-lowerToCFG2OptWithTypes = lowerToCFG2OptWithTypesWithOptions defaultInferOptions
+lowerToCFGOptWithTypes :: [Dec Range] -> IO CFG.Program
+lowerToCFGOptWithTypes = lowerToCFGOptWithTypesWithOptions defaultInferOptions
 
-lowerToCFG2OptWithTypesWithOptions :: InferOptions -> [Dec Range] -> IO C2.Program
-lowerToCFG2OptWithTypesWithOptions opts decs = optimizeCFG2 <$> lowerToCFG2WithTypesWithOptions opts decs
+lowerToCFGOptWithTypesWithOptions :: InferOptions -> [Dec Range] -> IO CFG.Program
+lowerToCFGOptWithTypesWithOptions opts decs = optimizeCFG <$> lowerToCFGWithTypesWithOptions opts decs
 
 -- | Lower declarations to CFG with the optimization + parallelization pipeline.
-lowerToCFG2OptParallel :: [Dec Range] -> C2.Program
-lowerToCFG2OptParallel = optimizeParallelCFG2 . lowerToCFG2
+lowerToCFGOptParallel :: [Dec Range] -> CFG.Program
+lowerToCFGOptParallel = optimizeParallelCFG . lowerToCFG
 
 -- | Compile declarations to optimized C without parallelization.
 --
 -- The frontend runs uniquification, shape normalization, and fusion before
 -- lowering, and can optionally prune dead procedures before code generation.
 compileToCOptWithPrune :: Bool -> [Dec Range] -> String
-compileToCOptWithPrune = compileSourceDecsToC compileToCFG2OptPrune
+compileToCOptWithPrune = compileSourceDecsToC compileToCFGOptPrune
 
 -- | Compile declarations to optimized C without parallelization.
 compileToCOpt :: [Dec Range] -> String
@@ -249,11 +249,11 @@ compileToCOptIO :: Bool -> [Dec Range] -> IO String
 compileToCOptIO = compileToCOptIOWithOptions defaultInferOptions
 
 compileToCOptIOWithOptions :: InferOptions -> Bool -> [Dec Range] -> IO String
-compileToCOptIOWithOptions = compileSourceDecsToCIO compileToCFG2OptPrune
+compileToCOptIOWithOptions = compileSourceDecsToCIO compileToCFGOptPrune
 
 -- | Compile declarations to optimized C with parallelization enabled.
 compileToCOptParallelWithPrune :: Bool -> [Dec Range] -> String
-compileToCOptParallelWithPrune = compileSourceDecsToC compileToCFG2OptParallelPrune
+compileToCOptParallelWithPrune = compileSourceDecsToC compileToCFGOptParallelPrune
 
 -- | Compile declarations to optimized C with parallelization enabled.
 compileToCOptParallel :: [Dec Range] -> String
@@ -265,101 +265,101 @@ compileToCOptParallelIO :: Bool -> [Dec Range] -> IO String
 compileToCOptParallelIO = compileToCOptParallelIOWithOptions defaultInferOptions
 
 compileToCOptParallelIOWithOptions :: InferOptions -> Bool -> [Dec Range] -> IO String
-compileToCOptParallelIOWithOptions = compileSourceDecsToCIO compileToCFG2OptParallelPrune
+compileToCOptParallelIOWithOptions = compileSourceDecsToCIO compileToCFGOptParallelPrune
 
-compileSourceDecsToC :: (Bool -> C2.Program -> String) -> Bool -> [Dec Range] -> String
-compileSourceDecsToC compile prune = compile prune . lowerToCFG2 . preprocessDecs
+compileSourceDecsToC :: (Bool -> CFG.Program -> String) -> Bool -> [Dec Range] -> String
+compileSourceDecsToC compile prune = compile prune . lowerToCFG . preprocessDecs
 
 compileSourceDecsToCIO
-  :: (Bool -> C2.Program -> String)
+  :: (Bool -> CFG.Program -> String)
   -> InferOptions
   -> Bool
   -> [Dec Range]
   -> IO String
 compileSourceDecsToCIO compile opts prune decs =
-  compile prune <$> inferAndLowerToCFG2 opts decs
+  compile prune <$> inferAndLowerToCFG opts decs
 
 -- | CFG-native optimized compilation (vectorization, no parallel)
-compileToCFG2Opt :: C2.Program -> String
-compileToCFG2Opt prog = codegenProgram2 (vectorizePipeline2 prog)
+compileToCFGOpt :: CFG.Program -> String
+compileToCFGOpt prog = codegenProgram (vectorizePipeline prog)
 
 -- | CFG-native optimized compilation (vectorization + parallel)
-compileToCFG2OptParallel :: C2.Program -> String
-compileToCFG2OptParallel prog = codegenProgram2 (parallelPipeline2 prog)
+compileToCFGOptParallel :: CFG.Program -> String
+compileToCFGOptParallel prog = codegenProgram (parallelPipeline prog)
 
 -- | Compile optimized CFG to C, optionally pruning dead procedures first.
-compileToCFG2OptPrune :: Bool -> C2.Program -> String
-compileToCFG2OptPrune prune prog = codegenProgram2Prune prune (vectorizePipeline2 prog)
+compileToCFGOptPrune :: Bool -> CFG.Program -> String
+compileToCFGOptPrune prune prog = codegenProgramPrune prune (vectorizePipeline prog)
 
 -- | Compile an optimized and parallelized CFG program to C, optionally pruning dead procedures.
-compileToCFG2OptParallelPrune :: Bool -> C2.Program -> String
-compileToCFG2OptParallelPrune prune prog = codegenProgram2Prune prune (parallelPipeline2 prog)
+compileToCFGOptParallelPrune :: Bool -> CFG.Program -> String
+compileToCFGOptParallelPrune prune prog = codegenProgramPrune prune (parallelPipeline prog)
 
 -- | Run the CFG optimization pipeline on a CFG program.
-optimizeCFG2 :: C2.Program -> C2.Program
-optimizeCFG2 = vectorizePipeline2
+optimizeCFG :: CFG.Program -> CFG.Program
+optimizeCFG = vectorizePipeline
 
 -- | Run the configurable CFG optimization pipeline.
-optimizeCFG2WithPipelineOptions :: PipelineOptions -> C2.Program -> C2.Program
-optimizeCFG2WithPipelineOptions = pipelineWithOptions
+optimizeCFGWithPipelineOptions :: PipelineOptions -> CFG.Program -> CFG.Program
+optimizeCFGWithPipelineOptions = pipelineWithOptions
 
 -- | Run the CFG parallelization pipeline on a CFG program.
-optimizeParallelCFG2 :: C2.Program -> C2.Program
-optimizeParallelCFG2 = parallelPipeline2
+optimizeParallelCFG :: CFG.Program -> CFG.Program
+optimizeParallelCFG = parallelPipeline
 
 -- | Run the Metal-targeted pipeline: optimize + parallelize without SIMD vectorization.
-optimizeMetalCFG2 :: C2.Program -> C2.Program
-optimizeMetalCFG2 = metalPipeline2
+optimizeMetalCFG :: CFG.Program -> CFG.Program
+optimizeMetalCFG = metalPipeline
 
 -- | Run the Metal-targeted pipeline with configurable tiling.
-optimizeMetalCFG2WithTiling :: Bool -> C2.Program -> C2.Program
-optimizeMetalCFG2WithTiling = metalPipelineWithTiling
+optimizeMetalCFGWithTiling :: Bool -> CFG.Program -> CFG.Program
+optimizeMetalCFGWithTiling = metalPipelineWithTiling
 
 -- | Compile optimized CFG to C using the given 'CodegenOptions'.
-compileToCFG2OptPruneWithOpts :: CodegenOptions -> Bool -> C2.Program -> String
-compileToCFG2OptPruneWithOpts opts prune prog =
-  case codegenProgram2WithOptionsPrune opts prune (vectorizePipelineWithWidth (codegenSimdWidth opts) prog) of
+compileToCFGOptPruneWithOpts :: CodegenOptions -> Bool -> CFG.Program -> String
+compileToCFGOptPruneWithOpts opts prune prog =
+  case codegenProgramWithOptionsPrune opts prune (vectorizePipelineWithWidth (codegenSimdWidth opts) prog) of
     Right artifacts -> codegenSource artifacts
     Left err -> error err
 
 -- | Compile optimized and parallelized CFG to C using the given 'CodegenOptions'.
-compileToCFG2OptParallelPruneWithOpts :: CodegenOptions -> Bool -> C2.Program -> String
-compileToCFG2OptParallelPruneWithOpts opts prune prog =
-  case codegenProgram2WithOptionsPrune opts prune (parallelPipelineWithWidth (codegenSimdWidth opts) prog) of
+compileToCFGOptParallelPruneWithOpts :: CodegenOptions -> Bool -> CFG.Program -> String
+compileToCFGOptParallelPruneWithOpts opts prune prog =
+  case codegenProgramWithOptionsPrune opts prune (parallelPipelineWithWidth (codegenSimdWidth opts) prog) of
     Right artifacts -> codegenSource artifacts
     Left err -> error err
 
 -- | Compile CFG to C using explicit pipeline options and codegen options.
-compileToCFG2PruneWithPipelineAndOpts :: PipelineOptions -> CodegenOptions -> Bool -> C2.Program -> String
-compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune prog =
+compileToCFGPruneWithPipelineAndOpts :: PipelineOptions -> CodegenOptions -> Bool -> CFG.Program -> String
+compileToCFGPruneWithPipelineAndOpts pipelineOpts codegenOpts prune prog =
   let opts = pipelineOpts { poVectorWidth = codegenSimdWidth codegenOpts }
-  in case codegenProgram2WithOptionsPrune codegenOpts prune (pipelineWithOptions opts prog) of
+  in case codegenProgramWithOptionsPrune codegenOpts prune (pipelineWithOptions opts prog) of
        Right artifacts -> codegenSource artifacts
        Left err -> error err
 
 -- | IO compile variant that accepts full 'CodegenOptions'.
 compileToCOptIOWithCodegenOptions :: InferOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptIOWithCodegenOptions inferOpts codegenOpts prune decs =
-  compileToCFG2OptPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG2 inferOpts decs
+  compileToCFGOptPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG inferOpts decs
 
 -- | IO parallel compile variant that accepts full 'CodegenOptions'.
 compileToCOptParallelIOWithCodegenOptions :: InferOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptParallelIOWithCodegenOptions inferOpts codegenOpts prune decs =
-  compileToCFG2OptParallelPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG2 inferOpts decs
+  compileToCFGOptParallelPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG inferOpts decs
 
 -- | IO compile variant with explicit pipeline options and codegen options.
 compileToCOptIOWithPipelineOptionsAndCodegenOptions
   :: InferOptions -> PipelineOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptIOWithPipelineOptionsAndCodegenOptions inferOpts pipelineOpts codegenOpts prune decs =
-  compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune <$> inferAndLowerToCFG2 inferOpts decs
+  compileToCFGPruneWithPipelineAndOpts pipelineOpts codegenOpts prune <$> inferAndLowerToCFG inferOpts decs
 
 -- | Like 'compileToCOptIOWithPipelineOptionsAndCodegenOptions' but also
 -- accepts 'FrontendOptions' to e.g. disable the fusion pass.
 compileToCOptIOWithAllOptions
   :: FrontendOptions -> InferOptions -> PipelineOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptIOWithAllOptions frontOpts inferOpts pipelineOpts codegenOpts prune decs =
-  compileToCFG2PruneWithPipelineAndOpts pipelineOpts codegenOpts prune
-    <$> inferAndLowerToCFG2WithFrontendOptions frontOpts inferOpts decs
+  compileToCFGPruneWithPipelineAndOpts pipelineOpts codegenOpts prune
+    <$> inferAndLowerToCFGWithFrontendOptions frontOpts inferOpts decs
 
 -- | Erase source-range annotations from an expression.
 stripRange :: Exp Range -> Either String (Exp ())

@@ -709,8 +709,8 @@ mkLet1 _ = do
   x <- freshVar "__fusion_x"
   pure (fn, x)
 
-mkLet2 :: a -> FusionM (Var, Var, Var)
-mkLet2 _ = do
+mkLet :: a -> FusionM (Var, Var, Var)
+mkLet _ = do
   fn <- freshVar "__fusion_f"
   x <- freshVar "__fusion_x"
   y <- freshVar "__fusion_y"
@@ -719,8 +719,8 @@ mkLet2 _ = do
 mkDec1 :: a -> Var -> Var -> Exp a -> Dec a
 mkDec1 a fn x body = Dec a fn [PVar a x] Nothing Nothing body
 
-mkDec2 :: a -> Var -> Var -> Var -> Exp a -> Dec a
-mkDec2 a fn x y body = Dec a fn [PVar a x, PVar a y] Nothing Nothing body
+mkDec :: a -> Var -> Var -> Var -> Exp a -> Dec a
+mkDec a fn x y body = Dec a fn [PVar a x, PVar a y] Nothing Nothing body
 
 -- | Small internal lambda-like kernel language with de Bruijn variables.
 --
@@ -1118,9 +1118,9 @@ scatterAbsorbMapValues :: a -> ScatterKernel a -> Maybe (FusionM (Dec a, Scatter
 scatterAbsorbMapValues a sk =
   case skValues sk of
     EMap _ g xs -> Just $ do
-      (fn, x, y) <- mkLet2 a
+      (fn, x, y) <- mkLet a
       let body = EApp a (EApp a (skCombine sk) (EApp a g (EVar a x))) (EVar a y)
-          dec = mkDec2 a fn x y body
+          dec = mkDec a fn x y body
       pure (dec, sk { skCombine = EVar a fn, skValues = xs })
     _ -> Nothing
 
@@ -1737,9 +1737,9 @@ fuseMap a f arr =
           case arr of
             -- map f (zipwith g xs ys) => zipwith (\x y -> f (g x y)) xs ys
             EZipWith _ g xs ys -> do
-              (fn, x, y) <- mkLet2 a
+              (fn, x, y) <- mkLet a
               let body = EApp a f (EApp a (EApp a g (EVar a x)) (EVar a y))
-                  dec = mkDec2 a fn x y body
+                  dec = mkDec a fn x y body
               pure $ ELetIn a dec (EZipWith a (EVar a fn) xs ys)
             _ -> pure (EMap a f arr)
 
@@ -1774,15 +1774,15 @@ fuseZipWith a f a1 a2 =
               case (a1, a2) of
                 -- zipwith f (map g xs) ys => zipwith (\x y -> f (g x) y) xs ys
                 (EMap _ g xs, ys) -> do
-                  (fn, x, y) <- mkLet2 a
+                  (fn, x, y) <- mkLet a
                   let body = EApp a (EApp a f (EApp a g (EVar a x))) (EVar a y)
-                      dec = mkDec2 a fn x y body
+                      dec = mkDec a fn x y body
                   pure $ ELetIn a dec (EZipWith a (EVar a fn) xs ys)
                 -- zipwith f xs (map g ys) => zipwith (\x y -> f x (g y)) xs ys
                 (xs, EMap _ g ys) -> do
-                  (fn, x, y) <- mkLet2 a
+                  (fn, x, y) <- mkLet a
                   let body = EApp a (EApp a f (EVar a x)) (EApp a g (EVar a y))
-                      dec = mkDec2 a fn x y body
+                      dec = mkDec a fn x y body
                   pure $ ELetIn a dec (EZipWith a (EVar a fn) xs ys)
                 -- zipwith f (fill s x) ys => map (\y -> f x y) ys
                 (EFill _ _ x, ys) -> do
@@ -1802,15 +1802,15 @@ fuseZipWith a f a1 a2 =
           case (a1, a2) of
             -- zipwith f (map g xs) ys => zipwith (\x y -> f (g x) y) xs ys
             (EMap _ g xs, ys) -> do
-              (fn, x, y) <- mkLet2 a
+              (fn, x, y) <- mkLet a
               let body = EApp a (EApp a f (EApp a g (EVar a x))) (EVar a y)
-                  dec = mkDec2 a fn x y body
+                  dec = mkDec a fn x y body
               pure $ ELetIn a dec (EZipWith a (EVar a fn) xs ys)
             -- zipwith f xs (map g ys) => zipwith (\x y -> f x (g y)) xs ys
             (xs, EMap _ g ys) -> do
-              (fn, x, y) <- mkLet2 a
+              (fn, x, y) <- mkLet a
               let body = EApp a (EApp a f (EVar a x)) (EApp a g (EVar a y))
-                  dec = mkDec2 a fn x y body
+                  dec = mkDec a fn x y body
               pure $ ELetIn a dec (EZipWith a (EVar a fn) xs ys)
             -- zipwith f (fill s x) ys => map (\y -> f x y) ys
             (EFill _ _ x, ys) -> do
@@ -2086,9 +2086,9 @@ fuseReduce a f z arr =
                 else pure (EReduce a f z arr)
         -- reduce f z (map g xs) => reduce (\acc x -> f acc (g x)) z xs
         EMap _ g xs -> do
-          (fn, acc, x) <- mkLet2 a
+          (fn, acc, x) <- mkLet a
           let body = EApp a (EApp a f (EVar a acc)) (EApp a g (EVar a x))
-              dec = mkDec2 a fn acc x body
+              dec = mkDec a fn acc x body
           pure $ ELetIn a dec (EReduce a (EVar a fn) z xs)
         -- reduce f z (gather idx xs) => reduce_generate f z (shape_of idx) (\i -> index (index i idx) xs)
         EGather _ idx xs -> do

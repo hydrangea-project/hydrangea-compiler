@@ -4,7 +4,7 @@ module Language.Hydrangea.TileSpec (spec) where
 
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..), Redop(..))
-import Language.Hydrangea.Tile (tileStmts2)
+import Language.Hydrangea.Tile (tileStmts)
 import Test.Hspec
 
 spec :: Spec
@@ -18,7 +18,7 @@ spec = describe "Tile" $ do
             , SArrayWrite (AVar "out") (AVar "ij") (AVar "x")
             ]
 
-    tileStmts2 [loop] `shouldBe` [loop]
+    tileStmts [loop] `shouldBe` [loop]
 
   it "tiles reuse-heavy ND loops by strip-mining useful dimensions" $ do
     let loop =
@@ -37,7 +37,7 @@ spec = describe "Tile" $ do
             , SArrayWrite (AVar "out") (AVar "ij") (AVar "sum2")
             ]
 
-    let tiled = tileStmts2 [loop]
+    let tiled = tileStmts [loop]
         loopSpecs = collectLoopSpecs tiled
 
     length loopSpecs `shouldSatisfy` (> 1)
@@ -48,7 +48,7 @@ spec = describe "Tile" $ do
             (LoopSpec ["i", "j"] [IConst 33, IConst 40] Serial Nothing LoopPlain [])
             [SArrayWrite (AVar "out") (AVar "i") (AVar "j")]
 
-    tileStmts2 [loop] `shouldBe` [loop]
+    tileStmts [loop] `shouldBe` [loop]
 
   it "tiles nested reduction loops without program-specific accumulator reloads" $ do
     let inner =
@@ -63,7 +63,7 @@ spec = describe "Tile" $ do
             , SArrayWrite (AVar "out") (AVar "j") (AVar "acc")
             ]
 
-    let tiled = tileStmts2 [outer]
+    let tiled = tileStmts [outer]
         loopSpecs = collectLoopSpecs tiled
 
     map lsRole loopSpecs `shouldBe` [LoopPlain, LoopReductionWrapper, LoopReduction]
@@ -83,7 +83,7 @@ spec = describe "Tile" $ do
             , SAssign "acc" (RBinOp CAdd (AVar "acc") (AVar "x"))
             ]
 
-    let tiled = tileStmts2 [loop]
+    let tiled = tileStmts [loop]
         loopSpecs = collectLoopSpecs tiled
 
     map lsRole loopSpecs `shouldBe` [LoopReductionWrapper, LoopReduction]
@@ -102,7 +102,7 @@ spec = describe "Tile" $ do
             (LoopSpec ["i"] [IConst 128] Serial Nothing LoopPlain [])
             [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
 
-    tileStmts2 [loop] `shouldBe` [loop]
+    tileStmts [loop] `shouldBe` [loop]
 
   it "leaves small constant map-reduction kernels unchanged" $ do
     let inner =
@@ -118,7 +118,7 @@ spec = describe "Tile" $ do
             , SArrayWrite (AVar "out") (AVar "j") (AVar "acc")
             ]
 
-    tileStmts2 [outer] `shouldBe` [outer]
+    tileStmts [outer] `shouldBe` [outer]
 
   it "does not tile fold loops even with large bounds" $ do
     let loop =
@@ -126,7 +126,7 @@ spec = describe "Tile" $ do
             (LoopSpec ["i"] [IConst 256] Serial Nothing LoopFold [])
             [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
 
-    tileStmts2 [loop] `shouldBe` [loop]
+    tileStmts [loop] `shouldBe` [loop]
 
   it "keeps tiling non-fold map-reduction nests (matmul-like shape)" $ do
     let inner =
@@ -141,7 +141,7 @@ spec = describe "Tile" $ do
             , SArrayWrite (AVar "out") (AVar "j") (AVar "acc")
             ]
 
-    let tiled = tileStmts2 [outer]
+    let tiled = tileStmts [outer]
         loopSpecs = collectLoopSpecs tiled
     length loopSpecs `shouldSatisfy` (> 2)
     map lsRole loopSpecs `shouldSatisfy` \roles ->

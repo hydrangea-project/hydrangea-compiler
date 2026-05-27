@@ -9,7 +9,7 @@ import Language.Hydrangea.Lexer hiding (Forall)
 import Language.Hydrangea.Parser
 import Language.Hydrangea.CFGCore (RHS(..), Atom(..), CVar, Redop(..))
 import Data.Set qualified as S
-import Language.Hydrangea.Lowering (lowerDecs2)
+import Language.Hydrangea.Lowering (lowerDecs)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.CFG hiding (CVar)
 
@@ -21,7 +21,7 @@ lowerFromSource :: BS.ByteString -> IO Program
 lowerFromSource src =
   case parseSource src of
     Left err -> fail $ "Parse error: " ++ err
-    Right decs -> pure $ lowerDecs2 decs
+    Right decs -> pure $ lowerDecs decs
 
 spec :: Spec
 spec = describe "Lowering - Reduce regression" $ do

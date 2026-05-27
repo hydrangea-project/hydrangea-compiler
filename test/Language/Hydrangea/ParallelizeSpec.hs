@@ -5,8 +5,8 @@ module Language.Hydrangea.ParallelizeSpec (spec) where
 import Data.Map.Strict qualified as Map
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
-import Language.Hydrangea.Parallelize (parallelizeProc2, parallelizeStmts2)
-import Language.Hydrangea.Tile (tileStmts2)
+import Language.Hydrangea.Parallelize (parallelizeProc, parallelizeStmts)
+import Language.Hydrangea.Tile (tileStmts)
 import Test.Hspec
 
 spec :: Spec
@@ -14,7 +14,7 @@ spec = describe "Parallelize" $ do
   it "preserves lowering-provided reduction metadata" $ do
     let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 1) RMul)) LoopReduction [])
                   [SAssign "acc" (RBinOp CMul (AVar "acc") (AInt 2))]
-    case parallelizeStmts2 [inner] of
+    case parallelizeStmts [inner] of
       [SLoop spec' _] -> do
         lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsRed spec' `shouldBe` Just (ReductionSpec "acc" (IConst 1) RMul)
@@ -23,14 +23,14 @@ spec = describe "Parallelize" $ do
   it "parallelizes simple single-level map loops without nested-loop heuristics" $ do
     let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
                  [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
-    case parallelizeStmts2 [loop] of
+    case parallelizeStmts [loop] of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized loop"
 
   it "parallelizes simple LoopMap kernels at top level" $ do
     let loop = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
                  [SArrayWrite (AVar "out") (AVar "i") (AInt 1)]
-    case parallelizeStmts2 [loop] of
+    case parallelizeStmts [loop] of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized map loop"
 
@@ -55,10 +55,10 @@ spec = describe "Parallelize" $ do
                   , ("out", ArrayFact True True False)
                   ]
             }
-    case parallelizeStmts2 [loop] of
+    case parallelizeStmts [loop] of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single parallelized loop"
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single fact-parallelized loop"
 
@@ -75,7 +75,7 @@ spec = describe "Parallelize" $ do
                 Map.fromList
                   [("out", ArrayFact True True False)]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
       _ -> expectationFailure "Expected a single conservative read-write loop"
 
@@ -89,7 +89,7 @@ spec = describe "Parallelize" $ do
             , SAssign "new" (RBinOp CAdd (AVar "val") (AVar "old"))
             , SArrayWrite (AVar "out") (AVar "idx") (AVar "new")
             ]
-    case parallelizeStmts2 [loop] of
+    case parallelizeStmts [loop] of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
       _ -> expectationFailure "Expected scatter-style read/write loop to remain serial"
 
@@ -112,7 +112,7 @@ spec = describe "Parallelize" $ do
                   , ("vals", ArrayFact False False True)
                   ]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)
       _ -> expectationFailure "Expected injective scatter loop to parallelize"
 
@@ -143,7 +143,7 @@ spec = describe "Parallelize" $ do
                   , ("new", CTInt64)
                   ]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)
       _ -> expectationFailure "Expected non-injective integer scatter-add loop to use atomic strategy"
 
@@ -174,7 +174,7 @@ spec = describe "Parallelize" $ do
                   , ("new", CTInt64)
                   ]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
       _ -> expectationFailure "Expected unsupported colliding scatter loop to stay serial"
 
@@ -210,7 +210,7 @@ spec = describe "Parallelize" $ do
                   , ("new", CTInt64)
                   ]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)
       _ -> expectationFailure "Expected guarded integer scatter-add loop to use atomic strategy"
 
@@ -241,7 +241,7 @@ spec = describe "Parallelize" $ do
                   , ("new", CTDouble)
                   ]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing Nothing)
       _ -> expectationFailure "Expected floating-point scatter-add loop to use atomic strategy"
 
@@ -272,7 +272,7 @@ spec = describe "Parallelize" $ do
                   , ("new", CTInt64)
                   ]
             }
-    case procBody (parallelizeProc2 proc) of
+    case procBody (parallelizeProc proc) of
       [_, _, SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)
       _ -> expectationFailure "Expected dense colliding scatter loop to use privatized strategy"
 
@@ -281,7 +281,7 @@ spec = describe "Parallelize" $ do
                   [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
         outer = SLoop (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMapReduction [])
                   [SAssign "acc" (RAtom (AInt 0)), inner]
-    case parallelizeStmts2 [outer] of
+    case parallelizeStmts [outer] of
       [SLoop outerSpec [_, SLoop innerSpec _]] -> do
         lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsExec innerSpec `shouldBe` Serial
@@ -292,7 +292,7 @@ spec = describe "Parallelize" $ do
                   [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
         wrapper = SLoop (LoopSpec ["j"] [IVar "one"] Serial Nothing LoopReductionWrapper [])
                     [SAssign "acc" (RAtom (AInt 0)), inner]
-    case parallelizeStmts2 [wrapper] of
+    case parallelizeStmts [wrapper] of
       [SLoop wrapperSpec [_, SLoop innerSpec _]] -> do
         lsExec wrapperSpec `shouldBe` Serial
         lsExec innerSpec `shouldBe` Serial
@@ -305,7 +305,7 @@ spec = describe "Parallelize" $ do
             [ SAssign "x" (RArrayLoad (AVar "arr") (AVar "k"))
             , SAssign "acc" (RBinOp CAdd (AVar "acc") (AVar "x"))
             ]
-    case parallelizeStmts2 (tileStmts2 [reductionLoop]) of
+    case parallelizeStmts (tileStmts [reductionLoop]) of
       [SLoop wrapperSpec body] -> do
         lsRole wrapperSpec `shouldBe` LoopReductionWrapper
         lsExec wrapperSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
@@ -322,7 +322,7 @@ spec = describe "Parallelize" $ do
                   [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
         outer = SLoop (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
                   [SAssign "acc" (RAtom (AInt 0)), inner]
-    case parallelizeStmts2 [outer] of
+    case parallelizeStmts [outer] of
       [SLoop outerSpec [_, SLoop innerSpec _]] -> do
         lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsExec innerSpec `shouldBe` Serial

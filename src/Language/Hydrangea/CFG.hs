@@ -13,9 +13,6 @@
 -- * 'LoopSpec' \/ 'ExecPolicy' — n-dimensional loop descriptors with
 --   serial, parallel, and vector execution hints.
 -- * 'Stmt' \/ 'Proc' \/ 'Program' — the minimal statement IR for lowered programs.
---
--- * /Naming convention/ — functions operating on this CFG IR use a @2@ suffix,
---   a legacy of a former two-layer CFG that was later unified.
 module Language.Hydrangea.CFG
   ( CVar
   , IndexExpr(..)
@@ -29,14 +26,15 @@ module Language.Hydrangea.CFG
   , LoopSpec(..)
   , ArrayFact(..)
   , VectorAccessFact(..)
+  , emptyVectorAccessFact
   , Stmt(..)
   , Proc(..)
   , Program(..)
   , simplifyIndexExpr
   , CType
   , mkProc
-  , rewriteStmts2With
-  , rewriteStmts2WithM
+  , rewriteStmtsWith
+  , rewriteStmtsWithM
   ) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
@@ -265,13 +263,13 @@ data Stmt
 
 -- | Walk a statement list, applying @rewrite@ to each statement after recursing
 -- into loops and conditionals.  @descend@ updates the context when entering a loop.
-rewriteStmts2With
+rewriteStmtsWith
   :: ctx
   -> (ctx -> ctx)
   -> (ctx -> Stmt -> [Stmt])
   -> [Stmt]
   -> [Stmt]
-rewriteStmts2With initialCtx descend rewrite = go initialCtx
+rewriteStmtsWith initialCtx descend rewrite = go initialCtx
   where
     go ctx = concatMap (goStmt ctx)
 
@@ -283,15 +281,15 @@ rewriteStmts2With initialCtx descend rewrite = go initialCtx
             _ -> stmt
       in rewrite ctx stmt'
 
--- | Monadic variant of 'rewriteStmts2With'; effects from @rewrite@ are sequenced left-to-right.
-rewriteStmts2WithM
+-- | Monadic variant of 'rewriteStmtsWith'; effects from @rewrite@ are sequenced left-to-right.
+rewriteStmtsWithM
   :: Monad m
   => ctx
   -> (ctx -> ctx)
   -> (ctx -> Stmt -> m [Stmt])
   -> [Stmt]
   -> m [Stmt]
-rewriteStmts2WithM initialCtx descend rewrite = go initialCtx
+rewriteStmtsWithM initialCtx descend rewrite = go initialCtx
   where
     go ctx = fmap concat . mapM (goStmt ctx)
 
@@ -330,6 +328,14 @@ data VectorAccessFact = VectorAccessFact
     -- ^ Lowering writes the array contiguously in iteration order.
   }
   deriving (Eq, Show)
+
+emptyVectorAccessFact :: VectorAccessFact
+emptyVectorAccessFact = VectorAccessFact
+  { vxfDenseLinearIndexOf = Nothing
+  , vxfDenseRead = False
+  , vxfIndirectRead = False
+  , vxfContiguousWrite = False
+  }
 
 -- | A procedure in the CFG program.
 data Proc = Proc

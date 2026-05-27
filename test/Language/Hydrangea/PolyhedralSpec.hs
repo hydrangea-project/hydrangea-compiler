@@ -13,17 +13,17 @@ import Language.Hydrangea.CFGPipeline
   , preparePolyhedralProgramWithOptions
   )
 import Language.Hydrangea.CFGCore qualified as C
-import Language.Hydrangea.Frontend (lowerToCFG2WithTypesWithOptions, readDecs)
+import Language.Hydrangea.Frontend (lowerToCFGWithTypesWithOptions, readDecs)
 import Language.Hydrangea.Infer (defaultInferOptions)
 import Language.Hydrangea.Polyhedral
-import Language.Hydrangea.Tile (tileStmts2)
+import Language.Hydrangea.Tile (tileStmts)
 import Test.Hspec
 
 spec :: Spec
 spec = describe "Polyhedral" $ do
   it "converts simple affine index expressions" $ do
     let expr =
-          affineExprFromIndexExpr2
+          affineExprFromIndexExpr
             (IAdd (IMul (IConst 4) (IVar "i")) (IAdd (IVar "n") (IConst 1)))
     case expr of
       Nothing -> expectationFailure "expected affine conversion to succeed"
@@ -41,7 +41,7 @@ spec = describe "Polyhedral" $ do
             , SAssign "y" (C.RBinOp C.CAddF (C.AVar "x") (C.AFloat 1.0))
             , SArrayWrite (C.AVar "out") (C.AVar "ix") (C.AVar "y")
             ]
-    case extractProcScops2 (mkProc "p" ["n", "arr", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "arr", "out"] [loop]) of
       [scop] -> do
         let accesses = concatMap (\stmt -> psReads stmt ++ psWrites stmt) (scStatements scop)
         scProcName scop `shouldBe` "p"
@@ -63,12 +63,12 @@ spec = describe "Polyhedral" $ do
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ij"))
             , SArrayWrite (C.AVar "out") (C.AVar "ij") (C.AVar "x")
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
       [scop] -> do
         scIterators scop `shouldBe` ["i", "j"]
         scParameters scop `shouldBe` ["m", "n"]
         scArrays scop `shouldBe` ["arr", "out"]
-        reifyScheduledScop2 (buildIdentitySchedule2 scop) `shouldBe` Just [loop]
+        reifyScheduledScop (buildIdentitySchedule scop) `shouldBe` Just [loop]
         case scSchedule scop of
           ScheduleLoopBand band -> do
             lbIters band `shouldBe` ["i", "j"]
@@ -84,9 +84,9 @@ spec = describe "Polyhedral" $ do
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
             , SArrayWrite (C.AVar "out") (C.AVar "ix") (C.AVar "x")
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
       [scop] ->
-        case ssSchedule (synthesizeScopSchedule2 scop) of
+        case ssSchedule (synthesizeScopSchedule scop) of
           ScheduleLoopBand band -> lbIters band `shouldBe` ["i", "j"]
           other -> expectationFailure ("unexpected schedule tree: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -101,9 +101,9 @@ spec = describe "Polyhedral" $ do
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "flat"))
             , SArrayWrite (C.AVar "out") (C.AVar "flat") (C.AVar "x")
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
       [scop] ->
-        case ssSchedule (synthesizeScopSchedule2 scop) of
+        case ssSchedule (synthesizeScopSchedule scop) of
           ScheduleLoopBand band -> lbIters band `shouldBe` ["i", "j"]
           other -> expectationFailure ("unexpected schedule tree: " <> show other)
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -116,9 +116,9 @@ spec = describe "Polyhedral" $ do
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "i"))
             , SArrayWrite (C.AVar "out") (C.AVar "flat") (C.AVar "x")
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
       [scop] -> do
-        let facts = collectScopProfitabilityFacts2 scop
+        let facts = collectScopProfitabilityFacts scop
         fmap ipInvariantReadHits (Map.lookup "j" facts) `shouldBe` Just 1
         fmap ipInvariantReadHits (Map.lookup "i" facts) `shouldBe` Just 0
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
@@ -133,7 +133,7 @@ spec = describe "Polyhedral" $ do
             [ ("j", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipReadTouchHits = 0, ipInvariantReadHits = 3 })
             , ("i", IteratorProfitability { ipAccessDimHits = Map.empty, ipUnitStrideLastHits = 0, ipReadTouchHits = 0, ipInvariantReadHits = 0 })
             ]
-    chooseBandPermutation2 facts 0 dims [] `shouldBe` [1, 0]
+    chooseBandPermutation facts 0 dims [] `shouldBe` [1, 0]
 
   it "extracts a map-reduction nest that matches today's tiling target" $ do
     let inner =
@@ -149,12 +149,12 @@ spec = describe "Polyhedral" $ do
             , inner
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [outer]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr", "out"] [outer]) of
       [scop] -> do
         scIterators scop `shouldBe` ["j", "k"]
         scParameters scop `shouldBe` ["m", "n"]
         scArrays scop `shouldBe` ["arr", "out"]
-        reifyScheduledScop2 (buildIdentitySchedule2 scop) `shouldBe` Just [outer]
+        reifyScheduledScop (buildIdentitySchedule scop) `shouldBe` Just [outer]
         case scSchedule scop of
           ScheduleLoopBand outerBand -> do
             lbIters outerBand `shouldBe` ["j"]
@@ -173,7 +173,7 @@ spec = describe "Polyhedral" $ do
           SLoop
             (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [SAssign "x" (C.RCall "opaque" [C.AVar "i"])]
-    case collectProcScopDiagnostics2 (mkProc "p" ["n"] [loop]) of
+    case collectProcScopDiagnostics (mkProc "p" ["n"] [loop]) of
       [diag] -> case diag of
         ScopRejected proc path (RejectUnsupportedRHS _) -> do
           proc `shouldBe` "p"
@@ -266,10 +266,10 @@ spec = describe "Polyhedral" $ do
           SLoop
             (LoopSpec ["i"] [tileCountBound] Serial Nothing LoopPlain [])
             [SArrayWrite (C.AVar "out") (C.AVar "i") (C.AInt 0)]
-    case extractProcScops2 (mkProc "p" ["n", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "out"] [loop]) of
       [scop] -> do
         scParameters scop `shouldBe` ["n"]
-        reifyScheduledScop2 (buildIdentitySchedule2 scop) `shouldBe` Just [loop]
+        reifyScheduledScop (buildIdentitySchedule scop) `shouldBe` Just [loop]
         case scSchedule scop of
           ScheduleLoopBand band -> lbBounds band `shouldBe` [tileCountBound]
           other -> expectationFailure ("unexpected schedule tree: " <> show other)
@@ -280,9 +280,9 @@ spec = describe "Polyhedral" $ do
           SLoop
             (LoopSpec ["i", "j"] [IConst 64, IConst 48] Serial Nothing LoopPlain [])
             [SArrayWrite (C.AVar "out") (C.AVar "i") (C.AVar "j")]
-    case extractProcScops2 (mkProc "p" ["out"] [loop]) of
+    case extractProcScops (mkProc "p" ["out"] [loop]) of
       [scop] ->
-        reifyScheduledScop2 (tileScop2 scop) `shouldBe` Just (tileStmts2 [loop])
+        reifyScheduledScop (tileScop scop) `shouldBe` Just (tileStmts [loop])
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
   it "reifies strip-mined map-reduction schedules like the legacy tiler" $ do
@@ -297,9 +297,9 @@ spec = describe "Polyhedral" $ do
             , inner
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
             ]
-    case extractProcScops2 (mkProc "p" ["out"] [outer]) of
+    case extractProcScops (mkProc "p" ["out"] [outer]) of
       [scop] ->
-        reifyScheduledScop2 (tileScop2 scop) `shouldBe` Just (tileStmts2 [outer])
+        reifyScheduledScop (tileScop scop) `shouldBe` Just (tileStmts [outer])
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
   it "extracts the matmul benchmark through the supported SCoP prelude path" $ do
@@ -320,7 +320,7 @@ spec = describe "Polyhedral" $ do
     diagnostics <- loadPreparedMatmulBenchmarkDiagnostics
     case [scop | ScopExtracted scop <- diagnostics, scProcName scop == "result"] of
       (scop : _) ->
-        case reifyScheduledScop2 (tileScop2 scop) of
+        case reifyScheduledScop (tileScop scop) of
           Just stmts -> do
             let (outerI, outerJ, redK) = resultMatmulIterPrefixes scop
             hasLoopIterPrefix (outerI <> "_tile") stmts `shouldBe` True
@@ -345,7 +345,7 @@ spec = describe "Polyhedral" $ do
             [ SAssign "opaque" (C.RCall "f" [C.AVar "i"])
             , inner
             ]
-        diagnostics = collectProcScopDiagnostics2 (mkProc "p" ["n", "m", "arr", "out"] [outer])
+        diagnostics = collectProcScopDiagnostics (mkProc "p" ["n", "m", "arr", "out"] [outer])
         isOuterReject diag = case diag of
           ScopRejected _ [0] (RejectUnsupportedRHS _) -> True
           _ -> False
@@ -363,9 +363,9 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "arr"] [loop]) of
       [scop] ->
-        collectScopDependences2 scop `shouldBe`
+        collectScopDependences scop `shouldBe`
           [ PolyhedralDependence
               { pdKind = PolyDepRAW
               , pdArray = "arr"
@@ -388,9 +388,9 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "arr"] [loop]) of
       [scop] ->
-        collectScopDependences2 scop `shouldBe`
+        collectScopDependences scop `shouldBe`
           [ PolyhedralDependence
               { pdKind = PolyDepRAW
               , pdArray = "arr"
@@ -414,9 +414,9 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr"] [loop]) of
       [scop] -> do
-        collectScopDependences2 scop `shouldBe`
+        collectScopDependences scop `shouldBe`
           [ PolyhedralDependence
               { pdKind = PolyDepRAW
               , pdArray = "arr"
@@ -427,7 +427,7 @@ spec = describe "Polyhedral" $ do
               , pdDistance = Just [1, -1]
               }
           ]
-        blockingScopDependences2 scop `shouldBe` []
+        blockingScopDependences scop `shouldBe` []
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
   it "surfaces backward loop-carried dependences as blocking" $ do
@@ -438,9 +438,9 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "prev"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "arr"] [loop]) of
       [scop] -> do
-        collectScopDependences2 scop `shouldBe`
+        collectScopDependences scop `shouldBe`
           [ PolyhedralDependence
               { pdKind = PolyDepRAW
               , pdArray = "arr"
@@ -451,7 +451,7 @@ spec = describe "Polyhedral" $ do
                , pdDistance = Just [-1]
                }
             ]
-        blockingScopDependences2 scop `shouldBe` collectScopDependences2 scop
+        blockingScopDependences scop `shouldBe` collectScopDependences scop
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
   it "records carried-band metadata for mixed-sign dependences" $ do
@@ -465,9 +465,9 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr"] [loop]) of
       [scop] ->
-        collectScopDependenceRelations2 scop `shouldBe`
+        collectScopDependenceRelations scop `shouldBe`
           [ PolyhedralDependenceRelation
               { pdrKind = PolyDepRAW
               , pdrArray = "arr"
@@ -514,9 +514,9 @@ spec = describe "Polyhedral" $ do
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "prev"))
             , SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AVar "x"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "arr"] [loop]) of
       [scop] ->
-        collectScopDependenceRelations2 scop `shouldBe`
+        collectScopDependenceRelations scop `shouldBe`
           [ PolyhedralDependenceRelation
               { pdrKind = PolyDepRAW
               , pdrArray = "arr"
@@ -562,9 +562,9 @@ spec = describe "Polyhedral" $ do
             , inner
             , SArrayWrite (C.AVar "out") (C.AVar "j") (C.AVar "acc")
             ]
-    case extractProcScops2 (mkProc "p" ["m", "n", "arr", "out"] [outer]) of
+    case extractProcScops (mkProc "p" ["m", "n", "arr", "out"] [outer]) of
       [scop] ->
-        collectScopDependenceRelations2 scop `shouldBe`
+        collectScopDependenceRelations scop `shouldBe`
           [ PolyhedralDependenceRelation
               { pdrKind = PolyDepRAW
               , pdrArray = "arr"
@@ -616,9 +616,9 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "i") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ix"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "arr"] [loop]) of
       [scop] ->
-        collectScopDependenceRelations2 scop `shouldBe`
+        collectScopDependenceRelations scop `shouldBe`
           [ PolyhedralDependenceRelation
               { pdrKind = PolyDepRAW
               , pdrArray = "arr"
@@ -656,14 +656,14 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr"] [loop]) of
       [scop] -> do
-        case ssAffineSchedule (synthesizeScopSchedule2 scop) of
+        case ssAffineSchedule (synthesizeScopSchedule scop) of
           AffineSchedule { asRoot = AffineScheduleLoopBand band } ->
             map sdIter (albDims band) `shouldBe` ["j", "i"]
           other ->
             expectationFailure ("unexpected affine schedule: " <> show other)
-        case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
+        case reifyScheduledScop (synthesizeScopSchedule scop) of
           Just [SLoop loopSpec _] ->
             lsIters loopSpec `shouldBe` ["j", "i"]
           other ->
@@ -685,9 +685,9 @@ spec = describe "Polyhedral" $ do
           SLoop
             (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopPlain [])
             [inner]
-    case extractProcScops2 (mkProc "p" ["n", "m", "p", "arr"] [outer]) of
+    case extractProcScops (mkProc "p" ["n", "m", "p", "arr"] [outer]) of
       [scop] -> do
-        case ssAffineSchedule (synthesizeScopSchedule2 scop) of
+        case ssAffineSchedule (synthesizeScopSchedule scop) of
           AffineSchedule
             { asRoot =
                 AffineScheduleLoopBand outerBand
@@ -699,7 +699,7 @@ spec = describe "Polyhedral" $ do
                   expectationFailure ("unexpected nested affine schedule: " <> show other)
           other ->
             expectationFailure ("unexpected affine schedule: " <> show other)
-        case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
+        case reifyScheduledScop (synthesizeScopSchedule scop) of
           Just
             [ SLoop _ [SLoop innerLoopSpec _] ] ->
               lsIters innerLoopSpec `shouldBe` ["k", "j"]
@@ -718,15 +718,15 @@ spec = describe "Polyhedral" $ do
             , SArrayWrite (C.AVar "arr") (C.AVar "srcIx") (C.AInt 0)
             , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "dstIx"))
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr"] [loop]) of
       [scop] -> do
-        blockingScopDependences2 scop `shouldBe` collectScopDependences2 scop
-        case ssAffineSchedule (synthesizeScopSchedule2 scop) of
+        blockingScopDependences scop `shouldBe` collectScopDependences scop
+        case ssAffineSchedule (synthesizeScopSchedule scop) of
           AffineSchedule { asRoot = AffineScheduleLoopBand band } ->
             map sdIter (albDims band) `shouldBe` ["j", "i"]
           other ->
             expectationFailure ("unexpected affine schedule: " <> show other)
-        case reifyScheduledScop2 (synthesizeScopSchedule2 scop) of
+        case reifyScheduledScop (synthesizeScopSchedule scop) of
           Just [SLoop loopSpec _] -> do
             -- After interchange, j is outer; i is inner (within-band skew
             -- is deferred; band permutation alone makes the schedule legal)
@@ -748,9 +748,9 @@ spec = describe "Polyhedral" $ do
             [ SAssign "base" (C.RAtom (C.AVar "i"))
             , inner
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
+    case extractProcScops (mkProc "p" ["n", "m", "arr", "out"] [loop]) of
       [scop] ->
-        reifyScheduledScop2 (buildIdentitySchedule2 scop) `shouldBe` Just [loop]
+        reifyScheduledScop (buildIdentitySchedule scop) `shouldBe` Just [loop]
       other -> expectationFailure ("expected one extracted scop, got: " <> show other)
 
   it "rewrites nested scop roots without changing surrounding CFG" $ do
@@ -767,7 +767,7 @@ spec = describe "Polyhedral" $ do
             , inner
             ]
         proc = mkProc "p" ["n", "m", "arr", "out"] [outer]
-    polyhedralProgram2 (Program [proc]) `shouldBe` Program [proc]
+    polyhedralProgram (Program [proc]) `shouldBe` Program [proc]
   fusionSpec
   skewingSpec
   temporalSkewingSpec
@@ -786,8 +786,8 @@ loadPreparedMatmulBenchmarkDiagnostics = do
               , poEnablePolyhedral = True
               , poEnableParallelization = True
               }
-      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
-      pure (collectProgramScopDiagnostics2 (preparePolyhedralProgramWithOptions pipelineOpts prog))
+      prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
+      pure (collectProgramScopDiagnostics (preparePolyhedralProgramWithOptions pipelineOpts prog))
 
 loadPreparedDiagnosticsFromSource :: BS.ByteString -> IO [ScopDiagnostic]
 loadPreparedDiagnosticsFromSource src =
@@ -801,8 +801,8 @@ loadPreparedDiagnosticsFromSource src =
               , poEnablePolyhedral = True
               , poEnableParallelization = True
               }
-      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
-      pure (collectProgramScopDiagnostics2 (preparePolyhedralProgramWithOptions pipelineOpts prog))
+      prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
+      pure (collectProgramScopDiagnostics (preparePolyhedralProgramWithOptions pipelineOpts prog))
 
 loadPolyhedralProcBodyFromSource :: C.CVar -> BS.ByteString -> IO [Stmt]
 loadPolyhedralProcBodyFromSource procName src =
@@ -816,9 +816,9 @@ loadPolyhedralProcBodyFromSource procName src =
               , poEnablePolyhedral = True
               , poEnableParallelization = False
               }
-      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
+      prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
       let prepared = preparePolyhedralProgramWithOptions pipelineOpts prog
-          Program procs = polyhedralProgram2 prepared
+          Program procs = polyhedralProgram prepared
       case [procBody proc | proc <- procs, Language.Hydrangea.CFG.procName proc == procName] of
         [body] ->
           pure body
@@ -839,9 +839,9 @@ loadTiledProcBodyFromSource procName src =
               , poEnablePolyhedral = True
               , poEnableParallelization = False
               }
-      prog <- lowerToCFG2WithTypesWithOptions defaultInferOptions decs
+      prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
       let prepared = preparePolyhedralProgramWithOptions pipelineOpts prog
-          Program procs = polyhedralTileProgram2 prepared
+          Program procs = polyhedralTileProgram prepared
       case [procBody proc | proc <- procs, Language.Hydrangea.CFG.procName proc == procName] of
         [body] ->
           pure body
@@ -942,8 +942,8 @@ sequenceBandCount tree = case tree of
 -- synthesize a schedule; return the affine schedule root.
 fuseSiblingBands :: Stmt -> AffineScheduleTree
 fuseSiblingBands outer =
-  case extractProcScops2 (mkProc "p" ["n", "m", "a", "b"] [outer]) of
-    (scop : _) -> asRoot (ssAffineSchedule (synthesizeScopSchedule2 scop))
+  case extractProcScops (mkProc "p" ["n", "m", "a", "b"] [outer]) of
+    (scop : _) -> asRoot (ssAffineSchedule (synthesizeScopSchedule scop))
     [] -> error "expected at least one scop"
 
 -- | Count inner loop bands inside the body of the outermost band.
@@ -967,7 +967,7 @@ reifiedInnerLoopCount (Just stmts) =
 fusionSpec :: Spec
 fusionSpec = describe "fusion" $ do
   it "two independent map bands with the same bound are structurally compatible" $ do
-    bandsStructurallyCompatible2 (mkMapBand "i") (mkMapBand "j") `shouldBe` True
+    bandsStructurallyCompatible (mkMapBand "i") (mkMapBand "j") `shouldBe` True
   it "two sibling inner loops with the same bound and no cross-deps fuse" $ do
     -- outer loop containing two independent inner loops
     let outer =
@@ -986,10 +986,10 @@ fusionSpec = describe "fusion" $ do
             , SLoop (LoopSpec ["k"] [IVar "m"] Serial Nothing LoopMap [])
                 [SArrayWrite (C.AVar "b") (C.AVar "k") (C.AVar "i")]
             ]
-    case extractProcScops2 (mkProc "p" ["n", "m", "a", "b"] [outer]) of
+    case extractProcScops (mkProc "p" ["n", "m", "a", "b"] [outer]) of
       (scop : _) -> do
-        let scheduled = synthesizeScopSchedule2 scop
-        case reifyScheduledScop2 scheduled of
+        let scheduled = synthesizeScopSchedule scop
+        case reifyScheduledScop scheduled of
           Just [SLoop _ [SLoop _ innerBody]] -> do
             let writes = [() | SArrayWrite {} <- innerBody]
             length writes `shouldBe` 2
@@ -1025,9 +1025,9 @@ fusionSpec = describe "fusion" $ do
                 ]
             ]
     innerBandCount (fuseSiblingBands outer) `shouldBe` 1
-  it "tryFuseBands2 returns Nothing for bands with mismatched bounds" $ do
+  it "tryFuseBands returns Nothing for bands with mismatched bounds" $ do
     let b2 = (mkMapBand "j") { albDims = [ScheduleDim "j" (IVar "m")] }
-    tryFuseBands2 0 [] (AffineScheduleLoopBand (mkMapBand "i")) (AffineScheduleLoopBand b2)
+    tryFuseBands 0 [] (AffineScheduleLoopBand (mkMapBand "i")) (AffineScheduleLoopBand b2)
       `shouldBe` Nothing
   where
     mkMapBand iter =
@@ -1046,18 +1046,18 @@ fusionSpec = describe "fusion" $ do
 
 skewingSpec :: Spec
 skewingSpec = describe "skewing" $ do
-  it "suggestBandSkew2 returns Nothing for a loop with no backward deps" $ do
+  it "suggestBandSkew returns Nothing for a loop with no backward deps" $ do
     let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
         relations = []
-    suggestBandSkew2 0 dims relations `shouldBe` Nothing
-  it "suggestBandSkew2 returns Nothing for a single-dim band" $ do
+    suggestBandSkew 0 dims relations `shouldBe` Nothing
+  it "suggestBandSkew returns Nothing for a single-dim band" $ do
     let dims = [ScheduleDim "i" (IVar "n")]
         rel = forwardRel "i" 1
-    suggestBandSkew2 0 dims [rel] `shouldBe` Nothing
-  it "suggestBandSkew2 suggests a skew when inner dim has backward dep and outer has forward dep" $ do
+    suggestBandSkew 0 dims [rel] `shouldBe` Nothing
+  it "suggestBandSkew suggests a skew when inner dim has backward dep and outer has forward dep" $ do
     let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
         rel = backwardInnerRel "i" "j" 1 (-1)
-    case suggestBandSkew2 0 dims [rel] of
+    case suggestBandSkew 0 dims [rel] of
       Nothing -> expectationFailure "expected a skew suggestion"
       Just skew -> do
         skewTarget skew `shouldBe` "j"
@@ -1066,16 +1066,16 @@ skewingSpec = describe "skewing" $ do
   it "skewCoeff >= ceil(innerDist / outerDist) ensures new inner dist is non-negative" $ do
     let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
         rel = backwardInnerRel "i" "j" 2 (-3)
-    case suggestBandSkew2 0 dims [rel] of
+    case suggestBandSkew 0 dims [rel] of
       Nothing -> expectationFailure "expected a skew suggestion"
       Just skew -> do
         let newInnerDist = (-3) + skewCoeff skew * 2
         newInnerDist `shouldSatisfy` (>= 0)
-  it "suggestBandSkew2 takes the maximum coefficient when multiple deps require skewing" $ do
+  it "suggestBandSkew takes the maximum coefficient when multiple deps require skewing" $ do
     let dims = [ScheduleDim "i" (IVar "n"), ScheduleDim "j" (IVar "m")]
         rel1 = backwardInnerRel "i" "j" 1 (-1)
         rel2 = backwardInnerRel "i" "j" 1 (-3)
-    case suggestBandSkew2 0 dims [rel1, rel2] of
+    case suggestBandSkew 0 dims [rel1, rel2] of
       Nothing -> expectationFailure "expected a skew suggestion"
       Just skew -> do
         let newInnerDist1 = (-1) + skewCoeff skew * 1
@@ -1242,7 +1242,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
         augmented = augmentWithTemporalDeps "iter_t" [fwdDep]
     augmented `shouldBe` [fwdDep]
 
-  it "suggestBandSkew2 is triggered for the augmented temporal stencil dep" $ do
+  it "suggestBandSkew is triggered for the augmented temporal stencil dep" $ do
     -- Simulate the dep produced by augmentWithTemporalDeps for a 1D stencil:
     -- outer band (iter_t: LoopIterate []), inner band (i: LoopMap [])
     -- distance: [+1, -1]  → outerDist(iter_t)=+1, innerDist(i)=-1
@@ -1275,7 +1275,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
           , pdrSrcIndex = []
           , pdrTgtIndex = []
           }
-    case suggestBandSkew2 0 dims [rel] of
+    case suggestBandSkew 0 dims [rel] of
       Nothing -> expectationFailure "expected a skew suggestion for temporal stencil dep"
       Just skew -> do
         skewTarget skew `shouldBe` "i"
@@ -1306,9 +1306,9 @@ temporalSkewingSpec = describe "temporal skewing" $ do
         outerLoop =
           SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate []) iterateBody
         proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
-    case extractProcScops2 proc of
+    case extractProcScops proc of
       [scop] -> do
-        let deps = collectScopDependenceRelations2 scop
+        let deps = collectScopDependenceRelations scop
         -- There should be at least one dep involving arr_next (or arr_cur substituted)
         -- that has a negative inner distance augmented with iter_t: +1
         let temporalDeps =
@@ -1325,7 +1325,7 @@ temporalSkewingSpec = describe "temporal skewing" $ do
 
 wavefrontSkewingSpec :: Spec
 wavefrontSkewingSpec = describe "wavefront skewing" $ do
-  it "suggestCrossBandSkew2 detects temporal stencil pattern" $ do
+  it "suggestCrossBandSkew detects temporal stencil pattern" $ do
     -- Augmented dep from the stencil: iter_t=+1, i=-1
     let rel = PolyhedralDependenceRelation
           { pdrKind = PolyDepWAR
@@ -1358,14 +1358,14 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
           , pdrSrcIndex = []
           , pdrTgtIndex = []
           }
-    case suggestCrossBandSkew2 0 ["iter_t"] ["i"] [rel] of
+    case suggestCrossBandSkew 0 ["iter_t"] ["i"] [rel] of
       [] -> expectationFailure "expected wavefront skew for (+1, -1) dep"
       skew : _ -> do
         skewTarget skew `shouldBe` "i"
         skewSource skew `shouldBe` "iter_t"
         skewCoeff skew `shouldBe` 1
 
-  it "synthesizeScopSchedule2 applies cross-band skew to LoopIterate+LoopMap" $ do
+  it "synthesizeScopSchedule applies cross-band skew to LoopIterate+LoopMap" $ do
     -- Build a 1D iterate loop similar to the stencil pattern
     let innerLoop =
           SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
@@ -1382,9 +1382,9 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
         outerLoop =
           SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate []) iterateBody
         proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
-    case extractProcScops2 proc of
+    case extractProcScops proc of
       [scop] -> do
-        let scheduled = synthesizeScopSchedule2 scop
+        let scheduled = synthesizeScopSchedule scop
             sched = ssSchedule scheduled
         -- Walk the schedule tree to find the inner LoopMap band.
         -- After synthesis the body may be a sequence (prelude + inner band + epilogue)
@@ -1418,7 +1418,7 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
           _ -> expectationFailure "expected ScheduleLoopBand"
       other -> expectationFailure ("expected one scop, got: " <> show (length other))
 
-  it "reifyScheduledScop2 preserves skew through ScheduleStripMine" $ do
+  it "reifyScheduledScop preserves skew through ScheduleStripMine" $ do
     let tupleStmt = SAssign "ij" (C.RTuple [C.AVar "i", C.AVar "j"])
         i1Stmt = SAssign "i1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
         j1Stmt = SAssign "j1" (C.RBinOp C.CAdd (C.AVar "j") (C.AInt 1))
@@ -1432,12 +1432,12 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
           SLoop (LoopSpec ["i", "j"] [IVar "n", IConst 16] Serial Nothing LoopMap [])
             [tupleStmt, i1Stmt, j1Stmt, downStmt, rightStmt, readStmt, readDownStmt, readRightStmt, stmt]
         proc = mkProc "p" ["t", "n", "arr", "out"] [loop]
-    case extractProcScops2 proc of
+    case extractProcScops proc of
       [scop] ->
-        case ssSchedule (tileScop2 scop) of
+        case ssSchedule (tileScop scop) of
           ScheduleStripMine band plans ->
             let scheduled =
-                  (tileScop2 scop)
+                  (tileScop scop)
                     { ssSchedule =
                         ScheduleStripMine
                           band
@@ -1447,7 +1447,7 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
                           plans
                     }
             in
-              case reifyScheduledScop2 scheduled of
+              case reifyScheduledScop scheduled of
                 Just
                   [ SAssign skewOrigin (C.RBinOp C.CMul (C.AInt 1) (C.AVar "t"))
                   , SLoop _ outerBody
@@ -1487,7 +1487,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
             ]
         proc = mkProc "p" ["n", "arr_cur"] [outerLoop]
-    case polyhedralProgram2 (Program [proc]) of
+    case polyhedralProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
@@ -1511,7 +1511,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
             ]
         proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
-    case polyhedralProgram2 (Program [proc]) of
+    case polyhedralProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
@@ -1547,7 +1547,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
                 [SAssign "__hyd_discard" (C.RArrayFree (C.AVar "arr_cur__iter_init_track"))]
                 []
             ]
-    case polyhedralProgram2 (Program [proc]) of
+    case polyhedralProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
@@ -1571,7 +1571,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
             ]
         proc = mkProc "p" ["arr_cur"] [outerLoop]
-    case polyhedralProgram2 (Program [proc]) of
+    case polyhedralProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldContain` [LoopIterate]
       other ->

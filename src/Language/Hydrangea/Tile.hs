@@ -6,14 +6,14 @@
 -- Backwards-compatible statement-list tiling entrypoint backed by the
 -- polyhedral identity-order tiler.
 module Language.Hydrangea.Tile
-  ( tileStmts2
+  ( tileStmts
   ) where
 
 import Language.Hydrangea.CFG
-import Language.Hydrangea.Polyhedral (polyhedralIdentityTileProgram2)
+import Language.Hydrangea.Polyhedral (polyhedralIdentityTileProgram)
 
-tileStmts2 :: [Stmt] -> [Stmt]
-tileStmts2 stmts =
-  case polyhedralIdentityTileProgram2 (Program [mkProc "tile_stmts2" [] stmts]) of
+tileStmts :: [Stmt] -> [Stmt]
+tileStmts stmts =
+  case polyhedralIdentityTileProgram (Program [mkProc "tile_stmts2" [] stmts]) of
     Program [proc] -> procBody proc
     Program _ -> stmts

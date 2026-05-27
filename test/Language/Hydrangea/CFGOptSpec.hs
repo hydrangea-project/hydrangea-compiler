@@ -17,7 +17,7 @@ spec = do
                   , SAssign "y" (RAtom (AVar "x"))
                   , SReturn (AVar "y")
                   ]
-          result = copyProp2 stmts
+          result = copyProp stmts
       -- Just verify it produces valid output
       length result `shouldSatisfy` (>= 0)
 
@@ -27,7 +27,7 @@ spec = do
                   , SAssign "z" (RAtom (AVar "y"))
                   , SReturn (AVar "z")
                   ]
-          result = copyProp2 stmts
+          result = copyProp stmts
       -- Just verify it produces valid output
       length result `shouldSatisfy` (>= 0)
 
@@ -37,7 +37,7 @@ spec = do
           stmts = [ SAssign "x" (RAtom (AInt 5))
                   , loop
                   ]
-          result = copyProp2 stmts
+          result = copyProp stmts
       -- x should still be propagated where legal, but not into loop if it's a loop var
       length result `shouldSatisfy` (>= 0)
 
@@ -47,7 +47,7 @@ spec = do
           stmts = [ SAssign "n" (RAtom (AInt 4))
                   , loop
                   ]
-          result = copyProp2 stmts
+          result = copyProp stmts
       case result of
         [_assignN, SLoop spec _] -> lsBounds spec `shouldBe` [IConst 4]
         _ -> expectationFailure "Expected loop after copy propagation"
@@ -58,7 +58,7 @@ spec = do
             , SAssign "next" (RAtom (AVar "tmp"))
             , SAssign "tmp" (RAtom (AVar "cur"))
             ]
-      copyProp2 stmts `shouldBe`
+      copyProp stmts `shouldBe`
         [ SAssign "cur" (RAtom (AVar "next"))
         , SAssign "next" (RAtom (AVar "tmp"))
         , SAssign "tmp" (RAtom (AVar "cur"))
@@ -70,7 +70,7 @@ spec = do
                   , SAssign "y" (RAtom (AInt 10))
                   , SReturn (AVar "y")
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- x is dead (never used), so it should be removed
       -- Result should be: y = 10; return y
       length result `shouldBe` 2
@@ -79,7 +79,7 @@ spec = do
       let stmts = [ SAssign "x" (RAtom (AInt 5))
                   , SReturn (AVar "x")
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- x is used in return, so both statements should be kept
       length result `shouldBe` 2
 
@@ -87,7 +87,7 @@ spec = do
       let stmts = [ SAssign "x" (RCall "sideEffect" [AInt 5])
                   , SReturn (AInt 0)
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- Even if x is unused, the call has side effects
       length result `shouldBe` 2
 
@@ -97,7 +97,7 @@ spec = do
                       [SReturn (AInt 1)]
                       [SReturn (AInt 0)]
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- x is dead (not used in either branch)
       length result `shouldBe` 1
 
@@ -107,7 +107,7 @@ spec = do
                       [SReturn (AVar "x")]
                       [SReturn (AInt 0)]
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- x is used in then branch, so should be kept
       length result `shouldBe` 2
 
@@ -117,7 +117,7 @@ spec = do
                   , SAssign "c" (RAtom (AVar "b"))
                   , SReturn (AInt 0)
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- All assignments are dead since return doesn't use them
       length result `shouldBe` 1
 
@@ -125,7 +125,7 @@ spec = do
       let stmts = [ SAssign "x" (RUnOp CSqrt (AFloat 4.0))
                   , SReturn (AInt 0)
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       result `shouldBe` [SReturn (AInt 0)]
 
   describe "CFGOpt - Loop Invariant Code Motion" $ do
@@ -134,7 +134,7 @@ spec = do
                      , SArrayWrite (AVar "arr") (AVar "i") (AVar "y")
                      ]
           stmts = [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain []) loopBody ]
-          result = loopInvariantCodeMotion2 stmts
+          result = loopInvariantCodeMotion stmts
       -- y should be hoisted before the loop
       -- For now, just verify it produces a valid result
       length result `shouldSatisfy` (>= 1)
@@ -144,7 +144,7 @@ spec = do
                      , SArrayWrite (AVar "arr") (AVar "i") (AVar "y")
                      ]
           stmts = [ SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain []) loopBody ]
-          result = loopInvariantCodeMotion2 stmts
+          result = loopInvariantCodeMotion stmts
       -- y depends on i, so should stay in loop
       length result `shouldBe` 1
 
@@ -161,7 +161,7 @@ spec = do
             , SArrayWrite (AVar "arr") (AVar "i") (AVar "x")
             ]
           stmts = [SLoop (LoopSpec ["i"] [IConst 10] Serial Nothing LoopPlain []) loopBody]
-          result = loopInvariantCodeMotion2 stmts
+          result = loopInvariantCodeMotion stmts
       case result of
         (SAssign "c" _ : SLoop _ body' : _) ->
           case body' of
@@ -186,7 +186,7 @@ spec = do
             , SArrayWrite (AVar "out") (AVar "iter_t") (AVar "x")
             , SAssign "cur" (RAtom (AVar "next"))
             ]
-          result = unswitchLoopInvariantIf2 [SLoop loopSpec loopBody]
+          result = unswitchLoopInvariantIf [SLoop loopSpec loopBody]
       case result of
         [ SAssign "n" (RAtom (AInt 5))
           , SAssign "is_small" (RBinOp CLe (AVar "n") (AInt 1))
@@ -214,7 +214,7 @@ spec = do
             , SAssign "val" (RArrayLoad (AVar "out_arr") (AVar "off"))
             , SReturn (AVar "val")
             ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
           hasOutArrAlloc = any isOutArrAlloc result
           hasOutArrWrite = any isOutArrWrite result
           hasOutArrShape = any isOutArrShape result
@@ -241,7 +241,7 @@ spec = do
                   , SAssign "y" (RAtom (AVar "x"))
                   , SReturn (AVar "y")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- After copy prop: y = 5, then DAE removes unused x
       -- But note: y is assigned but immediately returned with same value
       -- The result is minimal (either 1 or 2 statements is valid)
@@ -255,7 +255,7 @@ spec = do
                   , SAssign "d" (RAtom (AVar "c"))
                   , SReturn (AVar "d")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- Should collapse significantly through fixpoint iteration
       -- Optimizations may reduce to just return statement or single assignment
       length result `shouldSatisfy` (<= 3)
@@ -267,7 +267,7 @@ spec = do
                   , SAssign "y" (RAtom (AVar "x"))
                   , SReturn (AVar "y")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- Copy prop + DAE should significantly reduce this
       length result `shouldSatisfy` (<= 2)
 
@@ -278,7 +278,7 @@ spec = do
                       ]
                   , SReturn (AVar "arr")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- inv is loop-invariant, should be handled by LICM
       -- DAE should not remove inv since it's used in the loop
       -- Result: inv (hoisted), loop, return = 3, or LICM may keep it in different form
@@ -293,7 +293,7 @@ spec = do
                   , SAssign "c" (RAtom (AVar "b"))
                   , SReturn (AVar "c")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- Should converge to minimal form (1-2 statements)
       length result `shouldSatisfy` (<= 2)
 
@@ -310,7 +310,7 @@ spec = do
                 , SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_cur"))
                 ]
             ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
           hasBadSelfAssign stmt = case stmt of
             SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_next__iter_tmp")) -> True
             SLoop _ body -> any hasBadSelfAssign body
@@ -324,13 +324,13 @@ spec = do
                   , SAssign "z" (RBinOp CAddF (AVar "x") (AVar "y"))
                   , SReturn (AVar "z")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
           sqrtCount = length [() | SAssign _ (RUnOp CSqrt _) <- result]
       sqrtCount `shouldBe` 1
 
     it "preserves semantics of array operations" $ property $
       forAll simpleArrayProg $ \stmts ->
-        let result = optimizeStmts2 stmts
+        let result = optimizeStmts stmts
         in -- Array operations should still be present after optimization
            hasArrayAlloc stmts == hasArrayAlloc result
 
@@ -344,7 +344,7 @@ spec = do
                       ]
                   , SReturn (AVar "arr")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- outer is invariant to both loops, should be handled
       length result `shouldSatisfy` (>= 2)
 
@@ -356,7 +356,7 @@ spec = do
                       ]
                   , SReturn (AVar "arr")
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- acc is loop-carried, must be preserved
       length result `shouldBe` 3
 
@@ -367,7 +367,7 @@ spec = do
                       ]
                   , SReturn (AVar "arr")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- dead should be eliminated since it's not used
       length result `shouldBe` 2
 
@@ -380,7 +380,7 @@ spec = do
                       ]
                   , SReturn (AVar "arr")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- Vector loops should not be modified by standard optimizations
       case result of
         [_, SLoop spec _, _] -> lsExec spec `shouldBe` vectorSpec
@@ -388,19 +388,19 @@ spec = do
 
   describe "CFGOpt - Edge Cases" $ do
     it "handles empty statement lists" $ do
-      let result = optimizeStmts2 []
+      let result = optimizeStmts []
       result `shouldBe` ([] :: [Stmt])
 
     it "handles single return statement" $ do
       let stmts = [SReturn (AInt 42)]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       result `shouldBe` stmts
 
     it "handles self-referential assignments" $ do
       let stmts = [ SAssign "x" (RBinOp CAdd (AVar "x") (AInt 1))
                   , SReturn (AVar "x")
                   ]
-          result = deadAssignElim2 stmts
+          result = deadAssignElim stmts
       -- x is used in return, should be kept
       length result `shouldBe` 2
 
@@ -409,7 +409,7 @@ spec = do
                   , SAssign "y" (RAtom (AVar "x"))
                   , SReturn (AVar "y")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- Complex case - just verify it terminates and produces valid output
       length result `shouldSatisfy` (>= 0)
 
@@ -422,7 +422,7 @@ spec = do
                   , SAssign "e" (RAtom (AVar "d"))
                   , SReturn (AVar "e")
                   ]
-          result = optimizeStmts2 stmts
+          result = optimizeStmts stmts
       -- Should converge in a few iterations, not hit 100 limit
       length result `shouldSatisfy` (<= 5)
 
