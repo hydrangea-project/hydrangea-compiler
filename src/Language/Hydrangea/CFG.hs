@@ -3,10 +3,14 @@
 -- |
 -- Module: Language.Hydrangea.CFG
 --
--- Core IR types for the imperative CFG representation used by optimisation
--- and code-generation passes.
+-- Statement-, loop-, and procedure-level IR for the imperative CFG pipeline.
 --
--- The key abstractions are:
+-- "Language.Hydrangea.CFGCore" defines the value-level vocabulary used here.
+-- This module adds index expressions, loop descriptors, statements, procedures,
+-- and a few small helpers used throughout optimization, analysis, and code
+-- generation.
+--
+-- Key abstractions:
 --
 -- * 'IndexExpr' — a structural index expression language for loop bounds
 --   and dependence analysis; use 'simplifyIndexExpr' to obtain a canonical form.
@@ -38,14 +42,12 @@ module Language.Hydrangea.CFG
   ) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
+import Data.Functor.Identity (Identity(..), runIdentity)
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
-import Language.Hydrangea.CFGCore (Atom, RHS, Redop, CType)
-
--- | Canonical name for variables in the CFG.
-type CVar = ByteString
+import Language.Hydrangea.CFGCore (Atom, CType, CVar, RHS, Redop)
 
 -- | Structural index expression language for loop bounds and dependence analysis.
 -- Use 'simplifyIndexExpr' to obtain a canonical form suitable for comparison.
@@ -117,6 +119,10 @@ exprRank ex = case ex of
   ICall{} -> 3
   _ -> 2
 
+sortCanonicalTerms :: [IndexExpr] -> [IndexExpr]
+sortCanonicalTerms =
+  sortBy (comparing (\term -> (exprRank term, show term)))
+
 -- | Flatten and normalise an addition into a canonical 'IAdd' tree with the
 -- constant term last.
 simplifyAdd :: IndexExpr -> IndexExpr -> IndexExpr
@@ -130,7 +136,7 @@ simplifyAdd a b =
       (termsA, constA) = collectAdd a
       (termsB, constB) = collectAdd b
       constSum = constA + constB
-      sortedTerms = sortBy (comparing (\t -> (exprRank t, show t))) (termsA ++ termsB)
+      sortedTerms = sortCanonicalTerms (termsA ++ termsB)
 
       build ts n = case (ts, n) of
         ([], 0) -> IConst 0
@@ -154,7 +160,7 @@ simplifyMul a b =
       (termsA, constA) = collectMul a
       (termsB, constB) = collectMul b
       constProd = constA * constB
-      sortedTerms = sortBy (comparing (\t -> (exprRank t, show t))) (termsA ++ termsB)
+      sortedTerms = sortCanonicalTerms (termsA ++ termsB)
 
       build ts n = case (ts, n) of
         ([], 1) -> IConst 1
@@ -261,27 +267,24 @@ data Stmt
   | SBreak                     -- ^ Break out of the enclosing loop.
   deriving (Eq, Show)
 
--- | Walk a statement list, applying @rewrite@ to each statement after recursing
--- into loops and conditionals.  @descend@ updates the context when entering a loop.
+-- | Walk a statement list, applying @rewrite@ after recursing into nested
+-- statements.
+--
+-- The traversal always descends into loop bodies, conditionals, and parallel
+-- regions. @descend@ is applied only when entering a loop body, so callers can
+-- track loop-sensitive context such as nesting depth or active iterators.
 rewriteStmtsWith
   :: ctx
   -> (ctx -> ctx)
   -> (ctx -> Stmt -> [Stmt])
   -> [Stmt]
   -> [Stmt]
-rewriteStmtsWith initialCtx descend rewrite = go initialCtx
-  where
-    go ctx = concatMap (goStmt ctx)
+rewriteStmtsWith initialCtx descend rewrite stmts =
+  runIdentity $
+    rewriteStmtsWithM initialCtx descend (\ctx stmt -> Identity (rewrite ctx stmt)) stmts
 
-    goStmt ctx stmt =
-      let stmt' = case stmt of
-            SLoop spec body -> SLoop spec (go (descend ctx) body)
-            SParallelRegion body -> SParallelRegion (go ctx body)
-            SIf cond thn els -> SIf cond (go ctx thn) (go ctx els)
-            _ -> stmt
-      in rewrite ctx stmt'
-
--- | Monadic variant of 'rewriteStmtsWith'; effects from @rewrite@ are sequenced left-to-right.
+-- | Monadic variant of 'rewriteStmtsWith'; effects from @rewrite@ are
+-- sequenced left-to-right.
 rewriteStmtsWithM
   :: Monad m
   => ctx

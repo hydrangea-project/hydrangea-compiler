@@ -37,13 +37,14 @@ import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), UnOp(..))
 import Language.Hydrangea.CFGCore qualified as C
 
+-- | Recovered type information for CFG variables within one procedure.
 type TypeEnv = Map CVar CType
 
 -- | Maps each procedure name to the ordered types of its formal parameters.
 -- 'Nothing' entries indicate parameters whose types could not be determined.
 type CallParamTypes = Map CVar [Maybe CType]
 
--- | Merge two CTypes, preferring Float over Int at every leaf position.
+-- | Merge two 'CType' values, preferring Float over Int at every leaf position.
 -- The lowering pass defaults unknown types to Int, so when the fixpoint
 -- discovers a Float type through arithmetic, it should upgrade.
 mergeCType :: CType -> CType -> CType
@@ -89,89 +90,59 @@ lookupArrayElemType typeEnv atom = case atom of
     _ -> Nothing
   _ -> Nothing
 
+binOpSignature :: BinOp -> Maybe (CType, CType)
+binOpSignature op = case op of
+  CAdd -> Just (CTInt64, CTInt64)
+  CSub -> Just (CTInt64, CTInt64)
+  CMul -> Just (CTInt64, CTInt64)
+  CDiv -> Just (CTInt64, CTInt64)
+  CMod -> Just (CTInt64, CTInt64)
+  CEq -> Just (CTBool, CTInt64)
+  CNeq -> Just (CTBool, CTInt64)
+  CLt -> Just (CTBool, CTInt64)
+  CLe -> Just (CTBool, CTInt64)
+  CGt -> Just (CTBool, CTInt64)
+  CGe -> Just (CTBool, CTInt64)
+  CAnd -> Just (CTBool, CTBool)
+  COr -> Just (CTBool, CTBool)
+  CAddF -> Just (CTDouble, CTDouble)
+  CSubF -> Just (CTDouble, CTDouble)
+  CMulF -> Just (CTDouble, CTDouble)
+  CDivF -> Just (CTDouble, CTDouble)
+  CEqF -> Just (CTBool, CTDouble)
+  CNeqF -> Just (CTBool, CTDouble)
+  CLtF -> Just (CTBool, CTDouble)
+  CLeF -> Just (CTBool, CTDouble)
+  CGtF -> Just (CTBool, CTDouble)
+  CGeF -> Just (CTBool, CTDouble)
+
 inferBinOpResultType :: BinOp -> Maybe CType
-inferBinOpResultType op = case op of
-  CAdd -> Just CTInt64
-  CSub -> Just CTInt64
-  CMul -> Just CTInt64
-  CDiv -> Just CTInt64
-  CMod -> Just CTInt64
-  CEq -> Just CTBool
-  CNeq -> Just CTBool
-  CLt -> Just CTBool
-  CLe -> Just CTBool
-  CGt -> Just CTBool
-  CGe -> Just CTBool
-  CAnd -> Just CTBool
-  COr -> Just CTBool
-  CAddF -> Just CTDouble
-  CSubF -> Just CTDouble
-  CMulF -> Just CTDouble
-  CDivF -> Just CTDouble
-  CEqF -> Just CTBool
-  CNeqF -> Just CTBool
-  CLtF -> Just CTBool
-  CLeF -> Just CTBool
-  CGtF -> Just CTBool
-  CGeF -> Just CTBool
+inferBinOpResultType = fmap fst . binOpSignature
 
 inferBinOpOperandType :: BinOp -> Maybe CType
-inferBinOpOperandType op = case op of
-  CAdd -> Just CTInt64
-  CSub -> Just CTInt64
-  CMul -> Just CTInt64
-  CDiv -> Just CTInt64
-  CMod -> Just CTInt64
-  CEq -> Just CTInt64
-  CNeq -> Just CTInt64
-  CLt -> Just CTInt64
-  CLe -> Just CTInt64
-  CGt -> Just CTInt64
-  CGe -> Just CTInt64
-  CAnd -> Just CTBool
-  COr -> Just CTBool
-  CAddF -> Just CTDouble
-  CSubF -> Just CTDouble
-  CMulF -> Just CTDouble
-  CDivF -> Just CTDouble
-  CEqF -> Just CTDouble
-  CNeqF -> Just CTDouble
-  CLtF -> Just CTDouble
-  CLeF -> Just CTDouble
-  CGtF -> Just CTDouble
-  CGeF -> Just CTDouble
+inferBinOpOperandType = fmap snd . binOpSignature
+
+unOpSignature :: UnOp -> (Maybe CType, Maybe CType)
+unOpSignature op = case op of
+  CNot -> (Just CTBool, Just CTBool)
+  CNeg -> (Nothing, Nothing)
+  CSqrt -> (Just CTDouble, Just CTDouble)
+  CExpF -> (Just CTDouble, Just CTDouble)
+  CLog -> (Just CTDouble, Just CTDouble)
+  CSin -> (Just CTDouble, Just CTDouble)
+  CCos -> (Just CTDouble, Just CTDouble)
+  CAbsF -> (Just CTDouble, Just CTDouble)
+  CFloorF -> (Just CTDouble, Just CTDouble)
+  CCeilF -> (Just CTDouble, Just CTDouble)
+  CErf -> (Just CTDouble, Just CTDouble)
+  CFloatOf -> (Just CTDouble, Just CTInt64)
+  CIntOf -> (Just CTInt64, Just CTDouble)
 
 inferUnOpResultType :: UnOp -> Maybe CType
-inferUnOpResultType op = case op of
-  CNot -> Just CTBool
-  CNeg -> Nothing
-  CSqrt -> Just CTDouble
-  CExpF -> Just CTDouble
-  CLog -> Just CTDouble
-  CSin -> Just CTDouble
-  CCos -> Just CTDouble
-  CAbsF -> Just CTDouble
-  CFloorF -> Just CTDouble
-  CCeilF -> Just CTDouble
-  CErf -> Just CTDouble
-  CFloatOf -> Just CTDouble
-  CIntOf -> Just CTInt64
+inferUnOpResultType = fst . unOpSignature
 
 inferUnOpOperandType :: UnOp -> Maybe CType
-inferUnOpOperandType op = case op of
-  CNot -> Just CTBool
-  CNeg -> Nothing
-  CSqrt -> Just CTDouble
-  CExpF -> Just CTDouble
-  CLog -> Just CTDouble
-  CSin -> Just CTDouble
-  CCos -> Just CTDouble
-  CAbsF -> Just CTDouble
-  CFloorF -> Just CTDouble
-  CCeilF -> Just CTDouble
-  CErf -> Just CTDouble
-  CFloatOf -> Just CTInt64
-  CIntOf -> Just CTDouble
+inferUnOpOperandType = snd . unOpSignature
 
 inferCallType :: Map CVar CType -> CVar -> Maybe CType
 inferCallType callTypes fn =
@@ -301,8 +272,8 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
   _ ->
     typeEnv
 
--- | Collect all (srcVar, projIdx, resultVar) triples from RProj assignments
--- in a statement list (recursively into loops/conditionals).
+-- | Collect all @(srcVar, projIdx, resultVar)@ triples from @RProj@
+-- assignments in a statement list, recursing into loops and conditionals.
 collectProjAssigns :: [Stmt] -> [(CVar, Integer, CVar)]
 collectProjAssigns = concatMap go
   where

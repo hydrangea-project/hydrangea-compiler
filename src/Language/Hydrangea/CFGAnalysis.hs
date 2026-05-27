@@ -3,13 +3,13 @@
 -- |
 -- Module: Language.Hydrangea.CFGAnalysis
 --
--- Loop analysis for the canonical CFG loop representation.
+-- Conservative loop and variable analysis over the canonical CFG.
 --
--- This module performs light-weight static analyses used by CFG
--- optimisation and vectorisation passes. The analyses are intentionally
--- conservative: they produce easily-checkable information (trip-count
--- shapes, variable liveness sets and a simple vectorizability predicate)
--- that later passes use to decide safe transformations.
+-- The helpers here summarize loop structure, estimate trip counts, and collect
+-- defined/used variables for CFG statements. The results are intentionally
+-- conservative: they are simple enough for later passes to trust when deciding
+-- whether transformations such as vectorization, parallelization, or LICM are
+-- safe to apply.
 module Language.Hydrangea.CFGAnalysis
   ( -- * Loop Info
     LoopInfo(..)
@@ -144,10 +144,13 @@ tripCountValue (TCAdd l r) = do
   Just (a + b)
 tripCountValue _ = Nothing
 
+-- | Combine all loop-dimension bounds into one aggregate trip-count summary.
 loopTripCount :: LoopSpec -> TripCount
 loopTripCount spec =
   foldr mulTripCounts (TCConstant 1) (map tripCountFromIndexExpr (lsBounds spec))
 
+-- | Conservative heuristic for whether a trip count is large enough or symbolic
+-- enough to justify parallelization work.
 isParallelTripCount :: TripCount -> Bool
 isParallelTripCount tc = case tripCountValue tc of
   Just n -> n >= 4
@@ -157,7 +160,10 @@ isParallelTripCount tc = case tripCountValue tc of
     TCMul {} -> True
     _ -> False
 
--- | Collect variables that are defined (assigned) by a statement.
+-- | Collect variables whose storage is written by a statement.
+--
+-- Scalar assignments define their destination variable. Array writes count as a
+-- write to the destination buffer variable. Returns are not definitions.
 definedVarsStmt :: Stmt -> Set ByteString
 definedVarsStmt stmt = case stmt of
   SAssign v _ -> S.singleton v
@@ -165,7 +171,6 @@ definedVarsStmt stmt = case stmt of
   SLoop _ body -> S.unions (map definedVarsStmt body)
   SParallelRegion body -> S.unions (map definedVarsStmt body)
   SIf _ thn els -> S.unions (map definedVarsStmt (thn ++ els))
-  SReturn (AVar v) -> S.singleton v
   _ -> S.empty
 
 -- | Defined variables across a sequence of statements.
@@ -210,7 +215,7 @@ usedVarsRHS rhs = case rhs of
   RPairSnd _ a -> usedVarsAtom a
   RArrayFree a -> usedVarsAtom a
 
--- | Collect variables referenced by an 'IndexExpr'
+-- | Collect variables referenced by an 'IndexExpr'.
 usedVarsIndexExpr :: IndexExpr -> Set ByteString
 usedVarsIndexExpr ie = case ie of
   IVar v -> S.singleton v
@@ -262,7 +267,7 @@ analyzeLoop (SLoop spec body) = case lsIters spec of
 analyzeLoop _ = Nothing
 
 -- | Recursively collect @LoopInfo@ for all loops in a statement list.
--- This explores nested loops and `if` branches.
+-- This explores nested loops, parallel regions, and conditionals.
 analyzeStmts :: [Stmt] -> [LoopInfo]
 analyzeStmts = concatMap go
   where

@@ -3,7 +3,12 @@
 -- |
 -- Module: Language.Hydrangea.CFGCore
 --
--- Shared core IR atoms and RHS nodes used by CFG analysis/transforms/codegen.
+-- Shared value-level building blocks for the CFG IR.
+--
+-- This module defines the leaf vocabulary used throughout the CFG pipeline:
+-- variable names, scalar/vector atoms, concrete lowered types, and the
+-- right-hand-side operations that can appear in assignments. "Language.Hydrangea.CFG"
+-- builds the statement and procedure layer on top of these definitions.
 module Language.Hydrangea.CFGCore
   ( CVar
   , BinOp(..)
@@ -22,26 +27,70 @@ import Data.ByteString.Lazy.Char8 (ByteString)
 -- | Canonical variable name used across CFG representations.
 type CVar = ByteString
 
--- | Binary operators used in @RBinOp@ and vector/bin-op RHS forms.
-data BinOp = CAdd | CSub | CMul | CDiv | CMod | CEq | CNeq | CLt | CLe | CGt | CGe | CAnd | COr
-           | CAddF | CSubF | CMulF | CDivF | CEqF | CNeqF | CLtF | CLeF | CGtF | CGeF
+-- | Binary operators used in scalar and vector CFG expressions.
+data BinOp
+  = CAdd
+  | CSub
+  | CMul
+  | CDiv
+  | CMod
+  | CEq
+  | CNeq
+  | CLt
+  | CLe
+  | CGt
+  | CGe
+  | CAnd
+  | COr
+  | CAddF
+  | CSubF
+  | CMulF
+  | CDivF
+  | CEqF
+  | CNeqF
+  | CLtF
+  | CLeF
+  | CGtF
+  | CGeF
   deriving (Eq, Show)
 
--- | Unary operators.
-data UnOp = CNot | CNeg
-  -- Math functions (Float -> Float); lowered to <math.h> calls.
-  | CSqrt | CExpF | CLog | CSin | CCos | CAbsF | CFloorF | CCeilF | CErf | CFloatOf | CIntOf
+-- | Unary operators used in scalar and vector CFG expressions.
+data UnOp
+  = CNot
+  | CNeg
+  | CSqrt
+  | CExpF
+  | CLog
+  | CSin
+  | CCos
+  | CAbsF
+  | CFloorF
+  | CCeilF
+  | CErf
+  | CFloatOf
+  | CIntOf
   deriving (Eq, Show)
 
--- | Evaluatable, side-effect-free atoms. @AVecVar@ names a vector/array
--- variable reference.
-data Atom = AVar CVar | AInt Integer | AFloat Double | ABool Bool | AUnit | AString ByteString | AVecVar CVar
+-- | Side-effect-free values referenced by CFG statements.
+data Atom
+  = AVar CVar
+  | AInt Integer
+  | AFloat Double
+  | ABool Bool
+  | AUnit
+  | AString ByteString
+  | AVecVar CVar  -- ^ Explicit SIMD value introduced by vectorization.
   deriving (Eq, Show)
 
 -- | Element type descriptor for pair construction, used to carry type
 -- information through the CFG IR so the code generator can emit the
 -- correct C struct type without a separate type environment.
-data CElemType = CEInt | CEFloat | CEBool | CEPair CElemType CElemType | CEArray
+data CElemType
+  = CEInt
+  | CEFloat
+  | CEBool
+  | CEPair CElemType CElemType
+  | CEArray
   deriving (Eq, Show, Ord)
 
 -- | Concrete C type for all values appearing in generated code.
@@ -56,7 +105,7 @@ data CType
   | CTTuple                           -- ^ shape tuple (hyd_tuple_t; components are all int)
   | CTArray CType                     -- ^ hyd_array_t* of element type
   | CTPair CType CType                -- ^ hyd_pair_XY_t struct
-  | CTRecord [(ByteString, CType)]    -- ^ named struct (for future records)
+  | CTRecord [(ByteString, CType)]    -- ^ record value with normalized field order
   | CTUnknown                         -- ^ type not yet determined; must not reach codegen
   deriving (Eq, Ord, Show)
 
@@ -66,7 +115,7 @@ elemTypeToCType CEInt            = CTInt64
 elemTypeToCType CEFloat          = CTDouble
 elemTypeToCType CEBool           = CTBool
 elemTypeToCType (CEPair ct1 ct2) = CTPair (elemTypeToCType ct1) (elemTypeToCType ct2)
-elemTypeToCType CEArray          = CTArray CTDouble  -- opaque: used only as pair field type
+elemTypeToCType CEArray          = CTArray CTDouble
 
 -- | Project a 'CType' back to 'CElemType', if it is representable as one.
 -- Returns 'Nothing' for types that cannot appear as pair components
@@ -81,8 +130,11 @@ ctypeToElemType (CTArray _)       = Just CEArray
 ctypeToElemType CTUnknown         = Nothing
 ctypeToElemType _                 = Nothing
 
--- | Right-hand-side expressions for @SAssign@ in the CFG. These map
--- directly to imperative operations and code generation templates.
+-- | Right-hand-side expressions for @SAssign@ in the CFG.
+--
+-- These constructors cover pure scalar operations, tuple and record
+-- manipulation, array and shape primitives, direct procedure calls, and the
+-- explicit vector instructions introduced by the vectorizer.
 data RHS
   = RAtom Atom
   | RBinOp BinOp Atom Atom
@@ -92,11 +144,10 @@ data RHS
   | RRecord [(ByteString, Atom)]
   | RRecordProj ByteString Atom
   | RPairMake CElemType CElemType Atom Atom
-  | RPairFst CElemType Atom    -- ^ CElemType is the type of the extracted fst field
-  | RPairSnd CElemType Atom    -- ^ CElemType is the type of the extracted snd field
-  | RArrayAlloc Atom
-  | RArrayCopy Atom    -- ^ Allocate a fresh array with the same shape/elem-size as the
-                       --   source atom and copy all data into it (alloc + memcpy).
+  | RPairFst CElemType Atom    -- ^ Type of the extracted first field.
+  | RPairSnd CElemType Atom    -- ^ Type of the extracted second field.
+  | RArrayAlloc Atom           -- ^ Allocate an array with the given shape.
+  | RArrayCopy Atom            -- ^ Allocate and copy an existing array.
   | RArrayLoad Atom Atom
   | RArrayShape Atom
   | RShapeSize Atom

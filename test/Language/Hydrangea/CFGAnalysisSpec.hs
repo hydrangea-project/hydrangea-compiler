@@ -2,6 +2,7 @@
 
 module Language.Hydrangea.CFGAnalysisSpec (spec) where
 
+import Data.Set qualified as S
 import Test.Hspec
 import Data.Maybe (isJust)
 import Language.Hydrangea.CFG
@@ -97,3 +98,14 @@ spec = describe "CFGAnalysis loop analysis" $ do
   it "returns Nothing for non-loop statements" $ do
     let stmt = SAssign "x" (RAtom (AInt 5))
     analyzeLoop stmt `shouldBe` Nothing
+
+  describe "variable collection helpers" $ do
+    it "treats returns as uses, not definitions" $ do
+      definedVarsStmt (SReturn (AVar "x")) `shouldBe` S.empty
+      usedVarsStmt (SReturn (AVar "x")) `shouldBe` S.singleton "x"
+
+    it "treats array writes as writes to the destination buffer" $ do
+      definedVarsStmt (SArrayWrite (AVar "out") (AVar "i") (AVar "x"))
+        `shouldBe` S.singleton "out"
+      usedVarsStmt (SArrayWrite (AVar "out") (AVar "i") (AVar "x"))
+        `shouldBe` S.fromList ["out", "i", "x"]
