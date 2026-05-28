@@ -2,6 +2,7 @@
 
 module Language.Hydrangea.InterpreterSpec (spec) where
 
+import Control.Exception (finally)
 import Control.Monad.Except (runExceptT)
 import Data.ByteString.Lazy.Char8 (ByteString)
 import qualified Data.ByteString.Lazy.Char8 as BS
@@ -11,6 +12,7 @@ import Language.Hydrangea.Frontend
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Interpreter
 import System.Directory (getTemporaryDirectory, removeFile)
+import System.Environment (unsetEnv)
 import System.FilePath ((</>))
 import Test.Hspec
 
@@ -55,6 +57,16 @@ evalFusedString src =
             Left err -> Left $ show err
             Right val -> Right val
 
+evalRaw :: Exp () -> IO (Either EvalError Value)
+evalRaw = runExceptT . eval
+
+expectRawEvalError :: Exp () -> Expectation
+expectRawEvalError expr = do
+  res <- evalRaw expr
+  case res of
+    Left _ -> pure ()
+    Right val -> expectationFailure $ "Expected error but got: " ++ show val
+
 expectFusedSame :: ByteString -> Expectation
 expectFusedSame src = do
   original <- evalString src
@@ -63,6 +75,38 @@ expectFusedSame src = do
     (Right v1, Right v2) -> v1 `shouldBe` v2
     (Left err, _) -> expectationFailure $ "Original eval failed: " ++ err
     (_, Left err) -> expectationFailure $ "Fused eval failed: " ++ err
+
+withTempCsv :: FilePath -> String -> (FilePath -> IO a) -> IO a
+withTempCsv fileName contents action = do
+  tmpDir <- getTemporaryDirectory
+  let csvPath = tmpDir </> fileName
+  writeFile csvPath contents
+  action csvPath `finally` removeFile csvPath
+
+shape1 :: Integer -> Exp ()
+shape1 n = EVec () [EInt () n]
+
+index0 :: Exp ()
+index0 = EVec () [EInt () 0]
+
+scatterDefaults :: Exp ()
+scatterDefaults = EFill () (shape1 3) (EInt () 0)
+
+scatterIndices :: Integer -> Exp ()
+scatterIndices n = EFill () (shape1 n) index0
+
+scatterValues :: Integer -> Exp ()
+scatterValues n = EFill () (shape1 n) (EInt () 7)
+
+scatterGuards :: Integer -> Exp ()
+scatterGuards n = EFill () (shape1 n) (EBool () True)
+
+scatterChainExpr :: Exp () -> Maybe (Exp ()) -> Exp ()
+scatterChainExpr valsExpr guardExpr =
+  EScatterChain ()
+    (EOp () (Plus ()))
+    scatterDefaults
+    [ScatterPhase (scatterIndices 2) valsExpr guardExpr]
 
 spec :: Spec
 spec = do
@@ -323,6 +367,15 @@ spec = do
         Left _ -> pure ()
         Right _ -> expectationFailure "Should raise type error"
 
+    it "rejects scatter chains whose values array shape does not match the index shape" $
+      expectRawEvalError (scatterChainExpr (scatterValues 1) Nothing)
+
+    it "rejects scatter chains whose guard array shape does not match the index shape" $
+      expectRawEvalError (scatterChainExpr (scatterValues 2) (Just (scatterGuards 1)))
+
+    it "rejects scatter chains with non-boolean guard elements" $
+      expectRawEvalError (scatterChainExpr (scatterValues 2) (Just (EFill () (shape1 2) (EInt () 1))))
+
   describe "Interpreter - Integration" $ do
     it "evaluates nested function applications" $ do
       expectEval "let f x = x + 1 in let g x = f (f x) in g 5" (VInt 7)
@@ -348,48 +401,44 @@ spec = do
 
   describe "Interpreter - read_array" $ do
     it "reads a 1D array from a CSV file" $ do
-      tmpDir <- getTemporaryDirectory
-      let csvPath = tmpDir </> "hydrangea_test_1d.csv"
-      writeFile csvPath "10,20,30"
-      let code = "read_array [3] \"" <> fromString csvPath <> "\""
-      result <- evalString code
-      case result of
-        Right val -> val `shouldBe` VArray [3] [VInt 10, VInt 20, VInt 30]
-        Left err -> expectationFailure err
-      removeFile csvPath
+      withTempCsv "hydrangea_test_1d.csv" "10,20,30" $ \csvPath -> do
+        let code = "read_array [3] \"" <> fromString csvPath <> "\""
+        result <- evalString code
+        case result of
+          Right val -> val `shouldBe` VArray [3] [VInt 10, VInt 20, VInt 30]
+          Left err -> expectationFailure err
 
     it "reads a 2D array from a CSV file" $ do
-      tmpDir <- getTemporaryDirectory
-      let csvPath = tmpDir </> "hydrangea_test_2d.csv"
-      writeFile csvPath "1,2,3,4,5,6"
-      let code = "read_array [2,3] \"" <> fromString csvPath <> "\""
-      result <- evalString code
-      case result of
-        Right val -> val `shouldBe` VArray [2,3] [VInt 1, VInt 2, VInt 3, VInt 4, VInt 5, VInt 6]
-        Left err -> expectationFailure err
-      removeFile csvPath
+      withTempCsv "hydrangea_test_2d.csv" "1,2,3,4,5,6" $ \csvPath -> do
+        let code = "read_array [2,3] \"" <> fromString csvPath <> "\""
+        result <- evalString code
+        case result of
+          Right val -> val `shouldBe` VArray [2,3] [VInt 1, VInt 2, VInt 3, VInt 4, VInt 5, VInt 6]
+          Left err -> expectationFailure err
 
     it "reads array and applies map" $ do
-      tmpDir <- getTemporaryDirectory
-      let csvPath = tmpDir </> "hydrangea_test_map.csv"
-      writeFile csvPath "1,2,3"
-      let code = "let f x = x + 10 in map f (read_array [3] \"" <> fromString csvPath <> "\")"
-      result <- evalString code
-      case result of
-        Right val -> val `shouldBe` VArray [3] [VInt 11, VInt 12, VInt 13]
-        Left err -> expectationFailure err
-      removeFile csvPath
+      withTempCsv "hydrangea_test_map.csv" "1,2,3" $ \csvPath -> do
+        let code = "let f x = x + 10 in map f (read_array [3] \"" <> fromString csvPath <> "\")"
+        result <- evalString code
+        case result of
+          Right val -> val `shouldBe` VArray [3] [VInt 11, VInt 12, VInt 13]
+          Left err -> expectationFailure err
 
     it "reads array and reduces it" $ do
-      tmpDir <- getTemporaryDirectory
-      let csvPath = tmpDir </> "hydrangea_test_reduce.csv"
-      writeFile csvPath "1,2,3,4"
-      let code = "let add x y = x + y in index () (reduce add 0 (read_array [4] \"" <> fromString csvPath <> "\"))"
-      result <- evalString code
-      case result of
-        Right val -> val `shouldBe` VInt 10
-        Left err -> expectationFailure err
-      removeFile csvPath
+      withTempCsv "hydrangea_test_reduce.csv" "1,2,3,4" $ \csvPath -> do
+        let code = "let add x y = x + y in index () (reduce add 0 (read_array [4] \"" <> fromString csvPath <> "\"))"
+        result <- evalString code
+        case result of
+          Right val -> val `shouldBe` VInt 10
+          Left err -> expectationFailure err
+
+    it "reports malformed integer CSV input as an evaluation error" $
+      withTempCsv "hydrangea_test_bad_int.csv" "1,two,3" $ \csvPath ->
+        expectEvalError ("read_array [3] \"" <> fromString csvPath <> "\"")
+
+    it "reports malformed float CSV input as an evaluation error" $
+      withTempCsv "hydrangea_test_bad_float.csv" "1.0,oops,3.0" $ \csvPath ->
+        expectEvalError ("read_array_float [3] \"" <> fromString csvPath <> "\"")
 
   describe "Interpreter - Math functions" $ do
     it "sqrt 4.0 == 2.0" $
@@ -480,3 +529,18 @@ spec = do
       expectEval "float_of 4 +. 0.5" (VFloat 4.5)
     it "float_of on get_env_int result" $
       expectEval "float_of (let n = 7 in n)" (VFloat 7.0)
+
+  describe "Interpreter - environment variables" $ do
+    it "reports a missing environment variable as an evaluation error" $ do
+      let missingVar = "HYDRANGEA_TEST_MISSING_ENV_VAR"
+      unsetEnv missingVar
+      expectEvalError ("get_env_string \"" <> fromString missingVar <> "\"")
+
+  describe "Interpreter - write_array" $ do
+    it "rejects non-integer arrays for write_array" $
+      withTempCsv "hydrangea_test_write_int.csv" "" $ \csvPath ->
+        expectRawEvalError (EWriteArray () (EFill () (shape1 2) (EBool () True)) (EString () (fromString csvPath)))
+
+    it "rejects non-float arrays for write_array_float" $
+      withTempCsv "hydrangea_test_write_float.csv" "" $ \csvPath ->
+        expectRawEvalError (EWriteArrayFloat () (EFill () (shape1 2) (EInt () 1)) (EString () (fromString csvPath)))

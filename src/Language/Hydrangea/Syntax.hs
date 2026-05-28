@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -34,7 +35,7 @@ import GHC.Generics (Generic1)
 import Language.Hydrangea.Predicate (RefinePred, TaggedPred)
 import Text.Show.Deriving
 
--- | Variables in our syntax are just bytestrings
+-- | Variables in source syntax are lazy bytestring names.
 type Var = ByteString
 
 deriving instance Unifiable []
@@ -105,31 +106,31 @@ data TypeF f
   | TyFunF f f           -- ^ Function type.
   deriving (Functor, Foldable, Traversable, Generic1, Unifiable)
 
--- | Create a type variable node
+-- | Create a type variable node.
 tyVar :: Var -> Fix TypeF
 tyVar v = Fix $ TyVarF v
 
--- | Create a unit type node
+-- | Create a unit type node.
 tyUnit :: Fix TypeF
 tyUnit = Fix TyUnitF
 
--- | Create an int type node
+-- | Create an integer type node.
 tyInt :: Fix TypeF
 tyInt = Fix TyIntF
 
--- | Create a float type node
+-- | Create a floating-point type node.
 tyFloat :: Fix TypeF
 tyFloat = Fix TyFloatF
 
--- | Create a bool type node
+-- | Create a boolean type node.
 tyBool :: Fix TypeF
 tyBool = Fix TyBoolF
 
--- | Create a string type node
+-- | Create a string type node.
 tyString :: Fix TypeF
 tyString = Fix TyStringF
 
--- | Create a pair type node
+-- | Create a pair type node.
 tyPair :: Fix TypeF -> Fix TypeF -> Fix TypeF
 tyPair t1 t2 = Fix $ TyPairF t1 t2
 
@@ -141,7 +142,7 @@ normalizeRecordFields = sortOn fst
 tyRecord :: [(Var, Fix TypeF)] -> Fix TypeF
 tyRecord = Fix . TyRecordF . normalizeRecordFields
 
--- | Create an inductive tuple node
+-- | Create an inductive tuple node.
 tyCons :: Fix TypeF -> Fix TypeF -> Fix TypeF
 tyCons t1 t2 = Fix $ TyConsF t1 t2
 
@@ -153,7 +154,7 @@ tyArray shape elt = Fix $ TyArrayF shape elt
 tyRefine :: Var -> Fix TypeF -> Fix TypeF
 tyRefine v t = Fix $ TyRefineF v t
 
--- | Create a function type node
+-- | Create a function type node.
 tyFun :: Fix TypeF -> Fix TypeF -> Fix TypeF
 tyFun t1 t2 = Fix $ TyFunF t1 t2
 
@@ -280,15 +281,17 @@ data Exp a
   | -- | Pair construction: (e1, e2) — a product of two values of arbitrary types.
     -- Distinct from shape vec literals ([e1, e2]) and compiles to a C struct.
     EPair a (Exp a) (Exp a)
-  | -- | Record construction with named fields, canonicalized by field name.
+  | -- | Record construction with named fields in source order.
+    -- Later passes can normalize fields when they need canonical ordering.
     ERecord a [(Var, Exp a)]
   | -- | Named field projection from a record.
     ERecordProj a (Exp a) Var
-  | -- | Generate an immutable array: size (int) and a function (index -> value)
+  | -- | Generate an immutable array from a shape expression and an index function.
+    -- The function receives one index tuple per element in row-major order.
     EGenerate a (Exp a) (Exp a)
-  | -- | Map a function over an array: function, array
+  | -- | Map a function over every element of an array.
     EMap a (Exp a) (Exp a)
-  | -- | Zip two arrays with a binary function
+  | -- | Zip two arrays with a binary function.
     EZipWith a (Exp a) (Exp a) (Exp a)
   | -- | Reduce an array along the trailing/rightmost axis (rank-lowering): function, initial value, array
     EReduce a (Exp a) (Exp a) (Exp a)
@@ -452,7 +455,7 @@ data SliceDim a
 
 -- | Extract the outer annotation carried by an expression node.
 firstParam :: Exp a -> a
-firstParam e = case e of
+firstParam = \case
   EInt a _ -> a
   EFloat a _ -> a
   EVar a _ -> a
@@ -590,14 +593,22 @@ instance (Eq a) => Eq (Pat a) where
   PPair a1 p1a p1b == PPair a2 p2a p2b = a1 == a2 && p1a == p2a && p1b == p2b
   _                == _                = False
 
+patConstructorRank :: Pat a -> Int
+patConstructorRank = \case
+  PVar {} -> 0
+  PVec {} -> 1
+  PBound {} -> 2
+  PPair {} -> 3
+
+compareSamePattern :: Ord a => Pat a -> Pat a -> Ordering
+compareSamePattern (PVar a1 v1) (PVar a2 v2) = compare a1 a2 <> compare v1 v2
+compareSamePattern (PVec a1 ps1) (PVec a2 ps2) = compare a1 a2 <> compare ps1 ps2
+compareSamePattern (PBound a1 v1 _) (PBound a2 v2 _) = compare a1 a2 <> compare v1 v2
+compareSamePattern (PPair a1 p1a p1b) (PPair a2 p2a p2b) =
+  compare a1 a2 <> compare p1a p2a <> compare p1b p2b
+compareSamePattern _ _ = EQ
+
 instance (Ord a) => Ord (Pat a) where
-  compare (PVar a1 v1)     (PVar a2 v2)     = compare a1 a2 <> compare v1 v2
-  compare (PVec a1 ps1)    (PVec a2 ps2)    = compare a1 a2 <> compare ps1 ps2
-  compare (PBound a1 v1 _) (PBound a2 v2 _) = compare a1 a2 <> compare v1 v2
-  compare (PPair a1 p1a p1b) (PPair a2 p2a p2b) = compare a1 a2 <> compare p1a p2a <> compare p1b p2b
-  compare (PVar _ _)       _                = LT
-  compare _                (PVar _ _)       = GT
-  compare (PVec _ _)       _                = LT
-  compare _                (PVec _ _)       = GT
-  compare (PBound _ _ _)   _                = LT
-  compare _                (PBound _ _ _)   = GT
+  compare p1 p2 =
+    compare (patConstructorRank p1) (patConstructorRank p2)
+      <> compareSamePattern p1 p2

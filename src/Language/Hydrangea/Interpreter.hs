@@ -3,13 +3,13 @@
 -- |
 -- Module: Language.Hydrangea.Interpreter
 --
--- A reference interpreter for Hydrangea that evaluates expressions and declarations
--- to concrete values. This interpreter prioritizes clarity and correctness over
--- performance.
+-- A reference interpreter for Hydrangea that evaluates expressions and
+-- declarations to concrete values. This interpreter prioritizes clarity and
+-- correctness over performance.
 --
 -- The value representation includes:
 -- - Primitive values (Int, Bool, String, Unit)
--- - Tuples/vectors as inductive cons lists
+-- - Tuples and shape values as flat runtime lists
 -- - Immutable arrays with explicit shape and row-major flattened storage
 -- - Closures capturing the environment and pattern-matched parameters
 -- - Operators as first-class values (curried binary operators)
@@ -33,7 +33,7 @@ import Language.Hydrangea.Shape (generateIndicesRowMajor, computeOffsetRowMajor)
 import Language.Hydrangea.Util (stripStringQuotes)
 import Text.PrettyPrint.HughesPJClass
 import Prelude hiding ((<>))
-import System.Environment (getEnv)
+import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
 -- | A runtime value.
@@ -605,28 +605,27 @@ evalExp expr env = case expr of
           vIdxArr <- evalExp idxE env
           vValsArr <- evalExp valsE env
           case (buf, vIdxArr, vValsArr) of
-            (VArray dstShape dstVals, VArray idxShape idxVals, VArray _valsShape vals) -> do
-              let applyOne dstVals' (idxVal, val, gv) =
-                    case gv of
-                      VBool False -> pure dstVals'
-                      _ -> do
-                        idxShape' <- liftEither $ shapeFromValue idxVal
-                        dstOffset <- resolveOffset dstShape idxShape'
-                        if dstOffset < 0 || dstOffset >= length dstVals'
-                          then throwError $ IndexOutOfBounds "ScatterChain: index out of bounds"
+            (VArray dstShape dstVals, VArray idxShape idxVals, VArray valsShape vals) ->
+              if idxShape /= valsShape
+                then throwError $ InvalidArrayOperation "ScatterChain: index and values arrays must have same shape"
+                else do
+                  let applyOne dstVals' (idxVal, val, keepEntry) =
+                        if not keepEntry
+                          then pure dstVals'
                           else do
-                            let oldVal = dstVals' !! fromIntegral dstOffset
-                            combined <- evalApp vComb val env >>= \fnVal -> evalApp fnVal oldVal env
-                            pure $ take (fromIntegral dstOffset) dstVals' ++ [combined] ++ drop (fromIntegral dstOffset + 1) dstVals'
-              guards <- case guardE of
-                Nothing -> pure (replicate (length idxVals) (VBool True))
-                Just gExpr -> do
-                  vg <- evalExp gExpr env
-                  case vg of
-                    VArray _ gs -> pure gs
-                    _ -> throwError $ TypeError "ScatterChain: guard must be array"
-              result <- foldM applyOne dstVals (zip3 idxVals vals guards)
-              pure $ VArray dstShape result
+                            idxShape' <- liftEither $ shapeFromValue idxVal
+                            dstOffset <- resolveOffset dstShape idxShape'
+                            if dstOffset < 0 || dstOffset >= length dstVals'
+                              then throwError $ IndexOutOfBounds "ScatterChain: index out of bounds"
+                              else do
+                                let oldVal = dstVals' !! fromIntegral dstOffset
+                                combined <- evalApp vComb val env >>= \fnVal -> evalApp fnVal oldVal env
+                                pure $ take (fromIntegral dstOffset) dstVals' ++ [combined] ++ drop (fromIntegral dstOffset + 1) dstVals'
+                  guards <- case guardE of
+                    Nothing -> pure (replicate (length idxVals) True)
+                    Just gExpr -> evalExp gExpr env >>= guardArrayFromValue "ScatterChain" idxShape
+                  result <- foldM applyOne dstVals (zip3 idxVals vals guards)
+                  pure $ VArray dstShape result
             _ -> throwError $ TypeError "ScatterChain: expected arrays for index and values"
     foldM applyPhase initBuf phases
   EGather _ idxArrExpr arrExpr -> do
@@ -716,77 +715,40 @@ evalExp expr env = case expr of
     vShape <- evalExp shapeExpr env
     shape <- liftEither $ shapeFromValue vShape
     vFile <- evalExp fileExpr env
-    case vFile of
-      VString s -> do
-        let filename = BS.unpack (stripStringQuotes s)
-        contents <- liftIO $ readFile filename
-        let values = parseCSVInts contents
-            expected = product shape
-        when (fromIntegral (length values) /= expected) $
-          throwError $ RuntimeError $ "read_array: expected " ++ show expected
-            ++ " values but got " ++ show (length values)
-        pure $ VArray shape (map VInt values)
-      _ -> throwError $ TypeError "read_array: filename must be a string"
+    filename <- expectStringValue "read_array" "filename" vFile
+    readCSVArray "read_array" parseCSVInts VInt shape filename
 
   EReadArrayFloat _ shapeExpr fileExpr -> do
     vShape <- evalExp shapeExpr env
     shape <- liftEither $ shapeFromValue vShape
     vFile <- evalExp fileExpr env
-    case vFile of
-      VString s -> do
-        let filename = BS.unpack (stripStringQuotes s)
-        contents <- liftIO $ readFile filename
-        let values = parseCSVFloats contents
-            expected = product shape
-        when (fromIntegral (length values) /= expected) $
-          throwError $ RuntimeError $ "read_array_float: expected " ++ show expected
-            ++ " values but got " ++ show (length values)
-        pure $ VArray shape (map VFloat values)
-      _ -> throwError $ TypeError "read_array_float: filename must be a string"
+    filename <- expectStringValue "read_array_float" "filename" vFile
+    readCSVArray "read_array_float" parseCSVFloats VFloat shape filename
 
   EWriteArray _ arrExpr fileExpr -> do
     vArr <- evalExp arrExpr env
     vFile <- evalExp fileExpr env
-    case (vArr, vFile) of
-      (VArray _ vals, VString s) -> do
-        let filename = BS.unpack (stripStringQuotes s)
-            values = map (\case VInt i -> show i; _ -> "0") vals
-            content = intercalate "," values ++ "\n"
-        liftIO $ writeFile filename content
-        pure VUnit
-      _ -> throwError $ TypeError "write_array: expected array and string"
+    filename <- expectStringValue "write_array" "filename" vFile
+    writeCSVArray "write_array" renderIntCSVValue vArr filename
 
   EWriteArrayFloat _ arrExpr fileExpr -> do
     vArr <- evalExp arrExpr env
     vFile <- evalExp fileExpr env
-    case (vArr, vFile) of
-      (VArray _ vals, VString s) -> do
-        let filename = BS.unpack (stripStringQuotes s)
-            values = map (\case VFloat f -> show f; _ -> "0") vals
-            content = intercalate "," values ++ "\n"
-        liftIO $ writeFile filename content
-        pure VUnit
-      _ -> throwError $ TypeError "write_array_float: expected array and string"
+    filename <- expectStringValue "write_array_float" "filename" vFile
+    writeCSVArray "write_array_float" renderFloatCSVValue vArr filename
 
   EGetEnvInt _ varExpr -> do
     vVar <- evalExp varExpr env
-    case vVar of
-      VString s -> do
-        let varName = BS.unpack (stripStringQuotes s)
-        val <- liftIO $ getEnv varName
-        case readMaybe val of
-          Just i -> pure $ VInt i
-          Nothing -> throwError $ RuntimeError $ "get_env_int: cannot parse '" ++ val ++ "' as int"
-      _ -> throwError $ TypeError "get_env_int: argument must be a string"
+    varName <- expectStringValue "get_env_int" "argument" vVar
+    val <- lookupEnvironmentVariable varName
+    case readMaybe val of
+      Just i -> pure $ VInt i
+      Nothing -> throwError $ RuntimeError $ "get_env_int: cannot parse '" ++ val ++ "' as int"
 
   EGetEnvString _ varExpr -> do
     vVar <- evalExp varExpr env
-    case vVar of
-      VString s -> do
-        let varName = BS.unpack (stripStringQuotes s)
-        val <- liftIO $ getEnv varName
-        pure $ VString (BS.pack val)
-      _ -> throwError $ TypeError "get_env_string: argument must be a string"
+    varName <- expectStringValue "get_env_string" "argument" vVar
+    VString . BS.pack <$> lookupEnvironmentVariable varName
 
   EStencil _ bnd fnExp arrExp -> do
     vArr <- evalExp arrExp env
@@ -815,13 +777,95 @@ splitOn delims (x:xs)
 trimWS :: String -> String
 trimWS = filter (\c -> c /= ' ' && c /= '\n' && c /= '\r' && c /= '\t')
 
+-- | Split comma/newline-separated CSV text into trimmed fields.
+csvFields :: String -> [String]
+csvFields = filter (not . null) . map trimWS . splitOn ",\n\r"
+
+-- | Parse delimited scalar fields with an operation-specific error label.
+parseDelimitedValues :: String -> (String -> Maybe a) -> String -> Either EvalError [a]
+parseDelimitedValues opName parseField =
+  traverse parseOne . csvFields
+  where
+    parseOne field =
+      case parseField field of
+        Just value -> Right value
+        Nothing ->
+          Left $ RuntimeError $
+            opName ++ ": could not parse value '" ++ field ++ "'"
+
 -- | Parse comma/newline-separated integers from a string.
-parseCSVInts :: String -> [Integer]
-parseCSVInts = map read . filter (not . null) . map trimWS . splitOn ",\n\r"
+parseCSVInts :: String -> Either EvalError [Integer]
+parseCSVInts = parseDelimitedValues "read_array" readMaybe
 
 -- | Parse comma/newline-separated doubles from a string.
-parseCSVFloats :: String -> [Double]
-parseCSVFloats = map read . filter (not . null) . map trimWS . splitOn ",\n\r"
+parseCSVFloats :: String -> Either EvalError [Double]
+parseCSVFloats = parseDelimitedValues "read_array_float" readMaybe
+
+expectStringValue :: String -> String -> Value -> EvalM String
+expectStringValue opName what val =
+  case val of
+    VString s -> pure $ BS.unpack (stripStringQuotes s)
+    _ -> throwError $ TypeError (opName ++ ": " ++ what ++ " must be a string")
+
+readCSVArray
+  :: String
+  -> (String -> Either EvalError [a])
+  -> (a -> Value)
+  -> [Integer]
+  -> FilePath
+  -> EvalM Value
+readCSVArray opName parseValues wrapValue shape filename = do
+  contents <- liftIO $ readFile filename
+  values <- liftEither $ parseValues contents
+  let expected = product shape
+  when (fromIntegral (length values) /= expected) $
+    throwError $ RuntimeError $
+      opName ++ ": expected " ++ show expected
+        ++ " values but got " ++ show (length values)
+  pure $ VArray shape (map wrapValue values)
+
+writeCSVArray :: String -> (Value -> Either EvalError String) -> Value -> FilePath -> EvalM Value
+writeCSVArray opName renderValue vArr filename =
+  case vArr of
+    VArray _ vals -> do
+      renderedVals <- liftEither $ traverse renderValue vals
+      let content = intercalate "," renderedVals ++ "\n"
+      liftIO $ writeFile filename content
+      pure VUnit
+    _ -> throwError $ TypeError (opName ++ ": expected array and string")
+
+renderIntCSVValue :: Value -> Either EvalError String
+renderIntCSVValue (VInt i) = Right (show i)
+renderIntCSVValue _ =
+  Left $ TypeError "write_array: array must contain integers"
+
+renderFloatCSVValue :: Value -> Either EvalError String
+renderFloatCSVValue (VFloat f) = Right (show f)
+renderFloatCSVValue _ =
+  Left $ TypeError "write_array_float: array must contain floats"
+
+guardArrayFromValue :: String -> [Integer] -> Value -> EvalM [Bool]
+guardArrayFromValue opName idxShape = \case
+  VArray guardShape guardVals
+    | idxShape /= guardShape ->
+        throwError $ InvalidArrayOperation $
+          opName ++ ": index, values, and guard arrays must have same shape"
+    | otherwise ->
+        liftEither $ traverse expectBool guardVals
+  _ -> throwError $ TypeError (opName ++ ": guard must be array")
+  where
+    expectBool (VBool b) = Right b
+    expectBool _ =
+      Left $ TypeError (opName ++ ": guard array must contain booleans")
+
+lookupEnvironmentVariable :: String -> EvalM String
+lookupEnvironmentVariable varName = do
+  mValue <- liftIO $ lookupEnv varName
+  case mValue of
+    Just value -> pure value
+    Nothing ->
+      throwError $ RuntimeError $
+        "environment variable not found: " ++ varName
 
 -- | Evaluate a constant sub-expression (integer literal or variable) without IO.
 -- Used for shape dimension expressions in @replicate@ where IO is unavailable.
