@@ -20,12 +20,58 @@ import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process
-  ( callProcess
-  , createProcess
+  ( createProcess
   , proc
   , readProcessWithExitCode
   , waitForProcess
   )
+
+keepGeneratedSources :: Bool -> FilePath -> FilePath -> IO ()
+keepGeneratedSources keepMetal metalFile harnessFile =
+  when keepMetal $ do
+    copyFile metalFile "hydrangea_out.metal"
+    copyFile harnessFile "hydrangea_out.m"
+    putStrLn "Kept Metal sources: hydrangea_out.metal, hydrangea_out.m"
+
+writeOpenMPStub :: FilePath -> IO ()
+writeOpenMPStub ompStubFile =
+  writeFile ompStubFile $ unlines
+    [ "/* omp.h stub for Metal harness (GPU handles parallelism) */"
+    , "#ifndef OMP_H_STUB"
+    , "#define OMP_H_STUB"
+    , "static inline int omp_get_max_threads(void) { return 1; }"
+    , "static inline int omp_get_thread_num(void)  { return 0; }"
+    , "static inline int omp_get_num_threads(void) { return 1; }"
+    , "#endif"
+    ]
+
+ensureXcrunAvailable :: IO (Maybe ExitCode)
+ensureXcrunAvailable = do
+  (xcrunExit, _, _) <- readProcessWithExitCode "xcrun" ["--version"] ""
+  case xcrunExit of
+    ExitFailure _ -> do
+      hPutStrLn stderr "hydrangea: xcrun not found. Install Xcode command-line tools:"
+      hPutStrLn stderr "  xcode-select --install"
+      pure (Just (ExitFailure 1))
+    ExitSuccess ->
+      pure Nothing
+
+runCheckedTool :: String -> [String] -> String -> IO (Either ExitCode ())
+runCheckedTool cmd args failureLabel = do
+  (exitCode, _, stderrText) <- readProcessWithExitCode cmd args ""
+  case exitCode of
+    ExitSuccess -> pure (Right ())
+    ExitFailure _ -> do
+      putStrLn failureLabel
+      putStrLn stderrText
+      pure (Left exitCode)
+
+runOrReturn :: String -> [String] -> String -> IO ExitCode -> IO ExitCode
+runOrReturn cmd args failureLabel next = do
+  result <- runCheckedTool cmd args failureLabel
+  case result of
+    Left exitCode -> pure exitCode
+    Right () -> next
 
 -- | Compile and optionally run a Metal kernel + ObjC harness.
 --
@@ -43,74 +89,43 @@ compileAndRunMetal artifacts keepMetal compileOnly =
         exeFile     = dir </> "harness_exe"
 
     let ompStubFile = dir </> "omp.h"
+        harnessFlags =
+          [ "-O2"
+          , "-fobjc-arc"
+          , "-framework", "Metal"
+          , "-framework", "Foundation"
+          , "-Iruntime"
+          , "-Ithird_party/simde"
+          , "-I" ++ dir
+          , "-o", exeFile
+          , harnessFile
+          , "runtime/hyd_write_csv.c"
+          ]
 
     writeFile metalFile  (mslKernelSource artifacts)
     writeFile harnessFile (mslHarnessSource artifacts)
-    -- Stub out OpenMP: the Metal harness doesn't use CPU parallelism
-    writeFile ompStubFile $ unlines
-      [ "/* omp.h stub for Metal harness (GPU handles parallelism) */"
-      , "#ifndef OMP_H_STUB"
-      , "#define OMP_H_STUB"
-      , "static inline int omp_get_max_threads(void) { return 1; }"
-      , "static inline int omp_get_thread_num(void)  { return 0; }"
-      , "static inline int omp_get_num_threads(void) { return 1; }"
-      , "#endif"
-      ]
+    writeOpenMPStub ompStubFile
 
-    -- Copy generated sources to working directory early (before compilation)
-    when keepMetal $ do
-      copyFile metalFile "hydrangea_out.metal"
-      copyFile harnessFile "hydrangea_out.m"
-      putStrLn "Kept Metal sources: hydrangea_out.metal, hydrangea_out.m"
+    keepGeneratedSources keepMetal metalFile harnessFile
 
-    -- Detect xcrun availability
-    (xcrunExit, _, _) <- readProcessWithExitCode "xcrun" ["--version"] ""
-    case xcrunExit of
-      ExitFailure _ -> do
-        hPutStrLn stderr "hydrangea: xcrun not found. Install Xcode command-line tools:"
-        hPutStrLn stderr "  xcode-select --install"
-        return (ExitFailure 1)
-      ExitSuccess -> do
-        -- Compile .metal -> .air
-        (airExit, _, airErr) <- readProcessWithExitCode "xcrun"
-          ["-sdk", "macosx", "metal", "-c", "-o", airFile, metalFile] ""
-        case airExit of
-          ExitFailure _ -> do
-            putStrLn "Metal shader compilation failed:"
-            putStrLn airErr
-            return airExit
-          ExitSuccess -> do
-            -- Link .air -> .metallib
-            (libExit, _, libErr) <- readProcessWithExitCode "xcrun"
-              ["-sdk", "macosx", "metallib", "-o", metallibFile, airFile] ""
-            case libExit of
-              ExitFailure _ -> do
-                putStrLn "metallib linking failed:"
-                putStrLn libErr
-                return libExit
-              ExitSuccess -> do
-                -- Compile ObjC harness
-                let harnessFlags =
-                      [ "-O2"
-                      , "-fobjc-arc"
-                      , "-framework", "Metal"
-                      , "-framework", "Foundation"
-                      , "-Iruntime"
-                      , "-Ithird_party/simde"
-                      , "-I" ++ dir   -- provides stub omp.h
-                      , "-o", exeFile
-                      , harnessFile
-                      , "runtime/hyd_write_csv.c"
-                      ]
-                (harnessExit, _, harnessErr) <- readProcessWithExitCode "clang" harnessFlags ""
-                case harnessExit of
-                  ExitFailure _ -> do
-                    putStrLn "Harness compilation failed:"
-                    putStrLn harnessErr
-                    return harnessExit
-                  ExitSuccess -> do
-                    if compileOnly
-                      then return ExitSuccess
+    mxcrunFailure <- ensureXcrunAvailable
+    case mxcrunFailure of
+      Just exitCode -> pure exitCode
+      Nothing ->
+        runOrReturn
+          "xcrun"
+          ["-sdk", "macosx", "metal", "-c", "-o", airFile, metalFile]
+          "Metal shader compilation failed:"
+          $ runOrReturn
+              "xcrun"
+              ["-sdk", "macosx", "metallib", "-o", metallibFile, airFile]
+              "metallib linking failed:"
+              $ runOrReturn
+                  "clang"
+                  harnessFlags
+                  "Harness compilation failed:"
+                  $ if compileOnly
+                      then pure ExitSuccess
                       else do
                         (_, _, _, ph) <- createProcess (proc exeFile [metallibFile])
                         waitForProcess ph

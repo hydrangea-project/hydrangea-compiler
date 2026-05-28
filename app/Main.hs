@@ -4,9 +4,9 @@
 -- Command-line entry point for the Hydrangea compiler.
 --
 -- The executable reads declarations from a file or stdin, selects a frontend
--- mode from the CLI flags, and either prints an intermediate form, interprets
--- the program, emits C, or compiles and runs the generated C through the
--- external backend.
+-- mode from the CLI flags, and then either prints an intermediate form,
+-- interprets the program, emits C or Metal source, or invokes the matching
+-- backend to compile and run generated artifacts.
 module Main where
 
 import CBackend (compileAndRunC)
@@ -57,12 +57,43 @@ import System.Exit (exitFailure, exitWith, ExitCode(..))
 import System.FilePath (replaceExtension)
 import System.IO (hPutStrLn, stderr)
 import Text.PrettyPrint.HughesPJClass
+import Text.Read (readMaybe)
 
 flagValue :: String -> [String] -> Maybe String
 flagValue prefix flags = fmap (drop (length prefix)) $ find (prefix `isPrefixOf`) flags
 
 dieWithMessage :: String -> IO a
 dieWithMessage msg = putStrLn msg >> exitFailure
+
+resolveOrDie :: Either String a -> IO a
+resolveOrDie = either dieWithMessage pure
+
+parseSimdWidth :: Maybe String -> Either String Int
+parseSimdWidth Nothing = Right defaultVectorWidth
+parseSimdWidth (Just "2") = Right 2
+parseSimdWidth (Just "4") = Right 4
+parseSimdWidth (Just bad) =
+  Left ("--simd-width must be 2 or 4, got: " ++ bad)
+
+parseIntFlag :: String -> Int -> Maybe String -> Either String Int
+parseIntFlag _ defaultValue Nothing = Right defaultValue
+parseIntFlag flagName _ (Just raw) =
+  case readMaybe raw of
+    Just value -> Right value
+    Nothing -> Left (flagName ++ " must be an integer, got: " ++ raw)
+
+benchmarkConfigFromFlags
+  :: Maybe String -> Maybe String -> Maybe String -> Either String (Maybe BenchmarkConfig)
+benchmarkConfigFromFlags Nothing _ _ = Right Nothing
+benchmarkConfigFromFlags (Just name) benchWarmupFlag benchItersFlag = do
+  warmupIters <- parseIntFlag "--bench-warmup" 3 benchWarmupFlag
+  measureIters <- parseIntFlag "--bench-iters" 10 benchItersFlag
+  pure $
+    Just BenchmarkConfig
+      { bcKernelName = BS.pack name
+      , bcWarmupIters = warmupIters
+      , bcMeasureIters = measureIters
+      }
 
 usage :: String
 usage = unwords
@@ -139,18 +170,15 @@ main = do
       benchWarmupFlag = flagValue "--bench-warmup=" flags
       benchItersFlag = flagValue "--bench-iters=" flags
       simdWidthFlag = flagValue "--simd-width=" flags
-      simdWidth = case simdWidthFlag of
-        Nothing  -> defaultVectorWidth
-        Just "2" -> 2
-        Just "4" -> 4
-        Just bad -> error $ "--simd-width must be 2 or 4, got: " ++ bad
       useMetal = "--metal" `elem` flags
       metalKernelFlag = flagValue "--metal-kernel=" flags
       exportMetalKernelFlag = flagValue "--export-metal-kernel=" flags
       outputMetalFile = flagValue "--output-metal=" flags
       keepMetal = "--keep-metal" `elem` flags
       noMultiKernel = "--no-multi-kernel" `elem` flags
-      inferOptions = defaultInferOptions {inferSolveRefinements = solveRefinements}
+  simdWidth <- resolveOrDie (parseSimdWidth simdWidthFlag)
+  benchmarkConfig <- resolveOrDie (benchmarkConfigFromFlags benchmarkFlag benchWarmupFlag benchItersFlag)
+  let inferOptions = defaultInferOptions {inferSolveRefinements = solveRefinements}
       pipelineOptions =
         defaultPipelineOptions
           { poEnableTiling = enableTiling
@@ -163,13 +191,6 @@ main = do
   (input, mpath) <- readInput paths
 
   let ccFlag = flagValue "--cc=" flags
-      benchmarkConfig = case benchmarkFlag of
-        Nothing -> Nothing
-        Just name -> Just BenchmarkConfig
-          { bcKernelName  = BS.pack name
-          , bcWarmupIters  = maybe 3 read benchWarmupFlag
-          , bcMeasureIters = maybe 10 read benchItersFlag
-          }
       exportCodegenOptions =
         (case exportKernelFlag of
           Nothing -> defaultCodegenOptions { codegenBenchmark = benchmarkConfig }
@@ -180,6 +201,9 @@ main = do
               , codegenBenchmark = benchmarkConfig
               })
         { codegenSimdWidth = simdWidth }
+      writeGeneratedC outPath csrc = do
+        writeFile outPath csrc
+        putStrLn $ "Wrote C to " ++ outPath
 
   when (isJust outputHFile && not (isJust exportKernelFlag) && not (isJust exportMetalKernelFlag)) $
     dieWithMessage "--output-h requires --export-kernel or --export-metal-kernel."
@@ -200,6 +224,45 @@ main = do
         prog <- inferAndLowerToCFGWithFrontendOptions frontendOptions inferOptions decs
         let optimized = optimizeCFGWithPipelineOptions pipelineOptions prog
         pure (codegenProgramWithOptionsPrune exportCodegenOptions pruneDead optimized)
+      compileSelectedC decs =
+        let codegenOpts = defaultCodegenOptions { codegenSimdWidth = simdWidth }
+        in compileToCOptIOWithAllOptions
+             frontendOptions
+             inferOptions
+             pipelineOptions
+             codegenOpts
+             pruneDead
+             decs
+      generatedArtifactsOrDie decs =
+        generateExportArtifacts decs >>= resolveOrDie
+      emitGeneratedC decs =
+        case exportKernelFlag of
+          Just _ -> do
+            artifacts <- generatedArtifactsOrDie decs
+            putStrLn (codegenSource artifacts)
+            writeExportHeaderIfRequested artifacts
+          Nothing ->
+            case benchmarkConfig of
+              Just _ -> do
+                artifacts <- generatedArtifactsOrDie decs
+                putStrLn (codegenSource artifacts)
+              Nothing -> do
+                csrc <- compileSelectedC decs
+                putStrLn csrc
+      writeGeneratedCOutput decs outPath =
+        case exportKernelFlag of
+          Just _ -> do
+            artifacts <- generatedArtifactsOrDie decs
+            writeGeneratedC outPath (codegenSource artifacts)
+            writeExportHeaderIfRequested artifacts
+          Nothing ->
+            case benchmarkConfig of
+              Just _ -> do
+                artifacts <- generatedArtifactsOrDie decs
+                writeGeneratedC outPath (codegenSource artifacts)
+              Nothing -> do
+                csrc <- compileSelectedC decs
+                writeGeneratedC outPath csrc
 
       writeExportHeaderIfRequested artifacts =
         forM_ outputHFile $ \headerPath ->
@@ -208,6 +271,29 @@ main = do
             Just headerSrc -> do
               writeFile headerPath headerSrc
               putStrLn $ "Wrote header to " ++ headerPath
+
+      writeMetalExportArtifacts metalArtifacts = do
+        let metalPath = case outputMetalFile of
+              Just p -> p
+              Nothing ->
+                case outputCFile of
+                  Just p -> replaceExtension p ".metal"
+                  Nothing -> "hydrangea_out.metal"
+            harnessPath = case outputCFile of
+              Just p -> p
+              Nothing -> "hydrangea_out.m"
+            headerPath = case outputHFile of
+              Just p -> p
+              Nothing -> replaceExtension harnessPath ".h"
+        writeFile metalPath (mslKernelSource metalArtifacts)
+        putStrLn $ "Wrote Metal kernel to " ++ metalPath
+        writeFile harnessPath (mslHarnessSource metalArtifacts)
+        putStrLn $ "Wrote Metal harness to " ++ harnessPath
+        case mslHeaderSource metalArtifacts of
+          Just headerSrc -> do
+            writeFile headerPath headerSrc
+            putStrLn $ "Wrote header to " ++ headerPath
+          Nothing -> pure ()
 
   case readDecs input of
     Left perr -> dieWithMessage $ "Parse error: " ++ perr
@@ -229,15 +315,6 @@ main = do
               case checkKernelFused decs (BS.pack name) of
                 Left err -> dieWithMessage err
                 Right () -> pure ()
-          compileSelectedC =
-            let codegenOpts = defaultCodegenOptions { codegenSimdWidth = simdWidth }
-            in compileToCOptIOWithAllOptions
-                 frontendOptions
-                 inferOptions
-                 pipelineOptions
-                 codegenOpts
-                 pruneDead
-                 decs
           renderResult (v, p, mval) =
             case mval of
               Nothing -> putStrLn $ unpack v ++ " : evaluation error"
@@ -268,47 +345,11 @@ main = do
       when emitC $ do
         _ <- runCheckedInference
         ensureSelectedKernelIsFused
-        case exportKernelFlag of
-          Just _ -> do
-            artifactsRes <- generateExportArtifacts decs
-            case artifactsRes of
-              Left err -> dieWithMessage err
-              Right artifacts -> do
-                putStrLn (codegenSource artifacts)
-                writeExportHeaderIfRequested artifacts
-          Nothing -> case benchmarkConfig of
-            Just _ -> do
-              artifactsRes <- generateExportArtifacts decs
-              case artifactsRes of
-                Left err -> dieWithMessage err
-                Right artifacts -> putStrLn (codegenSource artifacts)
-            Nothing -> do
-              csrc <- compileSelectedC
-              putStrLn csrc
+        emitGeneratedC decs
       forM_ outputCFile $ \outPath -> when (not (isJust exportMetalKernelFlag)) $ do
         _ <- runCheckedInference
         ensureSelectedKernelIsFused
-        case exportKernelFlag of
-          Just _ -> do
-            artifactsRes <- generateExportArtifacts decs
-            case artifactsRes of
-              Left err -> dieWithMessage err
-              Right artifacts -> do
-                writeFile outPath (codegenSource artifacts)
-                putStrLn $ "Wrote C to " ++ outPath
-                writeExportHeaderIfRequested artifacts
-          Nothing -> case benchmarkConfig of
-            Just _ -> do
-              artifactsRes <- generateExportArtifacts decs
-              case artifactsRes of
-                Left err -> dieWithMessage err
-                Right artifacts -> do
-                  writeFile outPath (codegenSource artifacts)
-                  putStrLn $ "Wrote C to " ++ outPath
-            Nothing -> do
-              csrc <- compileSelectedC
-              writeFile outPath csrc
-              putStrLn $ "Wrote C to " ++ outPath
+        writeGeneratedCOutput decs outPath
       let metalExportMode = isJust exportMetalKernelFlag
           defaultMode =
             not printFused
@@ -342,27 +383,7 @@ main = do
               Left err -> dieWithMessage ("Metal codegen error: " ++ err)
               Right metalArtifacts -> case exportMetalKernelFlag of
                 Just _ -> do
-                  -- Export mode: write .metal, .m, .h files
-                  let metalPath = case outputMetalFile of
-                        Just p  -> p
-                        Nothing -> case outputCFile of
-                          Just p  -> replaceExtension p ".metal"
-                          Nothing -> "hydrangea_out.metal"
-                      harnessPath = case outputCFile of
-                        Just p  -> p
-                        Nothing -> "hydrangea_out.m"
-                      headerPath = case outputHFile of
-                        Just p  -> p
-                        Nothing -> replaceExtension harnessPath ".h"
-                  writeFile metalPath (mslKernelSource metalArtifacts)
-                  putStrLn $ "Wrote Metal kernel to " ++ metalPath
-                  writeFile harnessPath (mslHarnessSource metalArtifacts)
-                  putStrLn $ "Wrote Metal harness to " ++ harnessPath
-                  case mslHeaderSource metalArtifacts of
-                    Just h -> do
-                      writeFile headerPath h
-                      putStrLn $ "Wrote header to " ++ headerPath
-                    Nothing -> pure ()
+                  writeMetalExportArtifacts metalArtifacts
                 Nothing -> do
                   ec <- compileAndRunMetal metalArtifacts keepMetal compileOnly
                   case ec of
@@ -372,12 +393,10 @@ main = do
             _ <- runCheckedInference
             ensureSelectedKernelIsFused
             csrc <- case benchmarkConfig of
-              Nothing -> compileSelectedC
+              Nothing -> compileSelectedC decs
               Just _ -> do
-                artifactsRes <- generateExportArtifacts decs
-                case artifactsRes of
-                  Left err -> dieWithMessage err
-                  Right artifacts -> pure (codegenSource artifacts)
+                artifacts <- generatedArtifactsOrDie decs
+                pure (codegenSource artifacts)
             ec <- compileAndRunC ccFlag csrc keepC compileOnly parallel
             case ec of
               ExitSuccess -> pure ()

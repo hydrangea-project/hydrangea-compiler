@@ -16,6 +16,8 @@ import System.Directory (copyFile)
 import System.Exit (ExitCode(..))
 import Control.Monad (when)
 
+-- | Choose the compiler in CLI order: explicit @--cc@ override, then @$CC@,
+-- then the platform default @cc@.
 selectCompiler :: Maybe String -> Maybe String -> String
 selectCompiler mcc envCC =
   case mcc of
@@ -24,6 +26,47 @@ selectCompiler mcc envCC =
       case envCC of
         Just s | not (null s) -> s
         _ -> "cc"
+
+probeOpenMPSupport :: FilePath -> String -> IO (Maybe String)
+probeOpenMPSupport dir ccCmd = do
+  let probeSrc = unlines
+        [ "#include <omp.h>"
+        , "int main(void) {"
+        , "  int x = 0;"
+        , "#pragma omp parallel reduction(+:x)"
+        , "  { x += 1; }"
+        , "  return x;"
+        , "}"
+        ]
+      probeFile = dir </> "probe_openmp.c"
+      probeExe = dir </> "probe_openmp"
+      probeFlags = ["-fopenmp", "-std=c99", "-o", probeExe, probeFile]
+  writeFile probeFile probeSrc
+  (probeExit, _, probeErr) <- readProcessWithExitCode ccCmd probeFlags ""
+  pure $
+    case probeExit of
+      ExitSuccess -> Nothing
+      ExitFailure _ -> Just probeErr
+
+warnOpenMPProbeFailure :: String -> String -> IO ()
+warnOpenMPProbeFailure ccCmd probeErr = do
+  putStrLn $
+    "Warning: selected C compiler '" ++ ccCmd
+      ++ "' does not accept -fopenmp (or failed to link OpenMP)."
+  putStrLn
+    "If you're on macOS, consider installing and using Homebrew's gcc (e.g. gcc-15) and pass it via --cc=gcc-15 or CC=gcc-15."
+  putStrLn "You can also run with --no-parallel to disable generating OpenMP flags."
+  putStrLn "Compiler output:"
+  putStrLn probeErr
+
+keepBuiltArtifacts :: FilePath -> FilePath -> IO ()
+keepBuiltArtifacts cpath exe = do
+  let destC = "hydrangea_out.c"
+      destExe = "hydrangea_out"
+  copyFile cpath destC
+  copyFile exe destExe
+  -- Ensure the copied executable remains runnable.
+  callProcess "chmod" ["+x", destExe]
 
 -- | Compile generated C, optionally preserve the artifacts, and optionally run
 -- the produced executable.
@@ -44,43 +87,18 @@ compileAndRunC mcc src keepC compileOnly parallel =
     let ccCmd = selectCompiler mcc envCC
         ompFlags = if parallel then ["-fopenmp"] else []
         flags = ["-O3", "-march=native", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
-    -- If OpenMP is requested, probe whether the selected compiler accepts -fopenmp
     when parallel $ do
-      let probeSrc = unlines
-            [ "#include <omp.h>"
-            , "int main(void) {"
-            , "  int x = 0;"
-            , "#pragma omp parallel reduction(+:x)"
-            , "  { x += 1; }"
-            , "  return x;"
-            , "}"
-            ]
-          probeFile = dir </> "probe_openmp.c"
-          probeExe = dir </> "probe_openmp"
-          probeFlags = ["-fopenmp", "-std=c99", "-o", probeExe, probeFile]
-      writeFile probeFile probeSrc
-      (pExit, _pout, perr) <- readProcessWithExitCode ccCmd probeFlags ""
-      case pExit of
-        ExitSuccess -> pure ()
-        ExitFailure _ -> do
-          putStrLn $ "Warning: selected C compiler '" ++ ccCmd ++ "' does not accept -fopenmp (or failed to link OpenMP)."
-          putStrLn "If you're on macOS, consider installing and using Homebrew's gcc (e.g. gcc-15) and pass it via --cc=gcc-15 or CC=gcc-15."
-          putStrLn "You can also run with --no-parallel to disable generating OpenMP flags."
-          putStrLn "Compiler output:"
-          putStrLn perr
+      probeResult <- probeOpenMPSupport dir ccCmd
+      case probeResult of
+        Nothing -> pure ()
+        Just probeErr -> warnOpenMPProbeFailure ccCmd probeErr
     (cExit, _cout, cerr) <- readProcessWithExitCode ccCmd flags ""
     case cExit of
       ExitFailure {} -> do
         putStrLn "C compilation failed:" >> putStrLn cerr
         pure cExit
       ExitSuccess -> do
-        when keepC $ do
-          let destC = "hydrangea_out.c"
-              destExe = "hydrangea_out"
-          copyFile cpath destC
-          copyFile exe destExe
-          -- Ensure the copied executable remains runnable.
-          callProcess "chmod" ["+x", destExe]
+        when keepC (keepBuiltArtifacts cpath exe)
         if compileOnly
           then pure ExitSuccess
           else do
