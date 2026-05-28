@@ -5,7 +5,7 @@
 --
 -- Scalar CFG cleanup and optimization passes.
 --
--- The main fixpoint pipeline currently combines:
+-- The main fixpoint pipeline combines:
 --
 -- 1. /Copy propagation/ ('copyProp') — forward substitution of direct
 --    @x = a@ assignments.
@@ -1122,7 +1122,7 @@ inlineStmts procs = concatMap inlineOne
       SIf cond thn els -> [SIf cond (inlineStmts procs thn) (inlineStmts procs els)]
       _                -> [stmt]
 
--- | Perform one pass of inlining, substituting calls to all currently
+-- | Perform one pass of inlining, substituting calls to all
 -- inlineable procedures.  Dead procedures are not removed; that is left
 -- to a separate pass if required.
 inlineProgramOnce :: [Proc] -> [Proc]

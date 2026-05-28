@@ -79,6 +79,7 @@ postHoistIterateFixpoint = go 20
 normalizeIterateBodies :: [Stmt] -> [Stmt]
 normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs . fixpointOpt
 
+-- | Apply the same statement-list rewrite to every procedure body in a program.
 mapProcBodies :: ([Stmt] -> [Stmt]) -> Program -> Program
 mapProcBodies rewriteBody (Program procs) =
   Program [proc { procBody = rewriteBody (procBody proc) } | proc <- procs]

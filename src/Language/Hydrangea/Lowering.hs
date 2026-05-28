@@ -13,6 +13,8 @@
 --   formals when inlining to prevent name collisions.
 -- * Lower array operations (map, generate, zipWith, reduce, scatter, …)
 --   into explicit 'SLoop' and 'RHS' forms.
+-- * Populate per-procedure type and access facts that downstream
+--   code generation, vectorization, and parallelization use.
 module Language.Hydrangea.Lowering
   ( lowerDecs
   , lowerDecsWithTypeEnv
@@ -92,45 +94,41 @@ initStateWithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> LowerState
 initStateWithTypeEnvAndRanks topEnv rankEnv =
   initState { lsTopTypeEnv = topEnv, lsArrayRankEnv = rankEnv }
 
+preRegisterTopLevelFns :: [Dec Range] -> LowerM ()
+preRegisterTopLevelFns = mapM_ preRegister
+  where
+    preRegister (Dec _ name pats _ _ body)
+      | not (null pats) = registerFn name pats body
+      | otherwise       = pure ()
+
+lowerProgramWithState :: LowerState -> [Dec Range] -> Program
+lowerProgramWithState initialState decs =
+  evalState go initialState
+  where
+    go = do
+      preRegisterTopLevelFns decs
+      Program <$> mapM lowerDec decs
+
 -- | Lower a list of top-level declarations into a 'Program'.
 --
 -- Multi-argument function declarations are pre-registered so they can be
 -- inlined at call sites; each remaining declaration becomes a 'Proc'.
 lowerDecs :: [Dec Range] -> Program
-lowerDecs decs = evalState go initState
-  where
-    go = do
-      mapM_ preRegister decs
-      Program <$> mapM lowerDec decs
-    preRegister (Dec _ name pats _ _ body)
-      | not (null pats) = registerFn name pats body
-      | otherwise       = pure ()
+lowerDecs = lowerProgramWithState initState
 
--- | Like 'lowerDecs2' but initialised with a top-level type environment
--- from inference, enabling accurate 'CType' annotation for generated variables.
+-- | Lower declarations with a top-level type environment from inference,
+-- enabling more accurate 'CType' annotations for generated variables.
 lowerDecsWithTypeEnv :: Map Var CType -> [Dec Range] -> Program
-lowerDecsWithTypeEnv topEnv decs = evalState go (initStateWithTypeEnv topEnv)
-  where
-    go = do
-      mapM_ preRegister decs
-      Program <$> mapM lowerDec decs
-    preRegister (Dec _ name pats _ _ body)
-      | not (null pats) = registerFn name pats body
-      | otherwise       = pure ()
+lowerDecsWithTypeEnv topEnv =
+  lowerProgramWithState (initStateWithTypeEnv topEnv)
 
--- | Like 'lowerDecs2WithTypeEnv' but also supplies an array-rank map that
--- enables rank-aware optimisations during lowering (e.g. emitting a scalar
--- accumulator instead of a 0-D output array for 1-D reductions).
+-- | Lower declarations with both inferred top-level types and array ranks.
+--
+-- The extra rank information enables rank-aware lowering decisions, such as
+-- emitting a scalar accumulator instead of a 0-D output array for a 1-D reduction.
 lowerDecsWithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> [Dec Range] -> Program
-lowerDecsWithTypeEnvAndRanks topEnv rankEnv decs =
-  evalState go (initStateWithTypeEnvAndRanks topEnv rankEnv)
-  where
-    go = do
-      mapM_ preRegister decs
-      Program <$> mapM lowerDec decs
-    preRegister (Dec _ name pats _ _ body)
-      | not (null pats) = registerFn name pats body
-      | otherwise       = pure ()
+lowerDecsWithTypeEnvAndRanks topEnv rankEnv =
+  lowerProgramWithState (initStateWithTypeEnvAndRanks topEnv rankEnv)
 
 lowerDec :: Dec Range -> LowerM Proc
 lowerDec (Dec _ name pats _ _ body) = do
@@ -3297,6 +3295,11 @@ recordVectorAccessFact v updateFact = modify' $ \st ->
   let fact = updateFact (M.findWithDefault emptyVectorAccessFact v (lsVectorAccessFacts st))
   in st { lsVectorAccessFacts = M.insert v fact (lsVectorAccessFacts st) }
 
+-- | Update vector-access facts only when the atom is a named CFG variable.
+noteVectorAccessAtom :: (VectorAccessFact -> VectorAccessFact) -> Atom -> LowerM ()
+noteVectorAccessAtom updateFact (AVar v) = recordVectorAccessFact v updateFact
+noteVectorAccessAtom _ _ = pure ()
+
 noteDenseLinearIndex :: CVar -> CVar -> LowerM ()
 noteDenseLinearIndex v iter =
   recordVectorAccessFact v $ \fact -> fact { vxfDenseLinearIndexOf = Just iter }
@@ -3351,14 +3354,12 @@ propagateTupleDenseLinearIndex dst atoms =
       y : ys -> Just (reverse ys, y)
 
 noteDenseReadAtom :: Atom -> LowerM ()
-noteDenseReadAtom (AVar v) =
-  recordVectorAccessFact v $ \fact -> fact { vxfDenseRead = True }
-noteDenseReadAtom _ = pure ()
+noteDenseReadAtom =
+  noteVectorAccessAtom $ \fact -> fact { vxfDenseRead = True }
 
 noteIndirectReadAtom :: Atom -> LowerM ()
-noteIndirectReadAtom (AVar v) =
-  recordVectorAccessFact v $ \fact -> fact { vxfIndirectRead = True }
-noteIndirectReadAtom _ = pure ()
+noteIndirectReadAtom =
+  noteVectorAccessAtom $ \fact -> fact { vxfIndirectRead = True }
 
 markContiguousWriteArray :: CVar -> LowerM ()
 markContiguousWriteArray v =

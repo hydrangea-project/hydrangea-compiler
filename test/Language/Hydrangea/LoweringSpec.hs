@@ -392,6 +392,21 @@ spec = do
           let pairs = [ct | (_, ct@(CTPair _ _)) <- Map.toList tenv]
           null pairs `shouldBe` False
 
+    it "lowerDecsWithTypeEnvAndRanks lowers with explicit type and rank environments" $ do
+      let src = "let main = fill [4] 0"
+      case parseSource src of
+        Left err -> expectationFailure $ "Parse error: " ++ err
+        Right decs -> do
+          let prog =
+                lowerDecsWithTypeEnvAndRanks
+                  (Map.fromList [("main", CTArray CTInt64)])
+                  (Map.fromList [("main", 1)])
+                  decs
+          let Program procs = prog
+          length procs `shouldBe` 1
+          let Proc { procName = name } = head procs
+          name `shouldBe` "main"
+
   describe "Lowering - Array Facts (procArrayFacts)" $ do
     it "marks fill outputs as fresh and write-once" $ do
       prog <- lowerFromSource "let arr = fill [3] 0"
