@@ -94,15 +94,14 @@ test-suite hydrangea-test
        , Language.Hydrangea.ReduceLoweringSpec
        , Language.Hydrangea.ParserSpec
        , Language.Hydrangea.InterpreterSpec
-       , Language.Hydrangea.SyntaxSpec
        , Language.Hydrangea.FusionSpec
        , Language.Hydrangea.CFGAnalysisSpec
-        , Language.Hydrangea.CFGOptSpec
-        , Language.Hydrangea.TileSpec
-        , Language.Hydrangea.PolyhedralSpec
-        , Language.Hydrangea.CodegenCSpec
-        , Language.Hydrangea.VectorizeSpec
-        , Language.Hydrangea.EndToEndSpec
+       , Language.Hydrangea.CFGOptSpec
+       , Language.Hydrangea.TileSpec
+       , Language.Hydrangea.PolyhedralSpec
+       , Language.Hydrangea.CodegenCSpec
+       , Language.Hydrangea.VectorizeSpec
+       , Language.Hydrangea.EndToEndSpec
        , Language.Hydrangea.DependenceSpec
        , Language.Hydrangea.ParallelizeSpec
        , Language.Hydrangea.MatmulInterpSpec
