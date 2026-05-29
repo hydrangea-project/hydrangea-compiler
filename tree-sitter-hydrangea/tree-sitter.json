@@ -1,0 +1,21 @@
+{
+  "grammars": [
+    {
+      "name": "hydrangea",
+      "camelcase": "Hydrangea",
+      "title": "Hydrangea",
+      "scope": "source.hydrangea",
+      "path": ".",
+      "file-types": [
+        "hyd"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "BSD-3-Clause",
+    "description": "Tree-sitter grammar for the Hydrangea language."
+  }
+}
+

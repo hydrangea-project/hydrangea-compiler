@@ -1,0 +1,17 @@
+================================================================================
+Nested comments
+================================================================================
+
+(* outer (* inner *) still outer *)
+let main = [1, 2, 3]
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (comment)
+  (declaration
+    name: (identifier)
+    value: (vector_expression
+      (integer_literal)
+      (integer_literal)
+      (integer_literal))))

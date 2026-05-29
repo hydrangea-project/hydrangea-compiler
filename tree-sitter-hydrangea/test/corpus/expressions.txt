@@ -1,0 +1,102 @@
+================================================================================
+Let-in, lambda, and application
+================================================================================
+
+let main = let add x y = x + y in add 1 2
+let blur = stencil clamp (fn acc => acc (-1) + acc 0 + acc 1) input
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (declaration
+    name: (identifier)
+    value: (let_in_expression
+      binding: (declaration
+        name: (identifier)
+        parameter: (variable_pattern
+          name: (identifier))
+        parameter: (variable_pattern
+          name: (identifier))
+        value: (binary_expression
+          left: (identifier)
+          right: (identifier)))
+      body: (application_expression
+        function: (identifier)
+        argument: (integer_literal)
+        argument: (integer_literal))))
+  (declaration
+    name: (identifier)
+    value: (special_expression
+      (stencil_expression
+        boundary: (boundary_condition)
+        accessor: (parenthesized_expression
+          (lambda_expression
+            parameter: (variable_pattern
+              name: (identifier))
+            body: (binary_expression
+              left: (binary_expression
+                left: (application_expression
+                  function: (identifier)
+                  argument: (parenthesized_expression
+                    (unary_expression
+                      argument: (integer_literal))))
+                right: (application_expression
+                  function: (identifier)
+                  argument: (integer_literal)))
+              right: (application_expression
+                function: (identifier)
+                argument: (integer_literal)))))
+        source: (identifier)))))
+
+================================================================================
+Array forms, shapes, and slices
+================================================================================
+
+let row = slice [[0,1], All] mat
+let out = replicate [Any n, All] arr
+let res = reduce_generate (+.) 0.0 [k] (fn [idx] => index [idx] vals)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (declaration
+    name: (identifier)
+    value: (special_expression
+      (slice_expression
+        slice: (slice_spec
+          (slice_dimension
+            (slice_dimension_range
+              start: (integer_literal)
+              length: (integer_literal)))
+          (slice_dimension
+            (slice_dimension_all)))
+        source: (identifier))))
+  (declaration
+    name: (identifier)
+    value: (special_expression
+      (replicate_expression
+        shape: (shape_spec
+          (shape_dimension
+            (shape_dimension_any
+              value: (identifier)))
+          (shape_dimension
+            (shape_dimension_all)))
+        source: (identifier))))
+  (declaration
+    name: (identifier)
+    value: (special_expression
+      (reduce_generate_expression
+        function: (first_class_operator)
+        initial: (float_literal)
+        shape: (vector_expression
+          (identifier))
+        generator: (parenthesized_expression
+          (lambda_expression
+            parameter: (vector_pattern
+              (variable_pattern
+                name: (identifier)))
+            body: (special_expression
+              (index_expression
+                index: (vector_expression
+                  (identifier))
+                source: (identifier)))))))))

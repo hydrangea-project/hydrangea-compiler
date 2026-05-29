@@ -1,0 +1,79 @@
+================================================================================
+Top-level declarations
+================================================================================
+
+let add x y = x + y
+let id x : forall a . a -> a = x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (declaration
+    name: (identifier)
+    parameter: (variable_pattern
+      name: (identifier))
+    parameter: (variable_pattern
+      name: (identifier))
+    value: (binary_expression
+      left: (identifier)
+      right: (identifier)))
+  (declaration
+    name: (identifier)
+    parameter: (variable_pattern
+      name: (identifier))
+    type: (type_annotation
+      (polytype
+        type_parameter: (identifier)
+        (function_type
+          domain: (type_identifier
+            (identifier))
+          codomain: (type_identifier
+            (identifier)))))
+    value: (identifier)))
+
+================================================================================
+Where clauses and records
+================================================================================
+
+let my_gather (idx, src) where elem idx <= dim src 0 = gather idx src
+let coo = { nrows = 3, vals = [1, 2, 3] }
+let main = coo.vals
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (declaration
+    name: (identifier)
+    parameter: (pair_pattern
+      left: (variable_pattern
+        name: (identifier))
+      right: (variable_pattern
+        name: (identifier)))
+    precondition: (where_clause
+      (comparison_refine_predicate
+        left: (refine_elem
+          name: (identifier))
+        right: (refine_dim
+          name: (identifier)
+          index: (integer_literal))))
+    value: (special_expression
+      (gather_expression
+        indices: (identifier)
+        source: (identifier))))
+  (declaration
+    name: (identifier)
+    value: (record_expression
+      (record_field
+        name: (identifier)
+        value: (integer_literal))
+      (record_field
+        name: (identifier)
+        value: (vector_expression
+          (integer_literal)
+          (integer_literal)
+          (integer_literal)))))
+  (declaration
+    name: (identifier)
+    value: (postfix_expression
+      target: (identifier)
+      field: (identifier))))
