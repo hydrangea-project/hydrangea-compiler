@@ -88,6 +88,7 @@ test-suite hydrangea-test
     hs-source-dirs:   test
     other-modules:
          Language.Hydrangea.FrontendSpec
+       , Language.Hydrangea.SyntaxSpec
        , Language.Hydrangea.CLISpec
        , Language.Hydrangea.LexerSpec
        , Language.Hydrangea.LoweringSpec
