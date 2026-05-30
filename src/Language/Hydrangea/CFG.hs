@@ -181,11 +181,12 @@ data VectorSpec = VectorSpec { vsWidth :: Int, vsTail :: TailPolicy }
 
 -- | The parallelisation strategy selected for a loop.
 data ParallelStrategy
-  = ParallelGeneric                  -- ^ Generic parallel map (no scatter).
-  | ParallelScatterDirect            -- ^ Direct (injective) scatter.
-  | ParallelScatterAtomicAddInt      -- ^ Scatter with atomic integer addition.
-  | ParallelScatterAtomicAddFloat    -- ^ Scatter with atomic float addition.
-  | ParallelScatterPrivatizedIntAdd  -- ^ Scatter via thread-private accumulators.
+  = ParallelGeneric                    -- ^ Generic parallel map (no scatter).
+  | ParallelScatterDirect              -- ^ Direct (injective) scatter.
+  | ParallelScatterAtomicAddInt        -- ^ Scatter with atomic integer addition.
+  | ParallelScatterAtomicAddFloat      -- ^ Scatter with atomic float addition.
+  | ParallelScatterPrivatizedIntAdd    -- ^ int64 scatter via thread-private accumulators.
+  | ParallelScatterPrivatizedFloatAdd  -- ^ double scatter via thread-private accumulators.
   deriving (Eq, Show)
 
 -- | Parallel execution parameters for a loop.

@@ -1550,17 +1550,19 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap pr
       bodyLines = case scatterStrategy of
         Just _ ->
           case detectAtomicScatterAddLoop stmts of
-            Just (prefix, mGuard, arrAtom, idxAtom, valAtom) ->
-              let prefixStr = concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) prefix
-                  atomicLine = genMSLAtomicAdd 1 iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom
+            Just (outerPrefix, branchPrefix, mGuard, arrAtom, idxAtom, valAtom) ->
+              let outerStr = concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) outerPrefix
+                  branchStr depth = concatMap (genMSLStmt depth iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) branchPrefix
+                  atomicLine depth = genMSLAtomicAdd depth iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom
                in case mGuard of
-                    Nothing -> prefixStr ++ atomicLine
+                    Nothing -> outerStr ++ branchStr 1 ++ atomicLine 1
                     Just cond ->
-                      prefixStr
+                      outerStr
                         ++ "    if ("
                         ++ genMSLAtom iter cond
                         ++ ") {\n"
-                        ++ genMSLAtomicAdd 2 iter allInArrs typeEnv arrayElemTys arrAtom idxAtom valAtom
+                        ++ branchStr 2
+                        ++ atomicLine 2
                         ++ "    }\n"
             Nothing ->
               concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) stmts

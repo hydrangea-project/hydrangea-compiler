@@ -31,6 +31,7 @@ module Language.Hydrangea.Parallelize
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..))
@@ -453,33 +454,49 @@ collectArrayAllocSizes = snd . go M.empty M.empty
     atomInt (AInt n) = Just n
     atomInt _        = Nothing
 
--- | Returns 'True' when privatized reduction is both legal and
--- profitable: the destination array is a fresh integer array small
--- enough (≤ 64 elements) to fit comfortably in per-thread private
--- storage, and the loop trip count is large enough to amortize the
--- initialization and reduction costs.
-factsPermitPrivatizedIntScatterLoop
-  :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> LoopSpec -> [Stmt] -> Bool
-factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body =
+-- | Returns the destination element type when privatized reduction is
+-- both legal and profitable.  Legal: the loop is an atomic-add scatter
+-- (detected by 'detectScatterAtomicAddKernel'); the destination is a
+-- fresh, write-once int64 or double array; no other array in the loop
+-- is written.  Profitable: the destination's static size fits within
+-- the per-thread privatization budget, and the loop trip count is
+-- large enough to amortize the per-thread private buffer allocation
+-- and the merge phase.  When destinations are sized via env vars
+-- (every benchmark in the suite), the shape is not a literal tuple
+-- and the symbolic-size branch fires.
+factsPermitPrivatizedScatterLoop
+  :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> LoopSpec -> [Stmt]
+  -> Maybe CType
+factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body =
   case detectScatterAtomicAddKernel spec body of
-    Nothing   -> False
+    Nothing   -> Nothing
     Just info ->
-      let dest  = saDestArray info
-          usage = collectLoopArrayUsage body
+      let dest   = saDestArray info
+          elemTy = saValueType info
+          usage  = collectLoopArrayUsage body
       in  case (M.lookup dest usage, M.lookup dest arrayFacts, M.lookup dest typeEnv) of
-            (Just u, Just fact, Just (CTArray CTInt64)) ->
-              lauReads u
-              && lauWrites u
-              && afFreshAlloc fact
-              && afWriteOnce fact
-              && profitable dest
-              && all (safeNonDest dest) (M.toList usage)
-            _ -> False
+            (Just u, Just fact, Just (CTArray ty))
+              | ty == elemTy
+              , ty == CTInt64 || ty == CTDouble
+              , lauReads u
+              , lauWrites u
+              , afFreshAlloc fact
+              , afWriteOnce fact
+              , profitable dest
+              , all (safeNonDest dest) (M.toList usage) -> Just ty
+            _ -> Nothing
   where
+    -- Per-thread privatization budget when the size is statically
+    -- known.  262144 = 64^3 lets the voxel benchmarks (64^3 grids)
+    -- privatize statically; for typical 8-16 threads this is 16-32
+    -- MB total scratch.
+    privatizationCap = 262144
+
     profitable dest =
       case (M.lookup dest allocSizes, tripCountValue (loopTripCount spec)) of
-        (Just sz, Just tc) -> sz > 0 && sz <= 64 && tc >= max 32 (sz * 4)
-        _                  -> False  -- unknown output size: prefer atomic scatter (no alloc, no serial merge)
+        (Just sz, Just tc) -> sz > 0 && sz <= privatizationCap && tc >= max 16 sz
+        (Just sz, Nothing) -> sz > 0 && sz <= privatizationCap
+        _                  -> True
 
     safeNonDest dest (arr, u)
       | arr == dest = True
@@ -560,25 +577,26 @@ parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
     eligible =
          canParallelizeWithFacts
       || canParallelizeDirectScatter
-      || canParallelizePrivatizedScatter
+      || isJust privatizedScatterTy
       || canParallelizeAtomicScatter
       || passesConservativeDependenceCheck spec body
 
     strategy
-      | canParallelizeDirectScatter     = ParallelScatterDirect
-      | canParallelizePrivatizedScatter = ParallelScatterPrivatizedIntAdd
-      | canParallelizeAtomicScatter     = case detectScatterAtomicAddKernel spec body of
+      | canParallelizeDirectScatter          = ParallelScatterDirect
+      | Just CTInt64  <- privatizedScatterTy = ParallelScatterPrivatizedIntAdd
+      | Just CTDouble <- privatizedScatterTy = ParallelScatterPrivatizedFloatAdd
+      | canParallelizeAtomicScatter          = case detectScatterAtomicAddKernel spec body of
           Just info | saValueType info == CTDouble -> ParallelScatterAtomicAddFloat
           _                                        -> ParallelScatterAtomicAddInt
-      | otherwise                       = ParallelGeneric
+      | otherwise                            = ParallelGeneric
 
     canParallelizeWithFacts =
       lsRole spec == LoopMap
       && isParallelTripCount (loopTripCount spec)
       && factsPermitParallelLoop arrayFacts body
-    canParallelizeDirectScatter     = factsPermitDirectScatterLoop     arrayFacts           spec body
-    canParallelizePrivatizedScatter = factsPermitPrivatizedIntScatterLoop arrayFacts typeEnv allocSizes spec body
-    canParallelizeAtomicScatter     = factsPermitAtomicScatterLoop     arrayFacts typeEnv   spec body
+    canParallelizeDirectScatter = factsPermitDirectScatterLoop arrayFacts spec body
+    privatizedScatterTy         = factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body
+    canParallelizeAtomicScatter = factsPermitAtomicScatterLoop arrayFacts typeEnv spec body
 
 ------------------------------------------------------------------------
 -- Statement and procedure traversal

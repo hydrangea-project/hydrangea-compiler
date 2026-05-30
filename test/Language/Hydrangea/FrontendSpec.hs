@@ -605,15 +605,19 @@ spec = do
         ]
       csrc `shouldSatisfy` isInfixOf "hyd_array_reshape_view("
 
-    it "emits atomic parallel scatter code for weighted histogram" $ do
+    it "emits privatized parallel scatter code for weighted histogram" $ do
+      -- With the relaxed predicate, fresh write-once destinations
+      -- privatize by default, even when the destination shape is
+      -- symbolic.  Atomic scatter is now a fallback for non-fresh /
+      -- non-write-once destinations.
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
         [ "let src = generate [8] (let f [i] = i in f)"
         , "let idx = map (let r x = x / 2 in r) src"
         , "let vals = map (let g x = (x * 3) + 1 in g) src"
         , "let main = scatter (+) (fill [4] 0) idx vals"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-int */"
-      csrc `shouldSatisfy` isInfixOf "#pragma omp atomic update"
+      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
+      csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic update"
 
     it "emits privatized parallel scatter code for dense small histograms" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
@@ -624,11 +628,18 @@ spec = do
       csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
       csrc `shouldSatisfy` isInfixOf "#pragma omp for"
       csrc `shouldSatisfy` isInfixOf "calloc((size_t)"
-      -- merge uses per-element atomics (not a serializing critical section)
-      csrc `shouldSatisfy` isInfixOf "#pragma omp atomic"
+      -- Per-thread grids preallocated outside the parallel region.
+      csrc `shouldSatisfy` isInfixOf "omp_get_max_threads()"
+      csrc `shouldSatisfy` isInfixOf "omp_get_thread_num()"
+      csrc `shouldSatisfy` isInfixOf "omp_get_num_threads()"
+      -- Parallel merge over output cells: no atomics, no critical section.
+      csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic"
       csrc `shouldNotSatisfy` isInfixOf "#pragma omp critical"
 
-    it "emits atomic guarded parallel scatter code for masked weighted histogram" $ do
+    it "emits privatized guarded parallel scatter code for masked weighted histogram" $ do
+      -- Guarded scatter also flows through the privatized path; the
+      -- guard is emitted inside the per-thread scatter loop, around
+      -- the private-buffer update.
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
         [ "let main ="
         , "  let src = generate [16] (let f [i] = i in f) in"
@@ -637,19 +648,20 @@ spec = do
         , "    (map (let g x = (x * 3) + 1 in g) src)"
         , "    (map (let keep x = ((x / 3) * 3) = x in keep) src)"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-int */"
-      csrc `shouldSatisfy` isInfixOf "#pragma omp atomic update"
+      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
       csrc `shouldSatisfy` isInfixOf "if ("
+      csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic"
 
-    it "emits atomic parallel scatter code for floating-point weighted histogram" $ do
+    it "emits privatized parallel scatter code for floating-point weighted histogram" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
         [ "let src = generate [8] (let f [i] = i in f)"
         , "let idx = map (let r x = x / 2 in r) src"
         , "let vals = map (let g x = float_of ((x * 3) + 1) /. 8.0 in g) src"
         , "let main = scatter (+.) (fill [4] 0.0) idx vals"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-float */"
-      csrc `shouldSatisfy` isInfixOf "#pragma omp atomic update"
+      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-float-add */"
+      csrc `shouldSatisfy` isInfixOf "double* __hyd_priv_grids_"
+      csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic update"
 
     it "emits array-valued hyd_main with array return type" $ do
       csrc <- emitCFromSource "let main = fill [3] 1"

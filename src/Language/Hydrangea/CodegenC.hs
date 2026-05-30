@@ -57,7 +57,7 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG qualified as CFG
-import Language.Hydrangea.CFGAnalysis (usedVarsAtom, usedVarsStmts)
+import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsAtom, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom (..), BinOp (..), CElemType (..), CType (..), CVar, RHS (..), Redop (..), UnOp (..), ctypeToElemType)
 import Language.Hydrangea.CFGTyping (CallParamTypes, TypeEnv, buildCallParamTypes, inferProgramReturnTypes, recoverProcTypeEnv)
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
@@ -1000,6 +1000,7 @@ genLoop env declared spec body =
                 CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
                 CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
                 CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+                CFG.ParallelScatterPrivatizedFloatAdd -> text " /* scatter-privatized-float-add */"
            in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
         CFG.Workshare p ->
           let strategyComment = case CFG.psStrategy p of
@@ -1008,6 +1009,7 @@ genLoop env declared spec body =
                 CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
                 CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
                 CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+                CFG.ParallelScatterPrivatizedFloatAdd -> text " /* scatter-privatized-float-add */"
            in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
         _ -> empty
       origins = CFG.lsOrigins spec
@@ -1056,12 +1058,16 @@ genLoop env declared spec body =
       shouldEmitSimd ie = maybe True (>= minSimdTripCount) (constantTripCount ie)
       atomicScatterBodyDoc elemTy declared' =
         case detectAtomicScatterAddLoop loopBody of
-          Just (prefix, mGuard, arr, idx, val) ->
-            let prefixLiveAfter =
-                  maybe S.empty usedVarsAtom mGuard
-                    `S.union` usedVarsAtom arr
+          Just (outerPrefix, branchPrefix, mGuard, arr, idx, val) ->
+            let arrIdxVal =
+                  usedVarsAtom arr
                     `S.union` usedVarsAtom idx
                     `S.union` usedVarsAtom val
+                outerLiveAfter =
+                  maybe S.empty usedVarsAtom mGuard
+                    `S.union` usedVarsStmts branchPrefix
+                    `S.union` arrIdxVal
+                branchLiveAfter = arrIdxVal
                 atomicUpdate =
                   text "#pragma omp atomic update"
                     $$ genArrayAccess elemTy arr idx
@@ -1072,102 +1078,186 @@ genLoop env declared spec body =
                   case mGuard of
                     Nothing -> atomicUpdate
                     Just cond ->
-                      text "if ("
-                        <> genAtom cond
-                        <> text ") {"
-                        $$ nest 4 atomicUpdate
-                        $$ text "}"
-             in genStmts env declared' prefixLiveAfter prefix $$ guardedUpdate
+                      let outerDeclared =
+                            S.union declared' (definedVarsStmts outerPrefix)
+                          branchBody =
+                            genStmts env outerDeclared branchLiveAfter branchPrefix
+                              $$ atomicUpdate
+                      in text "if ("
+                          <> genAtom cond
+                          <> text ") {"
+                          $$ nest 4 branchBody
+                          $$ text "}"
+             in genStmts env declared' outerLiveAfter outerPrefix $$ guardedUpdate
           Nothing ->
             bodyDoc declared'
-      privatizedScatterLoopDoc declared' iter bound =
+      privatizedScatterLoopDoc elemTy declared' iter bound =
         case detectAtomicScatterAddLoop loopBody of
-          Just (prefix, mGuard, arr, idx, val) ->
+          Just (outerPrefix, branchPrefix, mGuard, arr, idx, val) ->
             let arrStem = case arr of
                   AVar arrV -> sanitize arrV
                   _ -> "scatter"
-                prefixLiveAfter =
-                  maybe S.empty usedVarsAtom mGuard
-                    `S.union` usedVarsAtom arr
+                arrIdxVal =
+                  usedVarsAtom arr
                     `S.union` usedVarsAtom idx
                     `S.union` usedVarsAtom val
-                sizeVar = text ("__hyd_priv_size_" ++ arrStem)
-                privVar = text ("__hyd_priv_buf_" ++ arrStem)
+                outerLiveAfter =
+                  maybe S.empty usedVarsAtom mGuard
+                    `S.union` usedVarsStmts branchPrefix
+                    `S.union` arrIdxVal
+                branchLiveAfter = arrIdxVal
+                sizeVar    = text ("__hyd_priv_size_"   ++ arrStem)
+                nthrVar    = text ("__hyd_priv_nthr_"   ++ arrStem)
+                gridsVar   = text ("__hyd_priv_grids_"  ++ arrStem)
+                privVar    = text ("__hyd_priv_buf_"    ++ arrStem)
+                tidVar     = text ("__hyd_priv_tid_"    ++ arrStem)
+                ntVar      = text ("__hyd_priv_nt_"     ++ arrStem)
+                tIxVar     = text ("__hyd_priv_t_"      ++ arrStem)
+                sumVar     = text ("__hyd_priv_sum_"    ++ arrStem)
                 mergeIxName = "__hyd_priv_merge_" ++ arrStem
                 mergeIx = text mergeIxName
                 ci = sanitize iter
+                elemTyDoc = text (cTypeName elemTy)
+                strategyTag = case elemTy of
+                  CTDouble -> text "scatter-privatized-float-add"
+                  _        -> text "scatter-privatized-int-add"
                 privUpdate =
                   privVar <> text "[" <> genAtom idx <> text "]" <+> text "+=" <+> genAtom val <> text ";"
+                outerDeclared =
+                  S.union declared' (definedVarsStmts outerPrefix)
+                branchPrefixDoc =
+                  genStmts env outerDeclared branchLiveAfter branchPrefix
                 guardedPrivUpdate =
                   case mGuard of
-                    Nothing -> privUpdate
+                    Nothing -> branchPrefixDoc $$ privUpdate
                     Just cond ->
                       text "if ("
                         <> genAtom cond
                         <> text ") {"
-                        $$ nest 4 privUpdate
+                        $$ nest 4 (branchPrefixDoc $$ privUpdate)
                         $$ text "}"
+                -- Per-thread scratch preallocated outside the parallel
+                -- region as an nthreads x dest grid.  Each thread writes
+                -- into its own slice without synchronisation; the merge
+                -- runs as a parallel-for over output cells (each cell
+                -- sums across threads with no atomics).
              in text "/* parallel"
                   <+> roleComment
                   <+> text "*/"
-                  $$ text "#pragma omp parallel /* scatter-privatized-int-add */"
                   $$ text "{"
-                  $$ nest
-                    4
+                  $$ nest 4
                     ( text "int64_t"
                         <+> sizeVar
                         <+> text "="
                         <+> text "hyd_shape_size("
                         <> genAtom arr
                         <> text "->shape);"
-                        $$ text "int64_t*"
-                        <+> privVar
+                        $$ text "int"
+                        <+> nthrVar
+                        <+> text "= omp_get_max_threads();"
+                        $$ elemTyDoc
+                        <> text "*"
+                        <+> gridsVar
                         <+> text "="
-                        <+> text "(int64_t*)calloc((size_t)"
+                        <+> text "("
+                        <> elemTyDoc
+                        <> text "*)calloc((size_t)"
+                        <> nthrVar
+                        <+> text "* (size_t)"
                         <> sizeVar
-                        <> text ", sizeof(int64_t));"
+                        <> text ", sizeof("
+                        <> elemTyDoc
+                        <> text "));"
                         $$ text "if ("
-                        <> privVar
+                        <> gridsVar
                         <+> text "== NULL) {"
-                        $$ nest
-                          4
+                        $$ nest 4
                           ( text "fprintf(stderr, \"hydrangea: failed to allocate privatized scatter buffer\\n\");"
                               $$ text "exit(1);"
                           )
                         $$ text "}"
-                        $$ text "#pragma omp for"
-                        $$ text "for (int64_t"
-                        <+> text ci
-                        <+> text "=" <+> originDoc 0 <> text ";"
-                        <+> text ci
-                        <+> text "<"
-                        <+> genIndexExpr bound
-                        <> text ";"
-                        <+> text ci
-                        <> text "++) {"
-                        $$ nest
-                          4
-                          ( genStmts env declared' prefixLiveAfter prefix
-                              $$ guardedPrivUpdate
-                          )
-                        $$ text "}"
-                        $$ text "for (int64_t"
-                        <+> mergeIx
-                        <+> text "= 0;"
-                        <+> mergeIx
-                        <+> text "<"
-                        <+> sizeVar
-                        <> text ";"
-                        <+> mergeIx
-                        <> text "++) {"
-                        $$ nest
-                          4
-                          ( text "#pragma omp atomic"
-                              $$ (genArrayAccess CTInt64 arr (AVar (BS.pack mergeIxName)) <+> text "+=" <+> privVar <> text "[" <> mergeIx <> text "];")
+                        $$ text "#pragma omp parallel /*" <+> strategyTag <+> text "*/"
+                        $$ text "{"
+                        $$ nest 4
+                          ( text "int"
+                              <+> tidVar
+                              <+> text "= omp_get_thread_num();"
+                              $$ text "int"
+                              <+> ntVar
+                              <+> text "= omp_get_num_threads();"
+                              $$ elemTyDoc
+                              <> text "*"
+                              <+> privVar
+                              <+> text "="
+                              <+> gridsVar
+                              <+> text "+ (size_t)"
+                              <> tidVar
+                              <+> text "* (size_t)"
+                              <> sizeVar
+                              <> text ";"
+                              $$ text "#pragma omp for"
+                              $$ text "for (int64_t"
+                              <+> text ci
+                              <+> text "=" <+> originDoc 0 <> text ";"
+                              <+> text ci
+                              <+> text "<"
+                              <+> genIndexExpr bound
+                              <> text ";"
+                              <+> text ci
+                              <> text "++) {"
+                              $$ nest 4
+                                ( genStmts env declared' outerLiveAfter outerPrefix
+                                    $$ guardedPrivUpdate
+                                )
+                              $$ text "}"
+                              $$ text "#pragma omp for"
+                              $$ text "for (int64_t"
+                              <+> mergeIx
+                              <+> text "= 0;"
+                              <+> mergeIx
+                              <+> text "<"
+                              <+> sizeVar
+                              <> text ";"
+                              <+> mergeIx
+                              <> text "++) {"
+                              $$ nest 4
+                                ( elemTyDoc
+                                    <+> sumVar
+                                    <+> text "="
+                                    <+> genArrayAccess elemTy arr (AVar (BS.pack mergeIxName))
+                                    <> text ";"
+                                    $$ text "for (int"
+                                    <+> tIxVar
+                                    <+> text "= 0;"
+                                    <+> tIxVar
+                                    <+> text "<"
+                                    <+> ntVar
+                                    <> text ";"
+                                    <+> tIxVar
+                                    <> text "++) {"
+                                    $$ nest 4
+                                      ( sumVar
+                                          <+> text "+="
+                                          <+> gridsVar
+                                          <> text "[(size_t)"
+                                          <> tIxVar
+                                          <+> text "* (size_t)"
+                                          <> sizeVar
+                                          <+> text "+"
+                                          <+> mergeIx
+                                          <> text "];"
+                                      )
+                                    $$ text "}"
+                                    $$ genArrayAccess elemTy arr (AVar (BS.pack mergeIxName))
+                                    <+> text "="
+                                    <+> sumVar
+                                    <> text ";"
+                                )
+                              $$ text "}"
                           )
                         $$ text "}"
                         $$ text "free("
-                        <> privVar
+                        <> gridsVar
                         <> text ");"
                     )
                   $$ text "}"
@@ -1331,8 +1421,8 @@ genLoop env declared spec body =
                     $$ text "}"
         (execPolicy, _, [i], [b])
           | Just p <- ompLoopParallelSpec execPolicy
-          , CFG.psStrategy p == CFG.ParallelScatterPrivatizedIntAdd ->
-              privatizedScatterLoopDoc declaredWithHoisted i b
+          , Just elemTy <- privatizedScatterStrategyType (CFG.psStrategy p) ->
+              privatizedScatterLoopDoc elemTy declaredWithHoisted i b
         (execPolicy, _, [i], [b]) | isOmpLoopExec execPolicy ->
           let ci = sanitize i
            in text "/* parallel"
@@ -1450,15 +1540,25 @@ genNestedLoops iters bounds origins body =
         $$ nest 4 inner
         $$ text "}"
 
-detectAtomicScatterAddLoop :: [CFG.Stmt] -> Maybe ([CFG.Stmt], Maybe Atom, Atom, Atom, Atom)
+-- | Destructure a guarded or unguarded atomic-add scatter loop body.
+--
+-- Returns @(outerPrefix, branchPrefix, mGuard, arr, idx, val)@ where
+-- @outerPrefix@ runs unconditionally and @branchPrefix@ only runs when
+-- the guard holds (or is empty when there is no guard).  Splitting the
+-- prefixes lets the codegen keep work that has been sunk past the
+-- guard (see 'CFGOpt.sinkUnusedIntoGuard') inside the guarded branch
+-- instead of merging it back into the unconditional prefix.
+detectAtomicScatterAddLoop
+  :: [CFG.Stmt]
+  -> Maybe ([CFG.Stmt], [CFG.Stmt], Maybe Atom, Atom, Atom, Atom)
 detectAtomicScatterAddLoop body =
   case reverse body of
     (CFG.SIf cond thn [] : revPrefix) -> do
       (branchPrefix, arrWrite, idxWrite, val) <- detectAtomicScatterAddCore thn
-      pure (reverse revPrefix ++ branchPrefix, Just cond, arrWrite, idxWrite, val)
+      pure (reverse revPrefix, branchPrefix, Just cond, arrWrite, idxWrite, val)
     _ -> do
       (prefix, arrWrite, idxWrite, val) <- detectAtomicScatterAddCore body
-      pure (prefix, Nothing, arrWrite, idxWrite, val)
+      pure (prefix, [], Nothing, arrWrite, idxWrite, val)
   where
     detectAtomicScatterAddCore stmts =
       case reverse stmts of
@@ -1490,6 +1590,12 @@ atomicScatterElemType p = case CFG.psStrategy p of
   CFG.ParallelScatterAtomicAddInt -> Just CTInt64
   CFG.ParallelScatterAtomicAddFloat -> Just CTDouble
   _ -> Nothing
+
+privatizedScatterStrategyType :: CFG.ParallelStrategy -> Maybe CType
+privatizedScatterStrategyType s = case s of
+  CFG.ParallelScatterPrivatizedIntAdd   -> Just CTInt64
+  CFG.ParallelScatterPrivatizedFloatAdd -> Just CTDouble
+  _                                     -> Nothing
 
 genIndexExpr :: CFG.IndexExpr -> Doc
 genIndexExpr expr = case CFG.simplifyIndexExpr expr of

@@ -34,6 +34,7 @@ module Language.Hydrangea.CFGOpt
   , deadAssignElim
   , loopInvariantCodeMotion
   , unswitchLoopInvariantIf
+  , sinkUnusedIntoGuard
   , removeNoOps
   , hoistIterateAllocs
     -- * Atom/statement substitution utilities
@@ -1144,6 +1145,84 @@ inlineProgram (Program procs) = go 50 procs
       in  if ps' == ps then Program ps else go (n - 1) ps'
 
 ------------------------------------------------------------------------
+-- Sink pure assignments inside a trailing guarded SIf
+------------------------------------------------------------------------
+
+-- | When a loop body ends with @SIf cond thn []@ (a guarded section
+-- with empty else branch — the structure produced by
+-- @scatter_guarded@ and similar fused guarded scatters), sink pure
+-- 'SAssign' statements that do not contribute to evaluating @cond@
+-- (and are not needed by any other prefix stmt) into the @thn@
+-- branch.  Stmts that the guard does not depend on become wasted work
+-- whenever @cond@ is false; sinking them past the guard skips that
+-- work on the @!cond@ path.
+--
+-- Soundness: backward dataflow over the prefix maintains a
+-- @keptUses@ set seeded with the SIf cond's used vars.  A pure
+-- 'SAssign' whose assigned var is not in @keptUses@ is sinkable;
+-- anything else (impure RHS, side-effecting stmts, nested
+-- conditionals, or pure assigns whose var is referenced by something
+-- already kept) stays in the outer prefix and contributes its uses
+-- to @keptUses@.  The SIf must be the last statement of the loop
+-- body so sunk vars cannot be referenced after the guard.
+sinkUnusedIntoGuard :: [Stmt] -> [Stmt]
+sinkUnusedIntoGuard = concatMap goStmt
+  where
+    goStmt :: Stmt -> [Stmt]
+    goStmt (SLoop spec body) =
+      let body' = sinkUnusedIntoGuard body
+      in [SLoop spec (sinkInBody body')]
+    goStmt (SIf cond thn els) =
+      [SIf cond (sinkUnusedIntoGuard thn) (sinkUnusedIntoGuard els)]
+    goStmt (SParallelRegion body) =
+      [SParallelRegion (sinkUnusedIntoGuard body)]
+    goStmt s = [s]
+
+    sinkInBody :: [Stmt] -> [Stmt]
+    sinkInBody body = case unsnocBody body of
+      Just (prefix, SIf cond thn []) ->
+        let (toSink, toKeep) = backwardSinkPass cond prefix
+        in if null toSink
+             then body
+             else toKeep ++ [SIf cond (toSink ++ thn) []]
+      _ -> body
+
+    unsnocBody :: [Stmt] -> Maybe ([Stmt], Stmt)
+    unsnocBody [] = Nothing
+    unsnocBody xs = case reverse xs of
+      (y : rest) -> Just (reverse rest, y)
+      _ -> Nothing
+
+    -- Backward dataflow over the prefix (right-to-left).  See haddock
+    -- on 'sinkUnusedIntoGuard' above for the soundness argument.
+    backwardSinkPass :: Atom -> [Stmt] -> ([Stmt], [Stmt])
+    backwardSinkPass cond prefix =
+      let (sink, keep, _) = foldr stepFwd ([], [], usedVarsAtom cond) prefix
+      in (sink, keep)
+      where
+        stepFwd stmt (sinkAcc, keepAcc, keptUses) = case stmt of
+          SAssign v rhs
+            | rhsIsPure rhs, not (v `S.member` keptUses) ->
+                (stmt : sinkAcc, keepAcc, keptUses)
+            | otherwise ->
+                (sinkAcc, stmt : keepAcc, keptUses `S.union` usedVarsRHS rhs)
+          _ ->
+            (sinkAcc, stmt : keepAcc, keptUses `S.union` usedVarsStmt stmt)
+
+    usedVarsStmt :: Stmt -> Set ByteString
+    usedVarsStmt stmt = case stmt of
+      SAssign _ rhs       -> usedVarsRHS rhs
+      SArrayWrite a i v   -> usedVarsAtom a `S.union` usedVarsAtom i `S.union` usedVarsAtom v
+      SIf cond thn els    ->
+        usedVarsAtom cond
+          `S.union` usedVarsStmts thn
+          `S.union` usedVarsStmts els
+      SLoop _ inner       -> usedVarsStmts inner
+      SParallelRegion inner -> usedVarsStmts inner
+      SReturn a           -> usedVarsAtom a
+      SBreak              -> S.empty
+
+------------------------------------------------------------------------
 -- Combined optimization pipeline
 ------------------------------------------------------------------------
 
@@ -1157,6 +1236,7 @@ inlineProgram (Program procs) = go 50 procs
 optimizeOnce :: [Stmt] -> [Stmt]
 optimizeOnce =
     loopInvariantCodeMotion
+  . sinkUnusedIntoGuard
   . deadAssignElim
   . scalarizeZeroDimArrayRoundtrips
   . copyProp

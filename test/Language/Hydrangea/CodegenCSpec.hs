@@ -159,8 +159,12 @@ spec = describe "CodegenC" $ do
     c `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
     c `shouldSatisfy` isInfixOf "#pragma omp for"
     c `shouldSatisfy` isInfixOf "calloc((size_t)"
-    -- merge uses per-element atomics (not a serializing critical section)
-    c `shouldSatisfy` isInfixOf "#pragma omp atomic"
+    -- Per-thread grids preallocated outside the parallel region.
+    c `shouldSatisfy` isInfixOf "omp_get_max_threads()"
+    c `shouldSatisfy` isInfixOf "omp_get_thread_num()"
+    c `shouldSatisfy` isInfixOf "omp_get_num_threads()"
+    -- Parallel merge over output cells: no atomics, no critical section.
+    c `shouldNotSatisfy` isInfixOf "#pragma omp atomic"
     c `shouldNotSatisfy` isInfixOf "#pragma omp critical"
 
   it "emits guarded atomic update code for guarded integer scatter-add loops" $ do

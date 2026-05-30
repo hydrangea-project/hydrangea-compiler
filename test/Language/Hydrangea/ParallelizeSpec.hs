@@ -116,7 +116,10 @@ spec = describe "Parallelize" $ do
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)
       _ -> expectationFailure "Expected injective scatter loop to parallelize"
 
-  it "keeps non-injective scatter kernels serial even with fresh destinations" $ do
+  it "uses privatized scatter for non-injective integer scatter kernels with fresh destinations" $ do
+    -- With the relaxed predicate, fresh+write-once destinations
+    -- privatize by default.  This case has no static dest allocation
+    -- in the procedure body, so the symbolic-size branch fires.
     let loop =
           SLoop
             (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
@@ -144,8 +147,8 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)
-      _ -> expectationFailure "Expected non-injective integer scatter-add loop to use atomic strategy"
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)
+      _ -> expectationFailure "Expected non-injective integer scatter-add loop to use privatized strategy"
 
   it "keeps unsupported colliding scatter combines serial" $ do
     let loop =
@@ -178,7 +181,7 @@ spec = describe "Parallelize" $ do
       [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
       _ -> expectationFailure "Expected unsupported colliding scatter loop to stay serial"
 
-  it "uses atomic scatter for guarded colliding integer add kernels" $ do
+  it "uses privatized scatter for guarded colliding integer add kernels" $ do
     let loop =
           SLoop
             (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
@@ -211,10 +214,10 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddInt Nothing Nothing)
-      _ -> expectationFailure "Expected guarded integer scatter-add loop to use atomic strategy"
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)
+      _ -> expectationFailure "Expected guarded integer scatter-add loop to use privatized strategy"
 
-  it "uses atomic scatter for colliding floating-point add kernels" $ do
+  it "uses privatized scatter for colliding floating-point add kernels" $ do
     let loop =
           SLoop
             (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
@@ -242,8 +245,8 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterAtomicAddFloat Nothing Nothing)
-      _ -> expectationFailure "Expected floating-point scatter-add loop to use atomic strategy"
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedFloatAdd Nothing Nothing)
+      _ -> expectationFailure "Expected floating-point scatter-add loop to use privatized strategy"
 
   it "uses privatized scatter for dense colliding integer add kernels with enough work" $ do
     let loop =
