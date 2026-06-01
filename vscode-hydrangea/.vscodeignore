@@ -1,0 +1,6 @@
+.gitignore
+scripts/**
+node_modules/web-tree-sitter/debug/**
+node_modules/web-tree-sitter/src/**
+node_modules/web-tree-sitter/lib/**
+**/*.map

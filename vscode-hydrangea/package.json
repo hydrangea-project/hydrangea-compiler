@@ -1,0 +1,48 @@
+{
+  "name": "hydrangea-vscode",
+  "displayName": "Hydrangea",
+  "description": "VS Code syntax highlighting for Hydrangea powered by tree-sitter.",
+  "version": "0.1.0",
+  "publisher": "hydrangea-project",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hydrangea-project/hydrangea-compiler.git",
+    "directory": "vscode-hydrangea"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:hydrangea"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "hydrangea",
+        "aliases": [
+          "Hydrangea",
+          "hydrangea"
+        ],
+        "extensions": [
+          ".hyd"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ]
+  },
+  "scripts": {
+    "prepare:assets": "node ./scripts/prepare-assets.mjs",
+    "package": "npm run prepare:assets && vsce package --out hydrangea-vscode.vsix"
+  },
+  "dependencies": {
+    "web-tree-sitter": "^0.25.10"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.2"
+  }
+}

@@ -13,6 +13,8 @@ RUN apt-get update \
         happy \
         libgomp1 \
         make \
+        nodejs \
+        npm \
         pkg-config \
         z3 \
     && rm -rf /var/lib/apt/lists/*

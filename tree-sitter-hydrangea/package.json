@@ -13,6 +13,7 @@
   ],
   "scripts": {
     "generate": "tree-sitter generate",
+    "build:wasm": "tree-sitter build --wasm -o dist/tree-sitter-hydrangea.wasm .",
     "test": "tree-sitter test",
     "parse:examples": "tree-sitter parse ../examples/simple.hyd ../examples/mat_mul.hyd ../examples/stencil_2d.hyd"
   },

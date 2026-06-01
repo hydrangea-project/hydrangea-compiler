@@ -14,6 +14,7 @@ The grammar is derived from the compiler's source-language definition in:
 cd tree-sitter-hydrangea
 npm install
 npm run generate
+npm run build:wasm
 npm test
 ```
 
@@ -28,6 +29,7 @@ npm run parse:examples
 
 - The grammar includes an external scanner for Hydrangea's nested `(* ... *)` comments.
 - Corpus tests cover focused syntax cases, while `parse:examples` exercises representative `.hyd` programs from the main repository.
+- `dist/tree-sitter-hydrangea.wasm` is consumed by the local VS Code extension in `../vscode-hydrangea`.
 
 ## Emacs
 

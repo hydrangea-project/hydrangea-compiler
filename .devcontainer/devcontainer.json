@@ -11,6 +11,7 @@
       ]
     }
   },
-  "postCreateCommand": "cabal update",
+  "postCreateCommand": "cabal update && .devcontainer/install-hydrangea-vscode-extension.sh --prepare-only",
+  "postAttachCommand": ".devcontainer/install-hydrangea-vscode-extension.sh",
   "remoteUser": "root"
 }

@@ -43,7 +43,9 @@ Inside `nix develop`, the shell exports `CC` to Nix-provided GCC so Hydrangea ca
 
 ### Dev container
 
-The repository includes a `.devcontainer/` setup for editors such as VS Code. It provides GHC 9.10.1, Cabal, GCC, OpenMP support through GCC, and `z3`.
+The repository includes a `.devcontainer/` setup for editors such as VS Code. It provides GHC 9.10.1, Cabal, GCC, Node.js, npm, OpenMP support through GCC, and `z3`.
+
+When the workspace is opened in the dev container from VS Code, the container also prepares and installs the local `vscode-hydrangea` extension so `.hyd` files pick up syntax highlighting from the repository's tree-sitter grammar.
 
 ## Backends
 
