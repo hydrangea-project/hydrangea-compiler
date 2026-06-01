@@ -42,17 +42,39 @@ let valueFn x = x * x
 let hist = scatter (+) (fill [64] 0) (map binFn data) (map valueFn data)
 ```
 
-Both `map` expressions derive from the same source, so the scatter-reindex fusion rule fires: neither mapped array is materialised. The compiler sees through the two maps and emits a single scatter loop that reads `data` once per element. With OpenMP enabled the scatter uses an atomic update:
+Both `map` expressions derive from the same source, so the scatter-reindex fusion rule fires: neither mapped array is materialised. The compiler sees through the two maps and emits one parallel scatter over `data`, and it privatizes the bins per thread and merges them afterward. The generated C is wrapped in runtime array plumbing, and the core loop shape looks like this:
 
 ```c
-/* parallel loop */
-#pragma omp parallel for /* scatter-atomic-add-int */
-for (int64_t i = 0; i < n; i++) {
-    int64_t bin = data[i] % 64;
-    int64_t val = data[i] * data[i];
-    #pragma omp atomic update
-    hist[bin] += val;
+int64_t priv_size = hyd_shape_size(hist->shape);
+int     priv_nthr = omp_get_max_threads();
+int64_t *priv_grids =
+    (int64_t *)calloc((size_t)priv_nthr * (size_t)priv_size, sizeof(int64_t));
+
+#pragma omp parallel /* scatter-privatized-int-add */
+{
+    int tid = omp_get_thread_num();
+    int nt  = omp_get_num_threads();
+    int64_t *priv_buf = priv_grids + (size_t)tid * (size_t)priv_size;
+
+    #pragma omp for
+    for (int64_t i = 0; i < n; i++) {
+        int64_t x   = data[i];
+        int64_t bin = x % 64;
+        int64_t val = x * x;
+        priv_buf[bin] += val;
+    }
+
+    #pragma omp for
+    for (int64_t bin = 0; bin < priv_size; bin++) {
+        int64_t sum = hist[bin];
+        for (int t = 0; t < nt; t++) {
+            sum += priv_grids[(size_t)t * (size_t)priv_size + bin];
+        }
+        hist[bin] = sum;
+    }
 }
+
+free(priv_grids);
 ```
 
 ### Stencil — 2D Laplacian
