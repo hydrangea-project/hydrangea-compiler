@@ -1511,7 +1511,8 @@ infer (EReduce _ fn initExp arrExp) = do
   arrTy <- infer arrExp
   initTy <- infer initExp
   (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  sTy_p <- promoteShapeUVar (firstParam arrExp) sTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy_p
   fty <- infer fn
   rank <- shapeArityFromType (firstParam arrExp) sTy'
   when (rank <= 0) $ throwError $ MiscError (Just (firstParam arrExp))
@@ -1546,7 +1547,8 @@ infer (EFoldl _ fn initExp arrExp) = do
   arrTy  <- infer arrExp
   initTy <- infer initExp
   (_mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  sTy_p <- promoteShapeUVar (firstParam arrExp) sTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy_p
   fty <- infer fn
   rank <- shapeArityFromType (firstParam arrExp) sTy'
   when (rank /= 1) $ throwError $ MiscError (Just (firstParam arrExp))
@@ -1563,7 +1565,8 @@ infer (EFoldlWhile _ predExp fn initExp arrExp) = do
   arrTy  <- infer arrExp
   initTy <- infer initExp
   (_mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  sTy_p <- promoteShapeUVar (firstParam arrExp) sTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy_p
   pty <- infer predExp
   fty <- infer fn
   rank <- shapeArityFromType (firstParam arrExp) sTy'
@@ -1575,7 +1578,8 @@ infer (EScan _ fn initExp arrExp) = do
   arrTy <- infer arrExp
   initTy <- infer initExp
   (mArrVar, sTy, eTy) <- asArrayType (firstParam arrExp) arrTy
-  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy
+  sTy_p <- promoteShapeUVar (firstParam arrExp) sTy
+  sTy' <- normalizeShapeToTupleOf (firstParam arrExp) UTyInt sTy_p
   fty <- infer fn
   rank <- shapeArityFromType (firstParam arrExp) sTy'
   when (rank /= 1) $ throwError $ MiscError (Just (firstParam arrExp))
