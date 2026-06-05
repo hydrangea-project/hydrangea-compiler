@@ -131,6 +131,12 @@ checkInlineSrcWithOptions inferOpts pipelineOpts src = do
               formatElem (VFloat f)  = stripTrailingZerosG (printf "%.17g" f)
               formatElem (VString s) = BS.unpack s
               formatElem (VPair a b) = "(" ++ formatElem a ++ ", " ++ formatElem b ++ ")"
+              formatElem (VArray shape vals) =
+                case traverse formatArrayElem vals of
+                  Just elems ->
+                    "[" ++ intercalate ", " elems
+                      ++ "] (shape: [" ++ intercalate ", " (map show shape) ++ "])"
+                  Nothing -> "<unprintable>"
               formatElem _           = "<unprintable>"
               -- Strip trailing zeros from %g output to match C printf("%.17g")
               -- which never emits trailing zeros or a trailing decimal point.
@@ -1001,4 +1007,33 @@ spec = do
         , "  let is = foldl (fn acc x => acc + x) 0"
         , "             (apply (fn x => x + 1) (generate [4] (fn [i] => i))) in"
         , "  fs +. (float_of is)"
+        ]
+
+  -- Printing compound results whose components are arrays.  Previously the
+  -- generated 'hyd_print_pair' _Generic macro could not print a pair whose
+  -- fields are 'hyd_array_t*' (e.g. a pair of reduce results, each a 0-D array),
+  -- causing a C compile error.  Pairs are now printed recursively per component.
+  describe "printing pairs/tuples containing arrays" $ do
+
+    it "prints a pair of 0-D arrays (reduce results)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let main ="
+        , "  let a = reduce (fn acc x => acc + x) 0 (generate [4] (fn [i] => i)) in"
+        , "  let b = reduce (fn acc x => acc + x) 0 (generate [3] (fn [i] => i + 10)) in"
+        , "  (a, b)"
+        ]
+
+    it "prints a pair of 1-D arrays" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let main ="
+        , "  let a = generate [3] (fn [i] => i + 1) in"
+        , "  let b = generate [3] (fn [i] => float_of i) in"
+        , "  (a, b)"
+        ]
+
+    it "prints a nested pair mixing a 0-D array and a scalar" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let main ="
+        , "  let s = reduce (fn acc x => acc + x) 0 (generate [4] (fn [i] => i)) in"
+        , "  ((s, 7), s)"
         ]

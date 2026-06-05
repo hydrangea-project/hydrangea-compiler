@@ -455,15 +455,27 @@ static hyd_array_t* hyd_sort_indices(hyd_array_t* keys) {
     return out;
 }
 
+/* Inline (no trailing newline) variants are used to print the components of a
+ * pair/tuple; the newline-terminated variants below are thin wrappers. */
+static void hyd_print_int_inline(int64_t v) {
+    printf("%lld", (long long)v);
+}
+
 static void hyd_print_int(int64_t v) {
-    printf("%lld\n", (long long)v);
+    hyd_print_int_inline(v);
+    printf("\n");
+}
+
+static void hyd_print_double_inline(double v) {
+    printf("%.17g", v);
 }
 
 static void hyd_print_double(double v) {
-    printf("%.17g\n", v);
+    hyd_print_double_inline(v);
+    printf("\n");
 }
 
-static void hyd_print_array(hyd_array_t* arr) {
+static void hyd_print_array_inline(hyd_array_t* arr) {
     int64_t size = hyd_shape_size(arr->shape);
     int64_t* data = (int64_t*)(void*)arr->data;
     printf("[");
@@ -476,7 +488,12 @@ static void hyd_print_array(hyd_array_t* arr) {
         if (i > 0) printf(", ");
         printf("%lld", (long long)arr->shape.elems[i]);
     }
-    printf("])\n");
+    printf("])");
+}
+
+static void hyd_print_array(hyd_array_t* arr) {
+    hyd_print_array_inline(arr);
+    printf("\n");
 }
 
 static void hyd_print_tuple(hyd_tuple_t t) {
@@ -498,7 +515,7 @@ static inline void hyd_array_set_float(hyd_array_t* arr, int64_t idx, double v) 
     memcpy(arr->data + ((size_t)idx * arr->elem_size), &v, sizeof(double));
 }
 
-static void hyd_print_float_array(hyd_array_t* arr) {
+static void hyd_print_float_array_inline(hyd_array_t* arr) {
     int64_t size = hyd_shape_size(arr->shape);
     printf("[");
     for (int64_t i = 0; i < size; i++) {
@@ -512,7 +529,12 @@ static void hyd_print_float_array(hyd_array_t* arr) {
         if (i > 0) printf(", ");
         printf("%lld", (long long)arr->shape.elems[i]);
     }
-    printf("])\n");
+    printf("])");
+}
+
+static void hyd_print_float_array(hyd_array_t* arr) {
+    hyd_print_float_array_inline(arr);
+    printf("\n");
 }
 
 /* Generic pair printing using _Generic (C11). */

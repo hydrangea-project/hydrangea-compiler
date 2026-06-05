@@ -490,6 +490,36 @@ exportHeaderGuard :: ExportSpec -> String
 exportHeaderGuard spec =
   "HYDRANGEA_EXPORT_" ++ map toUpper (sanitizeExportName (exportKernelName spec)) ++ "_H"
 
+-- | Emit statements that print a value of the given 'CType' with no trailing
+-- newline.  Pairs are printed recursively as @(a, b)@ by accessing the @.fst@
+-- and @.snd@ struct fields; arrays (including 0-D arrays, e.g. reduce results)
+-- are printed with the element-appropriate helper.  Used to print compound
+-- results such as a pair whose components are arrays, which the @_Generic@
+-- 'hyd_print_pair' macro cannot handle.
+printComponentInline :: CType -> Doc -> Doc
+printComponentInline ty expr = case ty of
+  CTDouble         -> call "hyd_print_double_inline"
+  CTInt64          -> call "hyd_print_int_inline"
+  CTBool           -> call "hyd_print_int_inline"
+  CTUnit           -> text "printf(\"()\");"
+  CTArray CTDouble -> call "hyd_print_float_array_inline"
+  CTArray CTInt64  -> call "hyd_print_array_inline"
+  CTArray CTBool   -> call "hyd_print_array_inline"
+  CTArray CTUnit   -> call "hyd_print_array_inline"
+  CTPair a b ->
+    text "printf(\"(\");"
+      $$ printComponentInline a (expr <> text ".fst")
+      $$ text "printf(\", \");"
+      $$ printComponentInline b (expr <> text ".snd")
+      $$ text "printf(\")\");"
+  _ -> text "(void)" <> parens expr <> text ";"
+  where
+    call fn = text fn <> parens expr <> text ";"
+
+-- | Print a pair value (declared elsewhere) followed by a trailing newline.
+printPairValue :: CType -> Doc -> Doc
+printPairValue ty expr = printComponentInline ty expr $$ text "printf(\"\\n\");"
+
 genMain :: Maybe BenchmarkConfig -> Map CVar VarKind -> Map CVar CType -> [CFG.Proc] -> Doc
 genMain mBench retKinds retTypes procs =
   text "int main(void) {"
@@ -626,6 +656,14 @@ genMain mBench retKinds retTypes procs =
                   invoke "hyd_array_t*" (text (structuredArrayPrintName eltTy) <> parens (text result) <> text ";")
               | otherwise ->
                   invoke "hyd_array_t*" (text "(void)" <> parens (text result) <> text ";")
+            -- Print a pair using the recovered component types.  This is the
+            -- accurate path: unlike 'KPair' (which collapses any array component
+            -- to CEArray and so cannot tell int arrays from float arrays), the
+            -- return type carries each component's full 'CType', which is needed
+            -- to print, e.g., a pair of reduce results (each a 0-D array).
+            Just ty@(CTPair c1 c2)
+              | Just (et1, et2) <- (,) <$> ctypeToElemType c1 <*> ctypeToElemType c2 ->
+                  invoke (pairStructName et1 et2) (printPairValue ty (text result))
             _ -> case kind of
               KFloatArray -> printFn "hyd_print_float_array"
               KArray -> printFn "hyd_print_array"
