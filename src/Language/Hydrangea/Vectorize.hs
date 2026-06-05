@@ -46,6 +46,8 @@ module Language.Hydrangea.Vectorize
 
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Set (Set)
+import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..))
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
@@ -291,12 +293,74 @@ supportedVecBinOp op = op `elem` [CAddF, CSubF, CMulF, CDivF]
 supportedVecUnOp :: C.UnOp -> Bool
 supportedVecUnOp op = op `elem` [C.CSqrt, C.CExpF, C.CLog, C.CErf]
 
+-- | Atoms directly referenced by a right-hand side.  Used to compute which
+-- variables vary from lane to lane within a vectorized loop body.
+rhsAtoms :: C.RHS -> [Atom]
+rhsAtoms rhs = case rhs of
+  C.RAtom a -> [a]
+  C.RBinOp _ a b -> [a, b]
+  C.RUnOp _ a -> [a]
+  C.RTuple as -> as
+  C.RProj _ a -> [a]
+  C.RRecord fields -> map snd fields
+  C.RRecordProj _ a -> [a]
+  C.RPairMake _ _ a b -> [a, b]
+  C.RPairFst _ a -> [a]
+  C.RPairSnd _ a -> [a]
+  C.RArrayAlloc a -> [a]
+  C.RArrayCopy a -> [a]
+  C.RArrayLoad a b -> [a, b]
+  C.RArrayShape a -> [a]
+  C.RShapeSize a -> [a]
+  C.RShapeInit a -> [a]
+  C.RShapeLast a -> [a]
+  C.RFlatToNd a b -> [a, b]
+  C.RNdToFlat a b -> [a, b]
+  C.R2DToFlat a b -> [a, b]
+  C.RCall _ args -> args
+  C.RVecLoad a b -> [a, b]
+  C.RVecStore a b c -> [a, b, c]
+  C.RVecBinOp _ a b -> [a, b]
+  C.RVecUnOp _ a -> [a]
+  C.RVecSplat a -> [a]
+  C.RVecReduce _ a -> [a]
+  C.RArrayFree a -> [a]
+
+-- | Compute the set of variables whose value varies from lane to lane within a
+-- vectorized loop, i.e. those transitively derived from the loop iteration
+-- variable.  A lane-varying /scalar/ must never be broadcast with a splat: doing
+-- so would replicate a single lane's value across all lanes (the classic bug
+-- when a fused @generate@ computes an element from the index, e.g.
+-- @float_of i@).  Array loads of such variables are handled separately as
+-- contiguous vector loads, so over-approximating here is harmless — lane-varying
+-- vectors are resolved before the splat path is ever reached.
+laneVaryingVars :: CVar -> [Stmt] -> Set CVar
+laneVaryingVars iter = foldl step (S.singleton iter)
+  where
+    step s stmt = case stmt of
+      SAssign v rhs
+        | any (atomInSet s) (rhsAtoms rhs) -> S.insert v s
+      SParallelRegion body -> foldl step s body
+      _ -> s
+    atomInSet s (AVar v) = S.member v s
+    atomInSet _ _ = False
+
 data VectorLowerCtx = VectorLowerCtx
   { vlcTypeEnv     :: TypeEnv
   , vlcAccessFacts :: AccessFacts
   , vlcIter        :: CVar
   , vlcBase        :: CVar
+  , vlcLaneVarying :: Set CVar
+    -- ^ Variables that vary per lane (derived from the iteration index); a
+    --   scalar in this set cannot be splatted.
   }
+
+-- | Is @atom@ a scalar that varies from lane to lane (so it cannot be splatted)?
+-- The atom is examined after iteration-variable substitution, so a bare index
+-- shows up as the loop @base@.
+scalarIsLaneVarying :: VectorLowerCtx -> Atom -> Bool
+scalarIsLaneVarying ctx (AVar v) = v == vlcBase ctx || S.member v (vlcLaneVarying ctx)
+scalarIsLaneVarying _ _ = False
 
 toVectorOperand :: VectorLowerCtx -> VecEnv -> CVar -> Atom -> Maybe ([Stmt], Atom)
 toVectorOperand ctx env owner atom =
@@ -304,6 +368,10 @@ toVectorOperand ctx env owner atom =
     AVar v | Just vv <- M.lookup v env ->
       Just ([], AVecVar vv)
     scalar
+      -- A lane-varying scalar (e.g. a fused @generate@ element computed from the
+      -- index) must not be broadcast: bail so the loop falls back to the correct
+      -- scalar form (with the @omp simd@ hint).
+      | scalarIsLaneVarying ctx scalar -> Nothing
       | isDoubleCompatibleAtom (vlcTypeEnv ctx) scalar ->
           let splatVar = owner <> "__splat"
           in Just ([SAssign splatVar (C.RVecSplat scalar)], AVecVar splatVar)
@@ -467,7 +535,7 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
           let accVec = vecVarName acc
               vecInit = SAssign accVec (C.RVecSplat initVal)
               vecEnv0 = M.singleton acc accVec
-              ctx = VectorLowerCtx typeEnv accessFacts iter vecBase
+              ctx = VectorLowerCtx typeEnv accessFacts iter vecBase (laneVaryingVars iter body)
           vecBody <- transformVectorBody ctx vecEnv0 body
           if not (hasExplicitVectorOps vecBody)
             then Nothing
@@ -479,7 +547,7 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
                     _ -> tailPrep ++ [SLoop tailLoopSpec tailBody]
               pure (vecTripsStmt : vecInit : vecLoop : reduceBack : tailStmts)
     Nothing -> do
-      let ctx = VectorLowerCtx typeEnv accessFacts iter vecBase
+      let ctx = VectorLowerCtx typeEnv accessFacts iter vecBase (laneVaryingVars iter body)
       vecBody <- transformVectorBody ctx M.empty body
       if not (hasExplicitVectorOps vecBody)
         then Nothing

@@ -1037,3 +1037,24 @@ spec = do
         , "  let s = reduce (fn acc x => acc + x) 0 (generate [4] (fn [i] => i)) in"
         , "  ((s, 7), s)"
         ]
+
+  -- Vectorization correctness: a float reduction whose element is computed from
+  -- the loop index (a fused 'generate') must not splat the per-lane value.
+  -- Regression test for the explicit width-4 vector path, which previously
+  -- broadcast a single lane's value across all lanes (e.g. summing 0..7 to 16
+  -- instead of 28).
+  describe "vectorized float reductions over fused generators" $ do
+
+    it "reduces a fused float generator (sum 0..7 = 28)" $ withCC $
+      checkInlineSrc $ BS.pack
+        "let main = reduce (fn acc x => acc +. x) 0.0 (generate [8] (fn [i] => float_of i))"
+
+    it "reduces a fused float generator with arithmetic on the index" $ withCC $
+      checkInlineSrc $ BS.pack
+        "let main = reduce (fn acc x => acc +. x) 0.0 (generate [8] (fn [i] => float_of i *. 2.0))"
+
+    it "sums squares of a float array (map then reduce)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a = generate [8] (fn [i] => float_of i)"
+        , "let main = reduce (fn acc x => acc +. x) 0.0 (map (fn x => x *. x) a)"
+        ]
