@@ -27,6 +27,7 @@ library
                    , Language.Hydrangea.Pretty
                    , Language.Hydrangea.Infer
                    , Language.Hydrangea.Uniquify
+                   , Language.Hydrangea.Specialize
                    , Language.Hydrangea.Fusion
                    , Language.Hydrangea.ShapeNormalize
                    , Language.Hydrangea.CLI
@@ -113,6 +114,7 @@ test-suite hydrangea-test
        , Language.Hydrangea.StencilSpec
        , Language.Hydrangea.GatherBoundsSpec
        , Language.Hydrangea.WherePrecondSpec
+       , Language.Hydrangea.SpecializeSpec
     type:             exitcode-stdio-1.0
     default-language: GHC2021
     build-depends:

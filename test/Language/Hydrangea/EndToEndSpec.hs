@@ -902,3 +902,103 @@ spec = do
         , "let hist  = scatter (+) (fill [3] 0) idx src"
         , "let total = reduce (let add x y = x + y in add) 0 hist"
         ]
+
+  -- Monomorphization / specialization of polymorphic array functions.
+  -- These exercise the whole-program specialization pass: a top-level helper
+  -- whose element type is left polymorphic by inference is specialized to the
+  -- concrete (ground) element type of the array it is actually applied to, so
+  -- code generation never sees an unknown element type.  Each program's C
+  -- output is checked against the interpreter.
+  describe "polymorphic array specialization" $ do
+
+    it "specializes a polymorphic identity over a float array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let id x = x"
+        , "let main = foldl (fn acc x => acc +. x) 0.0"
+        , "             (id (generate [4] (fn [i] => float_of i)))"
+        ]
+
+    it "specializes a polymorphic copy with a polymorphic combine over a float array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let dup a = zipwith (fn x y => x) a a"
+        , "let main = foldl (fn acc x => acc +. x) 0.0"
+        , "             (dup (generate [4] (fn [i] => float_of i)))"
+        ]
+
+    it "specializes a polymorphic map-identity over a float array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let myid a = map (fn x => x) a"
+        , "let main = foldl (fn acc x => acc +. x) 0.0"
+        , "             (myid (generate [4] (fn [i] => float_of i)))"
+        ]
+
+    it "specializes a polymorphic indexing helper over a float array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let firstOf a = index [0] a"
+        , "let main = firstOf (generate [4] (fn [i] => float_of i +. 5.0))"
+        ]
+
+    it "specializes one polymorphic function at both int and float instantiations" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let dup a = zipwith (fn x y => x) a a"
+        , "let main ="
+        , "  let fs = foldl (fn acc x => acc +. x) 0.0"
+        , "             (dup (generate [4] (fn [i] => float_of i))) in"
+        , "  let is = foldl (fn acc x => acc + x) 0"
+        , "             (dup (generate [4] (fn [i] => i))) in"
+        , "  fs +. (float_of is)"
+        ]
+
+  -- Higher-order user functions: a function passed as an ordinary parameter and
+  -- used as a combine/transform inside the callee.  Lowering aliases the
+  -- parameter to the supplied function so it can be inlined at its use site.
+  describe "higher-order function parameters" $ do
+
+    it "passes a named function to a map-applying helper" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let inc x = x + 1"
+        , "let apply f a = map f a"
+        , "let main = foldl (fn acc x => acc + x) 0"
+        , "             (apply inc (generate [4] (fn [i] => i)))"
+        ]
+
+    it "passes a lambda to a map-applying helper over a float array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let apply f a = map f a"
+        , "let main = foldl (fn acc x => acc +. x) 0.0"
+        , "             (apply (fn x => x +. 1.0) (generate [4] (fn [i] => float_of i)))"
+        ]
+
+    it "applies a function parameter directly (twice)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let twice f x = f (f x)"
+        , "let inc x = x + 1"
+        , "let main = twice inc 10"
+        ]
+
+    it "passes a function parameter through to zipwith" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let zw f a b = zipwith f a b"
+        , "let main = foldl (fn acc x => acc + x) 0"
+        , "             (zw (fn x y => x + y)"
+        , "                 (generate [4] (fn [i] => i))"
+        , "                 (generate [4] (fn [i] => i)))"
+        ]
+
+    it "threads a function value through a let binding" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let inc x = x + 1"
+        , "let main = let g = inc in"
+        , "  foldl (fn acc x => acc + x) 0 (map g (generate [4] (fn [i] => i)))"
+        ]
+
+    it "specializes a higher-order helper at both int and float instantiations" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let apply f a = map f a"
+        , "let main ="
+        , "  let fs = foldl (fn acc x => acc +. x) 0.0"
+        , "             (apply (fn x => x +. 1.0) (generate [4] (fn [i] => float_of i))) in"
+        , "  let is = foldl (fn acc x => acc + x) 0"
+        , "             (apply (fn x => x + 1) (generate [4] (fn [i] => i))) in"
+        , "  fs +. (float_of is)"
+        ]

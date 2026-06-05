@@ -19,6 +19,7 @@ module Language.Hydrangea.Lowering
   ( lowerDecs
   , lowerDecsWithTypeEnv
   , lowerDecsWithTypeEnvAndRanks
+  , lowerDecsWithEnvs
   ) where
 
 import Control.Applicative ((<|>))
@@ -51,6 +52,12 @@ data LowerState = LowerState
     -- ^ Top-level declaration types from inference (@Var → CType@).
   , lsArrayRankEnv :: Map Var Int
     -- ^ Array rank (number of dimensions) for each top-level declaration.
+  , lsBinderTypeEnv :: Map Var CType
+    -- ^ Concrete type for every source-level value binder (function/lambda
+    --   parameters, pattern bindings, monomorphic let bindings), recovered by
+    --   inference after the monomorphization pass.  Used as an authoritative
+    --   fallback so element types of polymorphic combine functions and array
+    --   parameters are known and never reach codegen as @CTUnknown@.
   }
 
 type LowerM = State LowerState
@@ -85,6 +92,7 @@ initState = LowerState
   , lsVectorAccessFacts = M.empty
   , lsTopTypeEnv = M.empty
   , lsArrayRankEnv = M.empty
+  , lsBinderTypeEnv = M.empty
   }
 
 initStateWithTypeEnv :: Map Var CType -> LowerState
@@ -93,6 +101,13 @@ initStateWithTypeEnv topEnv = initState { lsTopTypeEnv = topEnv }
 initStateWithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> LowerState
 initStateWithTypeEnvAndRanks topEnv rankEnv =
   initState { lsTopTypeEnv = topEnv, lsArrayRankEnv = rankEnv }
+
+initStateWithEnvs :: Map Var CType -> Map Var Int -> Map Var CType -> LowerState
+initStateWithEnvs topEnv rankEnv binderEnv =
+  initState { lsTopTypeEnv = topEnv
+            , lsArrayRankEnv = rankEnv
+            , lsBinderTypeEnv = binderEnv
+            }
 
 preRegisterTopLevelFns :: [Dec Range] -> LowerM ()
 preRegisterTopLevelFns = mapM_ preRegister
@@ -130,11 +145,27 @@ lowerDecsWithTypeEnvAndRanks :: Map Var CType -> Map Var Int -> [Dec Range] -> P
 lowerDecsWithTypeEnvAndRanks topEnv rankEnv =
   lowerProgramWithState (initStateWithTypeEnvAndRanks topEnv rankEnv)
 
+-- | Lower declarations with inferred top-level types, array ranks, and a
+-- per-binder concrete-type environment produced by the monomorphization pass.
+--
+-- The binder-type environment supplies concrete types for source-level value
+-- binders, which guarantees that polymorphic-but-instantiated code (e.g. a
+-- generic combine function specialized to a float array) never leaves an
+-- array element type undetermined at code generation time.
+lowerDecsWithEnvs :: Map Var CType -> Map Var Int -> Map Var CType -> [Dec Range] -> Program
+lowerDecsWithEnvs topEnv rankEnv binderEnv =
+  lowerProgramWithState (initStateWithEnvs topEnv rankEnv binderEnv)
+
 lowerDec :: Dec Range -> LowerM Proc
 lowerDec (Dec _ name pats _ _ body) = do
   let params = concatMap patVarNames pats
   when (null pats) $
     modify' $ \s -> s { lsValueProcs = S.insert name (lsValueProcs s) }
+  -- Seed each parameter's concrete type from the per-binder environment so the
+  -- procedure body (in particular when emitting all top-level procs) can lower
+  -- with known element types even before any call-site inlining.
+  binderEnv <- gets lsBinderTypeEnv
+  mapM_ (\p -> maybe (pure ()) (registerCType p) (M.lookup p binderEnv)) params
   savedFacts <- gets lsArrayFacts
   savedVectorFacts <- gets lsVectorAccessFacts
   modify' $ \s -> s { lsArrayFacts = M.empty
@@ -378,10 +409,18 @@ lowerExp expr = case expr of
         lowerExp rest
     | otherwise -> do
         (sb, ab) <- lowerExp body
-        let bindStmt = SAssign name (RAtom ab)
-        propagatePairInfo name ab
-        (sr, ar) <- lowerExp rest
-        pure (sb ++ [bindStmt] ++ sr, ar)
+        isFn <- aliasFnBinding name ab
+        if isFn
+          then do
+            -- @name@ is bound to a function value; alias it (no value
+            -- assignment) so later applications can inline it.
+            (sr, ar) <- lowerExp rest
+            pure (sb ++ sr, ar)
+          else do
+            let bindStmt = SAssign name (RAtom ab)
+            propagatePairInfo name ab
+            (sr, ar) <- lowerExp rest
+            pure (sb ++ [bindStmt] ++ sr, ar)
 
   EBoundLetIn _ x _ rhs body -> do
     (sr, ar) <- lowerExp rhs
@@ -3218,7 +3257,16 @@ ctypeOfAtom (ABool _)   = pure CTBool
 ctypeOfAtom AUnit       = pure CTUnit
 ctypeOfAtom (AString _) = pure CTInt64
 ctypeOfAtom (AInt _)    = pure CTInt64
-ctypeOfAtom (AVar v)    = gets $ fromMaybe CTUnknown . M.lookup v . lsTypeEnv
+ctypeOfAtom (AVar v)    = gets $ \s ->
+  -- Prefer the type discovered locally during lowering; fall back to the
+  -- per-binder type environment from the monomorphization pass so that
+  -- source binders (e.g. polymorphic combine-function parameters specialized
+  -- to a concrete element type) are never reported as CTUnknown.
+  case M.lookup v (lsTypeEnv s) of
+    Just t | t /= CTUnknown -> t
+    local -> case M.lookup v (lsBinderTypeEnv s) of
+      Just bt -> bt
+      Nothing -> fromMaybe CTUnknown local
 ctypeOfAtom (AVecVar _) = pure CTUnknown
 
 -- | Determine the @CElemType@ of an atom for use in @RPairMake@.
@@ -3468,19 +3516,39 @@ atomToIndexExpr (AVar v) = IVar v
 atomToIndexExpr (AInt n) = IConst n
 atomToIndexExpr _ = IConst 0
 
+-- | If @src@ names a function value (a binding present in the function
+-- environment), alias @dst@ to the same definition and report 'True'.  This is
+-- what makes function-valued parameters work: when a user function such as
+-- @apply f a = map f a@ is inlined and @f@ is bound to an argument that is
+-- itself a function (a top-level function, a lambda, or another function-valued
+-- variable), @f@ becomes resolvable by the function-inlining helpers at its use
+-- sites.  No value-level assignment is emitted, because a function is not a
+-- first-class C value.
+aliasFnBinding :: CVar -> Atom -> LowerM Bool
+aliasFnBinding dst (AVar v) = do
+  mFn <- lookupFn v
+  case mFn of
+    Just (ps, b) -> registerFn dst ps b >> pure True
+    Nothing      -> pure False
+aliasFnBinding _ _ = pure False
+
 bindCopyVar :: CVar -> Atom -> LowerM [Stmt]
 bindCopyVar dst src = do
-  -- Only propagate a concrete type when the source atom has one registered.
-  -- For AVar atoms not yet in lsTypeEnv (e.g. array parameters inlined from
-  -- a callee), ctypeOfAtom would return the CTInt64 default, incorrectly
-  -- poisoning the destination's type in procTypeEnv and blocking later
-  -- backward-propagation through RArrayLoad / RArrayShape.
-  mSrcTy <- case src of
-    AVar v  -> gets (M.lookup v . lsTypeEnv)
-    _       -> Just <$> ctypeOfAtom src
-  mapM_ (registerCType dst) mSrcTy
-  propagatePairInfo dst src
-  pure [SAssign dst (RAtom src)]
+  isFn <- aliasFnBinding dst src
+  if isFn
+    then pure []
+    else do
+      -- Only propagate a concrete type when the source atom has one registered.
+      -- For AVar atoms not yet in lsTypeEnv (e.g. array parameters inlined from
+      -- a callee), ctypeOfAtom would return the CTInt64 default, incorrectly
+      -- poisoning the destination's type in procTypeEnv and blocking later
+      -- backward-propagation through RArrayLoad / RArrayShape.
+      mSrcTy <- case src of
+        AVar v  -> gets (M.lookup v . lsTypeEnv)
+        _       -> Just <$> ctypeOfAtom src
+      mapM_ (registerCType dst) mSrcTy
+      propagatePairInfo dst src
+      pure [SAssign dst (RAtom src)]
 
 bindPatAtom :: Pat Range -> Atom -> LowerM [Stmt]
 bindPatAtom (PVar _ v) src = bindCopyVar v src
@@ -3978,12 +4046,23 @@ inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of
           EBinOp _ (EVar _ bx) op' (EVar _ by) | bx == x, by == y ->
             pure [ SAssign resultVar (RBinOp (lowerBinOp op') (AVar param1) (AVar param2)) ]
           _ -> do
+            -- Seed the parameter types from the input element types (recovered
+            -- via the binder-type environment) before lowering the body, then
+            -- propagate the body's result type to resultVar.  Without this a
+            -- polymorphic combine such as @fn x y => x@ leaves resultVar (and
+            -- the array it fills) typed as CTUnknown.
+            param1Ty <- ctypeOfAtom (AVar param1)
+            param2Ty <- ctypeOfAtom (AVar param2)
+            when (param1Ty /= CTUnknown) $ registerCType x param1Ty
+            when (param2Ty /= CTUnknown) $ registerCType y param2Ty
             propagatePairInfo x (AVar param1)
             (stmts, atom) <- lowerExp body
+            atomTy <- ctypeOfAtom atom
             px <- freshCVar "p"
             py <- freshCVar "p"
             let stmts' = renameVarInStmts x px $ renameVarInStmts y py stmts
                 atom' = renameVarInAtom x px $ renameVarInAtom y py atom
+            when (atomTy /= CTUnknown) $ registerCType resultVar atomTy
             propagatePairInfo px (AVar param1)
             propagatePairInfo resultVar atom'
             pure $ [ SAssign px (RAtom (AVar param1))

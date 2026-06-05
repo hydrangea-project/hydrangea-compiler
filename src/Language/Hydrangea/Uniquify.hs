@@ -17,6 +17,9 @@ module Language.Hydrangea.Uniquify
   ( uniquifyExp
   , uniquifyDec
   , uniquifyDecs
+  , uniquifyDecsForce
+  , collectVarsExp
+  , collectVarsDec
   ) where
 
 import Control.Monad.State
@@ -34,24 +37,40 @@ data UniqState = UniqState
   { uniqCounter :: Int
   , uniqEnv :: Map Var Var
   , uniqUsed :: Set Var
+  , uniqForce :: Bool
+    -- ^ When 'True', freshen every local binder including names already
+    --   suffixed with @__uniq_@/@__fusion_@.  Used after the monomorphization
+    --   pass to disambiguate binders that were duplicated when cloning
+    --   polymorphic functions.
   }
 
 -- | Freshen local binders in an expression while preserving its structure.
 uniquifyExp :: Exp a -> Exp a
 uniquifyExp expr =
-  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = collectVarsExp expr}
+  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = collectVarsExp expr, uniqForce = False}
    in evalState (runUniqM (uniqExp expr)) st
 
 -- | Freshen local binders within a single declaration body.
 uniquifyDec :: Dec a -> Dec a
 uniquifyDec dec =
-  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = collectVarsDec dec}
+  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = collectVarsDec dec, uniqForce = False}
    in evalState (runUniqM (uniqTopDec dec)) st
 
 -- | Freshen local binders across a group of declarations using one shared name supply.
 uniquifyDecs :: [Dec a] -> [Dec a]
 uniquifyDecs decs =
-  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = S.unions (map collectVarsDec decs)}
+  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = S.unions (map collectVarsDec decs), uniqForce = False}
+   in evalState (runUniqM (mapM uniqTopDec decs)) st
+
+-- | Like 'uniquifyDecs' but forcibly re-freshens every local binder, even those
+-- already carrying a @__uniq_@/@__fusion_@ suffix.  This is used after the
+-- monomorphization pass clones polymorphic functions: the clones share binder
+-- names with their originals, and forcing fresh names gives every binder a
+-- globally unique identity so per-binder type information is unambiguous.
+-- Top-level declaration names are preserved.
+uniquifyDecsForce :: [Dec a] -> [Dec a]
+uniquifyDecsForce decs =
+  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = S.unions (map collectVarsDec decs), uniqForce = True}
    in evalState (runUniqM (mapM uniqTopDec decs)) st
 
 uniqTopDec :: Dec a -> UniqM (Dec a)
@@ -221,9 +240,11 @@ withEnv env' action = do
   pure result
 
 freshenBinder :: Var -> UniqM Var
-freshenBinder v
-  | shouldSkip v = pure v
-  | otherwise = freshName v
+freshenBinder v = do
+  force <- gets uniqForce
+  if not force && shouldSkip v
+    then pure v
+    else freshName v
 
 shouldSkip :: Var -> Bool
 shouldSkip v = BS.isPrefixOf "__fusion_" v || BS.isPrefixOf "__uniq_" v

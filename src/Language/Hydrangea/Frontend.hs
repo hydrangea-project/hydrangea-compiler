@@ -10,6 +10,7 @@ import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.Functor.Fixedpoint (unFix)
 import qualified Data.Map as Map
 import qualified Data.Map.Strict as M
+import qualified Data.Set as Set
 
 import Language.Hydrangea.Lexer hiding (Forall)
 import Language.Hydrangea.Parser
@@ -20,9 +21,10 @@ import Language.Hydrangea.ErrorFormat (formatTypeError, formatEvalError)
 import Language.Hydrangea.Fusion
 import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, normalizeShapesDecs)
 import Language.Hydrangea.Uniquify
+import Language.Hydrangea.Specialize (monomorphizeDecs, polymorphicFnNames)
 import Language.Hydrangea.CFG qualified as CFG
 import Language.Hydrangea.CFGCore (CType(..))
-import Language.Hydrangea.Lowering (lowerDecs, lowerDecsWithTypeEnv, lowerDecsWithTypeEnvAndRanks)
+import Language.Hydrangea.Lowering (lowerDecs, lowerDecsWithTypeEnv, lowerDecsWithTypeEnvAndRanks, lowerDecsWithEnvs)
 import Language.Hydrangea.CFGPipeline
   ( PipelineOptions(..)
   , metalPipeline
@@ -204,10 +206,42 @@ inferAndLowerToCFG = inferAndLowerToCFGWithFrontendOptions defaultFrontendOption
 
 inferAndLowerToCFGWithFrontendOptions :: FrontendOptions -> InferOptions -> [Dec Range] -> IO CFG.Program
 inferAndLowerToCFGWithFrontendOptions frontOpts opts decs = do
-  (typeEnv, rankEnv) <- inferTopLevelTypesAndRanksWithOptions opts decs
+  -- Normalize, fuse, and uniquify the source program.
   let pre = preprocessDecsWithOptions frontOpts decs
-  let prog = lowerDecsWithTypeEnvAndRanks typeEnv rankEnv pre
+  -- Whole-program monomorphization: specialize polymorphic top-level functions
+  -- so every binder sits in a concrete (ground) context before lowering.
+  mono <- monomorphizeProgram opts pre
+  -- Recover concrete per-binder types and top-level types/ranks from the
+  -- monomorphic program that we actually lower.
+  binderEnv <- inferBinderTypeEnvWithOptions opts mono
+  (typeEnv, rankEnv) <- inferTopLevelTypesAndRanksWithOptions opts mono
+  let prog = lowerDecsWithEnvs typeEnv rankEnv binderEnv mono
   pure prog
+
+-- | Run the whole-program monomorphization pass: discover polymorphic
+-- top-level functions, specialize them per call site, and restore globally
+-- unique binder names.  On inference failure (or when there is nothing
+-- polymorphic to specialize) this is the identity, preserving the exact
+-- declarations that were previously lowered.
+monomorphizeProgram :: InferOptions -> [Dec Range] -> IO [Dec Range]
+monomorphizeProgram opts pre = do
+  res <- runInferDecsWithOptions opts pre
+  case res of
+    Right (schemes, _warnings) ->
+      let polyNames = polymorphicFnNames schemes pre
+      in if Set.null polyNames
+           then pure pre
+           else pure (uniquifyDecsForce (monomorphizeDecs polyNames pre))
+    Left _ -> pure pre
+
+-- | Infer the monomorphic program and project each ground value-binder type to
+-- its CFG 'CType'.  Polymorphic or non-representable binders are omitted.
+inferBinderTypeEnvWithOptions :: InferOptions -> [Dec Range] -> IO (Map.Map Var CType)
+inferBinderTypeEnvWithOptions opts decs = do
+  res <- runInferDecsBinderTypes opts decs
+  case res of
+    Left _      -> pure Map.empty
+    Right binds -> pure $ M.fromList [(v, ct) | (v, ty) <- M.toList binds, Just ct <- [typeOfType ty]]
 
 -- | Lower declarations to CFG using inferred top-level concrete types.
 lowerToCFGWithTypes :: [Dec Range] -> IO CFG.Program

@@ -132,6 +132,12 @@ data InferState = InferState
   , wherePrecondEnv :: Map Var ([Pat Range], RefinePred)
     -- ^ Maps function names to their where-clause preconditions.
     --   Used at call sites to emit proof obligations.
+  , inferBinderRaw :: Map Var UType
+    -- ^ Raw (unresolved) unification type for every value binder encountered
+    --   during inference (function/lambda/pattern parameters and monomorphic
+    --   let bindings).  Resolved with 'applyBindings' at the end of inference
+    --   by 'runInferDecsBinderTypes' to recover concrete per-binder types for
+    --   the monomorphization pass.  Names are assumed globally unique.
   }
 
 -- | Initial inference state.
@@ -142,7 +148,13 @@ initInferState = InferState
   , inferWarnings  = []
   , defBodyEnv     = M.empty
   , wherePrecondEnv = M.empty
+  , inferBinderRaw = M.empty
   }
+
+-- | Record the (unresolved) unification type bound to a value binder so that
+-- it can be resolved to a concrete 'Type' once inference completes.
+recordBinder :: Var -> UType -> Infer ()
+recordBinder v t = modify' (\s -> s { inferBinderRaw = M.insert v t (inferBinderRaw s) })
 
 -- | Lift a unification-library action into the full inference monad.
 liftBinding :: IntBindingT TypeF Identity a -> Infer a
@@ -2198,7 +2210,9 @@ buildPatFunType r bodyTy = go
 -- | Extend the context with a list of monomorphic variable bindings.
 bindPats :: [(Var, UType)] -> Infer a -> Infer a
 bindPats []            m = m
-bindPats ((v, t) : vs) m = withBinding v (Forall [] [] t) $ bindPats vs m
+bindPats ((v, t) : vs) m = do
+  recordBinder v t
+  withBinding v (Forall [] [] t) $ bindPats vs m
 
 -- | Build a map from pattern-bound names to their refinement variables, using
 -- the @(Var, UType)@ bindings produced by 'buildPatFunType'.  The 'Var' key
@@ -2411,6 +2425,11 @@ inferDecs (Dec r var pats mwhere mty e : rest) = do
   -- holds the wrapper); for function declarations funTy already tracks params.
   let rhsTy = if null pats then inferredBodyTy else funTy
   boundTy <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
+  -- Record the resolved type of monomorphic value bindings (no parameters)
+  -- so the monomorphization pass can recover concrete per-binder types.
+  case (pats, boundTy) of
+    ([], Forall [] _ vty) -> recordBinder var vty
+    _                     -> return ()
   -- Register the definition body for single-parameter functions so that EMap
   -- and EApp can infer output value bounds for non-inline call sites.  We
   -- extract the parameter name via 'patVar'; if it cannot be extracted (e.g.
@@ -2550,6 +2569,33 @@ runInferDecsWithOptions opts decs = do
           else return (v, Right poly, [])
       let warnings = inferWarnings st ++ concatMap (\(_, _, ws) -> ws) pairs
       return $ fmap (, warnings) $ traverse (\(v, res, _) -> fmap (v,) res) pairs
+
+-- | Infer the program and return a map from every value binder (function and
+-- lambda parameters, pattern bindings, and monomorphic let bindings) to its
+-- resolved concrete 'Type'.  Only bindings whose type is fully ground (no
+-- remaining unification or type variables) are included; polymorphic binders
+-- are omitted.  The monomorphization pass uses this to give lowering an
+-- authoritative source of concrete element types.
+--
+-- For meaningful results the input declarations should already be
+-- monomorphized (e.g. via the specialization pass) and have globally unique
+-- binder names.
+runInferDecsBinderTypes :: InferOptions -> [Dec Range] -> IO (Either TypeError (Map Var Type))
+runInferDecsBinderTypes _opts decs = do
+  let result =
+        runIdentity $ evalIntBindingT $ runExceptT $ runWriterT $
+          runStateT (flip runReaderT M.empty action) initInferState
+  case result of
+    Left err                      -> return (Left err)
+    Right ((resolved, _st), _preds) -> return (Right resolved)
+  where
+    action = do
+      _ <- inferDecs decs
+      raw <- gets inferBinderRaw
+      resolvedPairs <- forM (M.toList raw) $ \(v, ut) -> do
+        ut' <- applyBindings ut
+        pure (v, freeze ut')
+      pure $ M.fromList [(v, t) | (v, Just t) <- resolvedPairs]
 
 -- | Discharge the predicates attached to a generalized type scheme.
 finalizePoly :: Polytype -> IO (Either TypeError Polytype)
