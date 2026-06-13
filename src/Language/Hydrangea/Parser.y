@@ -50,6 +50,7 @@ import Language.Hydrangea.Syntax
   generate   { L.RangedToken L.Generate _ }
   map        { L.RangedToken L.Map _ }
   zipwith    { L.RangedToken L.ZipWith _ }
+  append     { L.RangedToken L.Append _ }
   reduce     { L.RangedToken L.Reduce _ }
   reduce_generate { L.RangedToken L.ReduceGenerate _ }
   foldl      { L.RangedToken L.Foldl _ }
@@ -309,6 +310,7 @@ expspecial :: { Exp L.Range }
   | scatter atom atom atom atom { EScatter (L.rtRange $1 <-> info $5) $2 $3 $4 $5 }
   | scatter_guarded atom atom atom atom atom { EScatterGuarded (L.rtRange $1 <-> info $6) $2 $3 $4 $5 $6 }
   | gather atom atom            { EGather (L.rtRange $1 <-> info $3) $2 $3 }
+  | append atom atom            { EAppend (L.rtRange $1 <-> info $3) $2 $3 }
   | sqrt atom      { EUnOp (L.rtRange $1 <-> info $2) (Sqrt (L.rtRange $1)) $2 }
   | fst atom       { EUnOp (L.rtRange $1 <-> info $2) (Fst (L.rtRange $1)) $2 }
   | snd atom       { EUnOp (L.rtRange $1 <-> info $2) (Snd (L.rtRange $1)) $2 }

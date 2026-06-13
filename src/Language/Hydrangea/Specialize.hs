@@ -182,6 +182,7 @@ rewriteExp path = go
       EGenerate a sz f -> EGenerate a <$> go sz <*> go f
       EMap a f arr -> EMap a <$> go f <*> go arr
       EZipWith a f a1 a2 -> EZipWith a <$> go f <*> go a1 <*> go a2
+      EAppend a a1 a2 -> EAppend a <$> go a1 <*> go a2
       EReduce a f z arr -> EReduce a <$> go f <*> go z <*> go arr
       EReduceGenerate a f z shape gen ->
         EReduceGenerate a <$> go f <*> go z <*> go shape <*> go gen

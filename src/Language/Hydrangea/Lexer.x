@@ -57,6 +57,7 @@ tokens :-
 <0> generate { tok Generate }
 <0> map      { tok Map }
 <0> zipwith  { tok ZipWith }
+<0> append   { tok Append }
 <0> reduce   { tok Reduce }
 <0> reduce_generate { tok ReduceGenerate }
 <0> foldl_while { tok FoldlWhile }
@@ -310,6 +311,7 @@ data Token
   | Generate
   | Map
   | ZipWith
+  | Append
   | Reduce
   | ReduceGenerate
   | Foldl

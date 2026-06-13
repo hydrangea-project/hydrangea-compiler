@@ -1507,6 +1507,23 @@ infer (EZipWith _ fn arrExp1 arrExp2) = do
             emitPred (PEq (TValBoundDim arrVar 0) outBound)
       return arrTyOut
     _ -> return arrTyOut
+infer (EAppend r arrExp1 arrExp2) = do
+  arrTy1 <- infer arrExp1
+  arrTy2 <- infer arrExp2
+  (mVar1, sTy1, eTy1) <- asArrayType (firstParam arrExp1) arrTy1
+  (mVar2, sTy2, eTy2) <- asArrayType (firstParam arrExp2) arrTy2
+  _ <- wrange (firstParam arrExp1) $ eTy1 =:= eTy2
+  rank1 <- shapeArityFromType (firstParam arrExp1) sTy1
+  rank2 <- shapeArityFromType (firstParam arrExp2) sTy2
+  when (rank1 /= 1 || rank2 /= 1) $
+    throwError $ MiscError (Just r)
+  let outShape = mkTyConsFromVec [UTyInt]
+  (arrVarOut, arrTyOut) <- freshRefined (UTyArray outShape eTy1)
+  case (mVar1, mVar2) of
+    (Just v1, Just v2) ->
+      emitPred (PEq (TDim arrVarOut 0) (TAdd (TDim v1 0) (TDim v2 0)))
+    _ -> pure ()
+  pure arrTyOut
 infer (EReduce _ fn initExp arrExp) = do
   arrTy <- infer arrExp
   initTy <- infer initExp

@@ -167,6 +167,7 @@ normExp expr = case expr of
   EGenerate a sz f -> EGenerate a <$> normExp sz <*> normExp f
   EMap a f arr -> EMap a <$> normExp f <*> normExp arr
   EZipWith a f a1 a2 -> EZipWith a <$> normExp f <*> normExp a1 <*> normExp a2
+  EAppend a a1 a2 -> EAppend a <$> normExp a1 <*> normExp a2
   EReduce a f z arr -> EReduce a <$> normExp f <*> normExp z <*> normExp arr
   EReduceGenerate a f z sz g -> EReduceGenerate a <$> normExp f <*> normExp z <*> normExp sz <*> normExp g
   EIterate a n initArr f -> EIterate a <$> normExp n <*> normExp initArr <*> normExp f

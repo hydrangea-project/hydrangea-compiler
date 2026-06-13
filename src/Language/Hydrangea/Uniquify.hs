@@ -111,6 +111,7 @@ uniqExp expr =
     EGenerate a sz f -> EGenerate a <$> uniqExp sz <*> uniqExp f
     EMap a f arr -> EMap a <$> uniqExp f <*> uniqExp arr
     EZipWith a f a1 a2 -> EZipWith a <$> uniqExp f <*> uniqExp a1 <*> uniqExp a2
+    EAppend a a1 a2 -> EAppend a <$> uniqExp a1 <*> uniqExp a2
     EReduce a f z arr -> EReduce a <$> uniqExp f <*> uniqExp z <*> uniqExp arr
     EReduceGenerate a f z shape gen -> EReduceGenerate a <$> uniqExp f <*> uniqExp z <*> uniqExp shape <*> uniqExp gen
     EIterate a n initArr f -> EIterate a <$> uniqExp n <*> uniqExp initArr <*> uniqExp f
@@ -318,6 +319,7 @@ collectVarsExp expr =
         `S.union` S.unions (map (\p -> collectVarsExp (sgpShape p) `S.union` collectVarsExp (sgpIndexFn p)
                                          `S.union` collectVarsExp (sgpValueFn p)
                                          `S.union` maybe S.empty collectVarsExp (sgpGuardFn p)) phases)
+    EAppend _ a b -> collectVarsExp a `S.union` collectVarsExp b
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a

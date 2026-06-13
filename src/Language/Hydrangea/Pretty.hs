@@ -139,6 +139,7 @@ instance Pretty (Exp a) where
   pPrint (EGenerate _ sz f) = text "generate" <+> pPrint sz <+> pPrint f
   pPrint (EMap _ f arr) = text "map" <+> pPrint f <+> pPrint arr
   pPrint (EZipWith _ f arr1 arr2) = text "zipwith" <+> pPrint f <+> pPrint arr1 <+> pPrint arr2
+  pPrint (EAppend _ a b) = text "append" <+> pPrint a <+> pPrint b
   pPrint (EReduce _ f z arr) = text "reduce" <+> pPrint f <+> pPrint z <+> pPrint arr
   pPrint (EReduceGenerate _ f z shape gen) =
     text "reduce_generate" <+> pPrint f <+> pPrint z <+> pPrint shape <+> pPrint gen

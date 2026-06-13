@@ -128,6 +128,7 @@ collectVarsExp expr =
         `S.union` S.unions (map (\p -> collectVarsExp (sgpShape p) `S.union` collectVarsExp (sgpIndexFn p)
                                          `S.union` collectVarsExp (sgpValueFn p)
                                          `S.union` maybe S.empty collectVarsExp (sgpGuardFn p)) phases)
+    EAppend _ a b -> collectVarsExp a `S.union` collectVarsExp b
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a
@@ -249,6 +250,7 @@ freeVarsExp expr =
         `S.union` S.unions (map (\p -> freeVarsExp (sgpShape p) `S.union` freeVarsExp (sgpIndexFn p)
                                          `S.union` freeVarsExp (sgpValueFn p)
                                          `S.union` maybe S.empty freeVarsExp (sgpGuardFn p)) phases)
+    EAppend _ a b -> freeVarsExp a `S.union` freeVarsExp b
     EGather _ idx a -> freeVarsExp idx `S.union` freeVarsExp a
     EIndex _ i a -> freeVarsExp i `S.union` freeVarsExp a
     ECheckIndex _ i def a -> freeVarsExp i `S.union` freeVarsExp def `S.union` freeVarsExp a
@@ -350,6 +352,7 @@ boundVarsExp expr =
         `S.union` S.unions (map (\p -> boundVarsExp (sgpShape p) `S.union` boundVarsExp (sgpIndexFn p)
                                          `S.union` boundVarsExp (sgpValueFn p)
                                          `S.union` maybe S.empty boundVarsExp (sgpGuardFn p)) phases)
+    EAppend _ a b -> boundVarsExp a `S.union` boundVarsExp b
     EGather _ idx a -> boundVarsExp idx `S.union` boundVarsExp a
     EIndex _ i a -> boundVarsExp i `S.union` boundVarsExp a
     ECheckIndex _ i def a -> boundVarsExp i `S.union` boundVarsExp def `S.union` boundVarsExp a
@@ -455,6 +458,7 @@ countVarExp v expr =
         + sum (map (\p -> countVarExp v (sgpShape p) + countVarExp v (sgpIndexFn p)
                            + countVarExp v (sgpValueFn p)
                            + maybe 0 (countVarExp v) (sgpGuardFn p)) phases)
+    EAppend _ a b -> countVarExp v a + countVarExp v b
     EGather _ idx a -> countVarExp v idx + countVarExp v a
     EIndex _ i a -> countVarExp v i + countVarExp v a
     ECheckIndex _ i def a -> countVarExp v i + countVarExp v def + countVarExp v a
@@ -572,6 +576,7 @@ substExp v replacement expr =
                                     (substExp v replacement (sgpIndexFn p))
                                     (substExp v replacement (sgpValueFn p))
                                     (fmap (substExp v replacement) (sgpGuardFn p))) phases)
+    EAppend a a1 a2 -> EAppend a (substExp v replacement a1) (substExp v replacement a2)
     EGather a idx arr -> EGather a (substExp v replacement idx) (substExp v replacement arr)
     EIndex a idx arr -> EIndex a (substExp v replacement idx) (substExp v replacement arr)
     ECheckIndex a idx def arr -> ECheckIndex a (substExp v replacement idx) (substExp v replacement def) (substExp v replacement arr)
@@ -1265,6 +1270,7 @@ normExp expr =
                                               <*> normExp (sgpValueFn p)
                                               <*> mapM normExp (sgpGuardFn p)) phases
       pure (EScatterGen a c' d' phases')
+    EAppend a x y -> EAppend a <$> normExp x <*> normExp y
     EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
     EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr
@@ -1654,6 +1660,10 @@ fuseOnce expr =
                                               <*> fuseOnce (sgpValueFn p)
                                               <*> mapM fuseOnce (sgpGuardFn p)) phases
       pure (EScatterGen a c' d' phases')
+    EAppend a x y -> do
+      x' <- fuseOnce x
+      y' <- fuseOnce y
+      fuseAppend a x' y'
     EGather a idx arr -> do
       idx' <- fuseOnce idx
       arr' <- fuseOnce arr
@@ -1735,6 +1745,11 @@ fuseMap a f arr =
         Just p -> emitProducer a p {producerElem = KApp (KConst f) (producerElem p)}
         Nothing ->
           case arr of
+            -- map f (append xs ys) => append (map f xs) (map f ys)
+            EAppend _ xs ys -> do
+              xs' <- fuseMap a f xs
+              ys' <- fuseMap a f ys
+              pure (EAppend a xs' ys')
             -- map f (zipwith g xs ys) => zipwith (\x y -> f (g x y)) xs ys
             EZipWith _ g xs ys -> do
               (fn, x, y) <- mkLet a
@@ -2097,7 +2112,59 @@ fuseReduce a f z arr =
               dec = mkDec1 a fn i body
               shape = EShapeOf a idx
           pure $ ELetIn a dec (EReduceGenerate a f z shape (EVar a fn))
+        -- reduce f z (append xs ys): preserved as-is at the surface level.
+        -- The algebraic rewrite [reduce f z (append a b) = reduce f (reduce f z a) b]
+        -- is type-incorrect in Hydrangea (reduce is rank-lowering; the inner reduce
+        -- produces a 0-D array rather than a scalar element).  Instead, we lower
+        -- EReduce-of-EAppend directly to a two-pass loop in Lowering.hs, which
+        -- threads the scalar accumulator through without ever materialising the
+        -- concatenated array.
+        EAppend {} -> pure (EReduce a f z arr)
         _ -> pure (EReduce a f z arr)
+
+-- | Push-fuse @append (generate s1 f1) (generate s2 f2)@ into a two-phase
+-- 'EScatterGen' — the operational realisation of the push-side reading of
+-- append (paper §"Extending the Algebra").
+--
+-- The append result is a length @|s1| ++ |s2|@ buffer written by two phases
+-- with a projection combine (each cell written exactly once):
+--   * phase 1 iterates @s1@, routes by the identity injection @i ↦ i@,
+--     and inlines the left generator @f1@ as its value kernel;
+--   * phase 2 iterates @s2@, routes by the right injection @i ↦ |s1| + i@,
+--     and inlines the right generator @f2@.
+--
+-- Only 1-D generator operands are handled; anything else falls back to a
+-- plain 'EAppend' (materialising lowering).
+fuseAppend :: (Eq a) => a -> Exp a -> Exp a -> FusionM (Exp a)
+fuseAppend ann x y =
+  case (x, y) of
+    (EGenerate _ s1 f1, EGenerate _ s2 f2)
+      | EVec _ [len1] <- s1
+      , EVec _ [len2] <- s2 -> do
+          combN <- freshVar "__app_comb"
+          accV  <- freshVar "__app_acc"
+          valV  <- freshVar "__app_x"
+          let comb = ELetIn ann
+                (Dec ann combN [PVar ann accV, PVar ann valV] Nothing Nothing
+                   (EVar ann valV))
+                (EVar ann combN)
+          r1 <- freshVar "__app_r1"
+          k1 <- freshVar "__app_k1"
+          let route1 = ELetIn ann
+                (Dec ann r1 [PVec ann [PVar ann k1]] Nothing Nothing (EVar ann k1))
+                (EVar ann r1)
+          r2 <- freshVar "__app_r2"
+          k2 <- freshVar "__app_k2"
+          let route2 = ELetIn ann
+                (Dec ann r2 [PVec ann [PVar ann k2]] Nothing Nothing
+                   (EBinOp ann len1 (Plus ann) (EVar ann k2)))
+                (EVar ann r2)
+          let outLen = EBinOp ann len1 (Plus ann) len2
+              dflt   = EFill ann (EVec ann [outLen]) (EFloat ann 0.0)
+              phases = [ ScatterGenPhase s1 route1 f1 Nothing
+                       , ScatterGenPhase s2 route2 f2 Nothing ]
+          pure (EScatterGen ann comb dflt phases)
+    _ -> pure (EAppend ann x y)
 
 fuseGather :: (Eq a) => a -> Exp a -> Exp a -> FusionM (Exp a)
 fuseGather a idx arr =

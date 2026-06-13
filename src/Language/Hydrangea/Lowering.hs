@@ -613,6 +613,96 @@ lowerExp expr = case expr of
          , AVar arr
          )
 
+  EAppend _ arr1Exp arr2Exp -> do
+    (s1, a1) <- lowerExp arr1Exp
+    (s2, a2) <- lowerExp arr2Exp
+    shp1 <- freshCVar "shp1"
+    shp2 <- freshCVar "shp2"
+    n1 <- freshCVar "n1"
+    n2 <- freshCVar "n2"
+    outN <- freshCVar "out_n"
+    outShp <- freshCVar "out_shp"
+    outArr <- freshCVar "out_arr"
+    i1 <- freshIterVar "i"
+    i2 <- freshIterVar "j"
+    e1 <- freshCVar "e1"
+    e2 <- freshCVar "e2"
+    destIdx <- freshCVar "dst"
+    arrTy <- ctypeOfAtom a1
+    let elemTy = case arrTy of CTArray et -> et; _ -> CTUnknown
+    registerCType e1 elemTy
+    registerCType e2 elemTy
+    registerCType outArr (CTArray elemTy)
+    noteReadOnlyAtom a1
+    noteReadOnlyAtom a2
+    markArrayFreshWriteOnce outArr
+    noteDenseReadAtom a1
+    noteDenseReadAtom a2
+    markContiguousWriteArray outArr
+    pure ( s1 ++ s2
+         ++ [ SAssign shp1 (RArrayShape a1)
+            , SAssign shp2 (RArrayShape a2)
+            , SAssign n1 (RShapeSize (AVar shp1))
+            , SAssign n2 (RShapeSize (AVar shp2))
+            , SAssign outN (RBinOp CAdd (AVar n1) (AVar n2))
+            , SAssign outShp (RTuple [AVar outN])
+            , SAssign outArr (RArrayAlloc (AVar outShp))
+            , SLoop (LoopSpec [i1] [atomToIndexExpr (AVar n1)] Serial Nothing LoopMap [])
+                [ SAssign e1 (RArrayLoad a1 (AVar i1))
+                , SArrayWrite (AVar outArr) (AVar i1) (AVar e1)
+                ]
+            , SLoop (LoopSpec [i2] [atomToIndexExpr (AVar n2)] Serial Nothing LoopMap [])
+                [ SAssign e2 (RArrayLoad a2 (AVar i2))
+                , SAssign destIdx (RBinOp CAdd (AVar n1) (AVar i2))
+                , SArrayWrite (AVar outArr) (AVar destIdx) (AVar e2)
+                ]
+            ]
+         , AVar outArr
+         )
+
+  -- Specialised lowering for the load-bearing 1-D fusion pattern:
+  -- reduce f init (append a b) → fold f over a, then over b, with a
+  -- single scalar accumulator threaded through.  Avoids the
+  -- allocation+copy of materialising the appended array.
+  EReduce _ fnExp initExp (EAppend _ aExp bExp) -> do
+    (si, ai) <- lowerExp initExp
+    (sa, aa) <- lowerExp aExp
+    (sb, ab) <- lowerExp bExp
+    shpA   <- freshCVar "shpA"
+    shpB   <- freshCVar "shpB"
+    nA     <- freshCVar "nA"
+    nB     <- freshCVar "nB"
+    outShp <- freshCVar "out_shp"
+    outArr <- freshCVar "out_arr"
+    acc    <- freshCVar "acc"
+    iA     <- freshIterVar "i"
+    iB     <- freshIterVar "j"
+    elemA  <- freshCVar "eA"
+    elemB  <- freshCVar "eB"
+    (bodyA, mRedopA) <- lowerReductionStep fnExp acc elemA
+    (bodyB, _      ) <- lowerReductionStep fnExp acc elemB
+    let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedopA
+    noteReadOnlyAtom aa
+    noteReadOnlyAtom ab
+    noteDenseReadAtom aa
+    noteDenseReadAtom ab
+    pure ( si ++ sa ++ sb
+         ++ [ SAssign shpA (RArrayShape aa)
+            , SAssign shpB (RArrayShape ab)
+            , SAssign nA (RShapeSize (AVar shpA))
+            , SAssign nB (RShapeSize (AVar shpB))
+            , SAssign outShp (RTuple [])
+            , SAssign outArr (RArrayAlloc (AVar outShp))
+            , SAssign acc (RAtom ai)
+            , SLoop (LoopSpec [iA] [atomToIndexExpr (AVar nA)] Serial mReductionSpec LoopReduction [])
+                ( [ SAssign elemA (RArrayLoad aa (AVar iA)) ] ++ bodyA )
+            , SLoop (LoopSpec [iB] [atomToIndexExpr (AVar nB)] Serial mReductionSpec LoopReduction [])
+                ( [ SAssign elemB (RArrayLoad ab (AVar iB)) ] ++ bodyB )
+            , SArrayWrite (AVar outArr) (AInt 0) (AVar acc)
+            ]
+         , AVar outArr
+         )
+
   EReduce _ fnExp initExp arrExp -> do
     (si, ai) <- lowerExp initExp
     (sa, aa) <- lowerExp arrExp

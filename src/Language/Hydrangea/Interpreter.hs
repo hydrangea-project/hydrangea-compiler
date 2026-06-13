@@ -222,6 +222,29 @@ evalExp expr env = case expr of
             newVals <- zipWithM (\a b -> evalApp vFn a env >>= \fnA -> evalApp fnA b env) vals1 vals2
             pure $ VArray shape1 newVals
       _ -> throwError $ TypeError "ZipWith requires two arrays"
+  EAppend _ a1Expr a2Expr -> do
+    varr1 <- evalExp a1Expr env
+    varr2 <- evalExp a2Expr env
+    case (varr1, varr2) of
+      (VArray shape1 vals1, VArray shape2 vals2) ->
+        case (reverse shape1, reverse shape2) of
+          (d1 : prefix1, d2 : prefix2)
+            | reverse prefix1 == reverse prefix2 ->
+                let outShape = reverse (d1 + d2 : prefix1)
+                    leadingSize = product (reverse prefix1)
+                    interleave [] [] = []
+                    interleave xs ys =
+                      let (xh, xt) = splitAt (fromInteger d1) xs
+                          (yh, yt) = splitAt (fromInteger d2) ys
+                      in xh ++ yh ++ interleave xt yt
+                in if fromInteger leadingSize * fromInteger d1 /= length vals1
+                     || fromInteger leadingSize * fromInteger d2 /= length vals2
+                   then throwError $ InvalidArrayOperation
+                          "Append: array element count does not match shape"
+                   else pure $ VArray outShape (interleave vals1 vals2)
+          _ -> throwError $ InvalidArrayOperation
+                 "Append: arrays must share leading dimensions"
+      _ -> throwError $ TypeError "Append requires two arrays"
   EReduce _ fnExpr zeroExpr arrExpr -> do
     vFn <- evalExp fnExpr env
     vZero <- evalExp zeroExpr env

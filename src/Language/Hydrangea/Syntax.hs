@@ -293,6 +293,10 @@ data Exp a
     EMap a (Exp a) (Exp a)
   | -- | Zip two arrays with a binary function.
     EZipWith a (Exp a) (Exp a) (Exp a)
+  | -- | Concatenate two arrays along their trailing/rightmost axis.
+    -- Both arrays must share their leading dimensions and element type;
+    -- their trailing dims add: @append : Array[s, n1] -> Array[s, n2] -> Array[s, n1+n2]@.
+    EAppend a (Exp a) (Exp a)
   | -- | Reduce an array along the trailing/rightmost axis (rank-lowering): function, initial value, array
     EReduce a (Exp a) (Exp a) (Exp a)
   | -- | Reduce a generated array along the trailing axis without materializing it: function, init, shape, generator
@@ -478,6 +482,7 @@ firstParam = \case
   EGenerate a _ _ -> a
   EMap a _ _ -> a
   EZipWith a _ _ _ -> a
+  EAppend a _ _ -> a
   EReduce a _ _ _ -> a
   EReduceGenerate a _ _ _ _ -> a
   EFoldl a _ _ _ -> a
