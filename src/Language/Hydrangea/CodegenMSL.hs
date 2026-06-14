@@ -88,7 +88,10 @@ data MSLArtifacts = MSLArtifacts
     -- | Contents of the self-contained ObjC harness.
     mslHarnessSource :: String,
     -- | Header file (present in export mode).
-    mslHeaderSource :: Maybe String
+    mslHeaderSource :: Maybe String,
+    -- | Diagnostics about work that falls back to the CPU (printed to stderr
+    -- by the CLI). Empty when the whole computation runs on the GPU.
+    mslWarnings :: [String]
   }
 
 -- | Options controlling which proc is selected as the GPU kernel.
@@ -159,12 +162,29 @@ codegenMSL opts prog@(CFG.Program procs) =
         Just _ -> codegenMSLSingle opts prog -- explicit kernel: single-kernel path
         Nothing
           | not (mslMultiKernel opts) -> codegenMSLSingle opts prog
+          -- A result proc that is itself a chain of several GPU loops
+          -- (e.g. fill -> scatter -> reduce) runs each loop as its own kernel
+          -- with GPU-resident buffers between them.
+          | Just rp <- resultProc procs,
+            topLevelGpuLoopCount rp >= 2 ->
+              codegenMSLMultiPhase prog rp
           | otherwise ->
               let gpuProcs = findGPUEligibleProcs procs
                in case gpuProcs of
                     [] -> Left "MSL backend: no proc with a parallelizable loop found"
-                    [_] -> codegenMSLSingle opts prog -- one GPU proc: existing path
-                    _ -> codegenMSLMulti prog gpuProcs
+                    _ ->
+                      -- The harness prints the program result: the `main` entry or
+                      -- the final binding. The last GPU-eligible proc is the buffer
+                      -- that gets printed; if it isn't the result proc, the result
+                      -- isn't GPU-computable and we'd silently print an intermediate.
+                      case resultProcName procs of
+                        Nothing -> Left "MSL backend: empty program"
+                        Just rname
+                          | rname /= CFG.procName (last gpuProcs) ->
+                              Left (resultNotLowerableMsg rname)
+                          | otherwise -> case gpuProcs of
+                              [_] -> codegenMSLSingle opts prog -- one GPU proc: existing path
+                              _ -> codegenMSLMulti prog gpuProcs
 
 -- | Multi-kernel code path: dispatch multiple GPU kernels in sequence.
 codegenMSLMulti :: CFG.Program -> [CFG.Proc] -> Either String MSLArtifacts
@@ -195,7 +215,8 @@ codegenMSLMulti prog@(CFG.Program procs) gpuProcs = do
         MSLArtifacts
           { mslKernelSource = kernelSrc,
             mslHarnessSource = harnessSrc,
-            mslHeaderSource = Nothing
+            mslHeaderSource = Nothing,
+            mslWarnings = cpuFallbackWarningsMulti procs kas
           }
 
 -- | Single-kernel code path (existing behaviour).
@@ -203,6 +224,23 @@ codegenMSLSingle :: MSLOptions -> CFG.Program -> Either String MSLArtifacts
 codegenMSLSingle opts prog@(CFG.Program procs) = do
   kernelProc <- findKernelProc opts procs
   ka <- analyzeOneKernel prog kernelProc
+  -- The harness can finish post-kernel CPU work only if it is straight-line
+  -- (projection / reshape). A loop after the kernel (e.g. a reduction) can't be
+  -- emitted on the CPU side, so refuse rather than produce wrong output. This is
+  -- only reachable via an explicit --metal-kernel override (normal selection
+  -- rejects procs with a loop after the kernel).
+  let postLoopHasLoop = not (null (topLevelLoopSpecs (kaPostLoopStmts ka)))
+      retPrintable = retResolvesToOutput (kaRetAtom ka) (kaPostLoopStmts ka) (kaOutputArrays ka)
+  () <-
+    if postLoopHasLoop && not retPrintable
+      then
+        Left $
+          "MSL backend: kernel `"
+            ++ BS.unpack (kaName ka)
+            ++ "` leaves a loop (e.g. a reduction) running after it that the Metal"
+            ++ " harness cannot finish on the CPU. Select a different kernel"
+            ++ " (--metal-kernel=<name>) or run on the C backend."
+      else Right ()
   let retKinds = procReturnKinds prog
       retTypes = inferProgramReturnTypes prog
   helperC <- genHelperC procs (kaName ka) retKinds
@@ -226,6 +264,7 @@ codegenMSLSingle opts prog@(CFG.Program procs) = do
           (kaEffectivePreLoop ka)
           (kaLoopSpec ka)
           (kaRetAtom ka)
+          (kaPostLoopStmts ka)
           (kaTypeEnv ka)
           (kaArrayElemTys ka)
           retKinds
@@ -239,8 +278,281 @@ codegenMSLSingle opts prog@(CFG.Program procs) = do
     MSLArtifacts
       { mslKernelSource = kernelSrc,
         mslHarnessSource = harnessSrc,
-        mslHeaderSource = Nothing
+        mslHeaderSource = Nothing,
+        mslWarnings = cpuFallbackWarningsSingle ka
       }
+
+-- ---------------------------------------------------------------------------
+-- Multi-phase code path (Layer A): one proc, several GPU loops chained with
+-- GPU-resident buffers between them (e.g. fill -> scatter -> reduce).
+-- ---------------------------------------------------------------------------
+
+-- | True for a loop the GPU can run as a kernel: a map/map-reduction or any
+-- parallelized loop (which includes atomic/privatized scatter-add).
+isGpuLoopSpec :: CFG.LoopSpec -> Bool
+isGpuLoopSpec spec =
+  CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
+    || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
+
+-- | The proc whose result the program prints: @main@ if present, else the last.
+resultProc :: [CFG.Proc] -> Maybe CFG.Proc
+resultProc procs = case filter (\p -> CFG.procName p == "main") procs of
+  (p : _) -> Just p
+  [] -> if null procs then Nothing else Just (last procs)
+
+-- | Number of top-level GPU-eligible loops in a proc body (post-return).
+topLevelGpuLoopCount :: CFG.Proc -> Int
+topLevelGpuLoopCount p =
+  let (bodyNoRet, _) = splitFinalReturn (CFG.procBody p)
+   in length [() | CFG.SLoop spec _ <- bodyNoRet, isGpuLoopSpec spec]
+
+-- | Lower a proc that is a straight-line sequence of GPU loops (with scalar/
+-- shape glue between them) to a chain of kernel dispatches sharing GPU buffers.
+codegenMSLMultiPhase :: CFG.Program -> CFG.Proc -> Either String MSLArtifacts
+codegenMSLMultiPhase prog@(CFG.Program procs) rp = do
+  let body = CFG.procBody rp
+      (bodyNoRet, retAtom) = splitFinalReturn body
+      retTypes = inferProgramReturnTypes prog
+      retKinds = procReturnKinds prog
+      callParamTys = buildCallParamTypes retTypes procs
+      typeEnv = recoverProcTypeEnv retTypes callParamTys rp
+      arrayElemTys =
+        inferArrayElemTypesFromStmts
+          retTypes
+          body
+          (Map.fromList [(v, elt) | (v, CTArray elt) <- Map.toList typeEnv])
+      indexed = zip [0 ..] bodyNoRet
+      loopIdxs = [i | (i, CFG.SLoop spec _) <- indexed, isGpuLoopSpec spec]
+      -- Per-phase analysis: glue = all non-loop statements before this loop.
+      mkPhase phaseNo i =
+        case bodyNoRet !! i of
+          CFG.SLoop spec lb ->
+            let glueBefore = [s | (j, s) <- indexed, j < i, notLoopStmt s]
+                (ins, outs, scals, hoisted) =
+                  classifyKernelParams glueBefore lb spec typeEnv retKinds
+                aliases = collectArrayAliases (Set.fromList ins) (glueBefore ++ hoisted)
+             in KernelAnalysis
+                  { kaProc = rp,
+                    kaName = CFG.procName rp <> BS.pack ("_p" ++ show (phaseNo :: Int)),
+                    kaPreLoopStmts = glueBefore,
+                    kaLoopSpec = spec,
+                    kaLoopBody = lb,
+                    kaRetAtom = Nothing,
+                    kaTypeEnv = typeEnv,
+                    kaArrayElemTys = arrayElemTys,
+                    kaInputArrays = ins,
+                    kaOutputArrays = outs,
+                    kaScalarInputs = scals,
+                    kaEffectivePreLoop = glueBefore ++ hoisted,
+                    kaHoistedCallMap = buildHoistedCallMap hoisted,
+                    kaPreLoopAliases = aliases,
+                    kaPostLoopStmts = [],
+                    kaProcParams = CFG.procParams rp
+                  }
+          _ -> error "codegenMSLMultiPhase: loopIdxs pointed at a non-loop"
+      phases = zipWith mkPhase [0 ..] loopIdxs
+  mapM_ (validateMSLLoopBody . kaLoopBody) phases
+  helperC <- genHelperC procs (CFG.procName rp) retKinds
+  let kernelSrc = genMultiKernelMSL phases
+      harnessSrc =
+        genMultiPhaseHarness
+          rp
+          bodyNoRet
+          loopIdxs
+          phases
+          retAtom
+          typeEnv
+          arrayElemTys
+          retKinds
+          helperC
+  Right
+    MSLArtifacts
+      { mslKernelSource = kernelSrc,
+        mslHarnessSource = harnessSrc,
+        mslHeaderSource = Nothing,
+        mslWarnings = []
+      }
+
+-- | A statement that is not a loop (i.e. CPU glue between GPU phases).
+notLoopStmt :: CFG.Stmt -> Bool
+notLoopStmt (CFG.SLoop {}) = False
+notLoopStmt _ = True
+
+-- | Generate the harness for a multi-phase proc: walk the top-level statements
+-- in order, running scalar/shape glue on the host, allocating a Metal buffer per
+-- GPU array (shared across phases by name), dispatching each GPU loop as a
+-- kernel, then reading back the result, finishing on the CPU, and printing.
+genMultiPhaseHarness ::
+  CFG.Proc ->
+  -- | bodyNoRet (top-level statements, return split off)
+  [CFG.Stmt] ->
+  -- | indices of GPU loops within bodyNoRet
+  [Int] ->
+  -- | phases (aligned with the loop indices, in order)
+  [KernelAnalysis] ->
+  -- | return atom
+  Maybe Atom ->
+  TypeEnv ->
+  Map CVar CType ->
+  Map CVar VarKind ->
+  -- | helper C source
+  String ->
+  String
+genMultiPhaseHarness _rp bodyNoRet loopIdxs phases retAtom typeEnv arrayElemTys retKinds helperC =
+  unlines $
+    [ "// Hydrangea Metal harness (multi-phase) — generated by the MSL backend.",
+      "#include \"hydrangea_runtime.h\"",
+      "#include <stdio.h>",
+      "#include <string.h>",
+      "#include <stdlib.h>",
+      "#import <Foundation/Foundation.h>",
+      "#import <Metal/Metal.h>",
+      "",
+      "// ---- CPU helper procs ----",
+      helperC,
+      "",
+      "// ---- Metal harness main ----",
+      "int main(int argc, const char* argv[]) {",
+      "    @autoreleasepool {",
+      "    const char* _metallib = argc > 1 ? argv[1] : \"kernel.metallib\";",
+      "    id<MTLDevice> _dev = MTLCreateSystemDefaultDevice();",
+      "    if (!_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }",
+      "    NSError* _err = nil;",
+      "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:_metallib]];",
+      "    id<MTLLibrary> _lib = [_dev newLibraryWithURL:_libURL error:&_err];",
+      "    if (!_lib) { fprintf(stderr, \"hydrangea: failed to load metallib: %s\\n\", [_err.localizedDescription UTF8String]); return 1; }",
+      "    id<MTLCommandQueue> _queue = [_dev newCommandQueue];",
+      ""
+    ]
+      ++ concatMap genPSO phases
+      ++ [""]
+      ++ concatMap emitTopStmt preIndexed
+      ++ [""]
+      ++ concatMap genReadback neededReadback
+      ++ concatMap (genPreLoopLine typeEnv retKinds Set.empty Set.empty) postStmts
+      ++ printReturnLines
+      ++ [ "    } // @autoreleasepool",
+           "    return 0;",
+           "}"
+         ]
+  where
+    indexed = zip [0 ..] bodyNoRet
+    loopIdxSet = Set.fromList loopIdxs
+    phaseAt = Map.fromList (zip loopIdxs phases)
+    lastLoopIdx = if null loopIdxs then -1 else maximum loopIdxs
+    preIndexed = [(j, s) | (j, s) <- indexed, j <= lastLoopIdx]
+    postStmts = [s | (j, s) <- indexed, j > lastLoopIdx]
+
+    gpuArrays = nub (concatMap (\p -> kaInputArrays p ++ kaOutputArrays p) phases)
+    gpuArraySet = Set.fromList gpuArrays
+    phaseOutputs = nub (concatMap kaOutputArrays phases)
+    referencedVars =
+      usedVarsStmts postStmts
+        `Set.union` Set.fromList [v | Just (AVar v) <- [retAtom]]
+    neededReadback = [v | v <- phaseOutputs, v `Set.member` referencedVars]
+
+    mslElemTy v = case Map.lookup v arrayElemTys of
+      Just elt -> mslTypeName elt
+      Nothing -> case Map.lookup v typeEnv of
+        Just (CTArray elt) -> mslTypeName elt
+        _ -> "long"
+    scalarTyOf v = case Map.lookup v typeEnv of
+      Just ct -> mslTypeName ct
+      _ -> "long"
+
+    genPSO p =
+      let knm = sanitize (kaName p)
+       in [ "    id<MTLFunction> _fn_" ++ knm ++ " = [_lib newFunctionWithName:@\"" ++ knm ++ "\"];",
+            "    if (!_fn_" ++ knm ++ ") { fprintf(stderr, \"hydrangea: kernel " ++ knm ++ " not found\\n\"); return 1; }",
+            "    id<MTLComputePipelineState> _pso_" ++ knm ++ " = [_dev newComputePipelineStateWithFunction:_fn_" ++ knm ++ " error:&_err];",
+            "    if (!_pso_" ++ knm ++ ") { fprintf(stderr, \"hydrangea: pipeline error: %s\\n\", [_err.localizedDescription UTF8String]); return 1; }"
+          ]
+
+    emitTopStmt (j, s)
+      | j `Set.member` loopIdxSet = case Map.lookup j phaseAt of
+          Just p -> genDispatch p
+          Nothing -> []
+      | otherwise = case s of
+          CFG.SAssign v (RArrayAlloc shp)
+            | v `Set.member` gpuArraySet -> genBufferAlloc v shp
+          _ -> genPreLoopLine typeEnv retKinds gpuArraySet Set.empty s
+
+    genBufferAlloc v shp =
+      let elemTy = mslElemTy v
+          nm = sanitize v
+          szExpr = "(size_t)(" ++ nm ++ "_n * sizeof(" ++ elemTy ++ "))"
+       in [ "    hyd_tuple_t " ++ nm ++ "_shape = " ++ genCAtom shp ++ ";",
+            "    long " ++ nm ++ "_n = hyd_shape_size(" ++ nm ++ "_shape);",
+            "    id<MTLBuffer> _buf_" ++ nm ++ " = [_dev newBufferWithLength:" ++ szExpr ++ " options:MTLResourceStorageModeShared];",
+            "    memset(_buf_" ++ nm ++ ".contents, 0, " ++ szExpr ++ ");",
+            "    id<MTLBuffer> _bufshape_" ++ nm ++ " = [_dev newBufferWithBytes:&" ++ nm ++ "_shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];",
+            "    hyd_array_t " ++ nm ++ "_stub = { .shape = " ++ nm ++ "_shape, .data = NULL };",
+            "    hyd_array_t* " ++ nm ++ " = &" ++ nm ++ "_stub;"
+          ]
+
+    genDispatch p =
+      let knm = sanitize (kaName p)
+          ins = kaInputArrays p
+          outs = kaOutputArrays p
+          scals = kaScalarInputs p
+          nIn = length ins
+          inB = ["      [_enc setBuffer:_buf_" ++ sanitize v ++ " offset:0 atIndex:" ++ show i ++ "];" | (v, i) <- zip ins [0 ..]]
+          shB = ["      [_enc setBuffer:_bufshape_" ++ sanitize v ++ " offset:0 atIndex:" ++ show i ++ "];" | (v, i) <- zip ins [nIn ..]]
+          outB = ["      [_enc setBuffer:_buf_" ++ sanitize v ++ " offset:0 atIndex:" ++ show i ++ "];" | (v, i) <- zip outs [nIn * 2 ..]]
+          scB =
+            [ "      { " ++ scalarTyOf v ++ " _s = " ++ sanitize v ++ "; [_enc setBytes:&_s length:sizeof(" ++ scalarTyOf v ++ ") atIndex:" ++ show i ++ "]; }"
+            | (v, i) <- zip scals [nIn * 2 + length outs ..]
+            ]
+          gridExpr = case CFG.lsBounds (kaLoopSpec p) of
+            [b] -> "(long)" ++ genMSLIndexExpr b
+            bs -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
+       in [ "    // --- phase " ++ knm ++ " ---",
+            "    { id<MTLCommandBuffer> _cmd = [_queue commandBuffer];",
+            "      id<MTLComputeCommandEncoder> _enc = [_cmd computeCommandEncoder];",
+            "      [_enc setComputePipelineState:_pso_" ++ knm ++ "];"
+          ]
+            ++ inB
+            ++ shB
+            ++ outB
+            ++ scB
+            ++ [ "      long _gn = " ++ gridExpr ++ ";",
+                 "      NSUInteger _tgs = MIN(256UL, _pso_" ++ knm ++ ".maxTotalThreadsPerThreadgroup); if (_tgs==0) _tgs=1;",
+                 "      [_enc dispatchThreads:MTLSizeMake((NSUInteger)_gn,1,1) threadsPerThreadgroup:MTLSizeMake(_tgs,1,1)];",
+                 "      [_enc endEncoding]; [_cmd commit]; [_cmd waitUntilCompleted]; }"
+               ]
+
+    genReadback v =
+      let elemTy = mslElemTy v
+          nm = sanitize v
+       in [ "    // read back GPU output " ++ nm,
+            "    " ++ nm ++ " = hyd_array_alloc(" ++ nm ++ "_shape);"
+          ]
+            ++ ( if elemTy == "float"
+                   then
+                     [ "    { float* _gs = (float*)_buf_" ++ nm ++ ".contents; double* _gd = (double*)" ++ nm ++ "->data;",
+                       "      for (long _i = 0; _i < " ++ nm ++ "_n; _i++) _gd[_i] = (double)_gs[_i]; }"
+                     ]
+                   else
+                     ["    memcpy(" ++ nm ++ "->data, _buf_" ++ nm ++ ".contents, (size_t)(" ++ nm ++ "_n * sizeof(" ++ elemTy ++ ")));"]
+               )
+
+    printReturnLines = case retAtom of
+      Just (AVar v) -> case Map.lookup v typeEnv of
+        Just (CTArray elt) -> arrayPrint v (mslTypeName elt)
+        Just CTDouble -> ["    printf(\"%.17g\\n\", (double)" ++ sanitize v ++ ");"]
+        Just _ -> ["    printf(\"%ld\\n\", (long)" ++ sanitize v ++ ");"]
+        Nothing -> ["    printf(\"%ld\\n\", (long)" ++ sanitize v ++ ");"]
+      Just (AInt n) -> ["    printf(\"%ld\\n\", (long)" ++ show n ++ "LL);"]
+      Just (AFloat f) -> ["    printf(\"%.17g\\n\", (double)" ++ show f ++ ");"]
+      _ -> []
+
+    arrayPrint v eTy =
+      let fmt = if eTy == "float" then "%.17g" else "%ld"
+          cast = if eTy == "float" then "(double)" else "(long)"
+          nm = sanitize v
+       in [ "    { " ++ eTy ++ "* _rp = (" ++ eTy ++ "*)" ++ nm ++ "->data; long _rn = hyd_shape_size(" ++ nm ++ "->shape);",
+            "      printf(\"[\"); for (long _pi = 0; _pi < _rn; _pi++) { if (_pi>0) printf(\", \"); printf(\"" ++ fmt ++ "\", " ++ cast ++ "_rp[_pi]); } printf(\"]\\n\"); }"
+          ]
 
 -- ---------------------------------------------------------------------------
 -- Export-kernel code path
@@ -305,7 +617,8 @@ codegenMSLExport opts prog@(CFG.Program procs) = do
     MSLArtifacts
       { mslKernelSource = kernelSrc,
         mslHarnessSource = harnessSrc,
-        mslHeaderSource = Just headerSrc
+        mslHeaderSource = Just headerSrc,
+        mslWarnings = cpuFallbackWarningsSingle ka
       }
 
 -- | Check if a variable derives from a proc parameter (e.g., via RProj).
@@ -866,6 +1179,105 @@ analyzeOneKernel prog@(CFG.Program procs) kernelProc = do
 -- ---------------------------------------------------------------------------
 -- Analysis helpers
 
+-- | The proc whose result the harness prints: the @main@ entry if present,
+-- otherwise the final proc (the program's last top-level binding).
+resultProcName :: [CFG.Proc] -> Maybe BS.ByteString
+resultProcName procs =
+  case filter (\p -> CFG.procName p == "main") procs of
+    (p : _) -> Just (CFG.procName p)
+    [] -> case procs of
+      [] -> Nothing
+      _ -> Just (CFG.procName (last procs))
+
+-- | Error explaining that the program's result can't be realized as a GPU
+-- kernel, so the Metal backend declines rather than printing an intermediate.
+resultNotLowerableMsg :: BS.ByteString -> String
+resultNotLowerableMsg rname =
+  unlines
+    [ "MSL backend: the program result `"
+        ++ BS.unpack rname
+        ++ "` cannot be lowered to a GPU kernel.",
+      "  Its computation uses control flow or serial loops the Metal backend can't",
+      "  express as a single kernel (e.g. stencil boundary handling).",
+      "  Use --export-metal-kernel=<name> to export a specific GPU kernel, or run on",
+      "  the C backend."
+    ]
+
+-- | Human-readable label for a CPU loop's role, for fallback diagnostics.
+cpuLoopLabel :: CFG.LoopSpec -> String
+cpuLoopLabel spec = case CFG.lsRole spec of
+  CFG.LoopReduction -> "reduction"
+  CFG.LoopReductionWrapper -> "reduction"
+  CFG.LoopMapReduction -> "reduction"
+  CFG.LoopSegRedOuter -> "segmented-reduction"
+  CFG.LoopFold -> "fold"
+  CFG.LoopMap -> "map"
+  CFG.LoopIterate -> "iterate"
+  CFG.LoopPlain -> "scatter/serial"
+
+-- | Top-level loops in a statement list (descending through @if@ but not into
+-- nested loops, which are tiles/inner loops of the same logical loop).
+topLevelLoopSpecs :: [CFG.Stmt] -> [CFG.LoopSpec]
+topLevelLoopSpecs = concatMap go
+  where
+    go (CFG.SLoop spec _) = [spec]
+    go (CFG.SIf _ t e) = topLevelLoopSpecs t ++ topLevelLoopSpecs e
+    go _ = []
+
+-- | Render a CPU-fallback summary line, or [] when @specs@ is empty.
+cpuFallbackLine :: String -> [CFG.LoopSpec] -> [String]
+cpuFallbackLine context specs
+  | null specs = []
+  | otherwise =
+      [ "Metal: " ++ context ++ show (length specs)
+          ++ " loop(s) run on the CPU, not the GPU ("
+          ++ intercalate ", " (nub (map cpuLoopLabel specs))
+          ++ "). The Metal backend could not offload these to a GPU kernel."
+      ]
+
+-- | CPU-fallback warnings for a single-kernel offload: the GPU runs the kernel
+-- loop; any pre-loop producers or post-loop consumers run on the CPU.
+cpuFallbackWarningsSingle :: KernelAnalysis -> [String]
+cpuFallbackWarningsSingle ka =
+  cpuFallbackLine
+    ("in `" ++ BS.unpack (kaName ka) ++ "`, ")
+    (topLevelLoopSpecs (kaEffectivePreLoop ka) ++ topLevelLoopSpecs (kaPostLoopStmts ka))
+
+-- | CPU-fallback warnings for the multi-kernel path: any reachable proc that is
+-- not a GPU kernel, plus the GPU kernels' own pre/post loops, run on the CPU.
+cpuFallbackWarningsMulti :: [CFG.Proc] -> [KernelAnalysis] -> [String]
+cpuFallbackWarningsMulti allProcs kas =
+  let gpuNames = Set.fromList (map kaName kas)
+      cpuProcLoops =
+        [ spec
+        | p <- allProcs,
+          CFG.procName p `Set.notMember` gpuNames,
+          spec <- topLevelLoopSpecs (CFG.procBody p)
+        ]
+      gpuSideLoops =
+        concatMap
+          (\ka -> topLevelLoopSpecs (kaEffectivePreLoop ka) ++ topLevelLoopSpecs (kaPostLoopStmts ka))
+          kas
+   in cpuFallbackLine "" (cpuProcLoops ++ gpuSideLoops)
+
+-- | Does the proc's return value resolve to (a reshaped view of) one of the
+-- kernel's output arrays? If so, the GPU output buffer can be printed/returned
+-- directly; otherwise the harness must finish on the CPU and print the actual
+-- return value.
+retResolvesToOutput :: Maybe Atom -> [CFG.Stmt] -> [CVar] -> Bool
+retResolvesToOutput retAtom postLoop outputs =
+  let aliases =
+        Map.fromList
+          [ (v, out)
+          | CFG.SAssign v (RCall "hyd_array_reshape_view" (AVar out : _)) <- postLoop
+          ]
+      resolve v = case Map.lookup v aliases of
+        Just o -> resolve o
+        Nothing -> v
+   in case retAtom of
+        Just (AVar v) -> resolve v `Set.member` Set.fromList outputs
+        _ -> False
+
 -- | Find the proc to use as the Metal kernel.
 findKernelProc :: MSLOptions -> [CFG.Proc] -> Either String CFG.Proc
 findKernelProc opts procs =
@@ -876,13 +1288,17 @@ findKernelProc opts procs =
         (p : _) -> Right p
     Nothing ->
       let candidates = filter (procHasMapLoop . CFG.procBody) procs
-       in -- Prefer the "main" proc if it's a candidate; otherwise use last candidate
-          -- (last is typically the final top-level binding, the program output)
-          case candidates of
-            [] -> Left "MSL backend: no proc with a map loop found in program"
-            _ -> case filter (\p -> CFG.procName p == "main") candidates of
-              (p : _) -> Right p
-              [] -> Right (last candidates)
+       in -- Prefer the "main" proc; otherwise the program result must itself be a
+          -- kernel candidate, else we'd emit and print an unrelated intermediate.
+          case filter (\p -> CFG.procName p == "main") candidates of
+            (p : _) -> Right p
+            [] -> case resultProcName procs of
+              Just rname
+                | not (any (\p -> CFG.procName p == rname) candidates) ->
+                    Left (resultNotLowerableMsg rname)
+              _ -> case candidates of
+                [] -> Left "MSL backend: no proc with a map loop found in program"
+                _ -> Right (last candidates)
   where
     procHasMapLoop = any isKernelLoopStmt
     isKernelLoopStmt (CFG.SLoop spec _) =
@@ -1570,10 +1986,16 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap pr
           concatMap (genMSLStmt 1 iter allInArrs outArrs typeEnv arrayElemTys hoistedCallMap tupDefs) stmts
    in declLines ++ aliasDefLines ++ bodyLines
   where
+    -- On the GPU, every scatter-add must use atomics. The CPU parallelizer
+    -- prefers *privatization* (per-thread accumulator buffers) for scatter-add,
+    -- but that technique does not apply to the GPU's many threads — so we treat
+    -- both privatized and atomic scatter-add strategies as atomic here.
     scatterStrategy = case execPolicy of
       CFG.Parallel p -> case CFG.psStrategy p of
         CFG.ParallelScatterAtomicAddInt -> Just CTInt64
         CFG.ParallelScatterAtomicAddFloat -> Just CTDouble
+        CFG.ParallelScatterPrivatizedIntAdd -> Just CTInt64
+        CFG.ParallelScatterPrivatizedFloatAdd -> Just CTDouble
         _ -> Nothing
       _ -> Nothing
 
@@ -1926,8 +2348,10 @@ genObjCHarnessSrc ::
   -- | Pre-loop stmts
   [CFG.Stmt] ->
   CFG.LoopSpec ->
-  -- | Return atom (for output identification)
+  -- | Return atom (the proc's actual result)
   Maybe Atom ->
+  -- | Post-loop stmts (CPU work between the kernel loop and the return)
+  [CFG.Stmt] ->
   TypeEnv ->
   -- | Array element types
   Map CVar CType ->
@@ -1951,7 +2375,8 @@ genObjCHarnessSrc
   kernelName
   preLoopStmts
   loopSpec
-  _retAtom
+  retAtom
+  postLoopStmts
   typeEnv
   arrayElemTys
   retKinds
@@ -2030,10 +2455,9 @@ genObjCHarnessSrc
              "    [_enc endEncoding];",
              "    [_cmd commit];",
              "    [_cmd waitUntilCompleted];",
-             "",
-             "    // --- Print output ---"
+             ""
            ]
-        ++ printLines
+        ++ resultLines
         ++ [ "    } // @autoreleasepool",
              "    return 0;",
              "}"
@@ -2159,6 +2583,83 @@ genObjCHarnessSrc
           [ genOutputPrintLines v i
           | (v, i) <- zip outputArrays [nInputArrays * 2 ..]
           ]
+
+      -- The proc's result. When the kernel's output array IS the return value
+      -- (the common map/reduce case), print the GPU buffer directly. Otherwise
+      -- (e.g. scatter→reduce→project, where the GPU loop is an intermediate),
+      -- copy the GPU output back to a CPU array, run the post-loop CPU work, and
+      -- print the proc's actual return value — not the kernel buffer.
+      resultLines
+        | retIsKernelOutput =
+            ["    // --- Print output (kernel buffer is the result) ---"] ++ printLines
+        | otherwise =
+            ["    // --- Read GPU output back, finish on CPU, print result ---"]
+              ++ readbackLines
+              ++ concatMap genRunPostLoopLine postLoopStmts
+              ++ printReturnLines
+
+      retIsKernelOutput = retResolvesToOutput retAtom postLoopStmts outputArrays
+
+      -- Copy each GPU output buffer into a CPU hyd_array_t* bound to the proc's
+      -- own variable name, so post-loop CPU statements can read it.
+      readbackLines =
+        concat
+          [ let elemTy = mslElemTy v
+                sizeVar = "_outN" ++ show i
+                shapeExpr = case Map.lookup v outputAllocShapes of
+                  Just shpAtom -> genCAtom shpAtom
+                  Nothing -> "hyd_tuple_make(1, (int64_t)" ++ sizeVar ++ ")"
+             in [ "    // Read back GPU output: " ++ sanitize v,
+                  "    hyd_array_t* " ++ sanitize v ++ " = hyd_array_alloc(" ++ shapeExpr ++ ");"
+                ]
+                  ++ ( if elemTy == "float"
+                         then
+                           [ "    { float* _gsrc = (float*)_buf" ++ show i ++ ".contents;",
+                             "      double* _gdst = (double*)" ++ sanitize v ++ "->data;",
+                             "      for (long _ri = 0; _ri < " ++ sizeVar ++ "; _ri++) _gdst[_ri] = (double)_gsrc[_ri]; }"
+                           ]
+                         else
+                           [ "    memcpy("
+                               ++ sanitize v
+                               ++ "->data, _buf"
+                               ++ show i
+                               ++ ".contents, (size_t)("
+                               ++ sizeVar
+                               ++ " * sizeof("
+                               ++ elemTy
+                               ++ ")));"
+                           ]
+                     )
+          | (v, i) <- zip outputArrays [nInputArrays * 2 ..]
+          ]
+
+      -- CPU post-loop statements; reshape_view / pair construction are handled
+      -- by the return printing itself.
+      genRunPostLoopLine (CFG.SAssign _ (RCall "hyd_array_reshape_view" _)) = []
+      genRunPostLoopLine (CFG.SAssign _ (RPairMake {})) = []
+      genRunPostLoopLine stmt = genPreLoopLine typeEnv retKinds Set.empty Set.empty stmt
+
+      -- Print the proc's actual return value (scalar, array, or fallback).
+      printReturnLines = case retAtom of
+        Just (AVar v) -> case Map.lookup v typeEnv of
+          Just (CTArray elt) -> genResultArrayPrint v (mslTypeName elt)
+          Just CTDouble -> ["    printf(\"%.17g\\n\", (double)" ++ sanitize v ++ ");"]
+          Just _ -> ["    printf(\"%ld\\n\", (long)" ++ sanitize v ++ ");"]
+          Nothing -> ["    printf(\"%ld\\n\", (long)" ++ sanitize v ++ ");"]
+        Just (AInt n) -> ["    printf(\"%ld\\n\", (long)" ++ show n ++ "LL);"]
+        Just (AFloat f) -> ["    printf(\"%.17g\\n\", (double)" ++ show f ++ ");"]
+        _ -> printLines
+
+      genResultArrayPrint v eTy =
+        let fmt = if eTy == "float" then "%.17g" else "%ld"
+            cast = if eTy == "float" then "(double)" else "(long)"
+            nm = sanitize v
+         in [ "    { " ++ eTy ++ "* _rp = (" ++ eTy ++ "*)" ++ nm ++ "->data;",
+              "      long _rn = hyd_shape_size(" ++ nm ++ "->shape);",
+              "      printf(\"[\");",
+              "      for (long _pi = 0; _pi < _rn; _pi++) { if (_pi > 0) printf(\", \"); printf(\"" ++ fmt ++ "\", " ++ cast ++ "_rp[_pi]); }",
+              "      printf(\"]\\n\"); }"
+            ]
 
       mslElemTy v = case Map.lookup v arrayElemTys of
         Just elt -> mslTypeName elt

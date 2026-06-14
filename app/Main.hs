@@ -298,9 +298,25 @@ main = do
   case readDecs input of
     Left perr -> dieWithMessage $ "Parse error: " ++ perr
     Right parsedDecs -> do
-      let selectFlags = if useMetal then allTopLevelProcsFlag : flags else flags
+      -- Metal run mode prunes to `main` like the other backends, so the harness
+      -- has a single, well-defined result to compute and print. Export mode and
+      -- explicit --metal-kernel selection name their own kernel, so they keep all
+      -- top-level procs. (Pass --all-top-level-procs explicitly for debug.)
+      let keepAllForMetal = isJust exportMetalKernelFlag || isJust metalKernelFlag
+          selectFlags
+            | useMetal && keepAllForMetal = allTopLevelProcsFlag : flags
+            | otherwise = flags
       decs <- case selectProgramDecs selectFlags parsedDecs of
-        Left err -> dieWithMessage err
+        Left err
+          | useMetal && not keepAllForMetal ->
+              dieWithMessage $ unlines
+                [ "Metal backend: " ++ err
+                , "The Metal backend runs the `main` entry point. Either:"
+                , "  * name your final top-level binding `main`, or"
+                , "  * use --export-metal-kernel=<name> to export a specific GPU kernel, or"
+                , "  * pass --all-top-level-procs to print every binding (debug)."
+                ]
+          | otherwise -> dieWithMessage err
         Right pr -> pure pr
       let reportTypeError terr = dieWithMessage (formatTypeError mpath (Just input) terr)
           runCheckedInference = do
@@ -381,14 +397,16 @@ main = do
                   , mslExportKernel = fmap BS.pack exportMetalKernelFlag }
             case codegenMSL metalOpts optimized of
               Left err -> dieWithMessage ("Metal codegen error: " ++ err)
-              Right metalArtifacts -> case exportMetalKernelFlag of
-                Just _ -> do
-                  writeMetalExportArtifacts metalArtifacts
-                Nothing -> do
-                  ec <- compileAndRunMetal metalArtifacts keepMetal compileOnly
-                  case ec of
-                    ExitSuccess -> pure ()
-                    ExitFailure _ -> exitWith ec
+              Right metalArtifacts -> do
+                mapM_ (\w -> hPutStrLn stderr ("warning: " ++ w)) (mslWarnings metalArtifacts)
+                case exportMetalKernelFlag of
+                  Just _ ->
+                    writeMetalExportArtifacts metalArtifacts
+                  Nothing -> do
+                    ec <- compileAndRunMetal metalArtifacts keepMetal compileOnly
+                    case ec of
+                      ExitSuccess -> pure ()
+                      ExitFailure _ -> exitWith ec
           else do
             _ <- runCheckedInference
             ensureSelectedKernelIsFused
