@@ -47,6 +47,7 @@ library
                    , Language.Hydrangea.CFGPipeline
                    , Language.Hydrangea.CodegenC
                    , Language.Hydrangea.CodegenMSL
+                   , Language.Hydrangea.CodegenCUDA
                    , Language.Hydrangea.Dependence
                    , Language.Hydrangea.ErrorFormat
                    , Language.Hydrangea.Util
@@ -82,6 +83,7 @@ executable hydrangea-compiler
     default-language: GHC2021
     other-modules:    CBackend
                     , MetalBackend
+                    , CUDABackend
 
 test-suite hydrangea-test
     import:           warnings

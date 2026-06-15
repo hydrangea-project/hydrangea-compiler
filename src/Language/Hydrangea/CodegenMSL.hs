@@ -25,6 +25,31 @@ module Language.Hydrangea.CodegenMSL
     MSLOptions (..),
     defaultMSLOptions,
     codegenMSL,
+
+    -- * Backend-neutral pieces shared with the CUDA backend
+    -- $shared
+    -- These are reused verbatim by "Language.Hydrangea.CodegenCUDA": the kernel
+    -- analysis is target-independent, and the statement/expression emitters
+    -- produce plain C (no Metal address spaces or attributes), so the CUDA
+    -- backend only has to supply its own kernel signature, atomics, headers and
+    -- host harness. See the @GpuDialect@ note in "CodegenCUDA".
+    KernelAnalysis (..),
+    analyzeOneKernel,
+    findKernelProc,
+    genHelperC,
+    retResolvesToOutput,
+    topLevelLoopSpecs,
+    genMSLStmt,
+    genMSLAtom,
+    genMSLIndexExpr,
+    collectTupleDefs,
+    collectArrayAliases,
+    collectAssignedVars,
+    collectPairTypesFromEnv,
+    mslPairStructName,
+    genPreLoopLine,
+    genCAtom,
+    cpuArrayElemCType,
   )
 where
 

@@ -11,6 +11,7 @@ module Main where
 
 import CBackend (compileAndRunC)
 import MetalBackend (compileAndRunMetal)
+import CUDABackend (compileAndRunCUDA)
 import Control.Monad (forM_, when)
 import Data.ByteString.Lazy.Char8 (unpack)
 import Data.ByteString.Lazy.Char8 qualified as BS
@@ -26,6 +27,7 @@ import Language.Hydrangea.CodegenC
   , defaultCodegenOptions
   )
 import Language.Hydrangea.CodegenMSL (MSLArtifacts(..), MSLOptions(..), defaultMSLOptions, codegenMSL)
+import Language.Hydrangea.CodegenCUDA (CUDAArtifacts(..), CUDAOptions(..), defaultCUDAOptions, codegenCUDA)
 import Language.Hydrangea.ErrorFormat (formatEvalError, formatTypeError)
 import Language.Hydrangea.Frontend
   ( compileToCOptIOWithAllOptions
@@ -128,6 +130,9 @@ usage = unwords
   , "[--export-metal-kernel=<name>]"
   , "[--output-metal=<file>]"
   , "[--keep-metal]"
+  , "[--cuda]"
+  , "[--cuda-kernel=<name>]"
+  , "[--keep-cuda]"
   , "[--no-multi-kernel]"
   , "[file]"
   ]
@@ -175,6 +180,9 @@ main = do
       exportMetalKernelFlag = flagValue "--export-metal-kernel=" flags
       outputMetalFile = flagValue "--output-metal=" flags
       keepMetal = "--keep-metal" `elem` flags
+      useCuda = "--cuda" `elem` flags
+      cudaKernelFlag = flagValue "--cuda-kernel=" flags
+      keepCuda = "--keep-cuda" `elem` flags
       noMultiKernel = "--no-multi-kernel" `elem` flags
   simdWidth <- resolveOrDie (parseSimdWidth simdWidthFlag)
   benchmarkConfig <- resolveOrDie (benchmarkConfigFromFlags benchmarkFlag benchWarmupFlag benchItersFlag)
@@ -217,8 +225,11 @@ main = do
   when (isJust exportMetalKernelFlag && not (isJust outputCFile)) $
     dieWithMessage "--export-metal-kernel requires --output-c=<file> for the .m harness."
 
-  when (enableExplicitVectorization && useMetal) $
+  when (enableExplicitVectorization && (useMetal || useCuda)) $
     dieWithMessage "--explicit-vectorization is only supported for the C backend."
+
+  when (useMetal && useCuda) $
+    dieWithMessage "Choose one GPU backend: --metal or --cuda, not both."
 
   let generateExportArtifacts decs = do
         prog <- inferAndLowerToCFGWithFrontendOptions frontendOptions inferOptions decs
@@ -302,18 +313,19 @@ main = do
       -- has a single, well-defined result to compute and print. Export mode and
       -- explicit --metal-kernel selection name their own kernel, so they keep all
       -- top-level procs. (Pass --all-top-level-procs explicitly for debug.)
-      let keepAllForMetal = isJust exportMetalKernelFlag || isJust metalKernelFlag
+      let keepAllForMetal = isJust exportMetalKernelFlag || isJust metalKernelFlag || isJust cudaKernelFlag
+          useGpu = useMetal || useCuda
           selectFlags
-            | useMetal && keepAllForMetal = allTopLevelProcsFlag : flags
+            | useGpu && keepAllForMetal = allTopLevelProcsFlag : flags
             | otherwise = flags
       decs <- case selectProgramDecs selectFlags parsedDecs of
         Left err
-          | useMetal && not keepAllForMetal ->
+          | useGpu && not keepAllForMetal ->
               dieWithMessage $ unlines
-                [ "Metal backend: " ++ err
-                , "The Metal backend runs the `main` entry point. Either:"
+                [ "GPU backend: " ++ err
+                , "The Metal/CUDA backends run the `main` entry point. Either:"
                 , "  * name your final top-level binding `main`, or"
-                , "  * use --export-metal-kernel=<name> to export a specific GPU kernel, or"
+                , "  * use --export-metal-kernel=<name>/--cuda-kernel=<name> to select a kernel, or"
                 , "  * pass --all-top-level-procs to print every binding (debug)."
                 ]
           | otherwise -> dieWithMessage err
@@ -407,6 +419,22 @@ main = do
                     case ec of
                       ExitSuccess -> pure ()
                       ExitFailure _ -> exitWith ec
+          else if useCuda then do
+            _ <- runCheckedInference
+            prog <- lowerToCFGWithTypesWithOptions inferOptions decs
+            -- Reuse the Metal CFG pipeline (parallelize, no SIMD vectorization):
+            -- both target a GPU and share the same loop-offload analysis.
+            let optimized = optimizeMetalCFGWithTiling enableTiling prog
+                cudaOpts = defaultCUDAOptions
+                  { cudaKernelToEmit = fmap BS.pack cudaKernelFlag }
+            case codegenCUDA cudaOpts optimized of
+              Left err -> dieWithMessage ("CUDA codegen error: " ++ err)
+              Right cudaArtifacts -> do
+                mapM_ (\w -> hPutStrLn stderr ("warning: " ++ w)) (cudaWarnings cudaArtifacts)
+                ec <- compileAndRunCUDA cudaArtifacts keepCuda compileOnly
+                case ec of
+                  ExitSuccess -> pure ()
+                  ExitFailure _ -> exitWith ec
           else do
             _ <- runCheckedInference
             ensureSelectedKernelIsFused
