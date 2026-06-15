@@ -29,16 +29,18 @@ module Language.Hydrangea.CodegenMSL
 where
 
 import Control.Applicative ((<|>))
+import Control.Monad (guard)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.Char (toUpper)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, maximumBy, nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Language.Hydrangea.CFG qualified as CFG
 import Language.Hydrangea.CFGAnalysis (usedVarsStmts)
+import Language.Hydrangea.CFGOpt (substStmts)
 import Language.Hydrangea.CFGCore
   ( Atom (..),
     BinOp (..),
@@ -162,11 +164,28 @@ codegenMSL opts prog@(CFG.Program procs) =
         Just _ -> codegenMSLSingle opts prog -- explicit kernel: single-kernel path
         Nothing
           | not (mslMultiKernel opts) -> codegenMSLSingle opts prog
+          -- A `main` that is a thin file-write sink over a GPU proc (a stencil
+          -- whose result is written to CSV rather than returned). Inline the
+          -- callee so the kernel paths offload the compute and the CSV write
+          -- runs as post-kernel CPU work.
+          | Just sinkProg@(CFG.Program sinkProcs) <- inlineFileSinkMain prog,
+            Just rp <- resultProc sinkProcs ->
+              if hasTopLevelIterate rp
+                then codegenMSLTemporal sinkProg rp
+                else
+                  if gpuLoopCountDeep rp >= 2
+                    then codegenMSLMultiPhase sinkProg rp
+                    else codegenMSLSingle opts sinkProg
+          -- A `main` that is itself a temporal loop (`iterate`): one GPU map
+          -- kernel dispatched N times over two ping-pong buffers.
+          | Just rp <- resultProc procs,
+            hasTopLevelIterate rp ->
+              codegenMSLTemporal prog rp
           -- A result proc that is itself a chain of several GPU loops
           -- (e.g. fill -> scatter -> reduce) runs each loop as its own kernel
           -- with GPU-resident buffers between them.
           | Just rp <- resultProc procs,
-            topLevelGpuLoopCount rp >= 2 ->
+            gpuLoopCountDeep rp >= 2 ->
               codegenMSLMultiPhase prog rp
           | otherwise ->
               let gpuProcs = findGPUEligibleProcs procs
@@ -216,7 +235,7 @@ codegenMSLMulti prog@(CFG.Program procs) gpuProcs = do
           { mslKernelSource = kernelSrc,
             mslHarnessSource = harnessSrc,
             mslHeaderSource = Nothing,
-            mslWarnings = cpuFallbackWarningsMulti procs kas
+            mslWarnings = cpuFallbackWarningsMulti procs kas ++ fp32DemotionWarning kas
           }
 
 -- | Single-kernel code path (existing behaviour).
@@ -279,7 +298,7 @@ codegenMSLSingle opts prog@(CFG.Program procs) = do
       { mslKernelSource = kernelSrc,
         mslHarnessSource = harnessSrc,
         mslHeaderSource = Nothing,
-        mslWarnings = cpuFallbackWarningsSingle ka
+        mslWarnings = cpuFallbackWarningsSingle ka ++ fp32DemotionWarning [ka]
       }
 
 -- ---------------------------------------------------------------------------
@@ -294,17 +313,119 @@ isGpuLoopSpec spec =
   CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
     || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
 
+-- | GPU loops anywhere in a statement list, descending through @SIf@ guards but
+-- not into a loop's own body (that body is the kernel). Pre-order. This finds
+-- the region maps of a clamped stencil, which the lowering nests inside
+-- grid-size feasibility guards rather than leaving at the top level.
+gpuLoopsDeep :: [CFG.Stmt] -> [CFG.Stmt]
+gpuLoopsDeep = concatMap go
+  where
+    go s@(CFG.SLoop spec _) | isGpuLoopSpec spec = [s]
+    go (CFG.SLoop _ _) = []
+    go (CFG.SIf _ thn els) = gpuLoopsDeep thn ++ gpuLoopsDeep els
+    go _ = []
+
+-- | True if any loop (descending through @SIf@) is *not* a GPU loop — i.e. there
+-- is serial work that the region-pipeline path can't offload.
+hasNonGpuLoopDeep :: [CFG.Stmt] -> Bool
+hasNonGpuLoopDeep = any go
+  where
+    go (CFG.SLoop spec body) = not (isGpuLoopSpec spec) || hasNonGpuLoopDeep body
+    go (CFG.SIf _ thn els) = hasNonGpuLoopDeep thn || hasNonGpuLoopDeep els
+    go _ = False
+
+-- | Number of GPU loops in a proc's body, descending through @SIf@ guards.
+gpuLoopCountDeep :: CFG.Proc -> Int
+gpuLoopCountDeep p = length (gpuLoopsDeep (fst (splitFinalReturn (CFG.procBody p))))
+
+-- | A proc that offloads cleanly as a (possibly multi-region) GPU pipeline:
+-- it has at least one GPU loop and no serial loops. Covers single maps,
+-- fill→scatter→reduce chains, and clamped-stencil region fills.
+allLoopsGpu :: CFG.Proc -> Bool
+allLoopsGpu p =
+  let (b, _) = splitFinalReturn (CFG.procBody p)
+   in not (null (gpuLoopsDeep b)) && not (hasNonGpuLoopDeep b)
+
+-- | True when a proc's body (return split off) has a top-level @LoopIterate@
+-- (an @iterate@ temporal loop) whose body contains a GPU map loop — i.e. it is
+-- a candidate for the ping-pong temporal kernel path.
+hasTopLevelIterate :: CFG.Proc -> Bool
+hasTopLevelIterate p =
+  let (bodyNoRet, _) = splitFinalReturn (CFG.procBody p)
+   in any isTemporalLoopStmt bodyNoRet
+  where
+    isTemporalLoopStmt (CFG.SLoop spec b) =
+      CFG.lsRole spec == CFG.LoopIterate && any innerGpuLoop b
+    isTemporalLoopStmt _ = False
+    innerGpuLoop (CFG.SLoop sp _) = isGpuLoopSpec sp
+    innerGpuLoop _ = False
+
+-- | Builtins that consume an array purely for a side effect (a CSV file write),
+-- producing no GPU-relevant value.
+isFileWriteBuiltin :: BS.ByteString -> Bool
+isFileWriteBuiltin fn =
+  fn == "hyd_write_array_csv" || fn == "hyd_write_array_csv_float"
+
+-- | When @main@ is a thin "file-write sink" — it calls a single GPU-eligible
+-- proc and then only writes that array to a CSV file (the shape produced by
+-- @write_array@ / @write_array_float@) — inline the callee's body into @main@
+-- so the kernel paths can offload the computation and run the CSV write as
+-- post-kernel CPU work. Temporaries are globally unique across procs, so the
+-- inlining needs no renaming. Returns 'Nothing' when the pattern doesn't hold,
+-- leaving the program untouched for the normal routing.
+inlineFileSinkMain :: CFG.Program -> Maybe CFG.Program
+inlineFileSinkMain (CFG.Program procs) = do
+  mp <- listToMaybe [p | p <- procs, CFG.procName p == "main"]
+  let body = CFG.procBody mp
+      (bodyNoRet, retAtom) = splitFinalReturn body
+      -- A callee is inlinable if it offloads: a plain GPU proc, a region
+      -- pipeline (all loops are GPU maps — e.g. a clamped stencil's interior +
+      -- boundary fills), or a temporal (`iterate`) proc.
+      gpuNames =
+        Set.fromList (map CFG.procName (findGPUEligibleProcs procs))
+          `Set.union` Set.fromList [CFG.procName p | p <- procs, hasTopLevelIterate p]
+          `Set.union` Set.fromList [CFG.procName p | p <- procs, allLoopsGpu p]
+  -- A pure side-effecting sink returns unit.
+  guard (retAtom == Just AUnit || retAtom == Nothing)
+  -- Exactly one top-level call to a GPU-eligible, zero-arg proc.
+  (callIdx, callVar, pName) <-
+    case [ (i, callVar, pName)
+         | (i, CFG.SAssign callVar (RCall pName [])) <- zip [0 ..] bodyNoRet,
+           pName `Set.member` gpuNames
+         ] of
+      [c] -> Just c
+      _ -> Nothing
+  -- That result must be consumed by a file-write builtin downstream.
+  let afterCall = drop (callIdx + 1) bodyNoRet
+      writesCallVar =
+        any
+          ( \s -> case s of
+              CFG.SAssign _ (RCall fn (AVar a : _)) ->
+                isFileWriteBuiltin fn && a == callVar
+              _ -> False
+          )
+          afterCall
+  guard writesCallVar
+  callee <- listToMaybe [p | p <- procs, CFG.procName p == pName]
+  let (calleeNoRet, calleeRet) = splitFinalReturn (CFG.procBody callee)
+  calleeRetAtom <- calleeRet
+  let before = take callIdx bodyNoRet
+      inlinedBody =
+        before
+          ++ calleeNoRet
+          ++ [CFG.SAssign callVar (RAtom calleeRetAtom)]
+          ++ afterCall
+          ++ [CFG.SReturn (fromMaybe AUnit retAtom)]
+      mergedTypeEnv = Map.union (CFG.procTypeEnv mp) (CFG.procTypeEnv callee)
+      mp' = mp {CFG.procBody = inlinedBody, CFG.procTypeEnv = mergedTypeEnv}
+  Just (CFG.Program [if CFG.procName p == "main" then mp' else p | p <- procs])
+
 -- | The proc whose result the program prints: @main@ if present, else the last.
 resultProc :: [CFG.Proc] -> Maybe CFG.Proc
 resultProc procs = case filter (\p -> CFG.procName p == "main") procs of
   (p : _) -> Just p
   [] -> if null procs then Nothing else Just (last procs)
 
--- | Number of top-level GPU-eligible loops in a proc body (post-return).
-topLevelGpuLoopCount :: CFG.Proc -> Int
-topLevelGpuLoopCount p =
-  let (bodyNoRet, _) = splitFinalReturn (CFG.procBody p)
-   in length [() | CFG.SLoop spec _ <- bodyNoRet, isGpuLoopSpec spec]
 
 -- | Lower a proc that is a straight-line sequence of GPU loops (with scalar/
 -- shape glue between them) to a chain of kernel dispatches sharing GPU buffers.
@@ -321,36 +442,37 @@ codegenMSLMultiPhase prog@(CFG.Program procs) rp = do
           retTypes
           body
           (Map.fromList [(v, elt) | (v, CTArray elt) <- Map.toList typeEnv])
-      indexed = zip [0 ..] bodyNoRet
-      loopIdxs = [i | (i, CFG.SLoop spec _) <- indexed, isGpuLoopSpec spec]
-      -- Per-phase analysis: glue = all non-loop statements before this loop.
-      mkPhase phaseNo i =
-        case bodyNoRet !! i of
-          CFG.SLoop spec lb ->
-            let glueBefore = [s | (j, s) <- indexed, j < i, notLoopStmt s]
-                (ins, outs, scals, hoisted) =
-                  classifyKernelParams glueBefore lb spec typeEnv retKinds
-                aliases = collectArrayAliases (Set.fromList ins) (glueBefore ++ hoisted)
-             in KernelAnalysis
-                  { kaProc = rp,
-                    kaName = CFG.procName rp <> BS.pack ("_p" ++ show (phaseNo :: Int)),
-                    kaPreLoopStmts = glueBefore,
-                    kaLoopSpec = spec,
-                    kaLoopBody = lb,
-                    kaRetAtom = Nothing,
-                    kaTypeEnv = typeEnv,
-                    kaArrayElemTys = arrayElemTys,
-                    kaInputArrays = ins,
-                    kaOutputArrays = outs,
-                    kaScalarInputs = scals,
-                    kaEffectivePreLoop = glueBefore ++ hoisted,
-                    kaHoistedCallMap = buildHoistedCallMap hoisted,
-                    kaPreLoopAliases = aliases,
-                    kaPostLoopStmts = [],
-                    kaProcParams = CFG.procParams rp
-                  }
-          _ -> error "codegenMSLMultiPhase: loopIdxs pointed at a non-loop"
-      phases = zipWith mkPhase [0 ..] loopIdxs
+      -- Flatten GPU loops in pre-order, descending through SIf guards. Each
+      -- loop's glue is the non-loop statements lexically before it (a superset
+      -- across both branches, which is fine for input/scalar classification).
+      flatToks = flattenPhaseToks bodyNoRet
+      withGlue =
+        [ ([s | TGlue s <- take i flatToks], spec, lb)
+        | (i, TLoop spec lb) <- zip [0 ..] flatToks
+        ]
+      mkPhase phaseNo (glueBefore, spec, lb) =
+        let (ins, outs, scals, hoisted) =
+              classifyKernelParams glueBefore lb spec typeEnv retKinds
+            aliases = collectArrayAliases (Set.fromList ins) (glueBefore ++ hoisted)
+         in KernelAnalysis
+              { kaProc = rp,
+                kaName = CFG.procName rp <> BS.pack ("_p" ++ show (phaseNo :: Int)),
+                kaPreLoopStmts = glueBefore,
+                kaLoopSpec = spec,
+                kaLoopBody = lb,
+                kaRetAtom = Nothing,
+                kaTypeEnv = typeEnv,
+                kaArrayElemTys = arrayElemTys,
+                kaInputArrays = ins,
+                kaOutputArrays = outs,
+                kaScalarInputs = scals,
+                kaEffectivePreLoop = glueBefore ++ hoisted,
+                kaHoistedCallMap = buildHoistedCallMap hoisted,
+                kaPreLoopAliases = aliases,
+                kaPostLoopStmts = [],
+                kaProcParams = CFG.procParams rp
+              }
+      phases = zipWith mkPhase [0 ..] withGlue
   mapM_ (validateMSLLoopBody . kaLoopBody) phases
   helperC <- genHelperC procs (CFG.procName rp) retKinds
   let kernelSrc = genMultiKernelMSL phases
@@ -358,7 +480,6 @@ codegenMSLMultiPhase prog@(CFG.Program procs) rp = do
         genMultiPhaseHarness
           rp
           bodyNoRet
-          loopIdxs
           phases
           retAtom
           typeEnv
@@ -370,25 +491,392 @@ codegenMSLMultiPhase prog@(CFG.Program procs) rp = do
       { mslKernelSource = kernelSrc,
         mslHarnessSource = harnessSrc,
         mslHeaderSource = Nothing,
-        mslWarnings = []
+        mslWarnings = fp32DemotionWarning phases
       }
 
--- | A statement that is not a loop (i.e. CPU glue between GPU phases).
-notLoopStmt :: CFG.Stmt -> Bool
-notLoopStmt (CFG.SLoop {}) = False
-notLoopStmt _ = True
+-- | A flattened multi-phase token: either host glue or a GPU loop (a kernel
+-- dispatch). Produced by pre-order traversal that descends through @SIf@ guards
+-- so the region maps of a clamped stencil become a flat dispatch sequence.
+data PhaseTok = TGlue CFG.Stmt | TLoop CFG.LoopSpec [CFG.Stmt]
 
--- | Generate the harness for a multi-phase proc: walk the top-level statements
--- in order, running scalar/shape glue on the host, allocating a Metal buffer per
--- GPU array (shared across phases by name), dispatching each GPU loop as a
--- kernel, then reading back the result, finishing on the CPU, and printing.
+-- | Flatten a statement list into phase tokens, descending through @SIf@. The
+-- @SIf@ wrapper is dropped (its condition computations remain as glue tokens);
+-- the harness re-derives the guards when it walks the tree for dispatch.
+flattenPhaseToks :: [CFG.Stmt] -> [PhaseTok]
+flattenPhaseToks = concatMap go
+  where
+    go (CFG.SLoop spec body) | isGpuLoopSpec spec = [TLoop spec body]
+    go (CFG.SIf _ thn els) = flattenPhaseToks thn ++ flattenPhaseToks els
+    go s = [TGlue s]
+
+-- | All statements in a body, descending through @SIf@ branches (but not into
+-- loop bodies). Used to find array allocations regardless of guard nesting.
+flattenAllStmts :: [CFG.Stmt] -> [CFG.Stmt]
+flattenAllStmts = concatMap go
+  where
+    go (CFG.SIf _ thn els) = flattenAllStmts thn ++ flattenAllStmts els
+    go s = [s]
+
+-- | All variables referenced anywhere in an 'IndexExpr' (recursively). Used to
+-- find scalar inputs hidden in nested loop-bound expressions (e.g. a tiled
+-- bound @(n + 29) / 32@ references @n@).
+indexExprVars :: CFG.IndexExpr -> [CVar]
+indexExprVars e = case e of
+  CFG.IVar v -> [v]
+  CFG.IConst _ -> []
+  CFG.IAdd a b -> indexExprVars a ++ indexExprVars b
+  CFG.ISub a b -> indexExprVars a ++ indexExprVars b
+  CFG.IMul a b -> indexExprVars a ++ indexExprVars b
+  CFG.IDiv a b -> indexExprVars a ++ indexExprVars b
+  CFG.ITuple es -> concatMap indexExprVars es
+  CFG.IProj _ a -> indexExprVars a
+  CFG.IFlatToNd a b -> indexExprVars a ++ indexExprVars b
+  CFG.INdToFlat a b -> indexExprVars a ++ indexExprVars b
+  CFG.ICall _ es -> concatMap indexExprVars es
+
+-- ---------------------------------------------------------------------------
+-- Temporal-loop code path: an `iterate` repeats one GPU map kernel N times,
+-- feeding each step's output back as the next step's input (Jacobi/PDE-style
+-- relaxation). Lowered to a host loop of dispatches over two ping-pong buffers;
+-- only the final buffer is read back. Sibling of Layer A: a bounded host loop
+-- around a single kernel rather than a chain of distinct kernels.
+-- ---------------------------------------------------------------------------
+
+-- | Split an iterate body into (step work, trailing ping-pong swap glue). The
+-- swap is the maximal suffix of array-alias assignments (@x = y@) the lowering
+-- emits to rotate the current/next/temp buffers each iteration.
+splitSwapGlue :: [CFG.Stmt] -> ([CFG.Stmt], [CFG.Stmt])
+splitSwapGlue stmts =
+  let isAlias (CFG.SAssign _ (RAtom (AVar _))) = True
+      isAlias _ = False
+      (revSwap, revWork) = span isAlias (reverse stmts)
+   in (reverse revWork, reverse revSwap)
+
+-- | Lower a proc whose body is a temporal @iterate@ loop around one GPU map
+-- kernel to a host loop of dispatches over two alternating buffers.
+codegenMSLTemporal :: CFG.Program -> CFG.Proc -> Either String MSLArtifacts
+codegenMSLTemporal prog@(CFG.Program procs) rp = do
+  let body = CFG.procBody rp
+      (bodyNoRet, retAtom) = splitFinalReturn body
+      indexed = zip [0 ..] bodyNoRet
+  (iterIdx, iterSpec, iterBody) <-
+    maybe (Left "MSL temporal: no iterate loop found") Right $
+      listToMaybe
+        [ (i, spec, b)
+        | (i, CFG.SLoop spec b) <- indexed,
+          CFG.lsRole spec == CFG.LoopIterate
+        ]
+  iterCount <-
+    maybe (Left "MSL temporal: iterate loop has no bound") Right $
+      listToMaybe (CFG.lsBounds iterSpec)
+  let (kernelWork, swapGlue) = splitSwapGlue iterBody
+      swapVars = Set.fromList [v | CFG.SAssign v (RAtom (AVar _)) <- swapGlue]
+      preGlueAll = [s | (i, s) <- indexed, i < iterIdx]
+      postGlueAll = [s | (i, s) <- indexed, i > iterIdx]
+  nextVar <-
+    case Set.toList (collectWrittenArrays kernelWork) of
+      [v] -> Right v
+      vs -> Left ("MSL temporal: step must write exactly one array, got " ++ show vs)
+  -- The current buffer is the ping-pong array the step reads.
+  curVar <-
+    case [v | v <- Set.toList (collectReadArrays kernelWork), v `Set.member` swapVars] of
+      (v : _) -> Right v
+      [] -> Left "MSL temporal: step reads no ping-pong buffer"
+  -- The initial array seeds both buffers: a stable (non-ping-pong) array fed
+  -- into a swap buffer in the pre-glue (the lowering copy-propagates, so this
+  -- may appear as either an alias or an array copy).
+  initArrVar <-
+    case [ src
+         | CFG.SAssign v rhs <- preGlueAll,
+           v `Set.member` swapVars,
+           src <- arraySourceOf rhs,
+           src `Set.notMember` swapVars
+         ] of
+      (s : _) -> Right s
+      [] -> Left "MSL temporal: could not identify the initial array"
+  -- Analyze the step as an ordinary kernel. The kernel-param classifier only
+  -- recognizes an input array that is a zero-arg call or a pre-loop alloc, and
+  -- an output that is a pre-loop alloc written in the loop. The ping-pong cur/
+  -- next buffers are aliases of the initial array, so we re-introduce them as
+  -- explicit allocs (read-only `cur`, written `next`) over the initial array's
+  -- shape; the real buffers are managed by the harness, so the alloc shape only
+  -- drives classification.
+  let shapeVar = BS.pack "__hyd_iter_shape"
+      stepPreGlue =
+        filter (not . assignsTo swapVars) preGlueAll
+          ++ [ CFG.SAssign shapeVar (RArrayShape (AVar initArrVar)),
+               CFG.SAssign curVar (RArrayAlloc (AVar shapeVar)),
+               CFG.SAssign nextVar (RArrayAlloc (AVar shapeVar))
+             ]
+      stepProc = rp {CFG.procBody = stepPreGlue ++ kernelWork ++ [CFG.SReturn (AVar nextVar)]}
+  ka <- analyzeOneKernel prog stepProc
+  -- Keep to the simple, well-understood shape: one ping-pong input that is the
+  -- current buffer, one output that is the next buffer, no extra static inputs.
+  () <-
+    case (kaInputArrays ka, kaOutputArrays ka) of
+      ([inV], [outV]) | inV == curVar && outV == nextVar -> Right ()
+      (ins, outs) ->
+        Left
+          ( "MSL temporal: unsupported step shape (inputs="
+              ++ show ins
+              ++ ", outputs="
+              ++ show outs
+              ++ "); expected one ping-pong input and one output"
+          )
+  let retKinds = procReturnKinds prog
+  helperC <- genHelperC procs (CFG.procName rp) retKinds
+  let kernelSrc =
+        genMSLKernelSrc
+          (kaName ka)
+          (kaLoopSpec ka)
+          (kaLoopBody ka)
+          (kaTypeEnv ka)
+          (kaArrayElemTys ka)
+          (kaInputArrays ka)
+          (kaOutputArrays ka)
+          (kaScalarInputs ka)
+          (kaHoistedCallMap ka)
+          (kaPreLoopAliases ka)
+      harnessSrc =
+        genTemporalHarness
+          ka
+          curVar
+          nextVar
+          initArrVar
+          iterCount
+          postGlueAll
+          retAtom
+          swapVars
+          retKinds
+          helperC
+  Right
+    MSLArtifacts
+      { mslKernelSource = kernelSrc,
+        mslHarnessSource = harnessSrc,
+        mslHeaderSource = Nothing,
+        mslWarnings = fp32DemotionWarning [ka]
+      }
+  where
+    assignsTo vs (CFG.SAssign v _) = v `Set.member` vs
+    assignsTo _ _ = False
+    arraySourceOf (RAtom (AVar s)) = [s]
+    arraySourceOf (RArrayCopy (AVar s)) = [s]
+    arraySourceOf _ = []
+
+-- | Array variables loaded (@RArrayLoad@) anywhere in a statement list,
+-- descending into nested loops and branches.
+collectReadArrays :: [CFG.Stmt] -> Set CVar
+collectReadArrays = foldMap go
+  where
+    go (CFG.SAssign _ (RArrayLoad (AVar v) _)) = Set.singleton v
+    go (CFG.SLoop _ body) = collectReadArrays body
+    go (CFG.SIf _ thn els) = collectReadArrays thn `Set.union` collectReadArrays els
+    go _ = Set.empty
+
+-- | Harness for a temporal @iterate@: seed two ping-pong buffers from the
+-- initial array, dispatch the step kernel @N@ times swapping cur/next, read
+-- the final buffer back, then run trailing CPU work (a CSV write, if any).
+-- Buffer layout matches the single-input kernel: 0=cur data, 1=cur shape,
+-- 2=next data, 3.. = scalar inputs.
+genTemporalHarness ::
+  KernelAnalysis ->
+  -- | current / next / initial-source array vars
+  CVar ->
+  CVar ->
+  CVar ->
+  -- | iteration count
+  CFG.IndexExpr ->
+  -- | post-glue (raw; only aliases + CSV writes are emitted)
+  [CFG.Stmt] ->
+  -- | return atom
+  Maybe Atom ->
+  -- | swap vars (cur/next/tmp)
+  Set CVar ->
+  Map CVar VarKind ->
+  String ->
+  String
+genTemporalHarness ka curVar nextVar initArrVar iterCount postGlue retAtom swapVars retKinds helperC =
+  unlines $
+    [ "// Hydrangea Metal harness (temporal iterate) — generated by the MSL backend.",
+      "#include \"hydrangea_runtime.h\"",
+      "#include <stdio.h>",
+      "#include <string.h>",
+      "#include <stdlib.h>",
+      "#import <Foundation/Foundation.h>",
+      "#import <Metal/Metal.h>",
+      "",
+      "// ---- CPU helper procs ----",
+      helperC,
+      "",
+      "int main(int argc, const char* argv[]) {",
+      "    @autoreleasepool {",
+      "    const char* _metallib = argc > 1 ? argv[1] : \"kernel.metallib\";",
+      "    // --- Proc parameters (defaults) ---"
+    ]
+      ++ procParamLines
+      ++ ["    // --- CPU pre-loop setup (scalars, shapes, initial array) ---"]
+      ++ preLoopLines
+      ++ [ "",
+           "    long _n = " ++ gridSizeExpr ++ ";",
+           "    id<MTLDevice> _dev = MTLCreateSystemDefaultDevice();",
+           "    if (!_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }",
+           "    NSError* _err = nil;",
+           "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:_metallib]];",
+           "    id<MTLLibrary> _lib = [_dev newLibraryWithURL:_libURL error:&_err];",
+           "    if (!_lib) { fprintf(stderr, \"hydrangea: failed to load metallib: %s\\n\", [_err.localizedDescription UTF8String]); return 1; }",
+           "    id<MTLFunction> _fn = [_lib newFunctionWithName:@\"" ++ knm ++ "\"];",
+           "    if (!_fn) { fprintf(stderr, \"hydrangea: kernel " ++ knm ++ " not found\\n\"); return 1; }",
+           "    id<MTLComputePipelineState> _pso = [_dev newComputePipelineStateWithFunction:_fn error:&_err];",
+           "    if (!_pso) { fprintf(stderr, \"hydrangea: pipeline error: %s\\n\", [_err.localizedDescription UTF8String]); return 1; }",
+           "    id<MTLCommandQueue> _queue = [_dev newCommandQueue];",
+           "",
+           "    // --- Two ping-pong buffers, both seeded from the initial array ---",
+           "    long _elemN = hyd_shape_size(" ++ san initArrVar ++ "->shape);",
+           "    size_t _bufsz = (size_t)(_elemN * sizeof(" ++ elemTy ++ "));",
+           "    id<MTLBuffer> _bufA = [_dev newBufferWithLength:_bufsz options:MTLResourceStorageModeShared];",
+           "    id<MTLBuffer> _bufB = [_dev newBufferWithLength:_bufsz options:MTLResourceStorageModeShared];"
+         ]
+      ++ seedLines "_bufA"
+      ++ seedLines "_bufB"
+      ++ [ "    id<MTLBuffer> _bufShape = [_dev newBufferWithBytes:&" ++ san initArrVar ++ "->shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];",
+           "    id<MTLBuffer> _bufCur = _bufA;",
+           "    id<MTLBuffer> _bufNext = _bufB;"
+         ]
+      ++ scalarDecls
+      ++ [ "    // --- Temporal loop: dispatch the step kernel, swap, repeat ---",
+           "    for (long _it = 0; _it < (long)(" ++ iterCountExpr ++ "); _it++) {",
+           "      id<MTLCommandBuffer> _cmd = [_queue commandBuffer];",
+           "      id<MTLComputeCommandEncoder> _enc = [_cmd computeCommandEncoder];",
+           "      [_enc setComputePipelineState:_pso];",
+           "      [_enc setBuffer:_bufCur offset:0 atIndex:0];",
+           "      [_enc setBuffer:_bufShape offset:0 atIndex:1];",
+           "      [_enc setBuffer:_bufNext offset:0 atIndex:2];"
+         ]
+      ++ scalarSet
+      ++ [ "      NSUInteger _tgs = MIN(256UL, _pso.maxTotalThreadsPerThreadgroup); if (_tgs==0) _tgs=1;",
+           "      [_enc dispatchThreads:MTLSizeMake((NSUInteger)_n,1,1) threadsPerThreadgroup:MTLSizeMake(_tgs,1,1)];",
+           "      [_enc endEncoding]; [_cmd commit]; [_cmd waitUntilCompleted];",
+           "      id<MTLBuffer> _swap = _bufCur; _bufCur = _bufNext; _bufNext = _swap;",
+           "    }",
+           "",
+           "    // --- Read the final buffer back into the result array ---",
+           "    hyd_array_t* " ++ san curVar ++ " = hyd_array_alloc(" ++ san initArrVar ++ "->shape);"
+         ]
+      ++ readbackLines
+      ++ postLines
+      ++ printReturnLines
+      ++ [ "    } // @autoreleasepool",
+           "    return 0;",
+           "}"
+         ]
+  where
+    knm = sanitize (kaName ka)
+    typeEnv = kaTypeEnv ka
+    arrayElemTys = kaArrayElemTys ka
+    san = sanitize
+    elemCType = case Map.lookup curVar arrayElemTys of
+      Just t -> t
+      Nothing -> case Map.lookup curVar typeEnv of
+        Just (CTArray t) -> t
+        _ -> CTDouble
+    elemTy = mslTypeName elemCType
+    scalars = kaScalarInputs ka
+    scalarTyOf v = case Map.lookup v typeEnv of Just t -> mslTypeName t; _ -> "long"
+
+    procParamLines = concatMap declProcParam (kaProcParams ka)
+    declProcParam v =
+      let ty = Map.findWithDefault CTInt64 v typeEnv
+          defVal = case ty of
+            CTDouble -> "0.0"
+            CTBool -> "0"
+            CTArray _ -> "NULL"
+            CTPair _ _ -> "((" ++ cTypeName ty ++ "){0})"
+            _ -> "0LL"
+       in ["    " ++ cTypeName ty ++ " " ++ san v ++ " = " ++ defVal ++ ";"]
+
+    -- Host setup: the kernel's effective pre-loop, which besides the original
+    -- pre-glue also holds any loop-invariant step preamble (e.g. a shape read
+    -- of the current buffer). References to the ping-pong buffers are redirected
+    -- to the initial array (same shape/contents on entry); their alloc stubs are
+    -- dropped since the harness owns the real Metal buffers.
+    hostPreLoop =
+      substStmts
+        (Map.fromList [(v, AVar initArrVar) | v <- Set.toList swapVars])
+        (kaEffectivePreLoop ka)
+    preLoopLines =
+      concatMap
+        (genPreLoopLine typeEnv retKinds (Set.fromList [curVar, nextVar]) Set.empty)
+        hostPreLoop
+
+    gridSizeExpr = case CFG.lsBounds (kaLoopSpec ka) of
+      [b] -> "(long)" ++ genMSLIndexExpr b
+      bs -> intercalate " * " ["(long)" ++ genMSLIndexExpr b | b <- bs]
+    iterCountExpr = genMSLIndexExpr iterCount
+
+    seedLines buf
+      | elemTy == "float" =
+          [ "    { double* _s = (double*)" ++ san initArrVar ++ "->data; float* _d = (float*)" ++ buf ++ ".contents;",
+            "      for (long _i = 0; _i < _elemN; _i++) _d[_i] = (float)_s[_i]; }"
+          ]
+      | otherwise =
+          ["    memcpy(" ++ buf ++ ".contents, " ++ san initArrVar ++ "->data, _bufsz);"]
+
+    scalarDecls =
+      ["    " ++ scalarTyOf v ++ " _sc" ++ show i ++ " = " ++ san v ++ ";" | (v, i) <- zip scalars [0 :: Int ..]]
+    scalarSet =
+      [ "      [_enc setBytes:&_sc" ++ show i ++ " length:sizeof(" ++ scalarTyOf v ++ ") atIndex:" ++ show (3 + i) ++ "];"
+      | (v, i) <- zip scalars [0 :: Int ..]
+      ]
+
+    readbackLines
+      | elemTy == "float" =
+          [ "    { float* _gs = (float*)_bufCur.contents; double* _gd = (double*)" ++ san curVar ++ "->data;",
+            "      for (long _i = 0; _i < _elemN; _i++) _gd[_i] = (double)_gs[_i]; }"
+          ]
+      | otherwise =
+          ["    memcpy(" ++ san curVar ++ "->data, _bufCur.contents, _bufsz);"]
+
+    -- Trailing CPU work: only array-alias bindings (e.g. `result = cur`) and CSV
+    -- writes. Iterate bookkeeping (frees, alias conditionals) is skipped — the
+    -- GPU manages the buffers.
+    postLines = concatMap emitPost postGlue
+    emitPost s = case s of
+      CFG.SAssign _ (RCall fn _) | isFileWriteBuiltin fn -> genPreLoopLine typeEnv retKinds Set.empty Set.empty s
+      CFG.SAssign _ (RAtom (AVar _)) -> genPreLoopLine typeEnv retKinds Set.empty Set.empty s
+      _ -> []
+
+    printReturnLines = case retAtom of
+      Just AUnit -> []
+      Just (AVar v) -> case Map.lookup v typeEnv of
+        Just (CTArray elt) -> tempArrayPrint v elt
+        Just CTDouble -> ["    printf(\"%.17g\\n\", (double)" ++ san v ++ ");"]
+        _ -> ["    printf(\"%ld\\n\", (long)" ++ san v ++ ");"]
+      Just (AInt n) -> ["    printf(\"%ld\\n\", (long)" ++ show n ++ "LL);"]
+      Just (AFloat f) -> ["    printf(\"%.17g\\n\", (double)" ++ show f ++ ");"]
+      _ -> []
+
+    -- Print a CPU result array. Float elements are stored as 8-byte doubles in
+    -- the host @hyd_array_t@, so read them as @double@ (not the GPU's @float@).
+    tempArrayPrint v elt =
+      let isF = elt == CTDouble
+          cty = if isF then "double" else "int64_t"
+          fmt = if isF then "%.17g" else "%ld"
+          cast = if isF then "(double)" else "(long)"
+       in [ "    { " ++ cty ++ "* _rp = (" ++ cty ++ "*)" ++ san v ++ "->data; long _rn = hyd_shape_size(" ++ san v ++ "->shape);",
+            "      printf(\"[\"); for (long _pi = 0; _pi < _rn; _pi++) { if (_pi>0) printf(\", \"); printf(\"" ++ fmt ++ "\", " ++ cast ++ "_rp[_pi]); } printf(\"]\\n\"); }"
+          ]
+
+-- | Generate the harness for a multi-phase proc: walk the body in order
+-- (descending through @SIf@ guards, which become host-side conditionals around
+-- their dispatches), running scalar/shape glue on the host, allocating a Metal
+-- buffer per GPU array (shared across phases by name), uploading any external
+-- CPU input arrays, dispatching each GPU loop as a kernel, then reading back the
+-- result, finishing on the CPU, and printing.
 genMultiPhaseHarness ::
   CFG.Proc ->
   -- | bodyNoRet (top-level statements, return split off)
   [CFG.Stmt] ->
-  -- | indices of GPU loops within bodyNoRet
-  [Int] ->
-  -- | phases (aligned with the loop indices, in order)
+  -- | phases (in pre-order, aligned with flattenPhaseToks)
   [KernelAnalysis] ->
   -- | return atom
   Maybe Atom ->
@@ -398,7 +886,7 @@ genMultiPhaseHarness ::
   -- | helper C source
   String ->
   String
-genMultiPhaseHarness _rp bodyNoRet loopIdxs phases retAtom typeEnv arrayElemTys retKinds helperC =
+genMultiPhaseHarness _rp bodyNoRet phases retAtom typeEnv arrayElemTys retKinds helperC =
   unlines $
     [ "// Hydrangea Metal harness (multi-phase) — generated by the MSL backend.",
       "#include \"hydrangea_runtime.h\"",
@@ -426,30 +914,110 @@ genMultiPhaseHarness _rp bodyNoRet loopIdxs phases retAtom typeEnv arrayElemTys 
     ]
       ++ concatMap genPSO phases
       ++ [""]
-      ++ concatMap emitTopStmt preIndexed
+      ++ glueDecls
+      ++ concatMap emitGlue setupStmts
+      ++ concatMap uploadExternalInput externalInputs
       ++ [""]
-      ++ concatMap genReadback neededReadback
-      ++ concatMap (genPreLoopLine typeEnv retKinds Set.empty Set.empty) postStmts
+      ++ fst (emitItems (0, Set.empty) (phaseStmts ++ postStmts))
       ++ printReturnLines
       ++ [ "    } // @autoreleasepool",
            "    return 0;",
            "}"
          ]
   where
-    indexed = zip [0 ..] bodyNoRet
-    loopIdxSet = Set.fromList loopIdxs
-    phaseAt = Map.fromList (zip loopIdxs phases)
-    lastLoopIdx = if null loopIdxs then -1 else maximum loopIdxs
-    preIndexed = [(j, s) | (j, s) <- indexed, j <= lastLoopIdx]
-    postStmts = [s | (j, s) <- indexed, j > lastLoopIdx]
+    indexedTop = zip [0 :: Int ..] bodyNoRet
+    containsPhase s = not (null (gpuLoopsDeep [s]))
+    phaseTopIdxs = [j | (j, s) <- indexedTop, containsPhase s]
+    firstPhaseTop = if null phaseTopIdxs then maxBound else minimum phaseTopIdxs
+    lastPhaseTop = if null phaseTopIdxs then -1 else maximum phaseTopIdxs
+    -- Host glue before the first dispatch (where external inputs are produced),
+    -- the phase region (dispatches + interleaved glue + SIf guards), and the
+    -- trailing CPU work after the last dispatch.
+    setupStmts = [s | (j, s) <- indexedTop, j < firstPhaseTop]
+    phaseStmts = [s | (j, s) <- indexedTop, j >= firstPhaseTop, j <= lastPhaseTop]
+    postStmts = [s | (j, s) <- indexedTop, j > lastPhaseTop]
 
     gpuArrays = nub (concatMap (\p -> kaInputArrays p ++ kaOutputArrays p) phases)
     gpuArraySet = Set.fromList gpuArrays
     phaseOutputs = nub (concatMap kaOutputArrays phases)
-    referencedVars =
-      usedVarsStmts postStmts
-        `Set.union` Set.fromList [v | Just (AVar v) <- [retAtom]]
-    neededReadback = [v | v <- phaseOutputs, v `Set.member` referencedVars]
+    -- Arrays the harness allocates as GPU-resident buffers (alloc'd, not uploaded).
+    gpuAllocedArrays =
+      Set.fromList [v | CFG.SAssign v (RArrayAlloc _) <- allBodyStmts, v `Set.member` gpuArraySet]
+    allBodyStmts = flattenAllStmts bodyNoRet
+    -- External CPU input arrays: read by a kernel but neither produced by a phase
+    -- nor allocated as a GPU buffer — they must be computed on the host and
+    -- uploaded (e.g. an array read from CSV feeding a stencil).
+    externalInputs =
+      [ v
+      | v <- nub (concatMap kaInputArrays phases),
+        v `notElem` phaseOutputs,
+        v `Set.notMember` gpuAllocedArrays
+      ]
+    -- Walk the phase region and trailing CPU work, threading (next phase index,
+    -- arrays already read back). Emits host glue, host `if`/`else` around SIf
+    -- guards, a dispatch per GPU loop (phases in pre-order), and — before any
+    -- CPU statement that consumes a phase output's data (e.g. a CSV write) — a
+    -- readback of that output. Outputs consumed only by later kernels stay
+    -- GPU-resident (kernels read them via buffers, not glue references).
+    emitItems :: (Int, Set CVar) -> [CFG.Stmt] -> ([String], (Int, Set CVar))
+    emitItems st [] = ([], st)
+    emitItems (n, rb) (s : rest) = case s of
+      CFG.SLoop spec _ | isGpuLoopSpec spec ->
+        let (rs, st') = emitItems (n + 1, rb) rest
+         in (genDispatch (phases !! n) ++ rs, st')
+      CFG.SIf cond thn els ->
+        let (tl, st1) = emitItems (n, rb) thn
+            (el, st2) = emitItems st1 els
+            blk =
+              ["    if (" ++ genCAtom cond ++ ") {"]
+                ++ tl
+                ++ (if null els then ["    }"] else ["    } else {"] ++ el ++ ["    }"])
+            (rs, st3) = emitItems st2 rest
+         in (blk ++ rs, st3)
+      _ ->
+        let used = usedVarsStmts [s]
+            newRb = [v | v <- phaseOutputs, v `Set.member` used, v `Set.notMember` rb]
+            rb' = rb `Set.union` Set.fromList newRb
+            (rs, st') = emitItems (n, rb') rest
+         in (concatMap genReadback newRb ++ emitGlue s ++ rs, st')
+
+    -- The clamped stencil reuses scalar glue var names across boundary regions
+    -- that were separate lexical scopes in the source. Flattened into one C
+    -- function they collide, so pre-declare every glue var once at the top and
+    -- emit plain assignments in the body (matching the C backend).
+    glueStmtsAll = flattenAllStmts (setupStmts ++ phaseStmts ++ postStmts)
+    -- Exclude GPU arrays (buffers/stubs and on-demand readback arrays, which are
+    -- declared by genBufferAlloc / genReadback) — only scalar/tuple glue is
+    -- pre-declared here.
+    glueVarList =
+      nub [v | CFG.SAssign v _ <- glueStmtsAll, v `Set.notMember` gpuArraySet]
+    glueVarSet = Set.fromList glueVarList
+    glueDecls =
+      ["    " ++ preLoopCTypeVar typeEnv retKinds v glueStmtsAll ++ " " ++ sanitize v ++ ";" | v <- glueVarList]
+
+    emitGlue s = case s of
+      CFG.SAssign v (RArrayAlloc shp)
+        | v `Set.member` gpuArraySet -> genBufferAlloc v shp
+      _ -> genPreLoopLine typeEnv retKinds gpuArraySet glueVarSet s
+
+    -- Upload an external CPU input array to a Metal buffer (data + shape).
+    uploadExternalInput v =
+      let elemTy = mslElemTy v
+          nm = sanitize v
+          fill
+            | elemTy == "float" =
+                [ "    { double* _us = (double*)" ++ nm ++ "->data; float* _ud = (float*)_buf_" ++ nm ++ ".contents;",
+                  "      for (long _ui = 0; _ui < _inN_" ++ nm ++ "; _ui++) _ud[_ui] = (float)_us[_ui]; }"
+                ]
+            | otherwise =
+                ["    memcpy(_buf_" ++ nm ++ ".contents, " ++ nm ++ "->data, _bufsz_" ++ nm ++ ");"]
+       in [ "    // upload external input " ++ nm,
+            "    long _inN_" ++ nm ++ " = hyd_shape_size(" ++ nm ++ "->shape);",
+            "    size_t _bufsz_" ++ nm ++ " = (size_t)(_inN_" ++ nm ++ " * sizeof(" ++ elemTy ++ "));",
+            "    id<MTLBuffer> _buf_" ++ nm ++ " = [_dev newBufferWithLength:_bufsz_" ++ nm ++ " options:MTLResourceStorageModeShared];"
+          ]
+            ++ fill
+            ++ ["    id<MTLBuffer> _bufshape_" ++ nm ++ " = [_dev newBufferWithBytes:&" ++ nm ++ "->shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"]
 
     mslElemTy v = case Map.lookup v arrayElemTys of
       Just elt -> mslTypeName elt
@@ -467,15 +1035,6 @@ genMultiPhaseHarness _rp bodyNoRet loopIdxs phases retAtom typeEnv arrayElemTys 
             "    id<MTLComputePipelineState> _pso_" ++ knm ++ " = [_dev newComputePipelineStateWithFunction:_fn_" ++ knm ++ " error:&_err];",
             "    if (!_pso_" ++ knm ++ ") { fprintf(stderr, \"hydrangea: pipeline error: %s\\n\", [_err.localizedDescription UTF8String]); return 1; }"
           ]
-
-    emitTopStmt (j, s)
-      | j `Set.member` loopIdxSet = case Map.lookup j phaseAt of
-          Just p -> genDispatch p
-          Nothing -> []
-      | otherwise = case s of
-          CFG.SAssign v (RArrayAlloc shp)
-            | v `Set.member` gpuArraySet -> genBufferAlloc v shp
-          _ -> genPreLoopLine typeEnv retKinds gpuArraySet Set.empty s
 
     genBufferAlloc v shp =
       let elemTy = mslElemTy v
@@ -537,6 +1096,7 @@ genMultiPhaseHarness _rp bodyNoRet loopIdxs phases retAtom typeEnv arrayElemTys 
                )
 
     printReturnLines = case retAtom of
+      Just AUnit -> []
       Just (AVar v) -> case Map.lookup v typeEnv of
         Just (CTArray elt) -> arrayPrint v (mslTypeName elt)
         Just CTDouble -> ["    printf(\"%.17g\\n\", (double)" ++ sanitize v ++ ");"]
@@ -618,7 +1178,7 @@ codegenMSLExport opts prog@(CFG.Program procs) = do
       { mslKernelSource = kernelSrc,
         mslHarnessSource = harnessSrc,
         mslHeaderSource = Just headerSrc,
-        mslWarnings = cpuFallbackWarningsSingle ka
+        mslWarnings = cpuFallbackWarningsSingle ka ++ fp32DemotionWarning [ka]
       }
 
 -- | Check if a variable derives from a proc parameter (e.g., via RProj).
@@ -1417,7 +1977,7 @@ classifyKernelParams ::
 classifyKernelParams preLoopStmts loopBody loopSpec typeEnv retKinds =
   let iterVars = Set.fromList (CFG.lsIters loopSpec)
       -- Include variables from loop bounds (needed for multi-dim decomposition)
-      boundVars = Set.fromList [v | CFG.IVar v <- CFG.lsBounds loopSpec]
+      boundVars = Set.fromList (concatMap indexExprVars (CFG.lsBounds loopSpec))
       loopUsedVars = (usedVarsStmts loopBody `Set.union` boundVars) `Set.difference` iterVars
       -- Also scan for written arrays inside nested loops
       loopWrittenAll = collectWrittenArrays loopBody
@@ -1672,6 +2232,37 @@ isMSLFloatType :: CType -> Bool
 isMSLFloatType CTDouble = True
 isMSLFloatType (CTArray CTDouble) = True
 isMSLFloatType _ = False
+
+-- | Whether a CType contains a @CTDouble@ anywhere — including under arrays and
+-- (nested) pairs, e.g. nbody's @((float, float), float)@ element type.
+ctypeHasFloat :: CType -> Bool
+ctypeHasFloat CTDouble = True
+ctypeHasFloat (CTArray t) = ctypeHasFloat t
+ctypeHasFloat (CTPair a b) = ctypeHasFloat a || ctypeHasFloat b
+ctypeHasFloat _ = False
+
+-- | True when a kernel computes in floating point (so Metal runs it at 32-bit
+-- single precision). Any float-typed temporary, array, or pair shows up in the
+-- recovered type environment, so scanning it suffices.
+kernelUsesFloat :: KernelAnalysis -> Bool
+kernelUsesFloat ka =
+  any ctypeHasFloat (Map.elems (kaTypeEnv ka))
+    || any ctypeHasFloat (Map.elems (kaArrayElemTys ka))
+
+-- | Apple GPUs lack fp64, so the MSL backend demotes every @float@ (a
+-- double-precision value in the surface language) to 32-bit single precision.
+-- Emit a one-line warning when any kernel computes in floating point so the
+-- precision difference from the C backend is not silent. (There is no
+-- surface-language way to request 32-bit float explicitly — @float@ is always
+-- double on the C backend and always demoted on Metal.)
+fp32DemotionWarning :: [KernelAnalysis] -> [String]
+fp32DemotionWarning kas
+  | any kernelUsesFloat kas =
+      [ "Metal: floating-point is computed in 32-bit single precision (Apple GPUs"
+          ++ " lack fp64), so results may differ from the C backend by ~1e-6"
+          ++ " relative. Hydrangea's `float` is double-precision on the C backend."
+      ]
+  | otherwise = []
 
 -- ---------------------------------------------------------------------------
 -- MSL kernel source generation
@@ -2641,6 +3232,9 @@ genObjCHarnessSrc
 
       -- Print the proc's actual return value (scalar, array, or fallback).
       printReturnLines = case retAtom of
+        -- A unit return is a pure side-effecting sink (e.g. a CSV file write run
+        -- as post-kernel CPU work): there is nothing to print to stdout.
+        Just AUnit -> []
         Just (AVar v) -> case Map.lookup v typeEnv of
           Just (CTArray elt) -> genResultArrayPrint v (mslTypeName elt)
           Just CTDouble -> ["    printf(\"%.17g\\n\", (double)" ++ sanitize v ++ ");"]
@@ -3101,7 +3695,7 @@ genPreLoopLine typeEnv retKinds skipAlloc preDeclared stmt = case stmt of
   CFG.SLoop spec body ->
     genPreLoopCLoop 1 typeEnv retKinds skipAlloc preDeclared spec body
   CFG.SArrayWrite arr idx val ->
-    ["    " ++ genPreLoopCArrayWrite arr idx val]
+    ["    " ++ genPreLoopCArrayWrite typeEnv arr idx val]
   CFG.SIf cond thn els ->
     let -- Pre-declare all variables assigned inside the if branches
         ifVars = Set.fromList (collectAssignedVars thn ++ collectAssignedVars els)
@@ -3180,11 +3774,20 @@ genPreLoopCLoop depth typeEnv retKinds skipAlloc preDeclared spec body =
    in initLines ++ loopLines
 
 -- | Render a C array write for pre-loop.
-genPreLoopCArrayWrite :: Atom -> Atom -> Atom -> String
-genPreLoopCArrayWrite (AVar arr) idx val =
-  "((int64_t*)" ++ sanitize arr ++ "->data)[" ++ genCAtom idx ++ "] = " ++ genCAtom val ++ ";"
-genPreLoopCArrayWrite arr idx val =
+genPreLoopCArrayWrite :: TypeEnv -> Atom -> Atom -> Atom -> String
+genPreLoopCArrayWrite typeEnv (AVar arr) idx val =
+  "((" ++ cpuArrayElemCType typeEnv arr ++ "*)" ++ sanitize arr ++ "->data)[" ++ genCAtom idx ++ "] = " ++ genCAtom val ++ ";"
+genPreLoopCArrayWrite _ arr idx val =
   genCAtom arr ++ "[" ++ genCAtom idx ++ "] = " ++ genCAtom val ++ ";"
+
+-- | CPU storage element type for an array variable's @->data@ pointer.
+-- The host-side @hyd_array_t@ stores floats as @double@ and ints as @int64_t@,
+-- so a projection/read must cast to the element's CPU C type — not a blanket
+-- @int64_t*@, which would reinterpret a double's bit pattern as an integer.
+cpuArrayElemCType :: TypeEnv -> CVar -> String
+cpuArrayElemCType typeEnv arr = case Map.lookup arr typeEnv of
+  Just (CTArray elt) -> cTypeName elt
+  _ -> "int64_t"
 
 -- | Render an IndexExpr as C code for pre-loop.
 genPreLoopCIndexExpr :: CFG.IndexExpr -> String
@@ -3298,7 +3901,7 @@ genPreLoopRHS typeEnv retKinds v rhs = case rhs of
           then genCAtom a ++ (if i == 0 then ".fst" else ".snd")
           else genCAtom a ++ ".elems[" ++ show i ++ "]"
   RArrayLoad (AVar arr) idx ->
-    "((int64_t*)" ++ sanitize arr ++ "->data)[" ++ genCAtom idx ++ "]"
+    "((" ++ cpuArrayElemCType typeEnv arr ++ "*)" ++ sanitize arr ++ "->data)[" ++ genCAtom idx ++ "]"
   RArrayLoad arr idx ->
     genCAtom arr ++ "[" ++ genCAtom idx ++ "]"
   RFlatToNd flat shp -> "hyd_flat_to_nd(" ++ genCAtom flat ++ ", " ++ genCAtom shp ++ ")"
