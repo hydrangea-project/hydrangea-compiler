@@ -35,7 +35,7 @@ import Data.Char (toUpper)
 import Data.List (intercalate, isInfixOf, isPrefixOf, isSuffixOf, maximumBy, nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Language.Hydrangea.CFG qualified as CFG
@@ -1302,6 +1302,7 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
            "int hyd_metal_init(const char* metallib_path) {",
            "    @autoreleasepool {",
            "    _hyd_dev = MTLCreateSystemDefaultDevice();",
+           "    if (!_hyd_dev) { NSArray<id<MTLDevice>>* _all = MTLCopyAllDevices(); if (_all.count > 0) _hyd_dev = _all[0]; }",
            "    if (!_hyd_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }",
            "    NSError* _err = nil;",
            "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallib_path]];",
@@ -1866,6 +1867,74 @@ findKernelProc opts procs =
         || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
     isKernelLoopStmt _ = False
 
+-- | True when a top-level statement is a GPU-offloadable (kernel-eligible) loop.
+isKernelLoopStmt :: CFG.Stmt -> Bool
+isKernelLoopStmt (CFG.SLoop spec _) =
+  CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
+    || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
+isKernelLoopStmt _ = False
+
+-- | True when a loop is a scatter we offload to the GPU as the kernel, running
+-- any trailing reduce on the CPU.  The scatter is the work the benchmark
+-- measures, so we always prefer it over the (cheap, checksum-only) reduce.
+--
+-- Accumulating scatters use a 32-bit atomic into the destination grid: a
+-- compare-exchange loop on the float bit-pattern for floats, and an unsigned
+-- 32-bit atomic add for integers (Metal provides no 64-bit atomics).  The grid
+-- slot is 8 bytes with its high word zeroed, so an integer bin is exact as long
+-- as it stays in [0, 2^32); the 64-bit running total is recovered by the CPU
+-- reduce.  Injective ('direct') scatters need no atomics at all.
+isScatterLoopStmt :: CFG.Stmt -> Bool
+isScatterLoopStmt (CFG.SLoop spec _) = case CFG.lsExec spec of
+  CFG.Parallel p -> case CFG.psStrategy p of
+    CFG.ParallelScatterDirect -> True
+    CFG.ParallelScatterAtomicAddInt -> True
+    CFG.ParallelScatterAtomicAddFloat -> True
+    CFG.ParallelScatterPrivatizedIntAdd -> True
+    CFG.ParallelScatterPrivatizedFloatAdd -> True
+    _ -> False
+  _ -> False
+isScatterLoopStmt _ = False
+
+-- | True when a statement contains a loop (itself or nested in an @if@).
+stmtHasLoopNested :: CFG.Stmt -> Bool
+stmtHasLoopNested (CFG.SLoop _ _) = True
+stmtHasLoopNested (CFG.SIf _ thn els) = any stmtHasLoopNested thn || any stmtHasLoopNested els
+stmtHasLoopNested _ = False
+
+-- | Choose the index of the top-level loop to offload to the GPU.
+--
+-- The single-kernel MSL path runs exactly one loop on the GPU and emits
+-- everything else as CPU pre/post code.
+--
+--   * If a scatter loop is present, we offload it (it is the expensive fused
+--     loop) and run any trailing reduce on the CPU as post-loop work.
+--   * Otherwise the chosen kernel must have no loop after it, since a
+--     non-scatter post-loop is not executed by the harness.  Among the
+--     kernel-eligible top-level loops with a loop-free suffix we pick the
+--     largest by nested-statement count.
+--
+-- Returns 'Nothing' when no kernel-eligible loop exists.
+selectKernelLoopIndex :: [CFG.Stmt] -> Maybe Int
+selectKernelLoopIndex stmts =
+  case [i | (i, s) <- indexed, isScatterLoopStmt s] of
+    (i : _) -> Just i
+    [] -> case terminalCandidates of
+      [] -> Nothing
+      _ -> Just (fst (maximumBy (\a b -> compare (snd a) (snd b)) terminalCandidates))
+  where
+    indexed = zip [0 ..] stmts
+    terminalCandidates =
+      [ (i, stmtCount lb)
+      | (i, s@(CFG.SLoop _ lb)) <- indexed,
+        isKernelLoopStmt s,
+        not (any stmtHasLoopNested (drop (i + 1) stmts))
+      ]
+    stmtCount = length . concatMap collectAllStmts
+    collectAllStmts (CFG.SLoop _ b) = b ++ concatMap collectAllStmts b
+    collectAllStmts (CFG.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
+    collectAllStmts s = [s]
+
 -- | Find all zero-arg procs with parallelizable loops (GPU-eligible).
 -- Returns procs in original definition order (callees before callers).
 findGPUEligibleProcs :: [CFG.Proc] -> [CFG.Proc]
@@ -1876,41 +1945,16 @@ findGPUEligibleProcs procs =
     gpuKernelCapturesAllWork (CFG.procBody p)
   ]
   where
+    -- A proc is GPU-eligible when some kernel loop captures all of its work:
+    -- i.e. there is a kernel-eligible loop with no loop after it, so the
+    -- remaining statements are loop-free CPU pre/post code.
     gpuKernelCapturesAllWork body =
-      let (bodyNoRet, _) = splitFinalReturn body
-       in case findKernelLoopIndex bodyNoRet of
-            Nothing -> False
-            Just idx ->
-              -- Reject procs where the GPU kernel would miss serial loops after it.
-              -- Such procs (e.g., scatter_guarded with a fill init + serial scatter)
-              -- need CPU execution for correctness.
-              let afterKernel = drop (idx + 1) bodyNoRet
-               in not (any hasLoopNested afterKernel)
-    findKernelLoopIndex stmts =
-      let indexed = zip [0 ..] stmts
-          candidates =
-            [ (i, stmtCount lb)
-            | (i, CFG.SLoop spec lb) <- indexed,
-              isKernelLoopStmt (CFG.SLoop spec lb)
-            ]
-          stmtCount = length . concatMap collectAllStmts
-          collectAllStmts (CFG.SLoop _ b) = b ++ concatMap collectAllStmts b
-          collectAllStmts (CFG.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
-          collectAllStmts s = [s]
-       in case candidates of
-            [] -> Nothing
-            _ -> Just (fst (maximumBy (\a b -> compare (snd a) (snd b)) candidates))
-    isKernelLoopStmt (CFG.SLoop spec _) =
-      CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
-        || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
-    isKernelLoopStmt _ = False
-    hasLoopNested (CFG.SLoop _ _) = True
-    hasLoopNested (CFG.SIf _ thn els) = any hasLoopNested thn || any hasLoopNested els
-    hasLoopNested _ = False
+      isJust (selectKernelLoopIndex (fst (splitFinalReturn body)))
 
 -- | Split proc body into (preLoopStmts, loopSpec, loopBody, postLoopStmts, retAtom).
--- Selects the largest kernel-eligible loop (by body size) in the proc body,
--- treating everything before and after it as pre-loop / post-loop CPU work.
+-- Selects the kernel loop with 'selectKernelLoopIndex' (largest kernel-eligible
+-- loop with no loop after it), treating everything before and after it as
+-- pre-loop / post-loop CPU work.
 analyzeKernelProc :: [CFG.Stmt] -> Either String ([CFG.Stmt], CFG.LoopSpec, [CFG.Stmt], [CFG.Stmt], Maybe Atom)
 analyzeKernelProc body = do
   let (bodyNoRet, retAtom) = splitFinalReturn body
@@ -1920,29 +1964,13 @@ analyzeKernelProc body = do
     Just (preLoop, spec, loopBody, postLoop) ->
       Right (preLoop, spec, loopBody, postLoop, retAtom)
   where
-    -- Find the largest kernel-eligible loop by body statement count,
-    -- returning (stmts before it, spec, body, stmts after it).
-    findBestKernelLoop stmts =
-      let indexed = zip [0 ..] stmts
-          candidates =
-            [ (i, spec, lb)
-            | (i, CFG.SLoop spec lb) <- indexed,
-              isKernelLoopStmt (CFG.SLoop spec lb)
-            ]
-          stmtCount = length . concatMap collectAllStmts
-          collectAllStmts (CFG.SLoop _ b) = b ++ concatMap collectAllStmts b
-          collectAllStmts (CFG.SIf _ t e) = t ++ e ++ concatMap collectAllStmts t ++ concatMap collectAllStmts e
-          collectAllStmts s = [s]
-       in case candidates of
-            [] -> Nothing
-            _ ->
-              let best = maximumBy (\(_, _, b1) (_, _, b2) -> compare (stmtCount b1) (stmtCount b2)) candidates
-                  (i, spec, lb) = best
-               in Just (take i stmts, spec, lb, drop (i + 1) stmts)
-    isKernelLoopStmt (CFG.SLoop spec _) =
-      CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
-        || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
-    isKernelLoopStmt _ = False
+    -- Pick the same kernel loop the eligibility check uses, returning
+    -- (stmts before it, spec, body, stmts after it).
+    findBestKernelLoop stmts = do
+      i <- selectKernelLoopIndex stmts
+      case stmts !! i of
+        CFG.SLoop spec lb -> Just (take i stmts, spec, lb, drop (i + 1) stmts)
+        _ -> Nothing
 
 -- | Validation: reject unsupported MSL constructs in the kernel loop body.
 validateMSLLoopBody :: [CFG.Stmt] -> Either String ()
@@ -2585,6 +2613,10 @@ genMSLBody iter execPolicy inArrs outArrs typeEnv arrayElemTys hoistedCallMap pr
       CFG.Parallel p -> case CFG.psStrategy p of
         CFG.ParallelScatterAtomicAddInt -> Just CTInt64
         CFG.ParallelScatterAtomicAddFloat -> Just CTDouble
+        -- The CPU parallelizer privatizes scatter accumulation (per-thread grids
+        -- merged afterwards).  The GPU has no such privatization, so on Metal a
+        -- privatized-add scatter is realised with a 32-bit hardware atomic
+        -- (unsigned add for ints, float-bit-pattern compare-exchange for floats).
         CFG.ParallelScatterPrivatizedIntAdd -> Just CTInt64
         CFG.ParallelScatterPrivatizedFloatAdd -> Just CTDouble
         _ -> Nothing
@@ -2633,8 +2665,11 @@ genMSLAtomicAdd depth iter inArrs typeEnv _arrayElemTys arrAtom idxAtom valAtom 
             ++ ind
             ++ "}\n"
         else
-          -- Integer atomic add
-          ind ++ "atomic_fetch_add_explicit((device atomic_int*)&" ++ arrName ++ "[" ++ idx ++ "], (int)(" ++ val ++ "), memory_order_relaxed);\n"
+          -- Integer atomic add.  Metal has no 64-bit atomics; the grid slot is
+          -- an 8-byte long with its high word zeroed, so we add into the low
+          -- 32 bits as unsigned.  Each bin is exact while it stays in [0, 2^32);
+          -- the 64-bit total is recovered by the CPU reduce on read-back.
+          ind ++ "atomic_fetch_add_explicit((device atomic_uint*)&" ++ arrName ++ "[" ++ idx ++ "], (uint)(" ++ val ++ "), memory_order_relaxed);\n"
 
 genMSLStmt :: Int -> CVar -> Set CVar -> Set CVar -> TypeEnv -> Map CVar CType -> Map CVar CVar -> Map CVar [Atom] -> CFG.Stmt -> String
 genMSLStmt depth iter inArrs outArrs typeEnv arrayElemTys hoistedCallMap tupleDefs stmt =
@@ -3006,6 +3041,7 @@ genObjCHarnessSrc
              "",
              "    // --- Metal device and pipeline setup ---",
              "    id<MTLDevice> _dev = MTLCreateSystemDefaultDevice();",
+             "    if (!_dev) { NSArray<id<MTLDevice>>* _all = MTLCopyAllDevices(); if (_all.count > 0) _dev = _all[0]; }",
              "    if (!_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }",
              "    NSError* _err = nil;",
              "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:_metallib]];",
@@ -3321,6 +3357,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
       "",
       "    // --- Metal device and library setup ---",
       "    id<MTLDevice> _dev = MTLCreateSystemDefaultDevice();",
+      "    if (!_dev) { NSArray<id<MTLDevice>>* _all = MTLCopyAllDevices(); if (_all.count > 0) _dev = _all[0]; }",
       "    if (!_dev) { fprintf(stderr, \"hydrangea: Metal not available\\n\"); return 1; }",
       "    NSError* _err = nil;",
       "    NSURL* _libURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:_metallib]];",
