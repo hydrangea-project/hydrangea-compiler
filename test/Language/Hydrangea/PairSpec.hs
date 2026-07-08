@@ -10,6 +10,7 @@ module Language.Hydrangea.PairSpec (spec) where
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (isInfixOf)
+import Language.Hydrangea.TestUtil (containsAll)
 import Test.Hspec
 
 import Language.Hydrangea.Frontend
@@ -148,9 +149,7 @@ spec = do
 
     it "emits pair struct typedef for (Float, Int)" $ do
       c <- emitC "let main = (0.0, 0)"
-      c `shouldSatisfy` isInfixOf "hyd_pair_fi_t"
-      c `shouldSatisfy` isInfixOf "double fst"
-      c `shouldSatisfy` isInfixOf "int64_t snd"
+      c `shouldSatisfy` containsAll ["hyd_pair_fi_t", "double fst", "int64_t snd"]
 
     it "emits pair struct typedef for (Int, Int)" $ do
       c <- emitC "let main = (1, 2)"
@@ -162,8 +161,7 @@ spec = do
 
     it "emits RPairMake as struct initializer" $ do
       c <- emitC "let main = (1.0, 42)"
-      c `shouldSatisfy` isInfixOf ".fst ="
-      c `shouldSatisfy` isInfixOf ".snd ="
+      c `shouldSatisfy` containsAll [".fst =", ".snd ="]
 
     it "emits RPairFst as .fst field access" $ do
       c <- emitC "let main = fst (1.0, 42)"
@@ -177,10 +175,8 @@ spec = do
       c <- emitC $ "let main = snd (foldl "
               <> "(fn acc _ => (fst acc +. 1.0, snd acc + 1)) "
               <> "(0.0, 0) (fill [3] 0))"
-      c `shouldSatisfy` isInfixOf "hyd_pair_fi_t"
-      c `shouldSatisfy` isInfixOf "for ("
-      -- The accumulator variable should be updated inside the loop
-      c `shouldSatisfy` isInfixOf ".snd"
+      -- The accumulator variable should be updated inside the loop (.snd)
+      c `shouldSatisfy` containsAll ["hyd_pair_fi_t", "for (", ".snd"]
 
     it "generates nested pair struct typedef" $ do
       c <- emitC "let main = ((1.0, 2.0), 3)"
@@ -194,9 +190,7 @@ spec = do
         Left err -> expectationFailure $ "Parse error: " ++ err
         Right ds -> do
           csrc <- compileToCOptIO False ds
-          csrc `shouldSatisfy` isInfixOf "hyd_pair_fi_t"
-          csrc `shouldSatisfy` isInfixOf "double fst"
-          csrc `shouldSatisfy` isInfixOf "int64_t snd"
+          csrc `shouldSatisfy` containsAll ["hyd_pair_fi_t", "double fst", "int64_t snd"]
 
     it "IO compilation produces correct C for foldl with pair accumulator" $ do
       let src = "let main = snd (foldl (fn acc _ => (fst acc +. 1.0, snd acc + 1)) (0.0, 0) (fill [5] 0))"
@@ -227,8 +221,7 @@ spec = do
         Right ds -> do
           csrc <- compileToCOptIO False ds
           csrc `shouldNotSatisfy` isInfixOf "#error"
-          csrc `shouldSatisfy` isInfixOf "((hyd_pair_ii_t*)(void*)"
-          csrc `shouldSatisfy` isInfixOf ".snd"
+          csrc `shouldSatisfy` containsAll ["((hyd_pair_ii_t*)(void*)", ".snd"]
 
     -- Regression test for the procReturnKinds / retKindOf bug where a
     -- function returning (snd param, fresh_array) got a wrong return-type
@@ -275,8 +268,7 @@ spec = do
         Left err -> expectationFailure $ "Parse error: " ++ err
         Right ds -> do
           csrc <- compileToCOptIO False ds
-          csrc `shouldSatisfy`    isInfixOf "hyd_array_t*"
-          csrc `shouldSatisfy`    isInfixOf "hyd_pair_af_t f"
+          csrc `shouldSatisfy`    containsAll ["hyd_array_t*", "hyd_pair_af_t f"]
           csrc `shouldNotSatisfy` isInfixOf "hyd_pair_if_t f"
 
     it "scan with unknown-type init param does not register CTUnknown (would crash codegen)" $ do

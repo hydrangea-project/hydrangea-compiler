@@ -4,6 +4,7 @@ module Language.Hydrangea.RecordSpec (spec) where
 
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (isInfixOf)
+import Language.Hydrangea.TestUtil (containsAll)
 import Data.Map qualified as Map
 import Test.Hspec
 
@@ -104,11 +105,8 @@ spec = do
 
     it "emits record struct typedefs and designated initializers" $ do
       c <- emitC "let main = {x = 1, y = 2.0}"
-      c `shouldSatisfy` isInfixOf "typedef struct"
-      c `shouldSatisfy` isInfixOf "int64_t x;"
-      c `shouldSatisfy` isInfixOf "double y;"
-      c `shouldSatisfy` isInfixOf ".x ="
-      c `shouldSatisfy` isInfixOf ".y ="
+      c `shouldSatisfy` containsAll
+        ["typedef struct", "int64_t x;", "double y;", ".x =", ".y ="]
 
     it "emits named field access in generated C" $ do
       c <- emitC "let main = let r = {x = 1, y = 2.0} in r.x"
@@ -120,5 +118,4 @@ spec = do
         , "let main = let r = index [1] arr in r.y"
         ]
       c `shouldNotSatisfy` isInfixOf "#error"
-      c `shouldSatisfy` isInfixOf "((hyd_record_x_i_y_i_t*)(void*)"
-      c `shouldSatisfy` isInfixOf ".y"
+      c `shouldSatisfy` containsAll ["((hyd_record_x_i_y_i_t*)(void*)", ".y"]

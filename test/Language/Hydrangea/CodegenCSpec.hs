@@ -4,6 +4,7 @@ module Language.Hydrangea.CodegenCSpec (spec) where
 
 import Data.List (isInfixOf)
 import Data.Map qualified as Map
+import Language.Hydrangea.TestUtil (containsAll, containsNone, containsInOrder)
 import Language.Hydrangea.CFGCore (Atom(..))
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
@@ -134,9 +135,11 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-int */"
-    c `shouldSatisfy` isInfixOf "#pragma omp atomic update"
-    c `shouldSatisfy` isInfixOf "+= val;"
+    c `shouldSatisfy` containsAll
+      [ "#pragma omp parallel for /* scatter-atomic-add-int */"
+      , "#pragma omp atomic update"
+      , "+= val;"
+      ]
 
   it "emits privatized scatter code for dense integer scatter-add loops" $ do
     let loopBody =
@@ -156,16 +159,17 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64), ("routes", C.CTArray C.CTInt64), ("vals", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
-    c `shouldSatisfy` isInfixOf "#pragma omp for"
-    c `shouldSatisfy` isInfixOf "calloc((size_t)"
-    -- Per-thread grids preallocated outside the parallel region.
-    c `shouldSatisfy` isInfixOf "omp_get_max_threads()"
-    c `shouldSatisfy` isInfixOf "omp_get_thread_num()"
-    c `shouldSatisfy` isInfixOf "omp_get_num_threads()"
+    c `shouldSatisfy` containsAll
+      [ "#pragma omp parallel /* scatter-privatized-int-add */"
+      , "#pragma omp for"
+      , "calloc((size_t)"
+      -- Per-thread grids preallocated outside the parallel region.
+      , "omp_get_max_threads()"
+      , "omp_get_thread_num()"
+      , "omp_get_num_threads()"
+      ]
     -- Parallel merge over output cells: no atomics, no critical section.
-    c `shouldNotSatisfy` isInfixOf "#pragma omp atomic"
-    c `shouldNotSatisfy` isInfixOf "#pragma omp critical"
+    c `shouldSatisfy` containsNone ["#pragma omp atomic", "#pragma omp critical"]
 
   it "emits guarded atomic update code for guarded integer scatter-add loops" $ do
     let loopBody =
@@ -188,9 +192,11 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-int */"
-    c `shouldSatisfy` isInfixOf "if (guard)"
-    c `shouldSatisfy` isInfixOf "#pragma omp atomic update"
+    c `shouldSatisfy` containsAll
+      [ "#pragma omp parallel for /* scatter-atomic-add-int */"
+      , "if (guard)"
+      , "#pragma omp atomic update"
+      ]
 
   it "emits atomic update code for floating-point scatter-add loops" $ do
     let loopBody =
@@ -209,9 +215,11 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTDouble)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-atomic-add-float */"
-    c `shouldSatisfy` isInfixOf "#pragma omp atomic update"
-    c `shouldSatisfy` isInfixOf "+= val;"
+    c `shouldSatisfy` containsAll
+      [ "#pragma omp parallel for /* scatter-atomic-add-float */"
+      , "#pragma omp atomic update"
+      , "+= val;"
+      ]
 
   it "emits serial 1D loop with correct bounds" $ do
     let prog = Program
@@ -232,8 +240,8 @@ spec = describe "CodegenC" $ do
               ]
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 3LL; i++)"
-    c `shouldSatisfy` isInfixOf "for (int64_t j = 0; j < 4LL; j++)"
+    c `shouldSatisfy` containsInOrder
+      ["for (int64_t i = 0; i < 3LL; i++)", "for (int64_t j = 0; j < 4LL; j++)"]
 
   it "emits array write inside loop" $ do
     let prog = Program
@@ -288,10 +296,7 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("r", C.CTRecord [("x", C.CTInt64), ("y", C.CTDouble)]), ("xv", C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "int64_t x;"
-    c `shouldSatisfy` isInfixOf "double y;"
-    c `shouldSatisfy` isInfixOf ".x = 1LL"
-    c `shouldSatisfy` isInfixOf "r.x"
+    c `shouldSatisfy` containsAll ["int64_t x;", "double y;", ".x = 1LL", "r.x"]
 
   it "emits serial reduction from ReductionSpec" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAdd (C.AVar "acc") (C.AInt 1))]
@@ -299,8 +304,8 @@ spec = describe "CodegenC" $ do
                   (Just (ReductionSpec "acc" (IConst 0) C.RAdd)) LoopReduction []
         prog = Program [mkProc "p" [] [SLoop spec' body, SReturn (C.AVar "acc")]]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "int64_t acc = 0LL;"
-    c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 16LL; i++)"
+    c `shouldSatisfy` containsAll
+      ["int64_t acc = 0LL;", "for (int64_t i = 0; i < 16LL; i++)"]
 
   it "emits variable-bound loop from IVar" $ do
     let prog = Program
@@ -320,8 +325,8 @@ spec = describe "CodegenC" $ do
               ]
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "vectorized loop, width = 4"
-    c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(4)"
+    c `shouldSatisfy` containsAll
+      ["vectorized loop, width = 4", "#pragma omp simd simdlen(4)"]
 
   it "emits vector loop with remainder when TailRemainder" $ do
     let prog = Program
@@ -331,8 +336,8 @@ spec = describe "CodegenC" $ do
               ]
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "compiler handles tail"
-    c `shouldSatisfy` isInfixOf "#pragma omp simd simdlen(4)"
+    c `shouldSatisfy` containsAll
+      ["compiler handles tail", "#pragma omp simd simdlen(4)"]
 
   it "emits simd reduction clauses for vectorized reduction loops" $ do
     let body = [SAssign "acc" (C.RBinOp C.CAddF (C.AVar "acc") (C.AVar "x"))]
@@ -362,9 +367,9 @@ spec = describe "CodegenC" $ do
           ]
         c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "hyd_float64x4_t x__vec"
-    c `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"
-    c `shouldSatisfy` isInfixOf "hyd_vec_add_f64x4"
-    c `shouldSatisfy` isInfixOf "hyd_vec_storeu_f64x4"
+    -- The lowering must emit load, then add, then store, in that order.
+    c `shouldSatisfy` containsInOrder
+      ["hyd_vec_loadu_f64x4", "hyd_vec_add_f64x4", "hyd_vec_storeu_f64x4"]
 
   it "disables memoization for pure zero-arg array procs in benchmark closure" $ do
     let inputProc =
@@ -496,8 +501,7 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c, codegenHeader = mHeader } -> do
-        c `shouldSatisfy` isInfixOf "int64_t hyd_export_main(void)"
-        c `shouldSatisfy` isInfixOf "return hyd_main();"
+        c `shouldSatisfy` containsAll ["int64_t hyd_export_main(void)", "return hyd_main();"]
         c `shouldNotSatisfy` isInfixOf "int main(void)"
         mHeader `shouldSatisfy` maybe False (isInfixOf "int64_t hyd_export_main(void);")
 
@@ -513,8 +517,7 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c, codegenHeader = mHeader } -> do
-        c `shouldSatisfy` isInfixOf "int64_t hyd_export_kernel(int64_t n)"
-        c `shouldSatisfy` isInfixOf "return kernel(n);"
+        c `shouldSatisfy` containsAll ["int64_t hyd_export_kernel(int64_t n)", "return kernel(n);"]
         mHeader `shouldSatisfy` maybe False (isInfixOf "int64_t hyd_export_kernel(int64_t n);")
 
   it "prunes uncalled zero-arg procs when pruning is enabled" $ do
