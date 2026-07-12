@@ -2841,6 +2841,8 @@ buildWavefrontBody :: WavefrontKernel -> TileM [Stmt]
 buildWavefrontBody kernel = do
   timeBlock <- buildForcedStripDim (wfkIterT kernel) (wfkIterBound kernel) (wfkStageWidth kernel)
   diagIter <- freshLike (wavefrontHeadIter (wfkInnerSpec kernel)) "__wavefront"
+  diagBase <- freshLike diagIter "__wf_diag_base"
+  absDiag <- freshLike diagIter "__wf_diag_abs"
   stageIter <- freshLike (wfkIterT kernel) "__wf_stage"
   stageTimeVars <-
     mapM
@@ -2866,6 +2868,13 @@ buildWavefrontBody kernel = do
         [ SAssign tVar (RBinOp CAdd (AVar (smdTileStart timeBlock)) (AInt offset))
         | (offset, tVar) <- zip [0 ..] stageTimeVars
         ]
+          -- The frontier loop iterates the skewed coordinate over a
+          -- tile-relative range, but the guard and unskew below use absolute
+          -- time; diagBase lifts the loop coordinate to absolute per tile.
+          ++ [ SAssign
+                 diagBase
+                 (RBinOp CMul (AInt (wfkSkewCoeff kernel)) (AVar (smdTileStart timeBlock)))
+             ]
       substEnv =
         M.fromList
           [ (wfkCurArray kernel, AVar curStageBuf)
@@ -2875,7 +2884,7 @@ buildWavefrontBody kernel = do
       innerBody =
         collapseWavefrontInnerLoop
           (wavefrontFrontierInnerExec kernel)
-          diagIter
+          absDiag
           (wfkInnerSpec kernel)
           (substStmts substEnv (wfkInnerBody kernel))
       suffixBody = substStmts substEnv (wfkStageSuffix kernel)
@@ -2883,7 +2892,9 @@ buildWavefrontBody kernel = do
         if wfkPreallocatedNext kernel
           then extraBuffers
           else drop 1 stageBuffers
-  guardedInner <- buildWavefrontInnerGuard kernel diagIter stageTimeVar innerBody
+  guardedInner0 <- buildWavefrontInnerGuard kernel absDiag stageTimeVar innerBody
+  let guardedInner =
+        SAssign absDiag (RBinOp CAdd (AVar diagIter) (AVar diagBase)) : guardedInner0
   let frontierLoop =
         SLoop
           LoopSpec

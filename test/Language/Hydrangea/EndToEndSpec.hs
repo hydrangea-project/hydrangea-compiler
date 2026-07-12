@@ -26,7 +26,9 @@ import Language.Hydrangea.Frontend
   )
 import Language.Hydrangea.Interpreter (Value(..))
 import qualified Data.Map as Map
+import Data.Char (isDigit)
 import Data.List (intercalate, dropWhileEnd, isInfixOf)
+import Text.Read (readMaybe)
 import Language.Hydrangea.Syntax (Dec(..))
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions)
 import Language.Hydrangea.CFGPipeline (PipelineOptions(..), defaultPipelineOptions)
@@ -192,7 +194,27 @@ checkInlineSrcWithOptions inferOpts pipelineOpts src = do
               (exit, out, _) <- readProcessWithExitCode "./hydrangea_out" [] ""
               case exit of
                 ExitFailure _ -> expectationFailure "Running generated executable failed"
-                ExitSuccess   -> out `shouldBe` expected
+                ExitSuccess   ->
+                  normalizeFloatTokens out `shouldBe` normalizeFloatTokens expected
+
+-- | C's printf("%.17g") and Haskell's printf "%.17g" can render the same
+-- double as different digit strings (C converts the exact binary value;
+-- Haskell pads the shortest round-trip digits). Both round-trip, so rewrite
+-- every numeric token to its parsed-Double 'show' form before comparing.
+normalizeFloatTokens :: String -> String
+normalizeFloatTokens [] = []
+normalizeFloatTokens s@(c : rest)
+  | numStart s =
+      let (tok, rest') = span numChar s
+      in case readMaybe tok :: Maybe Double of
+           Just d  -> show d ++ normalizeFloatTokens rest'
+           Nothing -> tok ++ normalizeFloatTokens rest'
+  | otherwise = c : normalizeFloatTokens rest
+  where
+    numStart (x : _) | isDigit x = True
+    numStart ('-' : x : _) = isDigit x
+    numStart _ = False
+    numChar x = isDigit x || x `elem` (".eE+-" :: String)
 
 -- ---------------------------------------------------------------------------
 -- Test suite
@@ -305,6 +327,27 @@ spec = do
           , "let result = iterate 3 init step"
           ])
 
+    -- Regression: with more time steps than the wavefront stage width (4),
+    -- the serial skewed fallback runs multiple time tiles; the skew guard
+    -- used absolute time against a tile-relative frontier range, losing all
+    -- interior writes after the first tile.
+    it "compiles and runs polyhedral 1D iterate stencil across multiple time tiles and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = False
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let init = generate [5] (let f [i] = float_of i in f)"
+          , "let step arr = stencil clamp"
+          , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
+          , "  arr"
+          , "let result = iterate 5 init step"
+          ])
+
     it "compiles and runs polyhedral constant-boundary stencil kernels and matches the interpreter" $ withCC $
       checkInlineSrcWithOptions
         defaultInferOptions
@@ -389,10 +432,11 @@ spec = do
                 untiledOpts = polyOpts { poEnableTiling = False }
                 -- 516x516 → interior width t25 = 514 ≥ 512, so the wavefront
                 -- profitability guard fires and the wavefront body actually runs.
+                -- 6 iterations > stage width 4 so the run spans two time tiles.
                 jacobiEnv =
                   [ ("JACOBI_H", "516")
                   , ("JACOBI_W", "516")
-                  , ("JACOBI_ITERS", "4")
+                  , ("JACOBI_ITERS", "6")
                   ]
                 tiledDir   = tmp </> "tiled"
                 untiledDir = tmp </> "untiled"
