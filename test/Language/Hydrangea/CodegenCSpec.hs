@@ -317,6 +317,25 @@ spec = describe "CodegenC" $ do
         c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < n; i++)"
 
+  -- lsBounds are trip counts: a loop with a nonzero origin runs
+  -- [origin, origin + bound) on every emission path (buglog Issue 1).
+  it "emits [origin, origin+bound) for loops with nonzero origins" $ do
+    let origin = IMul (IConst 2) (IVar "t")
+        loopWith exec =
+          Program
+            [ mkProc "p" ["t"]
+                [ SLoop (LoopSpec ["i"] [IConst 10] exec Nothing LoopPlain [origin])
+                    [ SAssign "x" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1)) ]
+                , SReturn (C.AInt 0)
+                ]
+            ]
+        serialC = codegenProgram (loopWith Serial)
+        parallelC = codegenProgram (loopWith (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)))
+        vectorC = codegenProgram (loopWith (Vector (VectorSpec 4 TailRemainder)))
+    serialC `shouldSatisfy` containsAll ["for (int64_t i = (t * 2LL); i < ((t * 2LL) + 10LL); i++)"]
+    parallelC `shouldSatisfy` containsAll ["for (int64_t i = (t * 2LL); i < ((t * 2LL) + 10LL); i++)"]
+    vectorC `shouldSatisfy` containsAll ["for (int64_t i = (t * 2LL); i < ((t * 2LL) + 10LL); i++)"]
+
   it "emits vector loop without remainder when TailNone" $ do
     let prog = Program
           [ mkProc "p" []

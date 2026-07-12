@@ -1435,6 +1435,43 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
           _ -> expectationFailure "expected ScheduleLoopBand"
       other -> expectationFailure ("expected one scop, got: " <> show (length other))
 
+  -- buglog Issue 1: a band with lbSkew but stale (zero) lbOrigins must still
+  -- reify with the skewed dimension starting at coeff*source, or the unskewed
+  -- iterator goes out of range for source > 0.
+  it "reifyScheduledScop derives skewed-dimension origins from lbSkew" $ do
+    let loop =
+          SLoop (LoopSpec ["t", "i"] [IVar "m", IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ti" (C.RTuple [C.AVar "t", C.AVar "i"])
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr") (C.AVar "ti"))
+            , SArrayWrite (C.AVar "out") (C.AVar "ti") (C.AVar "x")
+            ]
+        proc = mkProc "p" ["m", "n", "arr", "out"] [loop]
+    case extractProcScops proc of
+      [scop] ->
+        case ssSchedule (buildIdentitySchedule scop) of
+          ScheduleLoopBand band ->
+            let scheduled =
+                  (buildIdentitySchedule scop)
+                    { ssSchedule =
+                        ScheduleLoopBand band { lbSkew = [SkewSpec "i" "t" 2] }
+                    }
+            in
+              case reifyScheduledScop scheduled of
+                Just [SLoop spec' body'] -> do
+                  lsIters spec' `shouldBe` ["t", "i__s"]
+                  lsBounds spec' `shouldBe` [IVar "m", IVar "n"]
+                  lsOrigins spec' `shouldBe` [IConst 0, IMul (IConst 2) (IVar "t")]
+                  take 2 body' `shouldBe`
+                    [ SAssign "i__s__mul" (C.RBinOp C.CMul (C.AInt 2) (C.AVar "t"))
+                    , SAssign "i" (C.RBinOp C.CSub (C.AVar "i__s") (C.AVar "i__s__mul"))
+                    ]
+                other ->
+                  expectationFailure ("unexpected reified skewed band: " <> show other)
+          other ->
+            expectationFailure ("expected loop band schedule, got: " <> show other)
+      other ->
+        expectationFailure ("expected one scop, got: " <> show (length other))
+
   it "reifyScheduledScop preserves skew through ScheduleStripMine" $ do
     let tupleStmt = SAssign "ij" (C.RTuple [C.AVar "i", C.AVar "j"])
         i1Stmt = SAssign "i1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))

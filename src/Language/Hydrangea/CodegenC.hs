@@ -1060,6 +1060,8 @@ genLoop env declared spec body =
       originDoc i = case originFor i of
         CFG.IConst 0 -> text "0"
         o           -> genIndexExpr o
+      -- lsBounds are trip counts: a loop runs [origin, origin + bound).
+      endDoc i b = genIndexExpr (CFG.simplifyIndexExpr (CFG.IAdd (originFor i) b))
       parallelPragma extraClauses =
         let simdClause = case CFG.lsExec spec of
               CFG.Parallel p -> maybe empty (\w -> text " simd simdlen(" <> int w <> text ")") (CFG.psSimdLen p)
@@ -1239,7 +1241,7 @@ genLoop env declared spec body =
                               <+> text "=" <+> originDoc 0 <> text ";"
                               <+> text ci
                               <+> text "<"
-                              <+> genIndexExpr bound
+                              <+> endDoc 0 bound
                               <> text ";"
                               <+> text ci
                               <> text "++) {"
@@ -1309,7 +1311,7 @@ genLoop env declared spec body =
               <+> text "=" <+> originDoc 0 <> text ";"
               <+> text (sanitize iter)
               <+> text "<"
-              <+> genIndexExpr bound
+              <+> endDoc 0 bound
               <> text ";"
               <+> text (sanitize iter)
               <> text "++) {"
@@ -1332,7 +1334,7 @@ genLoop env declared spec body =
                 <+> text "=" <+> originDoc 0 <> text ";"
                 <+> text ci
                 <+> text "<"
-                <+> genIndexExpr b
+                <+> endDoc 0 b
                 <> text ";"
                 <+> text ci
                 <> text "++) {"
@@ -1358,7 +1360,7 @@ genLoop env declared spec body =
                 <+> text "=" <+> originDoc 0 <> text ";"
                 <+> text ci
                 <+> text "<"
-                <+> genIndexExpr b
+                <+> endDoc 0 b
                 <> text ";"
                 <+> text ci
                 <> text "++) {"
@@ -1404,7 +1406,7 @@ genLoop env declared spec body =
                     <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
-                    <+> genIndexExpr b
+                    <+> endDoc 0 b
                     <> text ";"
                     <+> text ci
                     <> text "++) {"
@@ -1418,7 +1420,7 @@ genLoop env declared spec body =
                     <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
-                    <+> genIndexExpr b
+                    <+> endDoc 0 b
                     <> text ";"
                     <+> text ci
                     <> text "++) {"
@@ -1438,7 +1440,7 @@ genLoop env declared spec body =
                     <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
-                    <+> genIndexExpr b
+                    <+> endDoc 0 b
                     <> text ";"
                     <+> text ci
                     <> text "++) {"
@@ -1451,7 +1453,7 @@ genLoop env declared spec body =
                     <+> text "=" <+> originDoc 0 <> text ";"
                     <+> text ci
                     <+> text "<"
-                    <+> genIndexExpr b
+                    <+> endDoc 0 b
                     <> text ";"
                     <+> text ci
                     <> text "++) {"
@@ -1472,7 +1474,7 @@ genLoop env declared spec body =
                 <+> text "=" <+> originDoc 0 <> text ";"
                 <+> text ci
                 <+> text "<"
-                <+> genIndexExpr b
+                <+> endDoc 0 b
                 <> text ";"
                 <+> text ci
                 <> text "++) {"
@@ -1562,8 +1564,8 @@ genNestedLoops iters bounds origins body =
   where
     mk (ci, b, o) inner =
       let startDoc = case o of
-            CFG.IConst _ -> text "0"
-            _           -> genIndexExpr o
+            CFG.IConst 0 -> text "0"
+            _            -> genIndexExpr o
       in text "for (int64_t"
         <+> text ci
         <+> text "="

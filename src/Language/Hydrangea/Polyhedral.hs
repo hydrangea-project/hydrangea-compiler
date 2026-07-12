@@ -2401,11 +2401,31 @@ applyBandSkewToStripMine band plans =
               [assignOrigIter td]
   in  (map localIterFor plans, localOrigins, skewPrelude, innerSetup)
 
+-- | Ensure a band's per-dimension origins reflect its skews: a skewed
+-- dimension iterates over @[coeff*source, coeff*source + bound)@, so its
+-- origin must be @coeff*source@ regardless of whether the producer kept
+-- 'lbOrigins' in sync with 'lbSkew' (buglog Issue 1: within-band skew was
+-- reified with zero origins, leaving the unskewed iterator out of range).
+-- Idempotent for producers that already set matching origins.
+bandWithSkewOrigins :: LoopBand -> LoopBand
+bandWithSkewOrigins band
+  | null (lbSkew band) = band
+  | otherwise =
+      let skewMap = M.fromList [(skewTarget s, s) | s <- lbSkew band]
+          originFor iter fallback = case M.lookup iter skewMap of
+            Just s -> IMul (IConst (skewCoeff s)) (IVar (skewSource s))
+            Nothing -> fallback
+      in band
+           { lbOrigins =
+               zipWith originFor (lbIters band) (lbOrigins band ++ repeat (IConst 0))
+           }
+
 reifyScheduleTree :: Map StmtId Stmt -> ScheduleTree -> Maybe [Stmt]
 reifyScheduleTree stmtMap sched = case sched of
   ScheduleSequence xs ->
     fmap concat (mapM (reifyScheduleTree stmtMap) xs)
-  ScheduleStripMine band plans -> do
+  ScheduleStripMine band0 plans -> do
+    let band = bandWithSkewOrigins band0
     body <- reifyScheduleTree stmtMap (lbBody band)
     let tiledDims = [td | StripTile td <- plans]
         tilePrelude = concatMap smdBoundPrelude tiledDims
@@ -2434,7 +2454,8 @@ reifyScheduleTree stmtMap sched = case sched of
       localBound plan = case plan of
         StripKeep _ bound -> bound
         StripTile td -> IVar (smdTileLen td)
-  ScheduleLoopBand band -> do
+  ScheduleLoopBand band0 -> do
+    let band = bandWithSkewOrigins band0
     body <- reifyScheduleTree stmtMap (lbBody band)
     let (iters', skewPreludes) = applyBandSkew (lbIters band) (lbSkew band)
     pure
