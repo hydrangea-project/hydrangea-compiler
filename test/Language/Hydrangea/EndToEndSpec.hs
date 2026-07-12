@@ -437,6 +437,30 @@ spec = do
         , "let main = a"
         ]
 
+    -- The stencil sums (no division) so interpreter and compiled float
+    -- results are bit-identical and the printed outputs compare exactly.
+    it "compiles an iterate in expression position (Issue 5 fix)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let result = index [2] (iterate 3 (generate [5] (fn [i] => float_of i)) (fn arr => stencil clamp (fn acc => acc (-1) +. acc 0 +. acc 1) arr))"
+        , "let main = 0"
+        ]
+
+    it "compiles a multi-use fn-valued step dec (Issue 5 fix)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let step = fn arr => stencil clamp (fn acc => acc (-1) +. acc 0 +. acc 1) arr"
+        , "let a = iterate 2 (generate [5] (fn [i] => float_of i)) step"
+        , "let b = iterate 3 a step"
+        , "let c = index [0] a"
+        , "let main = 0"
+        ]
+
+    it "merges nested inline iterates and matches the interpreter (Issue 5 fix)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let step = fn arr => stencil clamp (fn acc => acc (-1) +. acc 0 +. acc 1) arr"
+        , "let result = iterate 3 (iterate 2 (generate [5] (fn [i] => float_of i)) step) step"
+        , "let main = 0"
+        ]
+
     it "matmul benchmark uses blocked generic tiling and explicit-vector polyhedral codegen" $ do
       src <- BS.readFile "bench/matmul/mat_mul_bench.hyd"
       case readDecs src of

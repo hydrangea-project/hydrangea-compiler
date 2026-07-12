@@ -1432,11 +1432,16 @@ inlineFnValueDecs = go []
           -- Inline single-use function-valued expressions (enables cross-binding beta
           -- reduction). Array-valued declarations are handled separately by
           -- inlineScatterArrayDecs (which only inlines scatter defaults).
-          -- NOTE: iterate-valued decs are deliberately NOT inlined here:
-          -- lowering EIterate outside its own binding is currently broken
-          -- (1D split-stencil path crashes at runtime), so the temporal split
-          -- rewrite only fires on directly-nested iterate chains for now.
-          eligible = isFunctionExp body'
+          -- Iterate-valued decs are inlined ONLY when their sole use is the
+          -- init argument of an enclosing iterate, so the temporal split law
+          -- (iterate merge) can fire across top-level declarations. Inlining an
+          -- iterate into any other position gives no fusion benefit and would
+          -- just relocate the loop (and drop the dec from observable output).
+          iterateInitInlinable = case body' of
+            EIterate {} ->
+              any (\(Dec _ _ _ _ _ b) -> usedAsIterateInit name (applyEnv env b)) rest
+            _ -> False
+          eligible = (isFunctionExp body' || iterateInitInlinable)
                      && totalUsage == 1
       in if eligible
            then go ((name, body') : env) rest
@@ -1446,6 +1451,88 @@ inlineFnValueDecs = go []
       in Dec a name pats mw poly body' : go env rest
 
     applyEnv env e = foldl (\acc (v, r) -> substExp v r acc) e env
+
+-- | True when @name@ occurs as the direct init (second) argument of some
+-- 'EIterate' within @expr@ — the only position where inlining an
+-- iterate-valued dec lets the temporal split law merge the two loops.
+usedAsIterateInit :: Var -> Exp a -> Bool
+usedAsIterateInit name = go
+  where
+    go expr = directHit expr || any go (childExprs expr)
+    directHit (EIterate _ _ (EVar _ v) _) = v == name
+    directHit _ = False
+
+-- | Immediate 'Exp' children of an expression (one level deep).  Used by
+-- structural queries that need to recurse without re-listing every
+-- constructor at each call site.
+childExprs :: Exp a -> [Exp a]
+childExprs expr = case expr of
+  EInt {} -> []
+  EFloat {} -> []
+  EVar {} -> []
+  EString {} -> []
+  EUnit {} -> []
+  EBool {} -> []
+  EOp {} -> []
+  EVec _ es -> es
+  EApp _ f x -> [f, x]
+  EIfThen _ c t -> [c, t]
+  EIfThenElse _ c t f -> [c, t, f]
+  ENeg _ e -> [e]
+  EBinOp _ l _ r -> [l, r]
+  EUnOp _ _ e -> [e]
+  ELetIn _ (Dec _ _ _ _ _ b) body -> [b, body]
+  EProj _ _ e -> [e]
+  EPair _ e1 e2 -> [e1, e2]
+  ERecord _ fields -> map snd fields
+  ERecordProj _ e _ -> [e]
+  EGenerate _ sz f -> [sz, f]
+  EMap _ f arr -> [f, arr]
+  EZipWith _ f a b -> [f, a, b]
+  EReduce _ f z arr -> [f, z, arr]
+  EReduceGenerate _ f z shape gen -> [f, z, shape, gen]
+  EIterate _ n initArr f -> [n, initArr, f]
+  EFoldl _ f z arr -> [f, z, arr]
+  EFoldlWhile _ p f z arr -> [p, f, z, arr]
+  EScan _ f z arr -> [f, z, arr]
+  EScanInclusive _ f z arr -> [f, z, arr]
+  EScanR _ f z arr -> [f, z, arr]
+  EScanRInclusive _ f z arr -> [f, z, arr]
+  ESegmentedReduce _ f z offsets vals -> [f, z, offsets, vals]
+  ESortIndices _ arr -> [arr]
+  EIota _ n -> [n]
+  EMakeIndex _ n arr -> [n, arr]
+  ECOOSumDuplicates _ nrows ncols nnz rows cols vals -> [nrows, ncols, nnz, rows, cols, vals]
+  ECSRFromSortedCOO _ nrows ncols nnz rows cols vals -> [nrows, ncols, nnz, rows, cols, vals]
+  EPermute _ c d p a -> [c, d, p, a]
+  EScatter _ c d idx val -> [c, d, idx, val]
+  EScatterGuarded _ c d idx val g -> [c, d, idx, val, g]
+  EScatterGenerate _ c d idx f -> [c, d, idx, f]
+  EScatterChain _ c d phases ->
+    c : d : concatMap (\p -> spIndex p : spValues p : maybe [] pure (spGuard p)) phases
+  EScatterGen _ c d phases ->
+    c : d : concatMap (\p -> sgpShape p : sgpIndexFn p : sgpValueFn p : maybe [] pure (sgpGuardFn p)) phases
+  EAppend _ a b -> [a, b]
+  EGather _ idx a -> [idx, a]
+  EIndex _ i a -> [i, a]
+  ECheckIndex _ i def a -> [i, def, a]
+  EFill _ s val -> [s, val]
+  EShapeOf _ a -> [a]
+  EReplicate _ _ a -> [a]
+  ESlice _ _ a -> [a]
+  EReshape _ s a -> [s, a]
+  EReadArray _ s f -> [s, f]
+  EReadArrayFloat _ s f -> [s, f]
+  EWriteArray _ arr f -> [arr, f]
+  EWriteArrayFloat _ arr f -> [arr, f]
+  EGetEnvInt _ e -> [e]
+  EGetEnvString _ e -> [e]
+  EStencil _ bnd f arr -> boundExprs bnd ++ [f, arr]
+  EBoundLetIn _ _ boundExp rhs body -> [boundExp, rhs, body]
+  EReify _ e -> [e]
+  where
+    boundExprs (BConst e) = [e]
+    boundExprs _ = []
 
 fuseFix :: (Eq a) => Exp a -> FusionM (Exp a)
 fuseFix = fuseFixWithLimit 200

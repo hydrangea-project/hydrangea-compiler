@@ -119,10 +119,20 @@ preRegisterTopLevelFns = mapM_ preRegister
       | not (null pats) = registerFn name pats body
       | otherwise       = pure ()
 
+-- | Normalize @let f = (let g x… = body in g)@ — the desugaring of
+-- @let f = fn x… => body@ — into @let f x… = body@.  Without this a
+-- function-valued dec lowers as a zero-arg value proc whose body returns
+-- the (nonexistent) lambda symbol, while call sites pass arguments.
+etaNormalizeDec :: Dec Range -> Dec Range
+etaNormalizeDec (Dec a name [] mw poly (ELetIn _ (Dec _ g gPats _ _ gBody) (EVar _ g')))
+  | g == g', not (null gPats) = Dec a name gPats mw poly gBody
+etaNormalizeDec d = d
+
 lowerProgramWithState :: LowerState -> [Dec Range] -> Program
-lowerProgramWithState initialState decs =
+lowerProgramWithState initialState decs0 =
   evalState go initialState
   where
+    decs = map etaNormalizeDec decs0
     go = do
       preRegisterTopLevelFns decs
       Program <$> mapM lowerDec decs

@@ -811,12 +811,22 @@ restructureIterateBody spec body = do
   let mkResult skip hoistedExtra =
         let computeBody = [s | (i, s) <- zip [0..] prefix, i `S.notMember` skip]
             tmpVar = nextVar <> "__iter_tmp"
+            initTrackerVar = curVar <> "__iter_init_track"
             nextNotCurVar = nextVar <> "__iter_cleanup_not_cur"
+            nextNotInitVar = nextVar <> "__iter_cleanup_not_init"
+            nextFreeVar = nextVar <> "__iter_cleanup_cond"
             tmpNotCurVar = tmpVar <> "__iter_cleanup_not_cur"
+            tmpNotInitVar = tmpVar <> "__iter_cleanup_not_init"
+            tmpFreeVar = tmpVar <> "__iter_cleanup_cond"
             -- The tmp buffer is a private copy, NOT an alias of the init
             -- buffer: the init array may be shared (cached proc result, other
             -- consumers), so the ping-pong must never write into or free it.
             initSave = SAssign tmpVar (RArrayCopy (AVar curVar))
+            -- Track the init pointer so downstream cleanup (here and in the
+            -- wavefront transform, which rotates the init pointer through the
+            -- ring variables) can avoid freeing it: the proc-level cleanup
+            -- frees it when it owns it.
+            initTracker = SAssign initTrackerVar (RAtom (AVar curVar))
             pingSwap =
               [ SAssign curVar (RAtom (AVar nextVar))
               , SAssign nextVar (RAtom (AVar tmpVar))
@@ -828,13 +838,17 @@ restructureIterateBody spec body = do
             -- temp. ponytail: leak; free-if-afFreshAlloc if it ever matters.
             condFree =
               [ SAssign nextNotCurVar (RBinOp CNeq (AVar nextVar) (AVar curVar))
-              , SIf (AVar nextNotCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar nextVar))] []
+              , SAssign nextNotInitVar (RBinOp CNeq (AVar nextVar) (AVar initTrackerVar))
+              , SAssign nextFreeVar (RBinOp CAnd (AVar nextNotCurVar) (AVar nextNotInitVar))
+              , SIf (AVar nextFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar nextVar))] []
               , SAssign tmpNotCurVar (RBinOp CNeq (AVar tmpVar) (AVar curVar))
-              , SIf (AVar tmpNotCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar tmpVar))] []
+              , SAssign tmpNotInitVar (RBinOp CNeq (AVar tmpVar) (AVar initTrackerVar))
+              , SAssign tmpFreeVar (RBinOp CAnd (AVar tmpNotCurVar) (AVar tmpNotInitVar))
+              , SIf (AVar tmpFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar tmpVar))] []
               ]
             newBody = computeBody ++ pingSwap
             newLoop = SLoop spec newBody
-        in Just (hoistedExtra ++ [initSave, newLoop] ++ condFree)
+        in Just (hoistedExtra ++ [initSave, initTracker, newLoop] ++ condFree)
 
   -- Need at least one of shape or alloc to match the swap variables
   case (listToMaybe shapeCandidates, listToMaybe allocCandidates) of
