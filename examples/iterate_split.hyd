@@ -1,0 +1,12 @@
+(* Temporal split law as a fusion rewrite (proposal-temporal-tiling.md):
+     iterate n2 (iterate n1 init step) step  =  iterate (n1+n2) init step
+   The staged chain below fuses to a single `iterate 5` (see --print-fused),
+   so downstream time-tiling sees the full temporal extent. *)
+let n    = 16
+let init = generate [n] (fn [i] => float_of i *. 0.5)
+let step arr =
+  stencil clamp
+    (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)
+    arr
+let result = let half = iterate 2 init step in iterate 3 half step
+let main   = write_array_float result "iterate_split_out.csv"

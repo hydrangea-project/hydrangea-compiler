@@ -331,7 +331,6 @@ data WavefrontKernel = WavefrontKernel
   , wfkNextArray :: CVar
   , wfkAllocShape :: Atom
   , wfkPreallocatedNext :: Bool
-  , wfkInitTracker :: Maybe CVar
   , wfkHoistedPrefix :: [Stmt]
   , wfkStageSuffix :: [Stmt]
   , wfkInnerSpec :: LoopSpec
@@ -2697,10 +2696,6 @@ matchWavefrontKernel scheduled = do
        , wfkNextArray = nextVar
        , wfkAllocShape = allocShape
        , wfkPreallocatedNext = preallocatedNext
-       , wfkInitTracker =
-           if preallocatedNext
-             then Just (curVar <> "__iter_init_track")
-             else Nothing
        , wfkHoistedPrefix = prefixWithoutAlloc
        , wfkStageSuffix = stageSuffix
        , wfkInnerSpec = innerSpec
@@ -2925,24 +2920,16 @@ buildWavefrontBody kernel = do
   cleanup <- fmap concat (mapM (buildWavefrontCleanup kernel) cleanupTargets)
   pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
 
+-- | Free a wavefront ring buffer unless the result landed in it.  Ring
+-- buffers are always private copies/allocs (the CFGOpt iterate ping-pong no
+-- longer aliases the init buffer), so no init-tracker guard is needed.
 buildWavefrontCleanup :: WavefrontKernel -> CVar -> TileM [Stmt]
 buildWavefrontCleanup kernel arr = do
   notCurVar <- freshLike arr "__wf_free_not_cur"
-  case wfkInitTracker kernel of
-    Nothing ->
-      pure
-        [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
-        , SIf (AVar notCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
-        ]
-    Just initTrackerVar -> do
-      notInitVar <- freshLike arr "__wf_free_not_init"
-      freeVar <- freshLike arr "__wf_free"
-      pure
-        [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
-        , SAssign notInitVar (RBinOp CNeq (AVar arr) (AVar initTrackerVar))
-        , SAssign freeVar (RBinOp CAnd (AVar notCurVar) (AVar notInitVar))
-        , SIf (AVar freeVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
-        ]
+  pure
+    [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
+    , SIf (AVar notCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
+    ]
 
 matchWavefrontTail :: [Stmt] -> Maybe ([Stmt], CVar, CVar, Bool)
 matchWavefrontTail suffix = case reverse suffix of

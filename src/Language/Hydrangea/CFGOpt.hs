@@ -776,10 +776,11 @@ hoistIterateAllocs = go
     go (s : rest) = s : go rest
 
 -- | Given a @LoopIterate@ body, try to hoist the initial @alloc+shape@
--- out and replace the epilogue swap with a ping-pong three-way swap.
--- Also emits a post-loop conditional free of the init buffer to avoid
--- use-after-free (the returned variable may alias the init buffer on even
--- iteration counts). Returns the full replacement statement list.
+-- out and replace the epilogue swap with a ping-pong three-way swap over
+-- two private copies of the init buffer. The init buffer itself is never
+-- written or freed — it may be shared (cached proc results, other
+-- consumers). Post-loop, the private buffer(s) the result did not land in
+-- are freed. Returns the full replacement statement list.
 --
 -- The expected body ends with a swap:
 --
@@ -810,29 +811,30 @@ restructureIterateBody spec body = do
   let mkResult skip hoistedExtra =
         let computeBody = [s | (i, s) <- zip [0..] prefix, i `S.notMember` skip]
             tmpVar = nextVar <> "__iter_tmp"
-            initTrackerVar = curVar <> "__iter_init_track"
-            condFreeVar = curVar <> "__iter_cond"
             nextNotCurVar = nextVar <> "__iter_cleanup_not_cur"
-            nextNotInitVar = nextVar <> "__iter_cleanup_not_init"
-            nextFreeVar = nextVar <> "__iter_cleanup_cond"
-            initSave = SAssign tmpVar (RAtom (AVar curVar))
-            initTracker = SAssign initTrackerVar (RAtom (AVar curVar))
+            tmpNotCurVar = tmpVar <> "__iter_cleanup_not_cur"
+            -- The tmp buffer is a private copy, NOT an alias of the init
+            -- buffer: the init array may be shared (cached proc result, other
+            -- consumers), so the ping-pong must never write into or free it.
+            initSave = SAssign tmpVar (RArrayCopy (AVar curVar))
             pingSwap =
               [ SAssign curVar (RAtom (AVar nextVar))
               , SAssign nextVar (RAtom (AVar tmpVar))
               , SAssign tmpVar (RAtom (AVar curVar))
               ]
+            -- Free whichever private buffers the result did not land in.
+            -- The init buffer is never freed here: ownership is unknown, so
+            -- it leaks (once per call site) when it was a genuinely fresh
+            -- temp. ponytail: leak; free-if-afFreshAlloc if it ever matters.
             condFree =
-              [ SAssign condFreeVar (RBinOp CNeq (AVar curVar) (AVar initTrackerVar))
-              , SIf (AVar condFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar initTrackerVar))] []
-              , SAssign nextNotCurVar (RBinOp CNeq (AVar nextVar) (AVar curVar))
-              , SAssign nextNotInitVar (RBinOp CNeq (AVar nextVar) (AVar initTrackerVar))
-              , SAssign nextFreeVar (RBinOp CAnd (AVar nextNotCurVar) (AVar nextNotInitVar))
-              , SIf (AVar nextFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar nextVar))] []
+              [ SAssign nextNotCurVar (RBinOp CNeq (AVar nextVar) (AVar curVar))
+              , SIf (AVar nextNotCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar nextVar))] []
+              , SAssign tmpNotCurVar (RBinOp CNeq (AVar tmpVar) (AVar curVar))
+              , SIf (AVar tmpNotCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar tmpVar))] []
               ]
             newBody = computeBody ++ pingSwap
             newLoop = SLoop spec newBody
-        in Just (hoistedExtra ++ [initSave, initTracker, newLoop] ++ condFree)
+        in Just (hoistedExtra ++ [initSave, newLoop] ++ condFree)
 
   -- Need at least one of shape or alloc to match the swap variables
   case (listToMaybe shapeCandidates, listToMaybe allocCandidates) of

@@ -668,7 +668,9 @@ isArrayExp expr =
     EZipWith {} -> True
     EReduce {} -> True
     EReduceGenerate {} -> True
-    EIterate {} -> False
+    -- Single-use inlining only (not a producer): lets a let-bound iterate
+    -- meet an enclosing iterate so the temporal split law can merge them.
+    EIterate {} -> True
     EFoldl {} -> False
     EFoldlWhile {} -> False
     EScan {} -> True
@@ -1430,6 +1432,10 @@ inlineFnValueDecs = go []
           -- Inline single-use function-valued expressions (enables cross-binding beta
           -- reduction). Array-valued declarations are handled separately by
           -- inlineScatterArrayDecs (which only inlines scatter defaults).
+          -- NOTE: iterate-valued decs are deliberately NOT inlined here:
+          -- lowering EIterate outside its own binding is currently broken
+          -- (1D split-stencil path crashes at runtime), so the temporal split
+          -- rewrite only fires on directly-nested iterate chains for now.
           eligible = isFunctionExp body'
                      && totalUsage == 1
       in if eligible
@@ -1556,7 +1562,11 @@ fuseOnce expr =
       fuseReduce a f' z' arr'
     EReduceGenerate a f z shape gen ->
       EReduceGenerate a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce shape <*> fuseOnce gen
-    EIterate a n initArr f -> EIterate a <$> fuseOnce n <*> fuseOnce initArr <*> fuseOnce f
+    EIterate a n initArr f -> do
+      n' <- fuseOnce n
+      initArr' <- fuseOnce initArr
+      f' <- fuseOnce f
+      fuseIterate a n' initArr' f'
     EFoldl a f z arr -> EFoldl a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EFoldlWhile a p f z arr -> EFoldlWhile a <$> fuseOnce p <*> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
     EScan a f z arr -> EScan a <$> fuseOnce f <*> fuseOnce z <*> fuseOnce arr
@@ -1730,6 +1740,24 @@ fuseSliceDim dim =
   case dim of
     SliceAll a -> pure (SliceAll a)
     SliceRange a s l -> SliceRange a <$> fuseOnce s <*> fuseOnce l
+
+-- | Temporal split law, applied right-to-left as a fusion rewrite:
+-- @iterate n2 (iterate n1 init f) f = iterate (n1 + n2) init f@.
+-- Legality is the associativity of function iteration; merging the time
+-- ranges exposes the full temporal extent to downstream time-tiling.
+-- The step functions must be structurally identical (modulo annotations);
+-- after Uniquify a shared step binding satisfies this.
+fuseIterate :: (Eq a) => a -> Exp a -> Exp a -> Exp a -> FusionM (Exp a)
+fuseIterate a n initArr f =
+  case initArr of
+    EIterate _ n1 init0 f0 | eraseAnn f0 == eraseAnn f ->
+      fuseIterate a (addExp n1 n) init0 f
+    _ -> pure (EIterate a n initArr f)
+  where
+    eraseAnn :: Exp a -> Exp ()
+    eraseAnn = fmap (const ())
+    addExp (EInt _ x) (EInt _ y) = EInt a (x + y)
+    addExp e1 e2 = EBinOp a e1 (Plus a) e2
 
 fuseMap :: (Eq a) => a -> Exp a -> Exp a -> FusionM (Exp a)
 fuseMap a f arr =

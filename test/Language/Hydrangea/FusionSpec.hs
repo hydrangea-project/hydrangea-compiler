@@ -87,6 +87,10 @@ anyExp p expr
         ESlice _ dims arr -> any (anySliceDim p) dims || anyExp p arr
         EReshape _ s arr -> anyExp p s || anyExp p arr
         EReadArray _ s f -> anyExp p s || anyExp p f
+        EStencil _ bnd f arr ->
+          (case bnd of BConst e -> anyExp p e; _ -> False)
+            || anyExp p f || anyExp p arr
+        EIterate _ n i f -> anyExp p n || anyExp p i || anyExp p f
 
 anyShapeDim :: (Exp a -> Bool) -> ShapeDim a -> Bool
 anyShapeDim p = \case
@@ -101,6 +105,13 @@ anySliceDim p = \case
 
 hasMap, hasZipWith, hasGenerate, hasFill, hasReduceGenerate, hasPermute, hasGather, hasScatter, hasScatterGenerate, hasScatterGen, hasReplicate, hasSlice, hasReshape, hasIndex :: Exp a -> Bool
 hasMap = anyExp (\case EMap {} -> True; _ -> False)
+
+hasIterate, hasNestedIterate :: Exp a -> Bool
+hasIterate = anyExp (\case EIterate {} -> True; _ -> False)
+hasNestedIterate = anyExp (\case EIterate _ _ i _ -> hasIterate i; _ -> False)
+
+hasIterateCount :: Integer -> Exp a -> Bool
+hasIterateCount k = anyExp (\case EIterate _ (EInt _ n) _ _ -> n == k; _ -> False)
 hasZipWith = anyExp (\case EZipWith {} -> True; _ -> False)
 hasGenerate = anyExp (\case EGenerate {} -> True; _ -> False)
 hasFill = anyExp (\case EFill {} -> True; _ -> False)
@@ -492,6 +503,26 @@ spec = do
             hasGenerate fused `shouldBe` True)
 
   -- ---- Tests for new fusion rules (T1, T3, T4) ----
+
+  describe "Fusion - temporal split law (iterate merge)" $ do
+    it "merges directly-nested iterates with the same step, folding constant counts" $ do
+      expectFusionSensible
+        "let init = generate [4] (let h [i] = i in h) in let step = (let s arr = map (let f x = x + 1 in f) arr in s) in iterate 3 (iterate 2 init step) step"
+        (\fused -> do
+            hasNestedIterate fused `shouldBe` False
+            hasIterateCount 5 fused `shouldBe` True)
+
+    it "merges a let-bound staged iterate chain, adding symbolic counts" $ do
+      expectFusionSensible
+        "let n1 = 2 in let n2 = 3 in let init = generate [4] (let h [i] = i in h) in let step = (let s arr = map (let f x = x + 1 in f) arr in s) in let half = iterate n1 init step in iterate n2 half step"
+        (\fused -> do
+            hasIterate fused `shouldBe` True
+            hasNestedIterate fused `shouldBe` False)
+
+    it "does not merge nested iterates with different steps" $ do
+      expectFusionSensible
+        "let init = generate [4] (let h [i] = i in h) in let step1 = (let s arr = map (let f x = x + 1 in f) arr in s) in let step2 = (let s arr = map (let f x = x * 2 in f) arr in s) in iterate 3 (iterate 2 init step1) step2"
+        (\fused -> hasNestedIterate fused `shouldBe` True)
 
   describe "Fusion - fusePermute generalisation (T1)" $ do
     it "fuses permute over generate (not just map)" $ do

@@ -1566,6 +1566,7 @@ lowerExp expr = case expr of
 
   ESlice _ dims arrExp -> do
     (sa, aa) <- lowerExp arrExp
+    srcShp <- freshCVar "srcShp"
     outArr <- freshCVar "outArr"
     outShp <- freshCVar "outShp"
     outN <- freshCVar "outN"
@@ -1574,21 +1575,45 @@ lowerExp expr = case expr of
     srcTuple <- freshCVar "srcTuple"
     flatSrc <- freshCVar "flatSrc"
     val <- freshCVar "val"
-    let dimCount = length dims
-    dimVars <- if dimCount == 0
-                 then pure []
-                 else mapM (\d -> freshCVar ("dim" <> BS.pack (show (d :: Int)))) [0 .. dimCount - 1]
-    let dimStmts = concat $ zipWith (\d v -> [SAssign v (RProj d (AVar srcTuple))]) [0..] dimVars
+    -- Per output dimension: prelude statements, extent atom (output shape),
+    -- and start-offset atom (0 for All dims).
+    dimInfo <- mapM
+      (\(d, dim) -> case dim of
+          SliceAll _ -> do
+            ext <- freshCVar ("ext" <> BS.pack (show (d :: Int)))
+            pure ([SAssign ext (RProj (fromIntegral d) (AVar srcShp))], AVar ext, AInt 0)
+          SliceRange _ startE lenE -> do
+            (ss, sAtom) <- lowerExp startE
+            (ls, lAtom) <- lowerExp lenE
+            pure (ss ++ ls, lAtom, sAtom))
+      (zip [(0 :: Int) ..] dims)
+    let dimPrelude = concatMap (\(stmts, _, _) -> stmts) dimInfo
+        extents = map (\(_, ext, _) -> ext) dimInfo
+        starts = map (\(_, _, start) -> start) dimInfo
+    -- Per output dimension, inside the copy loop: project the nd coordinate
+    -- and add the slice start to get the source coordinate.
+    srcIdx <- mapM
+      (\(d, start) -> do
+          od <- freshCVar ("od" <> BS.pack (show (d :: Int)))
+          sd <- freshCVar ("sd" <> BS.pack (show d))
+          pure ( [ SAssign od (RProj (fromIntegral d) (AVar outIdx))
+                 , SAssign sd (RBinOp CAdd start (AVar od))
+                 ]
+               , sd ))
+      (zip [(0 :: Int) ..] starts)
+    let srcIdxStmts = concatMap fst srcIdx
+        srcVars = map snd srcIdx
     pure ( sa
-         ++ [ SAssign outShp (RArrayShape aa)
-            , SAssign outN (RShapeSize (AVar outShp))
+         ++ [SAssign srcShp (RArrayShape aa)]
+         ++ dimPrelude
+         ++ [ SAssign outShp (RTuple extents)
             , SAssign outArr (RArrayAlloc (AVar outShp))
             , SAssign outN (RShapeSize (AVar outShp))
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain [])
-                ( [SAssign outIdx (RNdToFlat (AVar i) (AVar outShp))]
-                  ++ dimStmts
-                  ++ [ SAssign srcTuple (RTuple (map AVar dimVars))
-                     , SAssign flatSrc (RNdToFlat (AVar srcTuple) aa)
+                ( [SAssign outIdx (RFlatToNd (AVar i) (AVar outShp))]
+                  ++ srcIdxStmts
+                  ++ [ SAssign srcTuple (RTuple (map AVar srcVars))
+                     , SAssign flatSrc (RNdToFlat (AVar srcTuple) (AVar srcShp))
                      , SAssign val (RArrayLoad aa (AVar flatSrc))
                      , SArrayWrite (AVar outArr) (AVar i) (AVar val)
                      ]

@@ -1,0 +1,36 @@
+(* Halo/decomposition law, 1D instance (proposal-temporal-tiling.md §2/§3):
+     iterate k step a
+   equals: split a, give each half k*r halo cells copied from its neighbor,
+   iterate each half independently, trim the k*r tile-edge cells the fake
+   boundary contaminated, and append.  True array edges keep the real
+   boundary condition; the tile-edge BC is irrelevant because every cell it
+   can reach within k steps is trimmed.
+   Here n = 16, split at 8, radius r = 1, k = 2, halo width h = k*r = 2.
+   The pad is expressed as slice (halo exchange comes for free from slicing
+   the original array); the trim is a slice.  No new primitive needed.
+   Expected output: 16 zeros. *)
+let n    = 16
+let k    = 2
+let init = generate [n] (fn [i] => float_of (i * i) *. 0.125)
+(* named-function form: a zero-pat function-valued dec (let step = fn arr =>)
+   shared by several iterates miscompiles (buglog Issue 5) *)
+let step arr =
+  stencil (constant 0.0)
+    (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)
+    arr
+
+let lhs = iterate k init step
+
+let left      = slice [[0, 10]] init
+let right     = slice [[6, 10]] init
+(* iterates stay at their own top-level bindings: EIterate in expression
+   position miscompiles (buglog Issue 5) *)
+let leftIter  = iterate k left step
+let rightIter = iterate k right step
+let leftRes   = slice [[0, 8]] leftIter
+let rightRes  = slice [[2, 8]] rightIter
+let rhs       = append leftRes rightRes
+
+let sub x y = x -. y
+let diff = zipwith sub lhs rhs
+let main = write_array_float diff "halo_law_diff.csv"

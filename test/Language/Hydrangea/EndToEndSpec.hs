@@ -300,7 +300,7 @@ spec = do
         (BS.pack $ unlines
           [ "let init = generate [5] (let f [i] = 1.0 in f)"
           , "let step arr = stencil clamp"
-          , "  (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0)"
+          , "  (fn acc => (acc (-1) +. acc 0 +. acc 0 +. acc 1) /. 4.0)"
           , "  arr"
           , "let result = iterate 3 init step"
           ])
@@ -598,6 +598,35 @@ spec = do
       it (filename ++ " - " ++ description) $ withCC $ do
         src <- BS.readFile ("examples/" ++ filename)
         checkInlineSrc src
+
+  -- ---- Iterate temporal laws (proposal-temporal-tiling.md) -----------------
+
+  describe "iterate temporal laws" $ do
+
+    -- Shares one init array between an iterate and two halo tiles; guards
+    -- against the iterate ping-pong clobbering/freeing shared init buffers
+    -- (buglog Issue 7) and exercises materialized slice lowering (Issue 6).
+    it "halo decomposition: split + halo + trim + append equals whole-array iterate" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let init = generate [16] (let f [i] = float_of ((i * i) + 8) *. 0.25 in f)"
+        , "let step arr = stencil (constant 0.0) (let s acc = (acc (-1) +. acc 0 +. acc 0 +. acc 1) /. 4.0 in s) arr"
+        , "let lhs = iterate 2 init step"
+        , "let left = slice [[0, 10]] init"
+        , "let right = slice [[6, 10]] init"
+        , "let leftIter = iterate 2 left step"
+        , "let rightIter = iterate 2 right step"
+        , "let leftRes = slice [[0, 8]] leftIter"
+        , "let rightRes = slice [[2, 8]] rightIter"
+        , "let rhs = append leftRes rightRes"
+        , "let diff = zipwith (let sub x y = x -. y in sub) lhs rhs"
+        ]
+
+    it "staged iterate chain fuses via the temporal split law and matches" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let init = generate [16] (let f [i] = float_of i *. 0.5 in f)"
+        , "let step arr = stencil clamp (let s acc = (acc (-1) +. acc 0 +. acc 0 +. acc 1) /. 4.0 in s) arr"
+        , "let result = let half = iterate 2 init step in iterate 3 half step"
+        ]
 
   -- ---- Inline micro-tests: one kernel type per describe --------------------
 
