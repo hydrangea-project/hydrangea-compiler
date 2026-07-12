@@ -1358,12 +1358,29 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
           , pdrSrcIndex = []
           , pdrTgtIndex = []
           }
-    case suggestCrossBandSkew 0 ["iter_t"] ["i"] [rel] of
+    case suggestCrossBandSkew 0 ["iter_t"] ["i"] [rel] Map.empty of
       [] -> expectationFailure "expected wavefront skew for (+1, -1) dep"
       skew : _ -> do
         skewTarget skew `shouldBe` "i"
         skewSource skew `shouldBe` "iter_t"
         skewCoeff skew `shouldBe` 1
+
+  it "suggestCrossBandSkew reads the coefficient off a stencil footprint with no dependence relations" $ do
+    -- Footprint-driven path: backward radius 2 licenses skew coeff 2 with no
+    -- dependence analysis at all.
+    let facts = Map.fromList [("i", StencilFact 2 1)]
+    case suggestCrossBandSkew 0 ["iter_t"] ["i"] [] facts of
+      [] -> expectationFailure "expected footprint-driven wavefront skew"
+      skew : _ -> do
+        skewTarget skew `shouldBe` "i"
+        skewSource skew `shouldBe` "iter_t"
+        skewCoeff skew `shouldBe` 2
+
+  it "footprint-driven strict skew strengthens to radius + 1" $ do
+    let facts = Map.fromList [("i", StencilFact 1 1)]
+        skews = suggestCrossBandSkew 0 ["iter_t"] ["i"] [] facts
+    map skewCoeff (strengthenWavefrontSkews [] facts 0 ["iter_t"] skews)
+      `shouldBe` [2]
 
   it "synthesizeScopSchedule applies cross-band skew to LoopIterate+LoopMap" $ do
     -- Build a 1D iterate loop similar to the stencil pattern

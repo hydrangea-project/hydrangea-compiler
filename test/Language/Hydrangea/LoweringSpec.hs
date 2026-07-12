@@ -245,6 +245,20 @@ spec = do
       any (\(spec, body) -> length (lsIters spec) == 2 && anyArrayLoad body) loops `shouldBe` True
       all (\(_, body) -> not (containsSIf body)) loops `shouldBe` True
 
+    it "records stencil footprint facts for the interior loop iterators" $ do
+      prog <- lowerFromSource $
+        BS.pack $
+          unlines
+            [ "let result arr = stencil clamp"
+            , "  (fn acc => acc (-2) 0 + acc 1 0 + acc 0 (-1) + acc 0 1)"
+            , "  arr"
+            ]
+      let Program procs = prog
+          resultProc = head [proc | proc@Proc { procName = name } <- procs, name == "result"]
+          facts = Map.elems (procStencilFacts resultProc)
+      -- Row dim: offsets {-2, 1, 0} → (2, 1); col dim: {0, -1, 1} → (1, 1).
+      facts `shouldMatchList` [StencilFact 2 1, StencilFact 1 1]
+
   describe "Lowering - Tuples" $ do
     it "lowers tuple construction" $ do
       prog <- lowerFromSource "let t = [1, 2, 3]"

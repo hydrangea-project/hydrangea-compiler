@@ -1,0 +1,11 @@
+(* 2D heat equation via Jacobi iteration: iterate + 2D 5-point stencil. *)
+let n     = 8
+let iters = 4
+let init  = generate [n,n] (let f [i,j] = float_of ((i * 8) + j) *. 0.01 in f)
+let step  = fn arr =>
+  stencil clamp
+    (fn acc =>
+      (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1 +. acc 0 0) /. 5.0)
+    arr
+let result = iterate iters init step
+let main   = write_array_float result "heat_2d_out.csv"

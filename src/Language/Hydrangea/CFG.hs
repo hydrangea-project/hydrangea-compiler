@@ -30,6 +30,7 @@ module Language.Hydrangea.CFG
   , LoopSpec(..)
   , ArrayFact(..)
   , VectorAccessFact(..)
+  , StencilFact(..)
   , emptyVectorAccessFact
   , Stmt(..)
   , Proc(..)
@@ -341,6 +342,19 @@ emptyVectorAccessFact = VectorAccessFact
   , vxfContiguousWrite = False
   }
 
+-- | Static stencil footprint for a stencil-interior loop iterator, recorded
+-- by the lowering pass when an 'EStencil' with constant offsets is lowered.
+-- The pair is @(backwardRadius, forwardRadius)@: the magnitudes of the most
+-- negative and most positive constant offsets the stencil's reads apply to
+-- this iterator.  A temporal-tiling pass can read the legal skew coefficient
+-- directly off the backward radius instead of recovering it by dependence
+-- analysis.
+data StencilFact = StencilFact
+  { sfBackward :: Integer  -- ^ magnitude of the most negative read offset
+  , sfForward  :: Integer  -- ^ magnitude of the most positive read offset
+  }
+  deriving (Eq, Show)
+
 -- | A procedure in the CFG program.
 data Proc = Proc
   { procName    :: CVar
@@ -352,6 +366,8 @@ data Proc = Proc
     -- ^ Buffer-level facts for array variables in this procedure.
   , procVectorAccessFacts :: Map CVar VectorAccessFact
     -- ^ Access\/layout facts for the vectorizer.
+  , procStencilFacts :: Map CVar StencilFact
+    -- ^ Stencil footprint facts keyed by interior-loop iterator variable.
   } deriving (Eq, Show)
 
 -- | An ordered collection of top-level procedures.
@@ -369,4 +385,5 @@ mkProc name params body = Proc
   , procTypeEnv = Map.empty
   , procArrayFacts = Map.empty
   , procVectorAccessFacts = Map.empty
+  , procStencilFacts = Map.empty
   }

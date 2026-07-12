@@ -48,6 +48,8 @@ data LowerState = LowerState
     -- ^ Buffer-level facts for the procedure being lowered; reset per proc.
   , lsVectorAccessFacts :: Map CVar VectorAccessFact
     -- ^ Access and layout facts for the vectorizer; reset per proc.
+  , lsStencilFacts :: Map CVar StencilFact
+    -- ^ Stencil footprint facts keyed by interior-loop iterator; reset per proc.
   , lsTopTypeEnv :: Map Var CType
     -- ^ Top-level declaration types from inference (@Var → CType@).
   , lsArrayRankEnv :: Map Var Int
@@ -90,6 +92,7 @@ initState = LowerState
   , lsTypeEnv = M.empty
   , lsArrayFacts = M.empty
   , lsVectorAccessFacts = M.empty
+  , lsStencilFacts = M.empty
   , lsTopTypeEnv = M.empty
   , lsArrayRankEnv = M.empty
   , lsBinderTypeEnv = M.empty
@@ -168,15 +171,19 @@ lowerDec (Dec _ name pats _ _ body) = do
   mapM_ (\p -> maybe (pure ()) (registerCType p) (M.lookup p binderEnv)) params
   savedFacts <- gets lsArrayFacts
   savedVectorFacts <- gets lsVectorAccessFacts
+  savedStencilFacts <- gets lsStencilFacts
   modify' $ \s -> s { lsArrayFacts = M.empty
                     , lsVectorAccessFacts = M.empty
+                    , lsStencilFacts = M.empty
                     }
   (stmts, result) <- lowerExp body
   typeEnv <- gets lsTypeEnv
   arrayFacts <- gets lsArrayFacts
   vectorAccessFacts <- gets lsVectorAccessFacts
+  stencilFacts <- gets lsStencilFacts
   modify' $ \s -> s { lsArrayFacts = savedFacts
                     , lsVectorAccessFacts = savedVectorFacts
+                    , lsStencilFacts = savedStencilFacts
                     }
   pure Proc
     { procName    = name
@@ -185,6 +192,7 @@ lowerDec (Dec _ name pats _ _ body) = do
     , procTypeEnv = typeEnv
     , procArrayFacts = arrayFacts
     , procVectorAccessFacts = vectorAccessFacts
+    , procStencilFacts = stencilFacts
     }
 
 patVarNames :: Pat a -> [CVar]
@@ -2461,6 +2469,23 @@ exactStencilSegments1D size =
   | ix <- [0 .. size - 1]
   ]
 
+-- | Record stencil footprint facts for the iterators of a stencil-interior
+-- loop.  The facts key the per-dimension @(backwardRadius, forwardRadius)@ by
+-- iterator variable so downstream passes (temporal skewing) can read the
+-- legal skew coefficient off the footprint without dependence analysis.
+recordStencilFacts :: [CVar] -> [StencilConstAccess] -> LowerM ()
+recordStencilFacts iters constAccesses =
+  case stencilFootprint (length iters) constAccesses of
+    Just pads ->
+      modify' $ \s -> s
+        { lsStencilFacts =
+            foldr
+              (\(iter, (back, fwd)) -> M.insert iter (StencilFact back fwd))
+              (lsStencilFacts s)
+              (zip iters pads)
+        }
+    Nothing -> pure ()
+
 mkStencilLoop1D :: IndexExpr -> Atom -> (Atom -> LowerM [Stmt]) -> LowerM Stmt
 mkStencilLoop1D bound offset buildBody = do
   i <- freshIterVar "i"
@@ -2772,6 +2797,10 @@ emitStencilLoops1D segments arrAtom outAtom bnd maDef nMinus1Atom rightPad bodyE
                   idxAtom
                   bodyExp
                   constAccesses
+          case (sdsKind seg, loop) of
+            (SegInterior, SLoop spec _) ->
+              recordStencilFacts (lsIters spec) constAccesses
+            _ -> pure ()
           pure (sdsPrelude seg ++ [loop])
       )
       segments
@@ -2834,6 +2863,10 @@ emitStencilLoops2D
                             bodyExp
                             constAccesses
                       )
+                  case (sdsKind rowSeg, sdsKind colSeg, loop) of
+                    (SegInterior, SegInterior, SLoop spec _) ->
+                      recordStencilFacts (lsIters spec) constAccesses
+                    _ -> pure ()
                   pure (sdsPrelude rowSeg ++ sdsPrelude colSeg ++ [loop])
               )
               colSegs

@@ -57,6 +57,7 @@ module Language.Hydrangea.Polyhedral
   , polyhedralIdentityTileProgram
   , polyhedralTileProgram
   , reifyScheduledScop
+  , strengthenWavefrontSkews
   , suggestBandSkew
   , suggestCrossBandSkew
   , synthesizeScopSchedule
@@ -284,6 +285,10 @@ data Scop = Scop
   , scIterators :: [CVar]
   , scParameters :: [CVar]
   , scArrays :: [CVar]
+  , scStencilFacts :: Map CVar StencilFact
+    -- ^ Stencil footprint facts from lowering, keyed by interior-loop
+    -- iterator.  When present, temporal skew coefficients are read off the
+    -- footprint directly instead of being recovered by dependence analysis.
   }
   deriving (Eq, Show)
 
@@ -512,7 +517,7 @@ synthesizeAffineSchedule scop =
       profitability = collectScopProfitabilityFacts scop
       (root', fusionRenames) =
         runState
-          (synthesizeAffineScheduleTree profitability 0 relations (asRoot (scAffineSchedule scop)))
+          (synthesizeAffineScheduleTree profitability 0 relations (scStencilFacts scop) (asRoot (scAffineSchedule scop)))
           M.empty
       schedule =
         AffineSchedule
@@ -617,11 +622,12 @@ synthesizeAffineScheduleTree
   :: ProfitabilityFacts
   -> Int
   -> [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact
   -> AffineScheduleTree
   -> FusionM AffineScheduleTree
-synthesizeAffineScheduleTree profitability bandDepth relations sched = case sched of
+synthesizeAffineScheduleTree profitability bandDepth relations stencilFacts sched = case sched of
   AffineScheduleSequence xs -> do
-    synthesized <- mapM (synthesizeAffineScheduleTree profitability bandDepth relations) xs
+    synthesized <- mapM (synthesizeAffineScheduleTree profitability bandDepth relations stencilFacts) xs
     fused <- greedyFuseM bandDepth relations synthesized
     pure (AffineScheduleSequence fused)
   AffineScheduleStmtRef stmtId ->
@@ -631,15 +637,15 @@ synthesizeAffineScheduleTree profitability bandDepth relations sched = case sche
           applyPermutation
             (chooseBandPermutation profitability bandDepth (albDims band) relations)
             (albDims band)
-    body' <- synthesizeAffineScheduleTree profitability (bandDepth + 1) relations (albBody band)
+    body' <- synthesizeAffineScheduleTree profitability (bandDepth + 1) relations stencilFacts (albBody band)
     let body'' = case albRole band of
           LoopIterate ->
             case body' of
               AffineScheduleLoopBand inner
                 | albRole inner == LoopMap ->
-                    applyCrossBandSkewToInner bandDepth (map sdIter dims') inner relations
+                    applyCrossBandSkewToInner bandDepth (map sdIter dims') inner relations stencilFacts
               AffineScheduleSequence xs ->
-                applyCrossBandSkewToSeq bandDepth (map sdIter dims') xs relations
+                applyCrossBandSkewToSeq bandDepth (map sdIter dims') xs relations stencilFacts
               _ -> body'
           _ -> body'
     pure $ AffineScheduleLoopBand band
@@ -964,21 +970,37 @@ suggestCrossBandSkew
   -> [CVar]           -- ^ outer band iterators
   -> [CVar]           -- ^ inner band iterators
   -> [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact  -- ^ footprint facts for the inner iterators
   -> [SkewSpec]
-suggestCrossBandSkew outerDepth outerIters innerIters relations
+suggestCrossBandSkew outerDepth outerIters innerIters relations stencilFacts
   | null outerIters || null innerIters = []
   | otherwise =
-      maybeToList $
-        listToMaybe
-          [ SkewSpec
-              { skewTarget = innerIter
-              , skewSource = outerIter
-              , skewCoeff  = coeff
-              }
-          | innerIter <- innerIters
-          , outerIter <- outerIters
-          , coeff <- maybeToList (crossSkewCoeff outerDepth outerIter innerIter relations)
-          ]
+      maybeToList (listToMaybe (footprintSkews ++ analysisSkews))
+  where
+    -- Footprint-driven path: for an iterate-of-stencil nest, the backward
+    -- footprint radius IS the legal skew coefficient (the temporal distance
+    -- is +1 per iterate step), so no dependence-distance recovery is needed.
+    footprintSkews =
+      [ SkewSpec
+          { skewTarget = innerIter
+          , skewSource = outerIter
+          , skewCoeff  = sfBackward fact
+          }
+      | innerIter <- innerIters
+      , fact <- maybeToList (M.lookup innerIter stencilFacts)
+      , sfBackward fact > 0
+      , outerIter <- take 1 outerIters
+      ]
+    analysisSkews =
+      [ SkewSpec
+          { skewTarget = innerIter
+          , skewSource = outerIter
+          , skewCoeff  = coeff
+          }
+      | innerIter <- innerIters
+      , outerIter <- outerIters
+      , coeff <- maybeToList (crossSkewCoeff outerDepth outerIter innerIter relations)
+      ]
 
 -- | Compute the required skew coefficient for a cross-band dependence where
 -- the outer iterator has positive distance and the inner iterator has
@@ -1046,9 +1068,10 @@ applyCrossBandSkewToInner
   -> [CVar]           -- ^ outer band iterators
   -> AffineLoopBand   -- ^ the inner LoopMap band
   -> [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact
   -> AffineScheduleTree
-applyCrossBandSkewToInner outerDepth outerIters inner relations =
-  let skews = suggestCrossBandSkew outerDepth outerIters (map sdIter (albDims inner)) relations
+applyCrossBandSkewToInner outerDepth outerIters inner relations stencilFacts =
+  let skews = suggestCrossBandSkew outerDepth outerIters (map sdIter (albDims inner)) relations stencilFacts
   in case skews of
     [] -> AffineScheduleLoopBand inner
     _ ->
@@ -1062,11 +1085,12 @@ applyCrossBandSkewToSeq
   -> [CVar]
   -> [AffineScheduleTree]
   -> [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact
   -> AffineScheduleTree
-applyCrossBandSkewToSeq outerDepth outerIters xs relations =
+applyCrossBandSkewToSeq outerDepth outerIters xs relations stencilFacts =
   case span (not . isLoopMapBand) xs of
     (before, AffineScheduleLoopBand inner : after) ->
-      let skews = suggestCrossBandSkew outerDepth outerIters (map sdIter (albDims inner)) relations
+      let skews = suggestCrossBandSkew outerDepth outerIters (map sdIter (albDims inner)) relations stencilFacts
           inner' = case skews of
             [] -> inner
             _  -> inner { albSkew = skews ++ albSkew inner, albOrigins = crossBandOrigins skews inner }
@@ -1098,7 +1122,7 @@ collectProcScopDiagnostics proc = go [] (procBody proc)
 
     goStmt path stmt = case stmt of
       SLoop spec body ->
-        case buildScop (procName proc) path spec body of
+        case buildScopWithStencilFacts (procName proc) (procStencilFacts proc) path spec body of
           Right scop -> [ScopExtracted scop]
           Left RejectNoMemoryAccess -> go path body
           Left reason -> ScopRejected (procName proc) path reason : go path body
@@ -1389,7 +1413,10 @@ commonLoopPrefix (x : xs) (y : ys)
 commonLoopPrefix _ _ = []
 
 buildScop :: CVar -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
-buildScop procName rootPath spec body = do
+buildScop procName = buildScopWithStencilFacts procName M.empty
+
+buildScopWithStencilFacts :: CVar -> Map CVar StencilFact -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
+buildScopWithStencilFacts procName stencilFacts rootPath spec body = do
   (stmts, schedule) <- extractLoop rootPath [] M.empty spec body
   if not (any stmtHasMemoryAccess stmts)
     then Left RejectNoMemoryAccess
@@ -1406,6 +1433,8 @@ buildScop procName rootPath spec body = do
            , scIterators = iterators
            , scParameters = params
            , scArrays = arrays
+           , scStencilFacts =
+               M.filterWithKey (\iter _ -> iter `elem` iterators) stencilFacts
           }
 
 stmtHasMemoryAccess :: PolyhedralStmt -> Bool
@@ -2506,43 +2535,46 @@ buildTiledWavefrontScop scheduled = do
 
 strengthenWavefrontScheduled :: ScheduledScop -> ScheduledScop
 strengthenWavefrontScheduled scheduled =
-  scheduled { ssSchedule = strengthenWavefrontScheduleTree relations 0 (ssSchedule scheduled) }
+  scheduled { ssSchedule = strengthenWavefrontScheduleTree relations stencilFacts 0 (ssSchedule scheduled) }
   where
     relations = collectScopDependenceRelations (ssOriginal scheduled)
+    stencilFacts = scStencilFacts (ssOriginal scheduled)
 
 strengthenWavefrontScheduleTree
   :: [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact
   -> Int
   -> ScheduleTree
   -> ScheduleTree
-strengthenWavefrontScheduleTree relations depth sched = case sched of
+strengthenWavefrontScheduleTree relations stencilFacts depth sched = case sched of
   ScheduleSequence xs ->
-    ScheduleSequence (map (strengthenWavefrontScheduleTree relations depth) xs)
+    ScheduleSequence (map (strengthenWavefrontScheduleTree relations stencilFacts depth) xs)
   ScheduleStmtRef {} ->
     sched
   ScheduleStripMine band plans ->
     ScheduleStripMine
-      band { lbBody = strengthenWavefrontScheduleTree relations (depth + 1) (lbBody band) }
+      band { lbBody = strengthenWavefrontScheduleTree relations stencilFacts (depth + 1) (lbBody band) }
       plans
   ScheduleLoopBand band ->
-    let body' = strengthenWavefrontScheduleTree relations (depth + 1) (lbBody band)
+    let body' = strengthenWavefrontScheduleTree relations stencilFacts (depth + 1) (lbBody band)
         band' = band { lbBody = body' }
     in case lbRole band of
          LoopIterate ->
-           ScheduleLoopBand band' { lbBody = strengthenWavefrontInnerSchedule relations depth (lbIters band') body' }
+           ScheduleLoopBand band' { lbBody = strengthenWavefrontInnerSchedule relations stencilFacts depth (lbIters band') body' }
          _ ->
            ScheduleLoopBand band'
 
 strengthenWavefrontInnerSchedule
   :: [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact
   -> Int
   -> [CVar]
   -> ScheduleTree
   -> ScheduleTree
-strengthenWavefrontInnerSchedule relations outerDepth outerIters sched = case sched of
+strengthenWavefrontInnerSchedule relations stencilFacts outerDepth outerIters sched = case sched of
   ScheduleLoopBand inner
     | lbRole inner == LoopMap ->
-        let skews = strengthenWavefrontSkews relations outerDepth outerIters (lbSkew inner)
+        let skews = strengthenWavefrontSkews relations stencilFacts outerDepth outerIters (lbSkew inner)
         in ScheduleLoopBand inner
              { lbSkew = skews
              , lbOrigins = loopBandOriginsFromSkews skews (lbIters inner)
@@ -2550,7 +2582,7 @@ strengthenWavefrontInnerSchedule relations outerDepth outerIters sched = case sc
   ScheduleSequence xs ->
     case span (not . isWavefrontLoopMapTree) xs of
       (before, target : after) ->
-        ScheduleSequence (before ++ strengthenWavefrontInnerSchedule relations outerDepth outerIters target : after)
+        ScheduleSequence (before ++ strengthenWavefrontInnerSchedule relations stencilFacts outerDepth outerIters target : after)
       _ ->
         sched
   _ ->
@@ -2558,24 +2590,34 @@ strengthenWavefrontInnerSchedule relations outerDepth outerIters sched = case sc
 
 strengthenWavefrontSkews
   :: [PolyhedralDependenceRelation]
+  -> Map CVar StencilFact
   -> Int
   -> [CVar]
   -> [SkewSpec]
   -> [SkewSpec]
-strengthenWavefrontSkews relations outerDepth outerIters skews =
+strengthenWavefrontSkews relations stencilFacts outerDepth outerIters skews =
   map strengthenOne skews
   where
     strengthenOne skew =
       let strictCoeff =
             maximum
               ( skewCoeff skew
-              : [ coeff
-                | outerIter <- outerIters
-                , outerIter == skewSource skew
-                , coeff <- maybeToList (strictCrossSkewCoeff outerDepth outerIter (skewTarget skew) relations)
-                ]
+              : footprintStrict skew
+              ++ [ coeff
+                 | outerIter <- outerIters
+                 , outerIter == skewSource skew
+                 , coeff <- maybeToList (strictCrossSkewCoeff outerDepth outerIter (skewTarget skew) relations)
+                 ]
               )
       in skew { skewCoeff = strictCoeff }
+    -- Footprint-driven strict coefficient: for a backward footprint radius r
+    -- and a temporal step of +1, transformed diagonal distances are strictly
+    -- forward once the coefficient exceeds r, i.e. at r + 1.
+    footprintStrict skew =
+      [ sfBackward fact + 1
+      | fact <- maybeToList (M.lookup (skewTarget skew) stencilFacts)
+      , sfBackward fact > 0
+      ]
 
 isWavefrontLoopMapTree :: ScheduleTree -> Bool
 isWavefrontLoopMapTree sched = case sched of
