@@ -77,7 +77,8 @@ postHoistIterateFixpoint = go 20
 -- Hoisting the ping-pong allocs can expose additional invariant shape-case
 -- branching, so run the scalar cleanup pass again afterwards.
 normalizeIterateBodies :: [Stmt] -> [Stmt]
-normalizeIterateBodies = postHoistIterateFixpoint . hoistIterateAllocs . fixpointOpt
+normalizeIterateBodies =
+  postHoistIterateFixpoint . hoistIterateAllocs . scalarizeIteratePairs . fixpointOpt
 
 -- | Apply the same statement-list rewrite to every procedure body in a program.
 mapProcBodies :: ([Stmt] -> [Stmt]) -> Program -> Program

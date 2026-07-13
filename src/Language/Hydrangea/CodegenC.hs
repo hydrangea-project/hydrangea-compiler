@@ -960,6 +960,14 @@ genStmt env declared liveAfter stmt = case stmt of
         RArrayCopy src -> text "hyd_array_alloc_copy(" <> genAtom src <> text ")"
         RProj 0 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".fst"
         RProj 1 (AVar src) | Map.member src (cePairVars env) -> genAtom (AVar src) <> text ".snd"
+        -- Cast compound literal: legal both as an initializer and as a plain
+        -- re-assignment (a bare brace literal only works in initializers).
+        -- The component tags on the Make statement may have defaulted; the
+        -- recovered per-variable pair type is authoritative.
+        RPairMake ct1 ct2 a1 a2 ->
+          let (c1, c2) = Map.findWithDefault (ct1, ct2) v (cePairVars env)
+          in text "(" <> text (pairStructName c1 c2) <> text ")"
+               <> text "{.fst =" <+> genAtom a1 <> text ", .snd =" <+> genAtom a2 <> text "}"
         _ -> genRHS (ceArrayElemTypes env) (ceFloatArrVars env) (Map.lookup v (ceVecVars env)) (ceTupleDefs env) assignedRhs
   CFG.SArrayWrite arr idx val
     | AVar arrV <- arr,

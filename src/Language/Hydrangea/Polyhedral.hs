@@ -65,6 +65,7 @@ module Language.Hydrangea.Polyhedral
   , tileScop
   , tryFuseBands
   , detectTemporalAlias
+  , detectTemporalAliases
   , augmentWithTemporalDeps
   ) where
 
@@ -1200,16 +1201,29 @@ outerIterateInfo sched = case sched of
 -- Supports both the simple tail swap @cur = next@ and the hoisted ping-pong
 -- suffix @cur = next; next = tmp; tmp = cur@.
 detectTemporalAlias :: [Stmt] -> Maybe (CVar, CVar)
-detectTemporalAlias stmts = case reverse stmts of
+detectTemporalAlias = listToMaybe . detectTemporalAliases
+
+-- | All temporal aliases at the end of a @LoopIterate@ body. A scalarized
+-- multi-array state (see @scalarizeIteratePairs@) ends with one @cur = next@
+-- copy per component; each carried pair gets its own alias. Only copies whose
+-- target is actually read earlier in the body qualify — a trailing copy of a
+-- variable the loop never reads is not loop-carried state.
+detectTemporalAliases :: [Stmt] -> [(CVar, CVar)]
+detectTemporalAliases stmts = case reverse stmts of
   ( SAssign _tmpOut (RAtom (AVar cur2))
     : SAssign next1 (RAtom (AVar _tmpIn))
     : SAssign cur1 (RAtom (AVar next))
     : _
     )
       | cur1 == cur2, next1 == next ->
-          Just (cur1, next1)
-  (SAssign cur (RAtom (AVar next)) : _) -> Just (cur, next)
-  _ -> Nothing
+          [(cur1, next1)]
+  rev ->
+    let swaps = trailingCopies rev
+        prefix = take (length stmts - length swaps) stmts
+    in [ (cur, next) | (cur, next) <- reverse swaps, usesVar cur prefix ]
+  where
+    trailingCopies (SAssign v (RAtom (AVar w)) : rest) = (v, w) : trailingCopies rest
+    trailingCopies _ = []
 
 -- | Augment dependence relations from a LoopIterate scop with the temporal
 -- dimension.  For every dep that is carried purely within spatial (non-iterate)
@@ -1804,9 +1818,9 @@ extractLoopWithAlias inheritedAlias loopPath domain env spec body
           -- loops (e.g. LoopMap inside LoopIterate) still substitute reads.
           aliasMap = case lsRole spec of
             LoopIterate ->
-              case detectTemporalAlias body of
-                Just (arrCur, arrNext) -> M.singleton arrCur arrNext
-                Nothing -> inheritedAlias
+              case detectTemporalAliases body of
+                [] -> inheritedAlias
+                aliases -> M.fromList aliases
             _ -> inheritedAlias
       (stmts, bodySchedule, _) <- extractStmtListWithAlias aliasMap loopPath domain' env body
       pure

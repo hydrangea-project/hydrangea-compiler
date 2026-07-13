@@ -36,7 +36,9 @@ module Language.Hydrangea.CFGOpt
   , unswitchLoopInvariantIf
   , sinkUnusedIntoGuard
   , removeNoOps
+  , foldShapeOfAlloc
   , hoistIterateAllocs
+  , scalarizeIteratePairs
     -- * Atom/statement substitution utilities
   , substAtom
   , substRHS
@@ -660,50 +662,57 @@ unswitchLoopInvariantIf = concatMap goStmt
     unswitchIterateInvariantIf :: LoopSpec -> [Stmt] -> Maybe [Stmt]
     unswitchIterateInvariantIf spec body = do
       guard (lsRole spec == LoopIterate)
-      (prefix, cond, thn, els, suffix) <- splitInvariantIf spec body
-      let mkBranch branch = [SLoop spec (branch ++ suffix)]
-      pure (prefix ++ [SIf cond (mkBranch thn) (mkBranch els)])
+      (hoisted, cond, rest, thn, els, suffix) <- splitInvariantIf spec body
+      let mkBranch branch = [SLoop spec (rest ++ branch ++ suffix)]
+      pure (hoisted ++ [SIf cond (mkBranch thn) (mkBranch els)])
 
-    splitInvariantIf :: LoopSpec -> [Stmt] -> Maybe ([Stmt], Atom, [Stmt], [Stmt], [Stmt])
-    splitInvariantIf spec body = go [] S.empty body
+    -- Find the first top-level @SIf@ whose condition depends only on
+    -- loop-invariant pure definitions. The condition's backward slice is
+    -- hoisted before the loop (it computes the same values every
+    -- iteration); statements before the @SIf@ that are not in the slice —
+    -- including whole loop nests — stay inside both unswitched copies.
+    splitInvariantIf
+      :: LoopSpec -> [Stmt] -> Maybe ([Stmt], Atom, [Stmt], [Stmt], [Stmt], [Stmt])
+    splitInvariantIf spec body = do
+      (before, cond, thn, els, suffix) <- firstTopLevelIf [] body
+      (sliceIdx, needed) <-
+        condSlice (usedVarsAtom cond) S.empty (reverse (zip [0 :: Int ..] before))
+      -- Every input the slice does not itself compute must come from
+      -- outside the loop body (in particular not from the tail swaps or
+      -- either branch), otherwise the condition is not invariant.
+      guard (S.null (needed `S.intersection` (bodyDefs `S.union` iterDefs)))
+      let inSlice i = i `S.member` sliceIdx
+          hoisted = [s | (i, s) <- zip [0 ..] before, inSlice i]
+          rest = [s | (i, s) <- zip [0 ..] before, not (inSlice i)]
+      pure (hoisted, cond, rest, thn, els, suffix)
       where
         iterDefs = S.fromList (lsIters spec)
         bodyDefs = definedVarsStmts body
         defCounts = countAssignedVars body
 
-        go :: [Stmt] -> Set ByteString -> [Stmt] -> Maybe ([Stmt], Atom, [Stmt], [Stmt], [Stmt])
-        go prefix hoistedDefs stmts = case stmts of
-          [] ->
-            Nothing
-          SIf cond thn els : suffix
-            | invariantCond hoistedDefs cond ->
-                Just (reverse prefix, cond, thn, els, suffix)
+        firstTopLevelIf acc stmts = case stmts of
+          [] -> Nothing
+          SIf cond thn els : suffix -> Just (reverse acc, cond, thn, els, suffix)
+          s : rest -> firstTopLevelIf (s : acc) rest
+
+        -- Walk backwards collecting the defining statements of the needed
+        -- variables. A needed variable defined by anything other than a
+        -- single pure assignment kills the unswitch.
+        condSlice needed sliceIdx revBefore = case revBefore of
+          [] -> Just (sliceIdx, needed)
+          (i, stmt) : rest
+            | S.null (definedVarsStmts [stmt] `S.intersection` needed) ->
+                condSlice needed sliceIdx rest
+            | SAssign x rhs <- stmt
+            , not (x `S.member` iterDefs)
+            , M.findWithDefault 0 x defCounts == 1
+            , rhsIsPure rhs || isZeroArgCall rhs ->
+                condSlice
+                  (S.delete x needed `S.union` usedVarsRHS rhs)
+                  (S.insert i sliceIdx)
+                  rest
             | otherwise ->
                 Nothing
-          stmt : rest
-            | invariantPrefixStmt hoistedDefs stmt ->
-                let hoistedDefs' = hoistedDefs `S.union` definedVarsStmts [stmt]
-                in go (stmt : prefix) hoistedDefs' rest
-            | otherwise ->
-                Nothing
-
-        invariantPrefixStmt :: Set ByteString -> Stmt -> Bool
-        invariantPrefixStmt hoistedDefs stmt = case stmt of
-          SAssign x rhs ->
-            not (x `S.member` iterDefs)
-              && M.findWithDefault 0 x defCounts == 1
-              && (rhsIsPure rhs || isZeroArgCall rhs)
-              && S.null (usedVarsRHS rhs `S.intersection` disallowed hoistedDefs)
-          _ ->
-            False
-
-        invariantCond :: Set ByteString -> Atom -> Bool
-        invariantCond hoistedDefs cond =
-          S.null (usedVarsAtom cond `S.intersection` disallowed hoistedDefs)
-
-        disallowed :: Set ByteString -> Set ByteString
-        disallowed hoistedDefs =
-          iterDefs `S.union` (bodyDefs `S.difference` hoistedDefs)
 
 ------------------------------------------------------------------------
 -- No-op cleanup
@@ -760,6 +769,84 @@ removeNoOps = concatMap goStmt
 -- >   tmp = arr_cur
 --
 -- This avoids re-allocating every temporal iteration.
+
+-- | Split a @LoopIterate@ whose loop-carried state is a pair into one
+-- carried variable per component, so downstream passes (and in particular
+-- polyhedral temporal-alias detection) see a plain @cur = next@ swap for
+-- every component array. Coupled-field steps (e.g. FDTD-style e/h updates)
+-- lower to this shape:
+--
+-- >   cur = <pair init>                     cur = <pair init>
+-- >   for iter_t:                           tf = fst cur
+-- >     tf = fst cur                        ts = snd cur
+-- >     ts = snd cur               =>       for iter_t:
+-- >     ...compute x, y...                    ...compute x, y...
+-- >     p = pair x y                          tf = x
+-- >     cur = p                               ts = y
+-- >                                         cur = pair tf ts
+--
+-- The extraction position inside the body does not matter: @cur@ is only
+-- written at the tail, so the components are loop-invariant within one
+-- iteration. Fires only when @cur@ and @p@ have no other reads or writes
+-- in the body.
+--
+-- ponytail: one pair level only — nested-pair state (three or more arrays)
+-- stays opaque; generalize with a carried-var-keyed fixpoint when
+-- FDTD-2D-style triples matter.
+scalarizeIteratePairs :: [Stmt] -> [Stmt]
+scalarizeIteratePairs = go
+  where
+    go [] = []
+    go (SLoop spec body : rest)
+      | lsRole spec == LoopIterate
+      , Just (pre, loop', post) <- splitPairState spec (scalarizeIteratePairs body) =
+          pre ++ loop' : post ++ go rest
+      | otherwise = SLoop spec (scalarizeIteratePairs body) : go rest
+    go (SIf c t e : rest) =
+      SIf c (scalarizeIteratePairs t) (scalarizeIteratePairs e) : go rest
+    go (s : rest) = s : go rest
+
+    splitPairState spec body = do
+      ( SAssign cur (RAtom (AVar p))
+        : SAssign p' (RPairMake tagA tagB x y)
+        : revMid
+        ) <- Just (reverse body)
+      guard (p' == p)
+      let mid0 = reverse revMid
+      [(tf, tagF)] <- Just [(v, tag) | SAssign v (RPairFst tag (AVar c)) <- mid0, c == cur]
+      [(ts, tagS)] <- Just [(v, tag) | SAssign v (RPairSnd tag (AVar c)) <- mid0, c == cur]
+      let isExtraction s = case s of
+            SAssign v (RPairFst _ (AVar c)) -> c == cur && v == tf
+            SAssign v (RPairSnd _ (AVar c)) -> c == cur && v == ts
+            _ -> False
+          mid = filter (not . isExtraction) mid0
+          midUsed = usedVarsStmts mid
+          midDefined = definedVarsStmts mid
+      guard (tf /= ts)
+      guard (all (`notElem` [cur, p]) [tf, ts])
+      guard (all (`S.notMember` midUsed) [cur, p])
+      guard (all (`S.notMember` midDefined) [cur, p, tf, ts])
+      guard (all (`notElem` [AVar cur, AVar p]) [x, y])
+      -- Shapes of the carried arrays are iterate-invariant (an iterate step
+      -- preserves its state shape — the same assumption the single-array
+      -- ping-pong hoist makes), so their reads can move before the loop,
+      -- where invariant-branch unswitching can reach the boundary guards
+      -- computed from them.
+      let defCounts = countAssignedVars mid
+          isCarriedShape s = case s of
+            SAssign sv (RArrayShape (AVar v)) ->
+              v `elem` [tf, ts] && M.findWithDefault (0 :: Int) sv defCounts == 1
+            _ -> False
+          (shapeStmts, midRest) = partition isCarriedShape mid
+      pure
+        ( [ SAssign tf (RPairFst tagF (AVar cur))
+          , SAssign ts (RPairSnd tagS (AVar cur))
+          ]
+            ++ shapeStmts
+        , SLoop spec (midRest ++ [SAssign tf (RAtom x), SAssign ts (RAtom y)])
+        , [SAssign cur (RPairMake tagA tagB (AVar tf) (AVar ts))]
+        )
+
 hoistIterateAllocs :: [Stmt] -> [Stmt]
 hoistIterateAllocs = go
   where
@@ -797,6 +884,12 @@ restructureIterateBody spec body = do
   (curVar, nextVar) <- case swapStmt of
     SAssign cur (RAtom (AVar next)) -> Just (cur, next)
     _ -> Nothing
+  -- A scalarized multi-array iterate (see 'scalarizeIteratePairs') ends with
+  -- one swap per component; the single-buffer ping-pong below must not adopt
+  -- just the last one.
+  guard $ case drop 1 (reverse body) of
+    SAssign _ (RAtom (AVar _)) : _ -> False
+    _ -> True
 
   -- Collect the stmts that precede the swap
   let prefix = init body
@@ -1262,6 +1355,63 @@ optimizeOnce =
   . copyProp
   . cseStmts
   . copyProp
+  . foldShapeOfAlloc
+
+-- | Fold @shape(a)@ back to the shape an array was allocated with:
+-- @a = alloc(shp); ...; s = shape(a)@ becomes @s = shp@ when neither @a@
+-- nor the shape variable is reassigned in between. Boundary-guard
+-- conditions on freshly allocated buffers become expressible in terms of
+-- the original shape, which downstream invariant-branch unswitching needs.
+--
+-- Applied only inside @LoopIterate@ bodies: some general-path passes and
+-- the backward type recovery pattern-match on @RArrayShape@ syntactically,
+-- so folding it program-wide regresses them, and the iterate bodies are
+-- where the unswitching needs it.
+foldShapeOfAlloc :: [Stmt] -> [Stmt]
+foldShapeOfAlloc = map top
+  where
+    top stmt = case stmt of
+      SLoop spec body
+        | lsRole spec == LoopIterate -> SLoop spec (fst (go M.empty body))
+        | otherwise -> SLoop spec (map top body)
+      SIf c t e -> SIf c (map top t) (map top e)
+      _ -> stmt
+    go :: Map ByteString Atom -> [Stmt] -> ([Stmt], Map ByteString Atom)
+    go env [] = ([], env)
+    go env (stmt : rest) = case stmt of
+      SAssign v (RArrayShape (AVar a))
+        | Just shp <- M.lookup a env ->
+            let (rest', envOut) = go (invalidate v env) rest
+            in (SAssign v (RAtom shp) : rest', envOut)
+      SAssign v rhs ->
+        let envInval = invalidate v env
+            env' = case rhs of
+              RArrayAlloc shp -> M.insert v shp envInval
+              _ -> envInval
+            (rest', envOut) = go env' rest
+        in (stmt : rest', envOut)
+      SLoop spec body ->
+        -- The body may reassign tracked vars on later iterations, so it is
+        -- processed with an empty environment; afterwards its assignments
+        -- are invalidated in the outer environment. Element writes are fine:
+        -- they never change an array's shape.
+        let (body', _) = go M.empty body
+            envAfter = foldr invalidate env (M.keys (countAssignedVars body))
+            (rest', envOut) = go envAfter rest
+        in (SLoop spec body' : rest', envOut)
+      SIf c t e ->
+        let (t', _) = go env t
+            (e', _) = go env e
+            assigns = M.keys (countAssignedVars (t ++ e))
+            envAfter = foldr invalidate env assigns
+            (rest', envOut) = go envAfter rest
+        in (SIf c t' e' : rest', envOut)
+      _ ->
+        let (rest', envOut) = go env rest
+        in (stmt : rest', envOut)
+
+    invalidate v =
+      M.filterWithKey (\k shp -> k /= v && not (v `S.member` usedVarsAtom shp))
 
 -- | Run 'optimizeOnce' to a fixpoint (or until the iteration limit of
 -- 100 is reached).  In practice the pipeline usually converges in only

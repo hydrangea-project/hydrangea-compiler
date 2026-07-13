@@ -1160,6 +1160,23 @@ temporalSkewingSpec = describe "temporal skewing" $ do
           ]
     detectTemporalAlias body `shouldBe` Nothing
 
+  it "detectTemporalAliases collects one alias per scalarized component swap" $ do
+    let body =
+          [ SAssign "x" (C.RArrayLoad (C.AVar "cur_e") (C.AVar "i"))
+          , SAssign "y" (C.RArrayLoad (C.AVar "cur_h") (C.AVar "i"))
+          , SAssign "cur_e" (C.RAtom (C.AVar "next_e"))
+          , SAssign "cur_h" (C.RAtom (C.AVar "next_h"))
+          ]
+    detectTemporalAliases body `shouldBe` [("cur_e", "next_e"), ("cur_h", "next_h")]
+
+  it "detectTemporalAliases drops trailing copies whose target the body never reads" $ do
+    let body =
+          [ SAssign "x" (C.RArrayLoad (C.AVar "cur") (C.AVar "i"))
+          , SAssign "cur" (C.RAtom (C.AVar "next"))
+          , SAssign "unrelated" (C.RAtom (C.AVar "other"))
+          ]
+    detectTemporalAliases body `shouldBe` [("cur", "next")]
+
   it "augmentWithTemporalDeps bumps iter_t distance from 0 to 1 for WAR deps with negative spatial distance" $ do
     -- A WAR dep as produced by the extractor for a LoopIterate stencil:
     -- iter_t carry is PolyCarryIndependent (0), i distance = -1.

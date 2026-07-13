@@ -530,6 +530,40 @@ spec = do
           any (== "add2") names `shouldBe` True
           any (== "main") names `shouldBe` True
 
+  describe "CFGOpt - scalarizeIteratePairs" $ do
+    it "splits pair-typed iterate state into per-component swaps" $ do
+      let body =
+            [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
+            , SAssign "ts" (RPairSnd CEArray (AVar "cur"))
+            , SAssign "x" (RArrayCopy (AVar "tf"))
+            , SAssign "y" (RArrayCopy (AVar "ts"))
+            , SAssign "p" (RPairMake CEArray CEArray (AVar "x") (AVar "y"))
+            , SAssign "cur" (RAtom (AVar "p"))
+            ]
+          loop = SLoop (LoopSpec ["t"] [IVar "k"] Serial Nothing LoopIterate []) body
+          result = scalarizeIteratePairs [loop]
+      case result of
+        [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
+          , SAssign "ts" (RPairSnd CEArray (AVar "cur"))
+          , SLoop _ body'
+          , SAssign "cur" (RPairMake CEArray CEArray (AVar "tf") (AVar "ts"))
+          ] -> do
+            drop (length body' - 2) body'
+              `shouldBe` [ SAssign "tf" (RAtom (AVar "x"))
+                         , SAssign "ts" (RAtom (AVar "y"))
+                         ]
+            any (\s -> case s of SAssign _ (RPairFst {}) -> True; _ -> False) body'
+              `shouldBe` False
+        other -> expectationFailure ("unexpected shape: " ++ show other)
+
+    it "leaves single-array iterate state alone" $ do
+      let body =
+            [ SAssign "x" (RArrayCopy (AVar "cur"))
+            , SAssign "cur" (RAtom (AVar "x"))
+            ]
+          loop = SLoop (LoopSpec ["t"] [IVar "k"] Serial Nothing LoopIterate []) body
+      scalarizeIteratePairs [loop] `shouldBe` [loop]
+
 -- Helper generators for property testing
 type SimpleStmts = [Stmt]
 

@@ -348,6 +348,33 @@ spec = do
           , "let result = iterate 5 init step"
           ])
 
+    -- Multi-array (FDTD-style) iterate state: a pair of arrays where the
+    -- second field's update reads the first field's fresh value. Exercises
+    -- pair-state scalarization, per-component temporal aliases, and the
+    -- pair re-assignment codegen.
+    it "compiles and runs a polyhedral pair-state coupled-field iterate and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = False
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let e0 = generate [6] (let f [i] = float_of i *. 0.1 in f)"
+          , "let h0 = generate [6] (let f [i] = 0.0 in f)"
+          , "let step s ="
+          , "  let e = fst s in"
+          , "  let h = snd s in"
+          , "  let e2 = zipwith (fn a b => a -. b) e"
+          , "    (stencil clamp (fn acc => (acc 0 -. acc (-1)) *. 0.5) h) in"
+          , "  let h2 = zipwith (fn a b => a -. b) h"
+          , "    (stencil clamp (fn acc => (acc 1 -. acc 0) *. 0.7) e2) in"
+          , "  (e2, h2)"
+          , "let result = iterate 4 (e0, h0) step"
+          ])
+
     it "compiles and runs polyhedral constant-boundary stencil kernels and matches the interpreter" $ withCC $
       checkInlineSrcWithOptions
         defaultInferOptions
