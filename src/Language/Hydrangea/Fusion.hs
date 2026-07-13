@@ -1795,7 +1795,7 @@ fuseOnce expr =
       bnd' <- fuseBnd bnd
       f'   <- fuseOnce f
       arr' <- fuseOnce arr
-      pure (EStencil a bnd' f' arr')
+      fuseStencil a bnd' f' arr'
     EReshape a s arr -> do
       s' <- fuseOnce s
       arr' <- fuseOnce arr
@@ -1845,6 +1845,60 @@ fuseIterate a n initArr f =
     eraseAnn = fmap (const ())
     addExp (EInt _ x) (EInt _ y) = EInt a (x + y)
     addExp e1 e2 = EBinOp a e1 (Plus a) e2
+
+-- | Pointwise-map fusion into a stencil argument:
+-- @stencil bnd (fn acc => body) (map g arr)
+--   = stencil bnd (fn acc => body[acc o.. := g (acc o..)]) arr@.
+-- Legal for index-remap boundaries (clamp\/wrap\/mirror), which commute with
+-- a pointwise map; a constant boundary does not (the out-of-bounds constant
+-- must not pass through @g@). The inserted @g@ applications beta-reduce on
+-- later 'fuseFix' passes, so lowering still sees a constant-offset stencil.
+fuseStencil :: (Eq a) => a -> BoundaryCondition a -> Exp a -> Exp a -> FusionM (Exp a)
+fuseStencil a bnd f arr =
+  case (bnd, f, arr) of
+    (BConst {}, _, _) -> stay
+    (_, ELetIn la (Dec da name [PVar pa accVar] mw poly fbody) (EVar va name'), EMap _ g inner)
+      | name == name'
+      , S.null (S.fromList [accVar, name] `S.intersection` freeVarsExp g)
+      , Just fbody' <- wrapAccCalls accVar (EApp a g) fbody ->
+          pure (EStencil a bnd (ELetIn la (Dec da name [PVar pa accVar] mw poly fbody') (EVar va name')) inner)
+    _ -> stay
+  where
+    stay = pure (EStencil a bnd f arr)
+
+-- | Wrap every saturated accessor application spine @acc o1 .. ok@ in @wrap@.
+-- Returns 'Nothing' when some accessor occurrence is not the head of an
+-- application spine (e.g. the bare accessor escapes as a value) or sits under
+-- a constructor this traversal does not cover; the caller must not fire then,
+-- since an unwrapped read would skip the mapped function.
+wrapAccCalls :: Var -> (Exp a -> Exp a) -> Exp a -> Maybe (Exp a)
+wrapAccCalls accVar wrap = go
+  where
+    go e = case e of
+      _ | countVarExp accVar e == 0 -> Just e
+      EApp ann fn x ->
+        case peelApps e of
+          (EVar _ v, args) | v == accVar ->
+            if all (\arg -> countVarExp accVar arg == 0) args
+              then Just (wrap e)
+              else Nothing
+          _ -> EApp ann <$> go fn <*> go x
+      EBinOp ann l op r -> (\l' r' -> EBinOp ann l' op r') <$> go l <*> go r
+      ENeg ann e1 -> ENeg ann <$> go e1
+      EUnOp ann op e1 -> EUnOp ann op <$> go e1
+      EIfThenElse ann c t el -> EIfThenElse ann <$> go c <*> go t <*> go el
+      EIfThen ann c t -> EIfThen ann <$> go c <*> go t
+      EPair ann e1 e2 -> EPair ann <$> go e1 <*> go e2
+      EProj ann i e1 -> EProj ann i <$> go e1
+      ERecord ann fields ->
+        ERecord ann <$> mapM (\(fld, fe) -> (,) fld <$> go fe) fields
+      ERecordProj ann e1 fld -> (\e1' -> ERecordProj ann e1' fld) <$> go e1
+      ELetIn ann d@(Dec dann dn dpats dw dpoly db) body
+        | accVar `S.member` decBoundVars d -> Nothing
+        | otherwise ->
+            (\db' body' -> ELetIn ann (Dec dann dn dpats dw dpoly db') body')
+              <$> go db <*> go body
+      _ -> Nothing
 
 fuseMap :: (Eq a) => a -> Exp a -> Exp a -> FusionM (Exp a)
 fuseMap a f arr =
