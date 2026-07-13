@@ -115,6 +115,9 @@ hasIterateCount k = anyExp (\case EIterate _ (EInt _ n) _ _ -> n == k; _ -> Fals
 
 hasStencilOfMap :: Exp a -> Bool
 hasStencilOfMap = anyExp (\case EStencil _ _ _ (EMap {}) -> True; _ -> False)
+
+hasMapOfStencil :: Exp a -> Bool
+hasMapOfStencil = anyExp (\case EMap _ _ (EStencil {}) -> True; _ -> False)
 hasZipWith = anyExp (\case EZipWith {} -> True; _ -> False)
 hasGenerate = anyExp (\case EGenerate {} -> True; _ -> False)
 hasFill = anyExp (\case EFill {} -> True; _ -> False)
@@ -537,6 +540,17 @@ spec = do
       expectFusionSensible
         "let init = generate [8] (let h [i] = i in h) in let step = (let s arr = stencil (constant 0) (let k acc = acc (-1) + acc 1 in k) (map (let f x = x * 2 in f) arr) in s) in iterate 2 init step"
         (\fused -> hasStencilOfMap fused `shouldBe` True)
+
+  describe "Fusion - map of stencil" $ do
+    it "fuses a pointwise map over a clamp-stencil into the stencil body" $ do
+      expectFusionSensible
+        "let init = generate [8] (let h [i] = i in h) in let step = (let s arr = map (let g x = x * 2 in g) (stencil clamp (let k acc = acc (-1) + acc 1 in k) arr) in s) in iterate 2 init step"
+        (\fused -> hasMapOfStencil fused `shouldBe` False)
+
+    it "fuses map over a constant-boundary stencil (outputs, not reads)" $ do
+      expectFusionSensible
+        "let init = generate [8] (let h [i] = i in h) in let step = (let s arr = map (let g x = x + 3 in g) (stencil (constant 0) (let k acc = acc (-1) + acc 1 in k) arr) in s) in iterate 2 init step"
+        (\fused -> hasMapOfStencil fused `shouldBe` False)
 
   describe "Fusion - fusePermute generalisation (T1)" $ do
     it "fuses permute over generate (not just map)" $ do

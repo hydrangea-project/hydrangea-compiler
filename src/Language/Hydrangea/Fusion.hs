@@ -1925,6 +1925,17 @@ fuseMap a f arr =
               let body = EApp a f (EApp a (EApp a g (EVar a x)) (EVar a y))
                   dec = mkDec a fn x y body
               pure $ ELetIn a dec (EZipWith a (EVar a fn) xs ys)
+            -- map f (stencil bnd (fn acc => body) xs)
+            --   => stencil bnd (fn acc => f body) xs
+            -- Dual of 'fuseStencil': f wraps the stencil OUTPUT, so it never
+            -- touches boundary reads — legal for every boundary condition,
+            -- and one application of f per element is preserved.
+            EStencil _ bnd (ELetIn la (Dec da name [PVar pa accVar] mw poly fbody) (EVar va name')) inner
+              | name == name'
+              , S.null (S.fromList [accVar, name] `S.intersection` freeVarsExp f) ->
+                  pure (EStencil a bnd
+                          (ELetIn la (Dec da name [PVar pa accVar] mw poly (EApp a f fbody)) (EVar va name'))
+                          inner)
             _ -> pure (EMap a f arr)
 
 fuseZipWith :: (Eq a) => a -> Exp a -> Exp a -> Exp a -> FusionM (Exp a)
