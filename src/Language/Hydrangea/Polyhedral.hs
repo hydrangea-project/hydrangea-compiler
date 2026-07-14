@@ -82,7 +82,7 @@ import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsIndexExpr, usedVarsStmt, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
 import Language.Hydrangea.CFGOpt (substStmts)
-import Language.Hydrangea.Util (unsnoc)
+import Language.Hydrangea.Util (unsnoc, freshUnusedName)
 
 type StmtId = [Int]
 
@@ -1723,14 +1723,9 @@ indexExprToAtom expr = case simplifyIndexExpr expr of
 freshLike :: CVar -> ByteString -> TileM CVar
 freshLike base suffix =
   state $ \(seen, nextId) ->
-    let (fresh, nextId') = pickFresh seen nextId
+    let (fresh, nextId') =
+          freshUnusedName (\n -> base <> suffix <> "_" <> BS.pack (show n)) seen nextId
     in (fresh, (S.insert fresh seen, nextId'))
-  where
-    pickFresh seen n =
-      let candidate = base <> suffix <> "_" <> BS.pack (show n)
-      in if candidate `S.member` seen
-           then pickFresh seen (n + 1)
-           else (candidate, n + 1)
 
 collectScopNames :: Scop -> Set CVar
 collectScopNames scop =

@@ -28,6 +28,7 @@ import Data.Map.Strict qualified as M
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.Syntax
+import Language.Hydrangea.Util (freshUnusedName)
 
 newtype UniqM a = UniqM {runUniqM :: State UniqState a}
   deriving (Functor, Applicative, Monad, MonadState UniqState)
@@ -246,13 +247,10 @@ shouldSkip v = BS.isPrefixOf "__fusion_" v || BS.isPrefixOf "__uniq_" v
 freshName :: Var -> UniqM Var
 freshName base = do
   st <- get
-  let n = uniqCounter st
-      candidate = base <> "__uniq_" <> BS.pack (show n)
-  if candidate `S.member` uniqUsed st
-    then put st {uniqCounter = n + 1} >> freshName base
-    else do
-      put st {uniqCounter = n + 1, uniqUsed = S.insert candidate (uniqUsed st)}
-      pure candidate
+  let (candidate, n') =
+        freshUnusedName (\n -> base <> "__uniq_" <> BS.pack (show n)) (uniqUsed st) (uniqCounter st)
+  put st {uniqCounter = n', uniqUsed = S.insert candidate (uniqUsed st)}
+  pure candidate
 
 collectVarsExp :: Exp a -> Set Var
 collectVarsExp expr =

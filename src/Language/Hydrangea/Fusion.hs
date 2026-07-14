@@ -60,6 +60,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, sliceShape)
 import Language.Hydrangea.Uniquify (collectVarsExp, collectVarsDec)
+import Language.Hydrangea.Util (freshUnusedName)
 
 -- | Track used variables to avoid capture, plus a fresh counter.
 data FusionState = FusionState
@@ -596,13 +597,10 @@ isArrayExp expr =
 freshVar :: ByteString -> FusionM Var
 freshVar prefix = do
   st <- get
-  let n = freshCounter st
-      candidate = prefix <> BS.pack (show n)
-  if candidate `S.member` usedVars st
-    then put st {freshCounter = n + 1} >> freshVar prefix
-    else do
-      put st {freshCounter = n + 1, usedVars = S.insert candidate (usedVars st)}
-      pure candidate
+  let (candidate, n') =
+        freshUnusedName (\n -> prefix <> BS.pack (show n)) (usedVars st) (freshCounter st)
+  put st {freshCounter = n', usedVars = S.insert candidate (usedVars st)}
+  pure candidate
 
 mkLet1 :: a -> FusionM (Var, Var)
 mkLet1 _ = do
