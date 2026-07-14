@@ -964,7 +964,11 @@ genMultiPhaseHarness _rp bodyNoRet phases retAtom typeEnv arrayElemTys retKinds 
     emitItems (n, rb) (s : rest) = case s of
       CFG.SLoop spec _ | isGpuLoopSpec spec ->
         let (rs, st') = emitItems (n + 1, rb) rest
-         in (genDispatch (phases !! n) ++ rs, st')
+            phase = case drop n phases of
+              (p : _) -> p
+              []      -> error ("internal error: emitItems: GPU dispatch #" ++ show n
+                                ++ " has no matching phase (only " ++ show (length phases) ++ " phases)")
+         in (genDispatch phase ++ rs, st')
       CFG.SIf cond thn els ->
         let (tl, st1) = emitItems (n, rb) thn
             (el, st2) = emitItems st1 els
@@ -2871,7 +2875,7 @@ genMSLRHS assignedVar iter inArrs outArrs typeEnv arrayElemTys tupleDefs rhs = c
          in go (elemStr 0) 1
   RNdToFlat nd shp ->
     "hyd_nd_to_flat(" ++ genMSLAtom iter nd ++ ", " ++ genMSLAtom iter shp ++ ")"
-  _ -> "0 /* unhandled RHS */"
+  other -> error ("internal error: genMSLRHS: unsupported RHS in kernel body: " ++ show other)
 
 -- | Generate MSL for an atom.
 genMSLAtom :: CVar -> Atom -> String
@@ -2902,8 +2906,7 @@ genMSLIndexExpr expr = case CFG.simplifyIndexExpr expr of
     "hyd_flat_to_nd((long)(" ++ genMSLIndexExpr flat ++ "), " ++ genMSLIndexExpr shp ++ ")"
   CFG.INdToFlat nd shp ->
     "hyd_nd_to_flat(" ++ genMSLIndexExpr nd ++ ", " ++ genMSLIndexExpr shp ++ ")"
-  CFG.ICall _ _ -> "0"
-  _ -> "0"
+  CFG.ICall _ _ -> error "internal error: genMSLIndexExpr reached an ICall (unresolved index-function call)"
 
 mslBinOp :: BinOp -> String
 mslBinOp CAdd = "+"
@@ -3844,7 +3847,6 @@ genPreLoopCIndexExpr expr = case CFG.simplifyIndexExpr expr of
       ++ ")"
   CFG.IProj i e -> genPreLoopCIndexExpr e ++ ".elems[" ++ show i ++ "]"
   CFG.ICall fn args -> sanitize fn ++ "(" ++ intercalate ", " (map genPreLoopCIndexExpr args) ++ ")"
-  _ -> "0"
 
 -- | C type string for a pre-loop variable.
 preLoopCType :: TypeEnv -> Map CVar VarKind -> CVar -> RHS -> String
@@ -3958,7 +3960,7 @@ genPreLoopRHS typeEnv retKinds v rhs = case rhs of
     "{" ++ intercalate ", " ["." ++ sanitize f ++ " = " ++ genCAtom a | (f, a) <- fields] ++ "}"
   RRecordProj f a -> genCAtom a ++ "." ++ sanitize f
   R2DToFlat i w -> "(" ++ genCAtom i ++ " * " ++ genCAtom w ++ ")"
-  _ -> "0 /* unhandled pre-loop RHS */"
+  other -> error ("internal error: genCPreLoopRHS: unsupported pre-loop RHS: " ++ show other)
 
 -- | Plain C atom rendering (same syntax as C, unlike genMSLAtom which maps gid).
 genCAtom :: Atom -> String

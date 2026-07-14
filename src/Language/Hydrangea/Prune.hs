@@ -36,6 +36,9 @@ collectTopLevelRefs topNames expr bound =
       let patBound = S.unions (map patVars pats)
        in go decBody patBound `S.union` go body (S.insert name (patBound `S.union` bound))
 
+    EBoundLetIn _ x boundE rhs body ->
+      go boundE bound `S.union` go rhs bound `S.union` go body (S.insert x bound)
+
     EVec _ es -> S.unions (map (`go` bound) es)
     EApp _ f x -> go f bound `S.union` go x bound
     EIfThen _ c t -> go c bound `S.union` go t bound

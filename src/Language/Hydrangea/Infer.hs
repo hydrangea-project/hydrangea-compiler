@@ -47,7 +47,7 @@ import Data.Map qualified as M
 import Data.Maybe
 import Data.Set (Set, (\\))
 import Data.Set qualified as S
-import Language.Hydrangea.Lexer (Range)
+import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Predicate
   ( Pred (..), TaggedPred (..), Term (..)
   , predBindVars, substTaggedPredVars, untagPred
@@ -2310,7 +2310,7 @@ resolveArgTerm :: Map Var Var -> Pat Range -> Exp Range -> Infer (Maybe (Map Var
 resolveArgTerm rfEnv (PVar _ v) (EInt _ n) =
   return $ Just $ M.singleton v (TConst (fromIntegral n))
 resolveArgTerm rfEnv (PVar _ v) (EVar _ w) = do
-  mBound <- inferBVal (EVar undefined w)
+  mBound <- inferBVal (EVar noRange w)
   ctx <- ask
   case M.lookup w ctx of
     Just wTy -> do
@@ -2319,7 +2319,7 @@ resolveArgTerm rfEnv (PVar _ v) (EVar _ w) = do
         Just wRfVar -> return $ Just $ M.singleton v (TVar wRfVar)
         Nothing     -> return Nothing
     Nothing -> return Nothing
-resolveArgTerm rfEnv (PBound _ v _) e = resolveArgTerm rfEnv (PVar undefined v) e
+resolveArgTerm rfEnv (PBound _ v _) e = resolveArgTerm rfEnv (PVar noRange v) e
 resolveArgTerm _ _ _ = return Nothing
 
 -- | Emit where-clause obligations at a call site.
@@ -2366,7 +2366,7 @@ patTypeTerm (PVar _ v) ty = do
   case fst (unwrapRefine ty') of
     Just rfVar -> return $ Just $ M.singleton v (TVar rfVar)
     Nothing    -> return Nothing
-patTypeTerm (PBound _ v _) ty = patTypeTerm (PVar undefined v) ty
+patTypeTerm (PBound _ v _) ty = patTypeTerm (PVar noRange v) ty
 patTypeTerm _ _ = return Nothing
 
 -- | (Kept for reference; no longer used by 'emitWhereObls'.)
@@ -2390,7 +2390,7 @@ patExpToTerm (PVar _ v) (EVar _ w) = do
         Just wRfVar -> return $ Just $ M.singleton v (TVar wRfVar)
         Nothing     -> return Nothing
     Nothing -> return Nothing
-patExpToTerm (PBound _ v _) e = patExpToTerm (PVar undefined v) e
+patExpToTerm (PBound _ v _) e = patExpToTerm (PVar noRange v) e
 patExpToTerm _ _ = return Nothing
 
 -- | Resolve a 'RefinePred' to 'Pred's using a 'Map Var Term' (from 'buildCallArgEnv').

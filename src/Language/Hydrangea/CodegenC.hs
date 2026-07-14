@@ -968,6 +968,14 @@ genStmt env declared liveAfter stmt = case stmt of
           let (c1, c2) = Map.findWithDefault (ct1, ct2) v (cePairVars env)
           in text "(" <> text (pairStructName c1 c2) <> text ")"
                <> text "{.fst =" <+> genAtom a1 <> text ", .snd =" <+> genAtom a2 <> text "}"
+        -- Like RPairMake: cast the compound literal so it is valid both as an
+        -- initializer and as a plain reassignment (a bare brace literal is not).
+        RRecord fields
+          | Just recFields <- Map.lookup v (ceRecordVars env) ->
+              text "(" <> text (recordStructName recFields) <> text ")"
+                <> text "{"
+                <> hsep (punctuate comma [text "." <> text (sanitizeFieldName field) <+> text "=" <+> genAtom atom | (field, atom) <- fields])
+                <> text "}"
         _ -> genRHS (ceArrayElemTypes env) (ceFloatArrVars env) (Map.lookup v (ceVecVars env)) (ceTupleDefs env) assignedRhs
   CFG.SArrayWrite arr idx val
     | AVar arrV <- arr,
@@ -1654,8 +1662,8 @@ genIndexExpr expr = case CFG.simplifyIndexExpr expr of
   CFG.IMul a b -> parens (genIndexExpr a <+> text "*" <+> genIndexExpr b)
   CFG.IDiv a b -> parens (genIndexExpr a <+> text "/" <+> genIndexExpr b)
   CFG.INdToFlat nd shp -> text "hyd_nd_to_flat(" <> genIndexExpr nd <> text "," <+> genIndexExpr shp <> text ")"
-  CFG.ICall _ _ -> text "0LL"
-  _ -> text "0LL"
+  CFG.ICall _ _ -> error "internal error: genIndexExpr reached an ICall (unresolved index-function call)"
+  other -> error ("internal error: genIndexExpr: unsupported index expression: " ++ show other)
 
 hasParallelStmt :: [CFG.Stmt] -> Bool
 hasParallelStmt = any go
@@ -2523,14 +2531,14 @@ genVecBinOp CAddF = text "add"
 genVecBinOp CSubF = text "sub"
 genVecBinOp CMulF = text "mul"
 genVecBinOp CDivF = text "div"
-genVecBinOp _ = text "add"
+genVecBinOp op = error ("internal error: genVecBinOp: no vector form for " ++ show op)
 
 genVecUnOp :: UnOp -> Doc
 genVecUnOp CSqrt = text "sqrt"
 genVecUnOp CExpF = text "exp"
 genVecUnOp CLog = text "log"
 genVecUnOp CErf = text "erf"
-genVecUnOp _ = text "sqrt"
+genVecUnOp op = error ("internal error: genVecUnOp: no vector form for " ++ show op)
 
 genUnOp :: UnOp -> Doc
 genUnOp CNot = text "!"

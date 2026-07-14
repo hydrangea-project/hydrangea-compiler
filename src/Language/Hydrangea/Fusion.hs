@@ -165,6 +165,7 @@ collectVarsPat pat =
     PVar _ v -> S.singleton v
     PBound _ v _ -> S.singleton v
     PVec _ ps -> S.unions (map collectVarsPat ps)
+    PPair _ p1 p2 -> collectVarsPat p1 <> collectVarsPat p2
 
 collectVarsShapeDim :: ShapeDim a -> Set Var
 collectVarsShapeDim dim =
@@ -628,6 +629,7 @@ substSliceDim v replacement dim =
 -- is complex and cannot be safely reduced here.
 substPat :: Pat a -> Exp a -> Exp a -> Maybe (Exp a)
 substPat (PVar _ v) arg body = Just (substExp v arg body)
+substPat (PBound _ v _) arg body = Just (substExp v arg body)
 substPat (PVec pa ps) arg body =
   -- For a vector/tuple pattern [x, y, ...], substitute arg_i for each p_i
   -- using EProj to extract each component. Use the PVec's own annotation for
@@ -636,6 +638,8 @@ substPat (PVec pa ps) arg body =
         acc' <- acc
         substPat p (EProj pa i arg) acc'
   in foldl go (Just body) (zip ps [0..])
+-- Complex patterns (e.g. PPair) cannot be safely reduced here; refuse to inline.
+substPat _ _ _ = Nothing
 
 -- | True when an expression represents a function value (has remaining
 -- parameters in a local let-binding), so that inlining it at application
@@ -1370,16 +1374,20 @@ appearsInNonScatterDefault name = go False
           EVar _ v ->
             -- Name found: bad unless we're inside a default chain
             v == name && not inDefault
-          EScatter _ _ d idx vals ->
+          EScatter _ comb d idx vals ->
+            countVarExp name comb > 0 ||    -- bad: in combine fn
             countVarExp name idx > 0 ||     -- bad: in index
             countVarExp name vals > 0 ||    -- bad: in values
             go True d                        -- follow default chain
-          EScatterGuarded _ _ d idx vals g ->
+          EScatterGuarded _ comb d idx vals g ->
+            countVarExp name comb > 0 ||
             countVarExp name idx > 0 ||
             countVarExp name vals > 0 ||
             countVarExp name g > 0 ||
             go True d
-          EPermute _ _ d _ arr ->
+          EPermute _ comb d permFn arr ->
+            countVarExp name comb > 0 ||
+            countVarExp name permFn > 0 ||
             countVarExp name arr > 0 ||
             go True d
           -- For all other expressions: name appearing here is not in a default chain.

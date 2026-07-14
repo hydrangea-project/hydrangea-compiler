@@ -56,7 +56,9 @@ findDependences accesses = do
   guard (aaArrayVar src == aaArrayVar tgt)
   guard (aaStmtIndex src < aaStmtIndex tgt)
   let (dir, dist) = analyzeIndex (aaIndex src) (aaIndex tgt)
-      loopCarried = aaStmtIndex src /= aaStmtIndex tgt
+      -- Loop-carried iff the dependence crosses iterations: a non-zero distance
+      -- in some dimension, or an unknown distance (conservatively carried).
+      loopCarried = maybe True (not . all (== 0)) dist
   return Dependence { depSource = src, depTarget = tgt, depDirection = dir, depIsLoopCarried = loopCarried, depDistance = dist }
 
 -- Analyze two IndexExprs conservatively.

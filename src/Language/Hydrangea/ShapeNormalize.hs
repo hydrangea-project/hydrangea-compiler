@@ -274,11 +274,10 @@ composeSliceDims innerDims outerDims =
       (SliceAll _, SliceAll a) -> SliceAll a
       -- All composed with Range = project from inner source
       (SliceAll _, SliceRange a start len) -> SliceRange a start len
-      -- Range composed with All = Range (offset)
-      (SliceRange _ innerStart _, SliceAll a) ->
-        -- The outer All wants the full range of the inner slice
-        -- So we keep the inner range but note it's offset
-        SliceAll a  -- Simplified: treat as taking all of sliced dim
+      -- Range composed with All = the inner range (outer All takes the whole
+      -- extent of the already-sliced dim, so both offset and length carry over).
+      (SliceRange a1 innerStart innerLen, SliceAll _) ->
+        SliceRange a1 innerStart innerLen
       -- Range composed with Range = compose ranges
       (SliceRange a1 innerStart innerLen, SliceRange a outerStart outerLen) ->
         SliceRange a (EBinOp a1 innerStart (Plus a1) outerStart) outerLen

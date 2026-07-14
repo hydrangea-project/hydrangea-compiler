@@ -34,7 +34,7 @@ import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
-import Language.Hydrangea.Lexer (Range)
+import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Util (stripStringQuotes)
 
@@ -1678,40 +1678,12 @@ lowerExp expr = case expr of
          , AVar arr
          )
 
-  EPermute _ _combExp defaultsExp _permFnExp srcExp -> do
-    (sd, ad) <- lowerExp defaultsExp
-    (ss, as') <- lowerExp srcExp
-    shpSrc <- freshCVar "shp"
-    shpDst <- freshCVar "shp"
-    out <- freshCVar "out"
-    nDst <- freshCVar "n"
-    nSrc <- freshCVar "n"
-    j <- freshIterVar "j"
-    i <- freshIterVar "i"
-    elemD <- freshCVar "elem"
-    idx <- freshCVar "idx"
-    permIdx <- freshCVar "pidx"
-    _flatPerm <- freshCVar "fp"
-    srcElem <- freshCVar "se"
-    registerCType idx CTTuple
-    noteDenseLinearIndex idx i
-    pure ( sd ++ ss
-         ++ [ SAssign shpDst (RArrayShape ad)
-            , SAssign out (RArrayAlloc (AVar shpDst))
-            , SAssign nDst (RShapeSize (AVar shpDst))
-            , SLoop (LoopSpec [j] [atomToIndexExpr (AVar nDst)] Serial Nothing LoopPlain [])
-                [SAssign elemD (RArrayLoad ad (AVar j)), SArrayWrite (AVar out) (AVar j) (AVar elemD)]
-            , SAssign shpSrc (RArrayShape as')
-            , SAssign nSrc (RShapeSize (AVar shpSrc))
-            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar nSrc)] Serial Nothing LoopPlain [])
-                ( [ SAssign srcElem (RArrayLoad as' (AVar i))
-                  , SAssign idx (RFlatToNd (AVar i) (AVar shpSrc))
-                  , SArrayWrite (AVar out) (AVar permIdx) (AVar srcElem)
-                  ]
-                )
-            ]
-         , AVar out
-         )
+  -- permute c d permFn arr  ≡  scatter c d (generate (shape arr) permFn) arr
+  -- (the same equivalence Fusion relies on; see Fusion.asScatter). Desugar and
+  -- reuse the scatter lowering rather than re-deriving the loop here.
+  EPermute ann combExp defaultsExp permFnExp srcExp ->
+    lowerExp (EScatter ann combExp defaultsExp
+                (EGenerate ann (EShapeOf ann srcExp) permFnExp) srcExp)
 
   EScatter _ combExp defaultsExp idxArrExp valsExp -> do
     (sd, ad) <- lowerExp defaultsExp
@@ -4022,7 +3994,7 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
         mPart <- lookupFn partialName
         case mPart of
           Just _ -> do
-            partStmts <- inlineArrayFn (EVar undefined partialName) paramVar resultVar
+            partStmts <- inlineArrayFn (EVar noRange partialName) paramVar resultVar
             pure $ sf ++ partStmts
           Nothing -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
       _ -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
@@ -4090,7 +4062,7 @@ inlineArrayFn1D fnExp paramVar resultVar = case fnExp of
         mPart <- lookupFn partialName
         case mPart of
           Just _ -> do
-            partStmts <- inlineArrayFn1D (EVar undefined partialName) paramVar resultVar
+            partStmts <- inlineArrayFn1D (EVar noRange partialName) paramVar resultVar
             pure $ sf ++ partStmts
           Nothing -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
       _ -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
@@ -4241,7 +4213,7 @@ inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of
         mPart <- lookupFn partialName
         case mPart of
           Just _ -> do
-            partStmts <- inlineBinaryFn (EVar undefined partialName) param1 param2 resultVar
+            partStmts <- inlineBinaryFn (EVar noRange partialName) param1 param2 resultVar
             pure $ sf ++ partStmts
           Nothing -> do
             t <- freshCVar "t"

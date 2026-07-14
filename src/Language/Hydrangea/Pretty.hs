@@ -223,6 +223,7 @@ instance Pretty (UnOperator a) where
   pPrint (CeilF  _) = text "ceil_f"
   pPrint (Erf    _) = text "erf"
   pPrint (FloatOf _) = text "float_of"
+  pPrint (IntOf _) = text "int_of"
 
 
 instance Pretty (Operator a) where
