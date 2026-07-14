@@ -837,59 +837,6 @@ lowerExp expr = case expr of
 
   -- Optimized: foldl over fill avoids allocating a temporary array.
   -- The fill element is loop-invariant; assign it once before the loop.
-  EFoldl _ fnExp initExp (EFill _ shapeExp valExp) -> do
-    (si, ai)  <- lowerExp initExp
-    (sv, av)  <- lowerExp valExp
-    acc   <- freshCVar "foldl_acc"
-    k     <- freshCVar "foldl_k"
-    elem' <- freshCVar "foldl_elem"
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    case shapeLength1DExp shapeExp of
-      Just lenExp -> do
-        (sl, alen) <- lowerExp lenExp
-        pure ( si ++ sl ++ sv
-             ++ [ SAssign acc   (RAtom ai)
-                , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr alen] Serial Nothing LoopFold [])
-                    bodyStmts
-                ]
-             , AVar acc
-             )
-      Nothing -> do
-        (ss, as') <- lowerExp shapeExp
-        n <- freshCVar "foldl_n"
-        pure ( si ++ ss ++ sv
-             ++ [ SAssign n     (RShapeSize as')
-                , SAssign acc   (RAtom ai)
-                , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                    bodyStmts
-                ]
-             , AVar acc
-             )
-
-  -- Optimized: foldl over generate avoids allocating a temporary array.
-  -- The generator body is inlined directly into the loop.
-  EFoldl _ fnExp initExp (EGenerate _ shapeExp genFnExp) -> do
-    (si, ai)  <- lowerExp initExp
-    (ss, as') <- lowerExp shapeExp
-    n     <- freshCVar "foldl_n"
-    acc   <- freshCVar "foldl_acc"
-    k     <- freshCVar "foldl_k"
-    elem' <- freshCVar "foldl_elem"
-    propagatePairInfo acc ai
-    genStmts  <- inlineArrayFn1D genFnExp k elem'
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    pure ( si ++ ss
-         ++ [ SAssign n   (RShapeSize as')
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( genStmts ++ bodyStmts )
-            ]
-         , AVar acc
-         )
-
   EIterate _ numExp initExp stepFnExp -> do
     (sn, an)  <- lowerExp numExp
     (si, ai)  <- lowerExp initExp
@@ -909,248 +856,21 @@ lowerExp expr = case expr of
          , AVar arr_cur
          )
 
-  EFoldl _ fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp  <- freshCVar "foldl_shp"
-    n    <- freshCVar "foldl_n"
-    acc  <- freshCVar "foldl_acc"
-    k    <- freshCVar "foldl_k"
-    elem' <- freshCVar "foldl_elem"
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign n (RShapeLast (AVar shp))
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( [ SAssign elem' (RArrayLoad aa (AVar k))
-                  ]
-                  ++ bodyStmts
-                )
-             ]
-         , AVar acc
-         )
+  EFoldl _ fnExp initExp arrExp ->
+    lowerFold Nothing fnExp initExp arrExp
   -- foldl_while: early-exit fold. Emits a break when the predicate on the
   -- accumulator is false before processing the next element.
-  EFoldlWhile _ predExp fnExp initExp (EFill _ shapeExp valExp) -> do
-    (si, ai)  <- lowerExp initExp
-    (sv, av)  <- lowerExp valExp
-    acc    <- freshCVar "foldl_acc"
-    k      <- freshCVar "foldl_k"
-    elem'  <- freshCVar "foldl_elem"
-    predV  <- freshCVar "foldl_pred"
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    predStmts <- inlineScalarFn predExp acc predV
-    case shapeLength1DExp shapeExp of
-      Just lenExp -> do
-        (sl, alen) <- lowerExp lenExp
-        pure ( si ++ sl ++ sv
-             ++ [ SAssign acc   (RAtom ai)
-                , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr alen] Serial Nothing LoopFold [])
-                    ( predStmts
-                      ++ [SIf (AVar predV) [] [SBreak]]
-                      ++ bodyStmts
-                    )
-                ]
-             , AVar acc
-             )
-      Nothing -> do
-        (ss, as') <- lowerExp shapeExp
-        n <- freshCVar "foldl_n"
-        pure ( si ++ ss ++ sv
-             ++ [ SAssign n     (RShapeSize as')
-                , SAssign acc   (RAtom ai)
-                , SAssign elem' (RAtom av)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                    ( predStmts
-                      ++ [SIf (AVar predV) [] [SBreak]]
-                      ++ bodyStmts
-                    )
-                ]
-             , AVar acc
-             )
+  EFoldlWhile _ predExp fnExp initExp arrExp ->
+    lowerFold (Just predExp) fnExp initExp arrExp
 
-  EFoldlWhile _ predExp fnExp initExp (EGenerate _ shapeExp genFnExp) -> do
-    (si, ai)  <- lowerExp initExp
-    (ss, as') <- lowerExp shapeExp
-    n      <- freshCVar "foldl_n"
-    acc    <- freshCVar "foldl_acc"
-    k      <- freshCVar "foldl_k"
-    elem'  <- freshCVar "foldl_elem"
-    predV  <- freshCVar "foldl_pred"
-    propagatePairInfo acc ai
-    genStmts  <- inlineArrayFn1D genFnExp k elem'
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    predStmts <- inlineScalarFn predExp acc predV
-    pure ( si ++ ss
-         ++ [ SAssign n   (RShapeSize as')
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( predStmts
-                  ++ [SIf (AVar predV) [] [SBreak]]
-                  ++ genStmts
-                  ++ bodyStmts
-                )
-            ]
-         , AVar acc
-         )
-
-  EFoldlWhile _ predExp fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp   <- freshCVar "foldl_shp"
-    n     <- freshCVar "foldl_n"
-    acc   <- freshCVar "foldl_acc"
-    k     <- freshCVar "foldl_k"
-    elem' <- freshCVar "foldl_elem"
-    predV <- freshCVar "foldl_pred"
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    predStmts <- inlineScalarFn predExp acc predV
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign n (RShapeLast (AVar shp))
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( predStmts
-                  ++ [SIf (AVar predV) [] [SBreak]]
-                  ++ [SAssign elem' (RArrayLoad aa (AVar k))]
-                  ++ bodyStmts
-                )
-            ]
-         , AVar acc
-         )
-
-  EScan _ fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp <- freshCVar "scan_shp"
-    n <- freshCVar "scan_n"
-    outArr <- freshCVar "scan_arr"
-    acc <- freshCVar "scan_acc"
-    k <- freshCVar "scan_k"
-    elem' <- freshCVar "scan_elem"
-    accTy <- ctypeOfAtom ai
-    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
-    when (accTy /= CTUnknown) $ do
-      registerCType acc accTy
-      registerCType outArr (CTArray accTy)
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign n (RShapeLast (AVar shp))
-            , SAssign outArr (RArrayAlloc (AVar shp))
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( [ SAssign elem' (RArrayLoad aa (AVar k))
-                  , SArrayWrite (AVar outArr) (AVar k) (AVar acc)
-                  ]
-                  ++ bodyStmts
-                )
-             ]
-          , AVar outArr
-          )
-  EScanInclusive _ fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp <- freshCVar "scan_incl_shp"
-    n <- freshCVar "scan_incl_n"
-    outArr <- freshCVar "scan_incl_arr"
-    acc <- freshCVar "scan_incl_acc"
-    k <- freshCVar "scan_incl_k"
-    elem' <- freshCVar "scan_incl_elem"
-    accTy <- ctypeOfAtom ai
-    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
-    when (accTy /= CTUnknown) $ do
-      registerCType acc accTy
-      registerCType outArr (CTArray accTy)
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign n (RShapeLast (AVar shp))
-            , SAssign outArr (RArrayAlloc (AVar shp))
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( [ SAssign elem' (RArrayLoad aa (AVar k)) ]
-                  ++ bodyStmts
-                  ++ [SArrayWrite (AVar outArr) (AVar k) (AVar acc)]
-                )
-             ]
-         , AVar outArr
-         )
-  EScanR _ fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp <- freshCVar "scanr_shp"
-    n <- freshCVar "scanr_n"
-    n1 <- freshCVar "scanr_n1"
-    outArr <- freshCVar "scanr_arr"
-    acc <- freshCVar "scanr_acc"
-    k <- freshCVar "scanr_k"
-    ix <- freshCVar "scanr_ix"
-    elem' <- freshCVar "scanr_elem"
-    accTy <- ctypeOfAtom ai
-    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
-    when (accTy /= CTUnknown) $ do
-      registerCType acc accTy
-      registerCType outArr (CTArray accTy)
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign n (RShapeLast (AVar shp))
-            , SAssign n1 (RBinOp CSub (AVar n) (AInt 1))
-            , SAssign outArr (RArrayAlloc (AVar shp))
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( [ SAssign ix (RBinOp CSub (AVar n1) (AVar k))
-                  , SAssign elem' (RArrayLoad aa (AVar ix))
-                  , SArrayWrite (AVar outArr) (AVar ix) (AVar acc)
-                  ]
-                  ++ bodyStmts
-                )
-             ]
-         , AVar outArr
-         )
-  EScanRInclusive _ fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp <- freshCVar "scanr_incl_shp"
-    n <- freshCVar "scanr_incl_n"
-    n1 <- freshCVar "scanr_incl_n1"
-    outArr <- freshCVar "scanr_incl_arr"
-    acc <- freshCVar "scanr_incl_acc"
-    k <- freshCVar "scanr_incl_k"
-    ix <- freshCVar "scanr_incl_ix"
-    elem' <- freshCVar "scanr_incl_elem"
-    accTy <- ctypeOfAtom ai
-    -- Only register concrete types; CTUnknown must not enter procTypeEnv.
-    when (accTy /= CTUnknown) $ do
-      registerCType acc accTy
-      registerCType outArr (CTArray accTy)
-    propagatePairInfo acc ai
-    bodyStmts <- inlineBinaryFn fnExp acc elem' acc
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign n (RShapeLast (AVar shp))
-            , SAssign n1 (RBinOp CSub (AVar n) (AInt 1))
-            , SAssign outArr (RArrayAlloc (AVar shp))
-            , SAssign acc (RAtom ai)
-            , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
-                ( [ SAssign ix (RBinOp CSub (AVar n1) (AVar k))
-                  , SAssign elem' (RArrayLoad aa (AVar ix))
-                  ]
-                  ++ bodyStmts
-                  ++ [SArrayWrite (AVar outArr) (AVar ix) (AVar acc)]
-                )
-             ]
-         , AVar outArr
-         )
+  EScan _ fnExp initExp arrExp ->
+    lowerScanFamily "scan" False False fnExp initExp arrExp
+  EScanInclusive _ fnExp initExp arrExp ->
+    lowerScanFamily "scan_incl" False True fnExp initExp arrExp
+  EScanR _ fnExp initExp arrExp ->
+    lowerScanFamily "scanr" True False fnExp initExp arrExp
+  EScanRInclusive _ fnExp initExp arrExp ->
+    lowerScanFamily "scanr_incl" True True fnExp initExp arrExp
   ESegmentedReduce _ fnExp initExp offsetsExp valsExp -> do
     (si, ai) <- lowerExp initExp
     (so, ao) <- lowerExp offsetsExp
@@ -3835,6 +3555,129 @@ scatterCombineWrite dst idxAtom oldVal newVal combStmts =
   [ SAssign oldVal (RArrayLoad dst idxAtom) ]
   ++ combStmts
   ++ [ SArrayWrite dst idxAtom (AVar newVal) ]
+
+-- | Lowering for the four scan variants.  @reverse'@ traverses the array
+-- right-to-left, writing at @ix = n-1-k@; @inclusive@ writes the /updated/
+-- accumulator after each step rather than the accumulator from before it.
+-- @prefix@ names the generated variables so each variant stays distinguishable.
+lowerScanFamily
+  :: ByteString -> Bool -> Bool
+  -> Exp Range -> Exp Range -> Exp Range
+  -> LowerM ([Stmt], Atom)
+lowerScanFamily prefix reverse' inclusive fnExp initExp arrExp = do
+  (si, ai) <- lowerExp initExp
+  (sa, aa) <- lowerExp arrExp
+  shp    <- freshCVar (prefix <> "_shp")
+  n      <- freshCVar (prefix <> "_n")
+  outArr <- freshCVar (prefix <> "_arr")
+  acc    <- freshCVar (prefix <> "_acc")
+  k      <- freshCVar (prefix <> "_k")
+  elem'  <- freshCVar (prefix <> "_elem")
+  accTy  <- ctypeOfAtom ai
+  -- Only register concrete types; CTUnknown must not enter procTypeEnv.
+  when (accTy /= CTUnknown) $ do
+    registerCType acc accTy
+    registerCType outArr (CTArray accTy)
+  propagatePairInfo acc ai
+  bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+  (idxAtom, dirPrelude, loopPrelude) <-
+    if reverse'
+      then do
+        n1 <- freshCVar (prefix <> "_n1")
+        ix <- freshCVar (prefix <> "_ix")
+        pure ( AVar ix
+             , [ SAssign n1 (RBinOp CSub (AVar n) (AInt 1)) ]
+             , [ SAssign ix (RBinOp CSub (AVar n1) (AVar k)) ] )
+      else pure (AVar k, [], [])
+  let loadElem = SAssign elem' (RArrayLoad aa idxAtom)
+      writeOut = SArrayWrite (AVar outArr) idxAtom (AVar acc)
+      stepBody
+        | inclusive = loopPrelude ++ [loadElem] ++ bodyStmts ++ [writeOut]
+        | otherwise = loopPrelude ++ [loadElem, writeOut] ++ bodyStmts
+  pure ( si ++ sa
+       ++ [ SAssign shp (RArrayShape aa)
+          , SAssign n (RShapeLast (AVar shp)) ]
+       ++ dirPrelude
+       ++ [ SAssign outArr (RArrayAlloc (AVar shp))
+          , SAssign acc (RAtom ai)
+          , SLoop (LoopSpec [k] [atomToIndexExpr (AVar n)] Serial Nothing LoopFold [])
+              stepBody
+          ]
+       , AVar outArr
+       )
+
+-- | Lowering for @foldl@ and @foldl_while@ over the three source forms
+-- (@fill@, @generate@, and a materialised array).  @mPred@ is 'Nothing' for a
+-- plain fold; @Just predExp@ adds the early-exit guard @predStmts ++ break@ that
+-- turns it into @foldl_while@.  The accumulator loops in @foldl_acc@ and the
+-- result is @AVar acc@.
+lowerFold
+  :: Maybe (Exp Range) -> Exp Range -> Exp Range -> Exp Range
+  -> LowerM ([Stmt], Atom)
+lowerFold mPred fnExp initExp arrExp = do
+  (si, ai) <- lowerExp initExp
+  acc   <- freshCVar "foldl_acc"
+  k     <- freshCVar "foldl_k"
+  elem' <- freshCVar "foldl_elem"
+  propagatePairInfo acc ai
+  bodyStmts <- inlineBinaryFn fnExp acc elem' acc
+  -- foldl_while prefixes each iteration with a predicate test that breaks the
+  -- loop before processing the next element; a plain foldl has no guard.
+  guardStmts <- case mPred of
+    Nothing -> pure []
+    Just predExp -> do
+      predV <- freshCVar "foldl_pred"
+      predStmts <- inlineScalarFn predExp acc predV
+      pure (predStmts ++ [SIf (AVar predV) [] [SBreak]])
+  let foldLoop bnd body = SLoop (LoopSpec [k] [bnd] Serial Nothing LoopFold []) body
+  case arrExp of
+    -- fill: the element is a constant, assigned once before the loop.
+    EFill _ shapeExp valExp -> do
+      (sv, av) <- lowerExp valExp
+      let loopBody = guardStmts ++ bodyStmts
+      case shapeLength1DExp shapeExp of
+        Just lenExp -> do
+          (sl, alen) <- lowerExp lenExp
+          pure ( si ++ sl ++ sv
+               ++ [ SAssign acc   (RAtom ai)
+                  , SAssign elem' (RAtom av)
+                  , foldLoop (atomToIndexExpr alen) loopBody
+                  ]
+               , AVar acc )
+        Nothing -> do
+          (ss, as') <- lowerExp shapeExp
+          n <- freshCVar "foldl_n"
+          pure ( si ++ ss ++ sv
+               ++ [ SAssign n     (RShapeSize as')
+                  , SAssign acc   (RAtom ai)
+                  , SAssign elem' (RAtom av)
+                  , foldLoop (atomToIndexExpr (AVar n)) loopBody
+                  ]
+               , AVar acc )
+    -- generate: inline the generator body into the loop; no temporary array.
+    EGenerate _ shapeExp genFnExp -> do
+      (ss, as') <- lowerExp shapeExp
+      n <- freshCVar "foldl_n"
+      genStmts <- inlineArrayFn1D genFnExp k elem'
+      pure ( si ++ ss
+           ++ [ SAssign n   (RShapeSize as')
+              , SAssign acc (RAtom ai)
+              , foldLoop (atomToIndexExpr (AVar n)) (guardStmts ++ genStmts ++ bodyStmts)
+              ]
+           , AVar acc )
+    -- materialised array: load each element from the array.
+    _ -> do
+      (sa, aa) <- lowerExp arrExp
+      shp <- freshCVar "foldl_shp"
+      n   <- freshCVar "foldl_n"
+      pure ( si ++ sa
+           ++ [ SAssign shp (RArrayShape aa)
+              , SAssign n (RShapeLast (AVar shp))
+              , SAssign acc (RAtom ai)
+              , foldLoop (atomToIndexExpr (AVar n))
+                  (guardStmts ++ [SAssign elem' (RArrayLoad aa (AVar k))] ++ bodyStmts)
+              ]
+           , AVar acc )
 
 inlineArrayFn :: Exp Range -> CVar -> CVar -> LowerM [Stmt]
 inlineArrayFn fnExp paramVar resultVar = case fnExp of
