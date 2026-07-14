@@ -48,7 +48,7 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
-import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..))
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..), mapRHSAtoms)
 import Language.Hydrangea.Util (unsnoc)
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis
@@ -133,38 +133,7 @@ substAtom env a = case a of
 -- information (operators, field names, type tags) is preserved; only
 -- leaf variable references are replaced.
 substRHS :: Map ByteString Atom -> RHS -> RHS
-substRHS env rhs =
-  let sub = substAtom env
-  in case rhs of
-    RAtom a                 -> RAtom (sub a)
-    RBinOp op a1 a2         -> RBinOp op (sub a1) (sub a2)
-    RUnOp op a              -> RUnOp op (sub a)
-    RTuple as               -> RTuple (map sub as)
-    RProj i a               -> RProj i (sub a)
-    RRecord fields          -> RRecord [(f, sub a) | (f, a) <- fields]
-    RRecordProj field a     -> RRecordProj field (sub a)
-    RArrayLoad a1 a2        -> RArrayLoad (sub a1) (sub a2)
-    RArrayAlloc a           -> RArrayAlloc (sub a)
-    RArrayCopy a            -> RArrayCopy (sub a)
-    RArrayShape a           -> RArrayShape (sub a)
-    RShapeSize a            -> RShapeSize (sub a)
-    RShapeInit a            -> RShapeInit (sub a)
-    RShapeLast a            -> RShapeLast (sub a)
-    RNdToFlat a shp         -> RNdToFlat (sub a) (sub shp)
-    RFlatToNd a shp         -> RFlatToNd (sub a) (sub shp)
-    R2DToFlat a w           -> R2DToFlat (sub a) (sub w)
-    RVecLoad a1 a2          -> RVecLoad (sub a1) (sub a2)
-    RVecStore a1 a2 a3      -> RVecStore (sub a1) (sub a2) (sub a3)
-    RVecBinOp op a1 a2      -> RVecBinOp op (sub a1) (sub a2)
-    RVecUnOp op a           -> RVecUnOp op (sub a)
-    RVecSplat a             -> RVecSplat (sub a)
-    RVecReduce op a         -> RVecReduce op (sub a)
-    RCall f args            -> RCall f (map sub args)
-    RPairMake ct1 ct2 a1 a2 -> RPairMake ct1 ct2 (sub a1) (sub a2)
-    RPairFst ct a           -> RPairFst ct (sub a)
-    RPairSnd ct a           -> RPairSnd ct (sub a)
-    RArrayFree a            -> RArrayFree (sub a)
-    _                       -> rhs
+substRHS env = mapRHSAtoms (substAtom env)
 
 -- | Apply a variable-to-atom substitution map throughout a list of
 -- statements, replacing every 'AVar' leaf that appears in the map.

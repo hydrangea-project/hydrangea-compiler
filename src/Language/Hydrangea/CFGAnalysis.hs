@@ -37,7 +37,7 @@ import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
-import Language.Hydrangea.CFGCore (Atom(..), RHS(..))
+import Language.Hydrangea.CFGCore (Atom(..), RHS(..), rhsAtoms)
 import Language.Hydrangea.CFG
 
 -- | Classification of a loop bound extracted from an @IndexExpr@.
@@ -179,35 +179,7 @@ usedVarsAtom _ = S.empty
 
 -- | Variables referenced by a right-hand-side expression.
 usedVarsRHS :: RHS -> Set ByteString
-usedVarsRHS rhs = case rhs of
-  RAtom a -> usedVarsAtom a
-  RBinOp _ a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
-  RUnOp _ a -> usedVarsAtom a
-  RTuple as -> S.unions (map usedVarsAtom as)
-  RProj _ a -> usedVarsAtom a
-  RRecord fields -> S.unions (map (usedVarsAtom . snd) fields)
-  RRecordProj _ a -> usedVarsAtom a
-  RArrayLoad a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
-  RArrayAlloc a -> usedVarsAtom a
-  RArrayCopy a -> usedVarsAtom a
-  RArrayShape a -> usedVarsAtom a
-  RShapeSize a -> usedVarsAtom a
-  RShapeInit a -> usedVarsAtom a
-  RShapeLast a -> usedVarsAtom a
-  RFlatToNd a shp -> usedVarsAtom a `S.union` usedVarsAtom shp
-  RNdToFlat a shp -> usedVarsAtom a `S.union` usedVarsAtom shp
-  R2DToFlat a w -> usedVarsAtom a `S.union` usedVarsAtom w
-  RCall _ args -> S.unions (map usedVarsAtom args)
-  RVecLoad a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
-  RVecStore a1 a2 a3 -> S.unions [usedVarsAtom a1, usedVarsAtom a2, usedVarsAtom a3]
-  RVecBinOp _ a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
-  RVecUnOp _ a -> usedVarsAtom a
-  RVecSplat a -> usedVarsAtom a
-  RVecReduce _ a -> usedVarsAtom a
-  RPairMake _ _ a1 a2 -> S.union (usedVarsAtom a1) (usedVarsAtom a2)
-  RPairFst _ a -> usedVarsAtom a
-  RPairSnd _ a -> usedVarsAtom a
-  RArrayFree a -> usedVarsAtom a
+usedVarsRHS = S.unions . map usedVarsAtom . rhsAtoms
 
 -- | Collect variables referenced by an 'IndexExpr'.
 usedVarsIndexExpr :: IndexExpr -> Set ByteString

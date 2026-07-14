@@ -15,6 +15,8 @@ module Language.Hydrangea.CFGCore
   , UnOp(..)
   , Atom(..)
   , RHS(..)
+  , rhsAtoms
+  , mapRHSAtoms
   , Redop(..)
   , CElemType(..)
   , CType(..)
@@ -165,6 +167,70 @@ data RHS
   | RVecReduce BinOp Atom
   | RArrayFree Atom
   deriving (Eq, Show)
+
+-- | All atoms directly referenced by a right-hand side, in left-to-right order.
+rhsAtoms :: RHS -> [Atom]
+rhsAtoms rhs = case rhs of
+  RAtom a             -> [a]
+  RBinOp _ a b        -> [a, b]
+  RUnOp _ a           -> [a]
+  RTuple as           -> as
+  RProj _ a           -> [a]
+  RRecord fields      -> map snd fields
+  RRecordProj _ a     -> [a]
+  RPairMake _ _ a b   -> [a, b]
+  RPairFst _ a        -> [a]
+  RPairSnd _ a        -> [a]
+  RArrayAlloc a       -> [a]
+  RArrayCopy a        -> [a]
+  RArrayLoad a b      -> [a, b]
+  RArrayShape a       -> [a]
+  RShapeSize a        -> [a]
+  RShapeInit a        -> [a]
+  RShapeLast a        -> [a]
+  RFlatToNd a b       -> [a, b]
+  RNdToFlat a b       -> [a, b]
+  R2DToFlat a b       -> [a, b]
+  RCall _ args        -> args
+  RVecLoad a b        -> [a, b]
+  RVecStore a b c     -> [a, b, c]
+  RVecBinOp _ a b     -> [a, b]
+  RVecUnOp _ a        -> [a]
+  RVecSplat a         -> [a]
+  RVecReduce _ a      -> [a]
+  RArrayFree a        -> [a]
+
+-- | Transform every atom of a right-hand side, preserving its structure.
+mapRHSAtoms :: (Atom -> Atom) -> RHS -> RHS
+mapRHSAtoms f rhs = case rhs of
+  RAtom a               -> RAtom (f a)
+  RBinOp op a b         -> RBinOp op (f a) (f b)
+  RUnOp op a            -> RUnOp op (f a)
+  RTuple as             -> RTuple (map f as)
+  RProj i a             -> RProj i (f a)
+  RRecord fields        -> RRecord [(field, f a) | (field, a) <- fields]
+  RRecordProj field a   -> RRecordProj field (f a)
+  RPairMake c1 c2 a b   -> RPairMake c1 c2 (f a) (f b)
+  RPairFst c a          -> RPairFst c (f a)
+  RPairSnd c a          -> RPairSnd c (f a)
+  RArrayAlloc a         -> RArrayAlloc (f a)
+  RArrayCopy a          -> RArrayCopy (f a)
+  RArrayLoad a b        -> RArrayLoad (f a) (f b)
+  RArrayShape a         -> RArrayShape (f a)
+  RShapeSize a          -> RShapeSize (f a)
+  RShapeInit a          -> RShapeInit (f a)
+  RShapeLast a          -> RShapeLast (f a)
+  RFlatToNd a b         -> RFlatToNd (f a) (f b)
+  RNdToFlat a b         -> RNdToFlat (f a) (f b)
+  R2DToFlat a b         -> R2DToFlat (f a) (f b)
+  RCall fn args         -> RCall fn (map f args)
+  RVecLoad a b          -> RVecLoad (f a) (f b)
+  RVecStore a b c       -> RVecStore (f a) (f b) (f c)
+  RVecBinOp op a b      -> RVecBinOp op (f a) (f b)
+  RVecUnOp op a         -> RVecUnOp op (f a)
+  RVecSplat a           -> RVecSplat (f a)
+  RVecReduce op a       -> RVecReduce op (f a)
+  RArrayFree a          -> RArrayFree (f a)
 
 -- | Reduction operators used by @ReductionSpec@ in CFG.
 data Redop = RAdd | RMul

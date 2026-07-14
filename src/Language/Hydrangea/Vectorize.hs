@@ -48,7 +48,7 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Set (Set)
 import Data.Set qualified as S
-import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..))
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), rhsAtoms, mapRHSAtoms)
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis (LoopBound(..), analyzeLoop, isVectorizableLoop)
@@ -226,105 +226,16 @@ atomRefsVector env atom = case atom of
   _ -> False
 
 substScalarRHS :: CVar -> CVar -> C.RHS -> C.RHS
-substScalarRHS iter base rhs = case rhs of
-  C.RAtom a -> C.RAtom (substScalarAtom iter base a)
-  C.RBinOp op a b -> C.RBinOp op (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RUnOp op a -> C.RUnOp op (substScalarAtom iter base a)
-  C.RTuple as -> C.RTuple (map (substScalarAtom iter base) as)
-  C.RProj i a -> C.RProj i (substScalarAtom iter base a)
-  C.RRecord fields -> C.RRecord [(field, substScalarAtom iter base atom) | (field, atom) <- fields]
-  C.RRecordProj field a -> C.RRecordProj field (substScalarAtom iter base a)
-  C.RPairMake ct1 ct2 a b -> C.RPairMake ct1 ct2 (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RPairFst ct a -> C.RPairFst ct (substScalarAtom iter base a)
-  C.RPairSnd ct a -> C.RPairSnd ct (substScalarAtom iter base a)
-  C.RArrayAlloc a -> C.RArrayAlloc (substScalarAtom iter base a)
-  C.RArrayCopy a -> C.RArrayCopy (substScalarAtom iter base a)
-  C.RArrayLoad a b -> C.RArrayLoad (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RArrayShape a -> C.RArrayShape (substScalarAtom iter base a)
-  C.RShapeSize a -> C.RShapeSize (substScalarAtom iter base a)
-  C.RShapeInit a -> C.RShapeInit (substScalarAtom iter base a)
-  C.RShapeLast a -> C.RShapeLast (substScalarAtom iter base a)
-  C.RFlatToNd a b -> C.RFlatToNd (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RNdToFlat a b -> C.RNdToFlat (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.R2DToFlat a b -> C.R2DToFlat (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RCall f args -> C.RCall f (map (substScalarAtom iter base) args)
-  C.RVecUnOp op a -> C.RVecUnOp op (substScalarAtom iter base a)
-  C.RVecLoad a b -> C.RVecLoad (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RVecStore a b c -> C.RVecStore (substScalarAtom iter base a) (substScalarAtom iter base b) (substScalarAtom iter base c)
-  C.RVecBinOp op a b -> C.RVecBinOp op (substScalarAtom iter base a) (substScalarAtom iter base b)
-  C.RVecSplat a -> C.RVecSplat (substScalarAtom iter base a)
-  C.RVecReduce op a -> C.RVecReduce op (substScalarAtom iter base a)
-  C.RArrayFree a -> C.RArrayFree (substScalarAtom iter base a)
+substScalarRHS iter base = mapRHSAtoms (substScalarAtom iter base)
 
 rhsRefsVector :: VecEnv -> C.RHS -> Bool
-rhsRefsVector env rhs = case rhs of
-  C.RAtom a -> atomRefsVector env a
-  C.RBinOp _ a b -> atomRefsVector env a || atomRefsVector env b
-  C.RUnOp _ a -> atomRefsVector env a
-  C.RTuple as -> any (atomRefsVector env) as
-  C.RProj _ a -> atomRefsVector env a
-  C.RRecord fields -> any (atomRefsVector env . snd) fields
-  C.RRecordProj _ a -> atomRefsVector env a
-  C.RPairMake _ _ a b -> atomRefsVector env a || atomRefsVector env b
-  C.RPairFst _ a -> atomRefsVector env a
-  C.RPairSnd _ a -> atomRefsVector env a
-  C.RArrayAlloc a -> atomRefsVector env a
-  C.RArrayCopy a -> atomRefsVector env a
-  C.RArrayLoad a b -> atomRefsVector env a || atomRefsVector env b
-  C.RArrayShape a -> atomRefsVector env a
-  C.RShapeSize a -> atomRefsVector env a
-  C.RShapeInit a -> atomRefsVector env a
-  C.RShapeLast a -> atomRefsVector env a
-  C.RFlatToNd a b -> atomRefsVector env a || atomRefsVector env b
-  C.RNdToFlat a b -> atomRefsVector env a || atomRefsVector env b
-  C.R2DToFlat a b -> atomRefsVector env a || atomRefsVector env b
-  C.RCall _ args -> any (atomRefsVector env) args
-  C.RVecLoad a b -> atomRefsVector env a || atomRefsVector env b
-  C.RVecStore a b c -> any (atomRefsVector env) [a, b, c]
-  C.RVecBinOp _ a b -> atomRefsVector env a || atomRefsVector env b
-  C.RVecUnOp _ a -> atomRefsVector env a
-  C.RVecSplat a -> atomRefsVector env a
-  C.RVecReduce _ a -> atomRefsVector env a
-  C.RArrayFree a -> atomRefsVector env a
+rhsRefsVector env = any (atomRefsVector env) . rhsAtoms
 
 supportedVecBinOp :: BinOp -> Bool
 supportedVecBinOp op = op `elem` [CAddF, CSubF, CMulF, CDivF]
 
 supportedVecUnOp :: C.UnOp -> Bool
 supportedVecUnOp op = op `elem` [C.CSqrt, C.CExpF, C.CLog, C.CErf]
-
--- | Atoms directly referenced by a right-hand side.  Used to compute which
--- variables vary from lane to lane within a vectorized loop body.
-rhsAtoms :: C.RHS -> [Atom]
-rhsAtoms rhs = case rhs of
-  C.RAtom a -> [a]
-  C.RBinOp _ a b -> [a, b]
-  C.RUnOp _ a -> [a]
-  C.RTuple as -> as
-  C.RProj _ a -> [a]
-  C.RRecord fields -> map snd fields
-  C.RRecordProj _ a -> [a]
-  C.RPairMake _ _ a b -> [a, b]
-  C.RPairFst _ a -> [a]
-  C.RPairSnd _ a -> [a]
-  C.RArrayAlloc a -> [a]
-  C.RArrayCopy a -> [a]
-  C.RArrayLoad a b -> [a, b]
-  C.RArrayShape a -> [a]
-  C.RShapeSize a -> [a]
-  C.RShapeInit a -> [a]
-  C.RShapeLast a -> [a]
-  C.RFlatToNd a b -> [a, b]
-  C.RNdToFlat a b -> [a, b]
-  C.R2DToFlat a b -> [a, b]
-  C.RCall _ args -> args
-  C.RVecLoad a b -> [a, b]
-  C.RVecStore a b c -> [a, b, c]
-  C.RVecBinOp _ a b -> [a, b]
-  C.RVecUnOp _ a -> [a]
-  C.RVecSplat a -> [a]
-  C.RVecReduce _ a -> [a]
-  C.RArrayFree a -> [a]
 
 -- | Compute the set of variables whose value varies from lane to lane within a
 -- vectorized loop, i.e. those transitively derived from the loop iteration
