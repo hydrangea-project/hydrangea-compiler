@@ -1021,11 +1021,7 @@ genMultiPhaseHarness _rp bodyNoRet phases retAtom typeEnv arrayElemTys retKinds 
             ++ fill
             ++ ["    id<MTLBuffer> _bufshape_" ++ nm ++ " = [_dev newBufferWithBytes:&" ++ nm ++ "->shape length:sizeof(hyd_tuple_t) options:MTLResourceStorageModeShared];"]
 
-    mslElemTy v = case Map.lookup v arrayElemTys of
-      Just elt -> mslTypeName elt
-      Nothing -> case Map.lookup v typeEnv of
-        Just (CTArray elt) -> mslTypeName elt
-        _ -> "long"
+    mslElemTy = mslElemTyOf arrayElemTys typeEnv
     scalarTyOf v = case Map.lookup v typeEnv of
       Just ct -> mslTypeName ct
       _ -> "long"
@@ -1354,11 +1350,7 @@ genExportObjCHarness _prog ka spec cachedArrayBindings retKinds _retTypes helper
     scals = kaScalarInputs ka
     nIn = length inputArrs
 
-    mslElemTy v = case Map.lookup v arrayElemTys of
-      Just elt -> mslTypeName elt
-      Nothing -> case Map.lookup v typeEnv of
-        Just (CTArray elt) -> mslTypeName elt
-        _ -> "long"
+    mslElemTy = mslElemTyOf arrayElemTys typeEnv
 
     -- Static declarations for cached GPU buffers
     genCachedBufDecl (v, _fn) =
@@ -2251,6 +2243,16 @@ mslTypeName (CTPair t1 t2)
       mslPairStructName ce1 ce2
 mslTypeName _ = "long"
 
+-- | Metal element-type name for an array variable: prefer the explicit
+-- array-element-type map, fall back to the (array) type in the type
+-- environment, and default to @long@.
+mslElemTyOf :: Map CVar CType -> TypeEnv -> CVar -> String
+mslElemTyOf arrayElemTys typeEnv v = case Map.lookup v arrayElemTys of
+  Just elt -> mslTypeName elt
+  Nothing -> case Map.lookup v typeEnv of
+    Just (CTArray elt) -> mslTypeName elt
+    _ -> "long"
+
 -- | Whether a CType contains a @CTDouble@ anywhere — including under arrays and
 -- (nested) pairs, e.g. nbody's @((float, float), float)@ element type.
 ctypeHasFloat :: CType -> Bool
@@ -2462,11 +2464,7 @@ genMSLKernelFunction
         ]
       gidParam = "uint " ++ sanitize gidVar ++ " [[thread_position_in_grid]]"
 
-      mslElemTy v = case Map.lookup v arrayElemTys of
-        Just elt -> mslTypeName elt
-        Nothing -> case Map.lookup v typeEnv of
-          Just (CTArray elt) -> mslTypeName elt
-          _ -> "long"
+      mslElemTy = mslElemTyOf arrayElemTys typeEnv
 
       mslScalarTy v = case Map.lookup v typeEnv of
         Just ct -> mslTypeName ct
@@ -3272,11 +3270,7 @@ genObjCHarnessSrc
               "      printf(\"]\\n\"); }"
             ]
 
-      mslElemTy v = case Map.lookup v arrayElemTys of
-        Just elt -> mslTypeName elt
-        Nothing -> case Map.lookup v typeEnv of
-          Just (CTArray elt) -> mslTypeName elt
-          _ -> "long"
+      mslElemTy = mslElemTyOf arrayElemTys typeEnv
 
       scalarTy v = case Map.lookup v typeEnv of
         Just ct -> mslTypeName ct
@@ -3449,7 +3443,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
     -- Input buffer for one array. Reuse GPU buffer if the origin is a prior kernel.
     genInputBuf ki p te ae (v, sub) =
       let bufName = p ++ "buf" ++ show sub
-          elemTy = mslElemTyFor ae te v
+          elemTy = mslElemTyOf ae te v
        in case Map.lookup v gpuAliases of
             Just producerVar ->
               -- Reuse the GPU buffer from the producing kernel
@@ -3491,7 +3485,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
 
     genOutputBuf ki p ka te ae (v, sub) =
       let bufName = p ++ "buf" ++ show sub
-          elemTy = mslElemTyFor ae te v
+          elemTy = mslElemTyOf ae te v
           outputAllocShapes =
             Map.fromList
               [(ov, shpAtom) | CFG.SAssign ov (RArrayAlloc shpAtom) <- kaEffectivePreLoop ka]
@@ -3633,7 +3627,7 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
               [ let sub = nIn * 2 + idx
                     bufName = p ++ "buf" ++ show sub
                     sizeVar = p ++ "outN" ++ show sub
-                    elemTy = mslElemTyFor ae te v
+                    elemTy = mslElemTyOf ae te v
                     fmt = if elemTy == "float" then "%.17g" else "%ld"
                     cast = if elemTy == "float" then "(double)" else "(long)"
                  in [ "    // Print output: " ++ sanitize v,
@@ -3648,11 +3642,6 @@ genMultiKernelHarnessSrc _prog kernels bufferOrigins gpuAliases retKinds _retTyp
               | (idx, v) <- zip [0 ..] outArrs
               ]
 
-    mslElemTyFor ae te v = case Map.lookup v ae of
-      Just elt -> mslTypeName elt
-      Nothing -> case Map.lookup v te of
-        Just (CTArray elt) -> mslTypeName elt
-        _ -> "long"
 
 -- | Pre-loop line generator for multi-kernel harness.
 -- For GPU-produced arrays, emits a shape-only stub instead of calling the
