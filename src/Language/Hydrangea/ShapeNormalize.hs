@@ -17,6 +17,7 @@ module Language.Hydrangea.ShapeNormalize
   ( normalizeShapesExp
   , normalizeShapesDec
   , normalizeShapesDecs
+  , sliceShape
   ) where
 
 import Control.Monad.State

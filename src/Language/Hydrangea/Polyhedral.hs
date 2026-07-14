@@ -82,6 +82,7 @@ import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsIndexExpr, usedVarsStmt, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
 import Language.Hydrangea.CFGOpt (substStmts)
+import Language.Hydrangea.Util (unsnoc)
 
 type StmtId = [Int]
 
@@ -3446,11 +3447,6 @@ localLoop td role body =
        , lsRole = role
        }
      (assignOrigIter td : body)
-
-unsnoc :: [a] -> Maybe ([a], a)
-unsnoc xs = case reverse xs of
-  [] -> Nothing
-  y : ys -> Just (reverse ys, y)
 
 splitFirstMatching :: (a -> Bool) -> [a] -> Maybe ([a], a, [a])
 splitFirstMatching matches xs =

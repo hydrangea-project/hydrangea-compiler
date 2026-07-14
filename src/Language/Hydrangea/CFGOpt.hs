@@ -49,11 +49,13 @@ import Data.Maybe (listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), RHS(..))
+import Language.Hydrangea.Util (unsnoc)
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis
   ( definedVarsStmts
   , usedVarsAtom
   , usedVarsRHS
+  , usedVarsStmt
   , usedVarsStmts
   , usedVarsIndexExpr
   )
@@ -1179,19 +1181,13 @@ sinkUnusedIntoGuard = concatMap goStmt
     goStmt s = [s]
 
     sinkInBody :: [Stmt] -> [Stmt]
-    sinkInBody body = case unsnocBody body of
+    sinkInBody body = case unsnoc body of
       Just (prefix, SIf cond thn []) ->
         let (toSink, toKeep) = backwardSinkPass cond prefix
         in if null toSink
              then body
              else toKeep ++ [SIf cond (toSink ++ thn) []]
       _ -> body
-
-    unsnocBody :: [Stmt] -> Maybe ([Stmt], Stmt)
-    unsnocBody [] = Nothing
-    unsnocBody xs = case reverse xs of
-      (y : rest) -> Just (reverse rest, y)
-      _ -> Nothing
 
     -- Backward dataflow over the prefix (right-to-left).  See haddock
     -- on 'sinkUnusedIntoGuard' above for the soundness argument.
@@ -1207,20 +1203,9 @@ sinkUnusedIntoGuard = concatMap goStmt
             | otherwise ->
                 (sinkAcc, stmt : keepAcc, keptUses `S.union` usedVarsRHS rhs)
           _ ->
+            -- usedVarsStmt counts variables referenced in a loop's bounds, so a
+            -- statement whose bound reads a var keeps that var live.
             (sinkAcc, stmt : keepAcc, keptUses `S.union` usedVarsStmt stmt)
-
-    usedVarsStmt :: Stmt -> Set ByteString
-    usedVarsStmt stmt = case stmt of
-      SAssign _ rhs       -> usedVarsRHS rhs
-      SArrayWrite a i v   -> usedVarsAtom a `S.union` usedVarsAtom i `S.union` usedVarsAtom v
-      SIf cond thn els    ->
-        usedVarsAtom cond
-          `S.union` usedVarsStmts thn
-          `S.union` usedVarsStmts els
-      SLoop _ inner       -> usedVarsStmts inner
-      SParallelRegion inner -> usedVarsStmts inner
-      SReturn a           -> usedVarsAtom a
-      SBreak              -> S.empty
 
 ------------------------------------------------------------------------
 -- Combined optimization pipeline

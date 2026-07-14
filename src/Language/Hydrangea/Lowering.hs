@@ -36,7 +36,7 @@ import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
 import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Syntax
-import Language.Hydrangea.Util (stripStringQuotes)
+import Language.Hydrangea.Util (stripStringQuotes, unsnoc)
 
 data LowerState = LowerState
   { lsFresh :: !Int
@@ -3481,10 +3481,6 @@ propagateTupleDenseLinearIndex dst atoms =
         _ -> pure ()
     Nothing ->
       pure ()
-  where
-    unsnoc xs = case reverse xs of
-      [] -> Nothing
-      y : ys -> Just (reverse ys, y)
 
 noteDenseReadAtom :: Atom -> LowerM ()
 noteDenseReadAtom =
@@ -3884,6 +3880,12 @@ is1DShapeExp :: Exp a -> Bool
 is1DShapeExp (EVec _ [_]) = True
 is1DShapeExp _            = False
 
+-- | Extract the single variable bound by a simple (PVar/PBound) pattern.
+patVar :: Pat a -> Maybe Var
+patVar (PVar _ v)     = Just v
+patVar (PBound _ v _) = Just v
+patVar _              = Nothing
+
 inlineArrayFn :: Exp Range -> CVar -> CVar -> LowerM [Stmt]
 inlineArrayFn fnExp paramVar resultVar = case fnExp of
   EVar _ name -> do
@@ -3892,16 +3894,7 @@ inlineArrayFn fnExp paramVar resultVar = case fnExp of
       Just ([pat], body) -> do
         (stmts, atom) <- lowerExp body
         case pat of
-          PVar _ x -> do
-            px <- freshCVar "p"
-            let stmts' = renameVarInStmts x px stmts
-                atom' = renameVarInAtom x px atom
-            atomTy <- ctypeOfAtom atom'
-            registerCType resultVar atomTy
-            propagatePairInfo resultVar atom'
-            bindParam <- bindCopyVar px (AVar paramVar)
-            pure $ bindParam ++ stmts' ++ [SAssign resultVar (RAtom atom')]
-          PBound _ x _ -> do
+          _ | Just x <- patVar pat -> do
             px <- freshCVar "p"
             let stmts' = renameVarInStmts x px stmts
                 atom' = renameVarInAtom x px atom
@@ -3968,16 +3961,10 @@ inlineArrayFn1D fnExp paramVar resultVar = case fnExp of
     case mFn of
       Just ([pat], body) -> do
         bindStmts <- case pat of
-          PVar _ x -> do
+          _ | Just x <- patVar pat -> do
             propagateDenseLinearIndex x (AVar paramVar)
             bindCopyVar x (AVar paramVar)
-          PBound _ x _ -> do
-            propagateDenseLinearIndex x (AVar paramVar)
-            bindCopyVar x (AVar paramVar)
-          PVec _ [PVar _ x] -> do
-            propagateDenseLinearIndex x (AVar paramVar)
-            bindCopyVar x (AVar paramVar)
-          PVec _ [PBound _ x _] -> do
+          PVec _ [p] | Just x <- patVar p -> do
             propagateDenseLinearIndex x (AVar paramVar)
             bindCopyVar x (AVar paramVar)
           PVec _ [p] -> do
@@ -4020,23 +4007,11 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
   EVar _ name -> do
     mFn <- lookupFn name
     case mFn of
-      Just ([PVar _ x], body) -> do
+      Just ([pat], body) | Just x <- patVar pat -> do
         -- Propagate paramVar's type to x before lowering the body so that
         -- index-pattern functions applied to x inside (e.g. `row_of x` where
         -- row_of expects [i]) can correctly determine whether to wrap the
         -- argument in a tuple.
-        paramTy <- ctypeOfAtom (AVar paramVar)
-        when (paramTy /= CTUnknown) $ registerCType x paramTy
-        (stmts, atom) <- lowerExp body
-        px <- freshCVar "p"
-        let stmts' = renameVarInStmts x px stmts
-            atom' = renameVarInAtom x px atom
-        atomTy <- ctypeOfAtom atom'
-        registerCType resultVar atomTy
-        propagatePairInfo resultVar atom'
-        bindParam <- bindCopyVar px (AVar paramVar)
-        pure $ bindParam ++ stmts' ++ [SAssign resultVar (RAtom atom')]
-      Just ([PBound _ x _], body) -> do
         paramTy <- ctypeOfAtom (AVar paramVar)
         when (paramTy /= CTUnknown) $ registerCType x paramTy
         (stmts, atom) <- lowerExp body

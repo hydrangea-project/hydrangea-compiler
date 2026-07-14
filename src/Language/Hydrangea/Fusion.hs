@@ -58,7 +58,8 @@ import Data.Map.Strict qualified as M
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.Syntax
-import Language.Hydrangea.ShapeNormalize (normalizeShapesExp)
+import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, sliceShape)
+import Language.Hydrangea.Uniquify (collectVarsExp, collectVarsDec)
 
 -- | Track used variables to avoid capture, plus a fresh counter.
 data FusionState = FusionState
@@ -68,117 +69,6 @@ data FusionState = FusionState
 
 newtype FusionM a = FusionM {runFusionM :: State FusionState a}
   deriving (Functor, Applicative, Monad, MonadState FusionState)
-
--- | Collect all variable names appearing in an expression.
-collectVarsExp :: Exp a -> Set Var
-collectVarsExp expr =
-  case expr of
-    EInt _ _ -> S.empty
-    EFloat _ _ -> S.empty
-    EVar _ v -> S.singleton v
-    EString _ _ -> S.empty
-    EUnit _ -> S.empty
-    EBool _ _ -> S.empty
-    EVec _ es -> S.unions (map collectVarsExp es)
-    EApp _ f x -> collectVarsExp f `S.union` collectVarsExp x
-    EIfThen _ c t -> collectVarsExp c `S.union` collectVarsExp t
-    EIfThenElse _ c t f -> collectVarsExp c `S.union` collectVarsExp t `S.union` collectVarsExp f
-    ENeg _ e -> collectVarsExp e
-    EBinOp _ l _ r -> collectVarsExp l `S.union` collectVarsExp r
-    EUnOp _ _ e -> collectVarsExp e
-    EOp _ _ -> S.empty
-    ELetIn _ d e -> collectVarsDec d `S.union` collectVarsExp e
-    EProj _ _ e -> collectVarsExp e
-    EPair _ e1 e2 -> collectVarsExp e1 `S.union` collectVarsExp e2
-    ERecord _ fields -> S.unions (map (collectVarsExp . snd) fields)
-    ERecordProj _ e _ -> collectVarsExp e
-    EGenerate _ sz f -> collectVarsExp sz `S.union` collectVarsExp f
-    EMap _ f arr -> collectVarsExp f `S.union` collectVarsExp arr
-    EZipWith _ f a b -> collectVarsExp f `S.union` collectVarsExp a `S.union` collectVarsExp b
-    EReduce _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    EReduceGenerate _ f z shape gen -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp shape `S.union` collectVarsExp gen
-    EIterate _ n initArr f -> collectVarsExp n `S.union` collectVarsExp initArr `S.union` collectVarsExp f
-    EFoldl _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    EFoldlWhile _ p f z arr -> collectVarsExp p `S.union` collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    EScan _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    EScanInclusive _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    EScanR _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    EScanRInclusive _ f z arr -> collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp arr
-    ESegmentedReduce _ f z offsets vals ->
-      collectVarsExp f `S.union` collectVarsExp z `S.union` collectVarsExp offsets `S.union` collectVarsExp vals
-    ESortIndices _ arr -> collectVarsExp arr
-    EIota _ n -> collectVarsExp n
-    EMakeIndex _ n arr -> collectVarsExp n `S.union` collectVarsExp arr
-    ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
-      collectVarsExp nrows `S.union` collectVarsExp ncols `S.union` collectVarsExp nnz
-        `S.union` collectVarsExp rows `S.union` collectVarsExp cols `S.union` collectVarsExp vals
-    ECSRFromSortedCOO _ nrows ncols nnz rows cols vals ->
-      collectVarsExp nrows `S.union` collectVarsExp ncols `S.union` collectVarsExp nnz
-        `S.union` collectVarsExp rows `S.union` collectVarsExp cols `S.union` collectVarsExp vals
-    EPermute _ c d p a -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp p `S.union` collectVarsExp a
-    EScatter _ c d idx v -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp v
-    EScatterGuarded _ c d idx v g -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp v `S.union` collectVarsExp g
-    EScatterGenerate _ c d idx f -> collectVarsExp c `S.union` collectVarsExp d `S.union` collectVarsExp idx `S.union` collectVarsExp f
-    EScatterChain _ c d phases ->
-      collectVarsExp c `S.union` collectVarsExp d
-        `S.union` S.unions (map (\p -> collectVarsExp (spIndex p) `S.union` collectVarsExp (spValues p)
-                                        `S.union` maybe S.empty collectVarsExp (spGuard p)) phases)
-    EScatterGen _ c d phases ->
-      collectVarsExp c `S.union` collectVarsExp d
-        `S.union` S.unions (map (\p -> collectVarsExp (sgpShape p) `S.union` collectVarsExp (sgpIndexFn p)
-                                         `S.union` collectVarsExp (sgpValueFn p)
-                                         `S.union` maybe S.empty collectVarsExp (sgpGuardFn p)) phases)
-    EAppend _ a b -> collectVarsExp a `S.union` collectVarsExp b
-    EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
-    EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
-    ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a
-    EFill _ s v -> collectVarsExp s `S.union` collectVarsExp v
-    EShapeOf _ a -> collectVarsExp a
-    EReplicate _ dims a -> S.unions (collectVarsShapeDim <$> dims) `S.union` collectVarsExp a
-    ESlice _ dims a -> S.unions (collectVarsSliceDim <$> dims) `S.union` collectVarsExp a
-    EReshape _ s a -> collectVarsExp s `S.union` collectVarsExp a
-    EReadArray _ s f -> collectVarsExp s `S.union` collectVarsExp f
-    EReadArrayFloat _ s f -> collectVarsExp s `S.union` collectVarsExp f
-    EWriteArray _ arr f -> collectVarsExp arr `S.union` collectVarsExp f
-    EWriteArrayFloat _ arr f -> collectVarsExp arr `S.union` collectVarsExp f
-    EGetEnvInt _ e -> collectVarsExp e
-    EGetEnvString _ e -> collectVarsExp e
-    EStencil _ bnd f arr ->
-      collectVarsBndFusion bnd `S.union` collectVarsExp f `S.union` collectVarsExp arr
-    EBoundLetIn _ x boundExp rhs body ->
-      S.insert x (collectVarsExp boundExp `S.union` collectVarsExp rhs `S.union` collectVarsExp body)
-    EReify _ e -> collectVarsExp e
-
-collectVarsBndFusion :: BoundaryCondition a -> Set Var
-collectVarsBndFusion BClamp     = S.empty
-collectVarsBndFusion BWrap      = S.empty
-collectVarsBndFusion BMirror    = S.empty
-collectVarsBndFusion (BConst e) = collectVarsExp e
-
-collectVarsDec :: Dec a -> Set Var
-collectVarsDec (Dec _ name pats _ _ body) =
-  S.insert name (S.unions (map collectVarsPat pats) `S.union` collectVarsExp body)
-
-collectVarsPat :: Pat a -> Set Var
-collectVarsPat pat =
-  case pat of
-    PVar _ v -> S.singleton v
-    PBound _ v _ -> S.singleton v
-    PVec _ ps -> S.unions (map collectVarsPat ps)
-    PPair _ p1 p2 -> collectVarsPat p1 <> collectVarsPat p2
-
-collectVarsShapeDim :: ShapeDim a -> Set Var
-collectVarsShapeDim dim =
-  case dim of
-    ShapeAll _ -> S.empty
-    ShapeAny _ e -> collectVarsExp e
-    ShapeDim _ e -> collectVarsExp e
-
-collectVarsSliceDim :: SliceDim a -> Set Var
-collectVarsSliceDim dim =
-  case dim of
-    SliceAll _ -> S.empty
-    SliceRange _ s l -> collectVarsExp s `S.union` collectVarsExp l
 
 patVars :: Pat a -> Set Var
 patVars pat =
@@ -968,16 +858,6 @@ sliceComponent a outPos dim =
 
 -- | Compute the shape expression for a sliced array.
 -- For each dimension, either keep the original size (SliceAll) or use the slice length.
-sliceShape :: a -> Exp a -> [SliceDim a] -> Exp a
-sliceShape a srcShape dims =
-  EVec a (zipWith (sliceDimShape a srcShape) [0..] dims)
-
-sliceDimShape :: a -> Exp a -> Int -> SliceDim a -> Exp a
-sliceDimShape a srcShape idx dim =
-  case dim of
-    SliceAll _ -> EProj a (fromIntegral idx) srcShape
-    SliceRange _ _ lenExpr -> lenExpr
-
 -- | Returns True for producer expressions that are not yet in atomic emitted
 -- form (EGenerate / EFill). Used as a convergence guard when trying to simplify
 -- the index side of EScatter: we only attempt simplification when the index
