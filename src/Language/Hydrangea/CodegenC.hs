@@ -17,32 +17,18 @@ module Language.Hydrangea.CodegenC
 
     -- * Shared utilities (used by alternative backends)
     sanitize,
-    sanitizeFieldName,
     celemTypeLetter,
     celemTypeCType,
     pairStructName,
-    recordStructName,
     cTypeName,
     splitFinalReturn,
-    allAssignedVars,
-    assignedRHSMap,
-    typeEnvToVarSets,
-    classifyVarKinds,
-    arrayVarsProc,
-    tupleVarsProc,
-    pairVarsProc,
     inferArrayElemTypesFromStmts,
     detectAtomicScatterAddLoop,
     procReturnKinds,
     isFloatArithBinOp,
     isMathFloatOp,
-    genAtom,
-    genIndexExpr,
-    genPairStructDefs,
-    genRecordStructDefs,
     ExportSpec (..),
     resolveExportSpec,
-    procReturnTypeName,
     sanitizeExportName,
   )
 where
@@ -2557,3 +2543,4 @@ assignedRHSMap = foldr go Map.empty
       CFG.SIf _ thn els -> assignedRHSMap thn `Map.union` assignedRHSMap els `Map.union` acc
       CFG.SLoop _ body -> assignedRHSMap body `Map.union` acc
       _ -> acc
+

@@ -122,7 +122,6 @@ defaultMSLOptions =
 data KernelAnalysis = KernelAnalysis
   { kaProc :: CFG.Proc,
     kaName :: CVar,
-    kaPreLoopStmts :: [CFG.Stmt],
     kaLoopSpec :: CFG.LoopSpec,
     kaLoopBody :: [CFG.Stmt],
     kaRetAtom :: Maybe Atom,
@@ -457,7 +456,6 @@ codegenMSLMultiPhase prog@(CFG.Program procs) rp = do
          in KernelAnalysis
               { kaProc = rp,
                 kaName = CFG.procName rp <> BS.pack ("_p" ++ show (phaseNo :: Int)),
-                kaPreLoopStmts = glueBefore,
                 kaLoopSpec = spec,
                 kaLoopBody = lb,
                 kaRetAtom = Nothing,
@@ -1725,7 +1723,6 @@ analyzeOneKernel prog@(CFG.Program procs) kernelProc = do
     KernelAnalysis
       { kaProc = kernelProc,
         kaName = kernelName,
-        kaPreLoopStmts = preLoopStmts,
         kaLoopSpec = mapLoopSpec,
         kaLoopBody = mapLoopBody,
         kaRetAtom = retAtom,
@@ -2253,17 +2250,6 @@ mslTypeName (CTPair t1 t2)
     Just ce2 <- ctypeToElemType t2 =
       mslPairStructName ce1 ce2
 mslTypeName _ = "long"
-
--- | MSL buffer element type for an array.
-mslArrayElemTypeName :: CType -> String
-mslArrayElemTypeName (CTArray elt) = mslTypeName elt
-mslArrayElemTypeName ct = mslTypeName ct
-
--- | Whether a CType is a float type (for printf format selection).
-isMSLFloatType :: CType -> Bool
-isMSLFloatType CTDouble = True
-isMSLFloatType (CTArray CTDouble) = True
-isMSLFloatType _ = False
 
 -- | Whether a CType contains a @CTDouble@ anywhere — including under arrays and
 -- (nested) pairs, e.g. nbody's @((float, float), float)@ element type.
@@ -2947,14 +2933,6 @@ mslUnOp CFloatOf = "(float)"
 mslUnOp CIntOf = "(long)"
 mslUnOp CNot = "!"
 mslUnOp CNeg = "-"
-
-isVecRHS :: RHS -> Bool
-isVecRHS (RVecLoad {}) = True
-isVecRHS (RVecBinOp {}) = True
-isVecRHS (RVecUnOp {}) = True
-isVecRHS (RVecSplat {}) = True
-isVecRHS (RVecReduce {}) = True
-isVecRHS _ = False
 
 -- ---------------------------------------------------------------------------
 -- ObjC harness generation
@@ -3987,12 +3965,6 @@ mslShapeHelpers =
       "};",
       "",
       "// Shape helpers",
-      "static inline uint hyd_metal_shape_size(constant uint* s, int n) {",
-      "    uint r = 1;",
-      "    for (int i = 0; i < n; i++) r *= s[i];",
-      "    return r;",
-      "}",
-      "",
       "static inline long hyd_shape_size_t(hyd_tuple_t shape) {",
       "    long r = 1;",
       "    for (int i = 0; i < shape.ndims; i++) r *= shape.elems[i];",

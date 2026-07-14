@@ -13,7 +13,6 @@
 module Language.Hydrangea.Polyhedral
   ( StmtId
   , AffineExpr(..)
-  , AffineConstraintOp(..)
   , AffineConstraint(..)
   , PolyhedralAccessType(..)
   , PolyhedralAccess(..)
@@ -51,7 +50,6 @@ module Language.Hydrangea.Polyhedral
   , collectScopProfitabilityFacts
   , chooseBandPermutation
   , extractProcScops
-  , extractProgramScops
   , fusionLegalAtDepth
   , polyhedralProgram
   , polyhedralIdentityTileProgram
@@ -93,12 +91,8 @@ data AffineExpr = AffineExpr
   }
   deriving (Eq, Show)
 
-data AffineConstraintOp = AffineEq | AffineLe | AffineGe
-  deriving (Eq, Show)
-
-data AffineConstraint = AffineConstraint
-  { acOp :: AffineConstraintOp
-  , acExpr :: IndexExpr
+newtype AffineConstraint = AffineConstraint
+  { acExpr :: IndexExpr
   }
   deriving (Eq, Show)
 
@@ -1101,9 +1095,6 @@ applyCrossBandSkewToSeq outerDepth outerIters xs relations stencilFacts =
     isLoopMapBand (AffineScheduleLoopBand b) = albRole b == LoopMap
     isLoopMapBand _ = False
 
-extractProgramScops :: Program -> [Scop]
-extractProgramScops (Program procs) = foldMap extractProcScops procs
-
 extractProcScops :: Proc -> [Scop]
 extractProcScops = foldMap onlyScop . collectProcScopDiagnostics
   where
@@ -1425,9 +1416,6 @@ commonLoopPrefix (x : xs) (y : ys)
   | lcIters x == lcIters y && lcRole x == lcRole y =
       x : commonLoopPrefix xs ys
 commonLoopPrefix _ _ = []
-
-buildScop :: CVar -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
-buildScop procName = buildScopWithStencilFacts procName M.empty
 
 buildScopWithStencilFacts :: CVar -> Map CVar StencilFact -> [Int] -> LoopSpec -> [Stmt] -> Either ScopRejectReason Scop
 buildScopWithStencilFacts procName stencilFacts rootPath spec body = do
@@ -1908,8 +1896,8 @@ loopDomainConstraints spec bounds =
   concatMap oneDim (zip (lsIters spec) bounds)
   where
     oneDim (iter, bound) =
-      [ AffineConstraint AffineGe (IVar iter)
-      , AffineConstraint AffineLe (simplifyIndexExpr (IAdd (ISub (IVar iter) bound) (IConst 1)))
+      [ AffineConstraint (IVar iter)
+      , AffineConstraint (simplifyIndexExpr (IAdd (ISub (IVar iter) bound) (IConst 1)))
       ]
 
 rhsSupportedInScop :: RHS -> Bool

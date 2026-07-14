@@ -66,18 +66,12 @@ data TripCount
 -- | Light-weight summary of an analyzed loop.
 --
 -- @liLoopVar@ is the first iterator name for the loop nest (most loops
--- use the first iterator as the primary induction variable). @liBounds@
--- records the per-dimension bounds as @LoopBound@. @liTripCount@ is a
--- derived trip-count for the (first) bound when possible. @liDefinedVars@
--- and @liUsedVars@ are the sets of variables defined/used in the loop
--- body and are used by optimisation passes.
+-- use the first iterator as the primary induction variable). @liTripCount@
+-- is a derived trip-count for the (first) bound when possible.
 data LoopInfo = LoopInfo
   { liLoopVar :: ByteString
-  , liBounds :: [LoopBound]
   , liTripCount :: TripCount
   , liBody :: [Stmt]
-  , liDefinedVars :: Set ByteString
-  , liUsedVars :: Set ByteString
   , liExecPolicy :: ExecPolicy
   } deriving (Eq, Show)
 
@@ -255,13 +249,10 @@ analyzeLoop (SLoop spec body) = case lsIters spec of
   [] -> Nothing
   (iter:_) -> Just $ LoopInfo
     { liLoopVar = iter
-    , liBounds = map classifyBound (lsBounds spec)
     , liTripCount = case lsBounds spec of
         (b:_) -> computeTripCount (classifyBound b)
         [] -> TCUnknown
     , liBody = body
-    , liDefinedVars = definedVarsStmts body
-    , liUsedVars = usedVarsStmts body
     , liExecPolicy = lsExec spec
     }
 analyzeLoop _ = Nothing
