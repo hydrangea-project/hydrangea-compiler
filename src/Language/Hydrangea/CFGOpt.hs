@@ -471,18 +471,27 @@ copyProp = go M.empty M.empty M.empty M.empty M.empty
 -- Dead assignment elimination
 ------------------------------------------------------------------------
 
--- | Backwards liveness pass over a statement list.  Returns the filtered
--- list and the set of variables live /before/ the first statement.
+-- | Backwards liveness pass over a statement list.  Returns the filtered list
+-- and the set of variables live /before/ the first statement.
 --
--- Pure assignments to dead variables are discarded.  Impure assignments
--- are retained for their side effects, but the defined variable is not
--- considered live (it is defined here, not used later).
-daeBackwards :: Set ByteString -> [Stmt] -> ([Stmt], Set ByteString)
-daeBackwards liveAfter [] = ([], liveAfter)
-daeBackwards liveAfter (stmt : rest) =
-  let (rest', live) = daeBackwards liveAfter rest
+-- Pure assignments to dead variables are discarded.  Impure assignments are
+-- retained for their side effects, but the defined variable is not considered
+-- live (it is defined here, not used later).
+--
+-- @loopCarried@ names variables that must stay live across iterations of the
+-- enclosing loop (the next iteration reads them), regardless of apparent local
+-- liveness.  It is empty for a straight-line list and non-empty only when
+-- processing a loop body via the @SLoop@ case.  @liveAfter@ seeds the live set
+-- at the end of the list.
+dae :: Set ByteString -> Set ByteString -> [Stmt] -> ([Stmt], Set ByteString)
+dae _           liveAfter [] = ([], liveAfter)
+dae loopCarried liveAfter (stmt : rest) =
+  let (rest', live) = dae loopCarried liveAfter rest
   in case stmt of
        SAssign x rhs
+         | x `S.member` loopCarried ->
+             -- Loop-carried: the next iteration reads this variable.
+             (stmt : rest', S.unions [live, usedVarsRHS rhs, S.singleton x])
          | x `S.member` live ->
              (stmt : rest', live `S.union` usedVarsRHS rhs)
          | rhsIsPure rhs ->
@@ -500,66 +509,23 @@ daeBackwards liveAfter (stmt : rest) =
          let iterVars  = S.fromList (lsIters spec)
              boundVars = S.unions (map usedVarsIndexExpr (lsBounds spec))
              carried   = usedVarsStmts body `S.intersection` definedVarsStmts body
-             (body', _) = daeLoopBody carried body
+             (body', _) = dae carried S.empty body
              bodyUsed   = usedVarsStmts body'
              -- Iterator variables are loop-local and must not leak into the
              -- surrounding live set.
              liveBefore = S.unions [live, bodyUsed, boundVars] `S.difference` iterVars
          in  (SLoop spec body' : rest', liveBefore)
        SParallelRegion body ->
-         let (body', bodyLive) = daeBackwards live body
+         let (body', bodyLive) = dae S.empty live body
              liveBefore = live `S.union` bodyLive
          in (SParallelRegion body' : rest', liveBefore)
        SIf cond thn els ->
          -- Variables live after the 'SIf' are also live at the end of each
-         -- branch, since control flow merges at the join point.
-         let (thn', thnLive) = daeBackwards live thn
-             (els', elsLive) = daeBackwards live els
-             liveBefore      = S.unions [live, thnLive, elsLive, usedVarsAtom cond]
-         in  (SIf cond thn' els' : rest', liveBefore)
-       SReturn a ->
-         (stmt : rest', usedVarsAtom a)
-       SBreak ->
-         (stmt : rest', live)
-
--- | Liveness pass for loop bodies, where variables in @loopCarried@ must
--- be preserved across iterations regardless of apparent local liveness.
-daeLoopBody :: Set ByteString -> [Stmt] -> ([Stmt], Set ByteString)
-daeLoopBody _           []            = ([], S.empty)
-daeLoopBody loopCarried (stmt : rest) =
-  let (rest', live) = daeLoopBody loopCarried rest
-  in case stmt of
-       SAssign x rhs
-         | x `S.member` loopCarried ->
-             -- Loop-carried: the next iteration reads this variable.
-             (stmt : rest', S.unions [live, usedVarsRHS rhs, S.singleton x])
-         | x `S.member` live ->
-             (stmt : rest', live `S.union` usedVarsRHS rhs)
-         | rhsIsPure rhs ->
-             (rest', live)
-         | otherwise ->
-             (stmt : rest', live `S.union` usedVarsRHS rhs)
-       SArrayWrite arr idx val ->
-         ( stmt : rest'
-         , S.unions [live, usedVarsAtom arr, usedVarsAtom idx, usedVarsAtom val]
-         )
-       SLoop spec body ->
-         let iterVars  = S.fromList (lsIters spec)
-             boundVars = S.unions (map usedVarsIndexExpr (lsBounds spec))
-             carried   = usedVarsStmts body `S.intersection` definedVarsStmts body
-             (body', _) = daeLoopBody carried body
-             bodyUsed   = usedVarsStmts body'
-             liveBefore = S.unions [live, bodyUsed, boundVars] `S.difference` iterVars
-         in  (SLoop spec body' : rest', liveBefore)
-       SParallelRegion body ->
-         let (body', bodyLive) = daeBackwards live body
-         in (SParallelRegion body' : rest', live `S.union` bodyLive)
-       SIf cond thn els ->
-         -- Loop-carried variables must survive to the next iteration, so
-         -- include them in the live set passed to each branch.
+         -- branch, since control flow merges at the join point; loop-carried
+         -- variables must likewise survive to the next iteration.
          let liveAtEnd       = live `S.union` loopCarried
-             (thn', thnLive) = daeBackwards liveAtEnd thn
-             (els', elsLive) = daeBackwards liveAtEnd els
+             (thn', thnLive) = dae S.empty liveAtEnd thn
+             (els', elsLive) = dae S.empty liveAtEnd els
              liveBefore      = S.unions [live, thnLive, elsLive, usedVarsAtom cond]
          in  (SIf cond thn' els' : rest', liveBefore)
        SReturn a ->
@@ -569,7 +535,7 @@ daeLoopBody loopCarried (stmt : rest) =
 
 -- | Remove dead pure assignments from a statement list.
 deadAssignElim :: [Stmt] -> [Stmt]
-deadAssignElim stmts = fst (daeBackwards S.empty stmts)
+deadAssignElim stmts = fst (dae S.empty S.empty stmts)
 
 ------------------------------------------------------------------------
 -- Loop-invariant code motion (LICM)
