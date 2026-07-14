@@ -1703,10 +1703,7 @@ lowerExp expr = case expr of
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                 ( [ SAssign idx (RArrayLoad ai (AVar i))
                   , SAssign val (RArrayLoad av (AVar i))
-                  , SAssign oldVal (RArrayLoad ad (AVar idx))
-                  ] ++ combStmts ++
-                  [ SArrayWrite ad (AVar idx) (AVar newVal)
-                  ]
+                  ] ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                 )
             ]
          , ad
@@ -1738,11 +1735,7 @@ lowerExp expr = case expr of
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( kernelStmts ++
                           [ SIf (AVar guardVal)
-                              ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                ] ++ combStmts ++
-                                [ SArrayWrite ad (AVar idx) (AVar newVal)
-                                ]
-                              )
+                              (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts)
                               []
                           ]
                         )
@@ -1765,11 +1758,7 @@ lowerExp expr = case expr of
                         ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
                           ] ++ kernelStmts ++
                           [ SIf (AVar guardVal)
-                              ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                ] ++ combStmts ++
-                                [ SArrayWrite ad (AVar idx) (AVar newVal)
-                                ]
-                              )
+                              (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts)
                               []
                           ]
                         )
@@ -1798,10 +1787,7 @@ lowerExp expr = case expr of
                    ++ [ SIf (AVar guardVal)
                         ( [ SAssign idx (RArrayLoad ai (AVar i))
                           , SAssign val (RArrayLoad av (AVar i))
-                          , SAssign oldVal (RArrayLoad ad (AVar idx))
-                          ]
-                          ++ combStmts
-                          ++ [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                          ] ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                         )
                         []
                       ]
@@ -1831,12 +1817,7 @@ lowerExp expr = case expr of
                  ++ hoistedCalls
                  ++ [ SAssign n (RShapeSize ashp)
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                        ( kernelStmts ++
-                          [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                          ] ++ combStmts ++
-                          [ SArrayWrite ad (AVar idx) (AVar newVal)
-                          ]
-                        )
+                        ( kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts )
                     ]
                  , ad
                  )
@@ -1852,11 +1833,7 @@ lowerExp expr = case expr of
                  ++ [ SAssign n (RShapeSize ashp)
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
-                          ] ++ kernelStmts ++
-                          [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                          ] ++ combStmts ++
-                          [ SArrayWrite ad (AVar idx) (AVar newVal)
-                          ]
+                          ] ++ kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                         )
                     ]
                  , ad
@@ -1888,11 +1865,7 @@ lowerExp expr = case expr of
                 , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                     ( [ SAssign ndIdx (RFlatToNd (AVar i) (AVar shp))
                       , SAssign elem' (RArrayLoad asrc (AVar i))
-                      ] ++ kernelStmts ++
-                      [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                      ] ++ combStmts ++
-                      [ SArrayWrite ad (AVar idx) (AVar newVal)
-                      ]
+                      ] ++ kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                     )
                 ]
              , ad
@@ -1920,11 +1893,7 @@ lowerExp expr = case expr of
                 , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                     ( [ SAssign ndIdx (RFlatToNd (AVar i) (AVar shp))
                       , SAssign idx (RArrayLoad ai (AVar i))
-                      ] ++ kernelStmts ++
-                      [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                      ] ++ combStmts ++
-                      [ SArrayWrite ad (AVar idx) (AVar newVal)
-                      ]
+                      ] ++ kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                     )
                 ]
              , ad
@@ -1959,9 +1928,7 @@ lowerExp expr = case expr of
                        ++ [ SAssign n (RShapeSize ashp)
                           , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                               ( kernelStmts ++
-                                [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                ] ++ combStmts ++
-                                [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                               )
                           ]
                        )
@@ -1978,9 +1945,7 @@ lowerExp expr = case expr of
                           , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                               ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
                                 ] ++ kernelStmts ++
-                                [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                ] ++ combStmts ++
-                                [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                               )
                           ]
                        )
@@ -1999,10 +1964,7 @@ lowerExp expr = case expr of
                           , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                               ( kernelStmts ++
                                 [ SIf (AVar guardVal)
-                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                      ] ++ combStmts ++
-                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
-                                    )
+                                    (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts)
                                     []
                                 ]
                               )
@@ -2023,10 +1985,7 @@ lowerExp expr = case expr of
                               ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
                                 ] ++ kernelStmts ++
                                 [ SIf (AVar guardVal)
-                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                      ] ++ combStmts ++
-                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
-                                    )
+                                    (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts)
                                     []
                                 ]
                               )
@@ -2048,10 +2007,7 @@ lowerExp expr = case expr of
                               ( kernelStmts ++
                                 [ SAssign guardVal (RArrayLoad ag (AVar i))
                                 , SIf (AVar guardVal)
-                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                      ] ++ combStmts ++
-                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
-                                    )
+                                    (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts)
                                     []
                                 ]
                               )
@@ -2072,10 +2028,7 @@ lowerExp expr = case expr of
                                 ] ++ kernelStmts ++
                                 [ SAssign guardVal (RArrayLoad ag (AVar i))
                                 , SIf (AVar guardVal)
-                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                                      ] ++ combStmts ++
-                                      [ SArrayWrite ad (AVar idx) (AVar newVal) ]
-                                    )
+                                    (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts)
                                     []
                                 ]
                               )
@@ -2094,9 +2047,7 @@ lowerExp expr = case expr of
                       , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                           ( [ SAssign idx (RArrayLoad ai (AVar i))
                             , SAssign val (RArrayLoad av (AVar i))
-                            , SAssign oldVal (RArrayLoad ad (AVar idx))
-                            ] ++ combStmts ++
-                            [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                            ] ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                           )
                       ]
                    )
@@ -2111,9 +2062,7 @@ lowerExp expr = case expr of
                             , SIf (AVar guardVal)
                                 ( [ SAssign idx (RArrayLoad ai (AVar i))
                                   , SAssign val (RArrayLoad av (AVar i))
-                                  , SAssign oldVal (RArrayLoad ad (AVar idx))
-                                  ] ++ combStmts ++
-                                  [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                                  ] ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                                 )
                                 []
                             ]
@@ -2141,18 +2090,10 @@ lowerExp expr = case expr of
       let loopBody kernelStmts mGuardStmts mGuardAtom =
             case (mGuardStmts, mGuardAtom) of
               (Nothing, _) ->
-                kernelStmts ++
-                [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                ] ++ combStmts ++
-                [ SArrayWrite ad (AVar idx) (AVar newVal) ]
+                kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
               (Just gStmts, Just gAtom) ->
                 kernelStmts ++ gStmts ++
-                [ SIf gAtom
-                    ( [ SAssign oldVal (RArrayLoad ad (AVar idx))
-                      ] ++ combStmts ++
-                      [ SArrayWrite ad (AVar idx) (AVar newVal) ])
-                    []
-                ]
+                [ SIf gAtom (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts) [] ]
               _ -> kernelStmts
       if is1DShapeExp shpExp
         then do
@@ -3885,6 +3826,15 @@ patVar :: Pat a -> Maybe Var
 patVar (PVar _ v)     = Just v
 patVar (PBound _ v _) = Just v
 patVar _              = Nothing
+
+-- | The core scatter update at @dst[idxAtom]@: read the current value into
+-- @oldVal@, run @combStmts@ (which computes @newVal@ from @val@ and @oldVal@),
+-- then write @newVal@ back.
+scatterCombineWrite :: Atom -> Atom -> CVar -> CVar -> [Stmt] -> [Stmt]
+scatterCombineWrite dst idxAtom oldVal newVal combStmts =
+  [ SAssign oldVal (RArrayLoad dst idxAtom) ]
+  ++ combStmts
+  ++ [ SArrayWrite dst idxAtom (AVar newVal) ]
 
 inlineArrayFn :: Exp Range -> CVar -> CVar -> LowerM [Stmt]
 inlineArrayFn fnExp paramVar resultVar = case fnExp of
