@@ -3,7 +3,45 @@
 --
 -- High-level compiler entry points for parsing, type checking, lowering,
 -- evaluation, and optimized C code generation.
-module Language.Hydrangea.Frontend where
+module Language.Hydrangea.Frontend
+  ( FrontendOptions(..)
+  , defaultFrontendOptions
+    -- * Parsing / reading
+  , readDecs
+  , readExp
+  , readPolytype
+  , readAndEval
+    -- * Type checking
+  , typeCheckExp
+  , typeCheckExpWithOptions
+  , inferDecsTop
+  , inferDecsTopWithWarnings
+    -- * Preprocessing / lowering
+  , preprocessDecs
+  , monomorphizeProgram
+  , fuseExpAfterTypeCheck
+  , lowerToCFG
+  , lowerToCFGWithTypes
+  , lowerToCFGWithTypesWithOptions
+  , lowerToCFGOptWithTypes
+  , lowerToCFGOptWithTypesWithOptions
+  , inferAndLowerToCFGWithFrontendOptions
+    -- * CFG optimization
+  , optimizeCFGWithPipelineOptions
+  , optimizeParallelCFG
+  , optimizeMetalCFGWithTiling
+    -- * Compilation to C
+  , compileToCOpt
+  , compileToCOptIO
+  , compileToCOptParallelIO
+  , compileToCOptIOWithAllOptions
+  , compileToCOptIOWithPipelineOptionsAndCodegenOptions
+    -- * Evaluation
+  , evalDecsFrontend
+  , evalExpFrontend
+    -- * Range utilities
+  , stripRange
+  ) where
 
 import Control.Monad.Except (runExceptT)
 import Data.ByteString.Lazy.Char8 (ByteString)
@@ -24,21 +62,17 @@ import Language.Hydrangea.Uniquify
 import Language.Hydrangea.Specialize (monomorphizeDecs, polymorphicFnNames)
 import Language.Hydrangea.CFG qualified as CFG
 import Language.Hydrangea.CFGCore (CType(..))
-import Language.Hydrangea.Lowering (lowerDecs, lowerDecsWithTypeEnv, lowerDecsWithTypeEnvAndRanks, lowerDecsWithEnvs)
+import Language.Hydrangea.Lowering (lowerDecs, lowerDecsWithEnvs)
 import Language.Hydrangea.CFGPipeline
   ( PipelineOptions(..)
-  , metalPipeline
   , metalPipelineWithTiling
   , parallelPipeline
-  , parallelPipelineWithWidth
   , pipelineWithOptions
   , vectorizePipeline
-  , vectorizePipelineWithWidth
   )
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
   , CodegenOptions(..)
-  , codegenProgram
   , codegenProgramPrune
   , codegenProgramWithOptionsPrune
   )
@@ -160,16 +194,6 @@ inferTopLevelTypesAndRanksWithOptions opts decs = do
       )
 
 
-inferTopLevelTypes = inferTopLevelTypesWithOptions defaultInferOptions
-
-inferTopLevelTypesWithOptions :: InferOptions -> [Dec Range] -> IO (Map.Map Var CType)
-inferTopLevelTypesWithOptions opts decs = do
-  res <- runInferDecsWithOptions opts decs
-  case res of
-    Left _            -> pure Map.empty
-    Right (pairs, _) -> pure $
-      M.fromList [(v, ct) | (v, poly) <- pairs, Just ct <- [typeOfPolytype poly]]
-
 -- | Type-check a single expression and return its inferred polytype.
 typeCheckExp :: Exp Range -> IO (Either String Polytype)
 typeCheckExp = typeCheckExpWithOptions defaultInferOptions
@@ -197,9 +221,6 @@ fuseExpAfterTypeCheckWithOptions opts e = do
 -- | Lower declarations directly to canonical CFG IR.
 lowerToCFG :: [Dec Range] -> CFG.Program
 lowerToCFG = lowerDecs
-
-lowerToCFGWithConcreteTypes :: Map.Map Var CType -> [Dec Range] -> CFG.Program
-lowerToCFGWithConcreteTypes typeEnv = lowerDecsWithTypeEnv typeEnv . preprocessDecs
 
 inferAndLowerToCFG :: InferOptions -> [Dec Range] -> IO CFG.Program
 inferAndLowerToCFG = inferAndLowerToCFGWithFrontendOptions defaultFrontendOptions
@@ -250,10 +271,6 @@ lowerToCFGWithTypes = lowerToCFGWithTypesWithOptions defaultInferOptions
 lowerToCFGWithTypesWithOptions :: InferOptions -> [Dec Range] -> IO CFG.Program
 lowerToCFGWithTypesWithOptions = inferAndLowerToCFG
 
--- | Lower declarations to CFG with the optimization/vectorization pipeline.
-lowerToCFGOpt :: [Dec Range] -> CFG.Program
-lowerToCFGOpt = optimizeCFG . lowerToCFG
-
 -- | Lower declarations with the same preprocessing used by optimized C emission,
 -- then run the CFG optimization pipeline.
 lowerToCFGOptWithTypes :: [Dec Range] -> IO CFG.Program
@@ -262,9 +279,6 @@ lowerToCFGOptWithTypes = lowerToCFGOptWithTypesWithOptions defaultInferOptions
 lowerToCFGOptWithTypesWithOptions :: InferOptions -> [Dec Range] -> IO CFG.Program
 lowerToCFGOptWithTypesWithOptions opts decs = optimizeCFG <$> lowerToCFGWithTypesWithOptions opts decs
 
--- | Lower declarations to CFG with the optimization + parallelization pipeline.
-lowerToCFGOptParallel :: [Dec Range] -> CFG.Program
-lowerToCFGOptParallel = optimizeParallelCFG . lowerToCFG
 
 -- | Compile declarations to optimized C without parallelization.
 --
@@ -285,15 +299,7 @@ compileToCOptIO = compileToCOptIOWithOptions defaultInferOptions
 compileToCOptIOWithOptions :: InferOptions -> Bool -> [Dec Range] -> IO String
 compileToCOptIOWithOptions = compileSourceDecsToCIO compileToCFGOptPrune
 
--- | Compile declarations to optimized C with parallelization enabled.
-compileToCOptParallelWithPrune :: Bool -> [Dec Range] -> String
-compileToCOptParallelWithPrune = compileSourceDecsToC compileToCFGOptParallelPrune
-
--- | Compile declarations to optimized C with parallelization enabled.
-compileToCOptParallel :: [Dec Range] -> String
-compileToCOptParallel = compileToCOptParallelWithPrune False
-
--- | IO variant of 'compileToCOptParallelWithPrune' that threads inferred
+-- | IO variant of the parallel compile path that threads inferred
 -- concrete types into lowering.
 compileToCOptParallelIO :: Bool -> [Dec Range] -> IO String
 compileToCOptParallelIO = compileToCOptParallelIOWithOptions defaultInferOptions
@@ -312,14 +318,6 @@ compileSourceDecsToCIO
   -> IO String
 compileSourceDecsToCIO compile opts prune decs =
   compile prune <$> inferAndLowerToCFG opts decs
-
--- | CFG-native optimized compilation (vectorization, no parallel)
-compileToCFGOpt :: CFG.Program -> String
-compileToCFGOpt prog = codegenProgram (vectorizePipeline prog)
-
--- | CFG-native optimized compilation (vectorization + parallel)
-compileToCFGOptParallel :: CFG.Program -> String
-compileToCFGOptParallel prog = codegenProgram (parallelPipeline prog)
 
 -- | Compile optimized CFG to C, optionally pruning dead procedures first.
 compileToCFGOptPrune :: Bool -> CFG.Program -> String
@@ -341,27 +339,9 @@ optimizeCFGWithPipelineOptions = pipelineWithOptions
 optimizeParallelCFG :: CFG.Program -> CFG.Program
 optimizeParallelCFG = parallelPipeline
 
--- | Run the Metal-targeted pipeline: optimize + parallelize without SIMD vectorization.
-optimizeMetalCFG :: CFG.Program -> CFG.Program
-optimizeMetalCFG = metalPipeline
-
 -- | Run the Metal-targeted pipeline with configurable tiling.
 optimizeMetalCFGWithTiling :: Bool -> CFG.Program -> CFG.Program
 optimizeMetalCFGWithTiling = metalPipelineWithTiling
-
--- | Compile optimized CFG to C using the given 'CodegenOptions'.
-compileToCFGOptPruneWithOpts :: CodegenOptions -> Bool -> CFG.Program -> String
-compileToCFGOptPruneWithOpts opts prune prog =
-  case codegenProgramWithOptionsPrune opts prune (vectorizePipelineWithWidth (codegenSimdWidth opts) prog) of
-    Right artifacts -> codegenSource artifacts
-    Left err -> error err
-
--- | Compile optimized and parallelized CFG to C using the given 'CodegenOptions'.
-compileToCFGOptParallelPruneWithOpts :: CodegenOptions -> Bool -> CFG.Program -> String
-compileToCFGOptParallelPruneWithOpts opts prune prog =
-  case codegenProgramWithOptionsPrune opts prune (parallelPipelineWithWidth (codegenSimdWidth opts) prog) of
-    Right artifacts -> codegenSource artifacts
-    Left err -> error err
 
 -- | Compile CFG to C using explicit pipeline options and codegen options.
 compileToCFGPruneWithPipelineAndOpts :: PipelineOptions -> CodegenOptions -> Bool -> CFG.Program -> String
@@ -370,16 +350,6 @@ compileToCFGPruneWithPipelineAndOpts pipelineOpts codegenOpts prune prog =
   in case codegenProgramWithOptionsPrune codegenOpts prune (pipelineWithOptions opts prog) of
        Right artifacts -> codegenSource artifacts
        Left err -> error err
-
--- | IO compile variant that accepts full 'CodegenOptions'.
-compileToCOptIOWithCodegenOptions :: InferOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
-compileToCOptIOWithCodegenOptions inferOpts codegenOpts prune decs =
-  compileToCFGOptPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG inferOpts decs
-
--- | IO parallel compile variant that accepts full 'CodegenOptions'.
-compileToCOptParallelIOWithCodegenOptions :: InferOptions -> CodegenOptions -> Bool -> [Dec Range] -> IO String
-compileToCOptParallelIOWithCodegenOptions inferOpts codegenOpts prune decs =
-  compileToCFGOptParallelPruneWithOpts codegenOpts prune <$> inferAndLowerToCFG inferOpts decs
 
 -- | IO compile variant with explicit pipeline options and codegen options.
 compileToCOptIOWithPipelineOptionsAndCodegenOptions
@@ -418,25 +388,3 @@ readAndEval str =
         Left err -> Left (formatEvalError Nothing Nothing err)
         Right v -> Right v
 
--- | Parse, type-check, and evaluate declarations from source text.
-readAndEvalDecs :: ByteString -> IO (Either String [(Var, Polytype, Maybe Value)])
-readAndEvalDecs str =
-  case readDecs str of
-    Left err -> pure (Left err)
-    Right ds -> typeCheckAndEvalDecs ds
-
--- | Type-check and evaluate declarations.
-typeCheckAndEvalDecs :: [Dec Range] -> IO (Either String [(Var, Polytype, Maybe Value)])
-typeCheckAndEvalDecs = typeCheckAndEvalDecsWithOptions defaultInferOptions
-
-typeCheckAndEvalDecsWithOptions :: InferOptions -> [Dec Range] -> IO (Either String [(Var, Polytype, Maybe Value)])
-typeCheckAndEvalDecsWithOptions opts decs = do
-  res <- runInferDecsWithOptions opts decs
-  case fmap fst $ formatInferResult res (formatTypeError Nothing Nothing) of
-    Left err -> pure (Left err)
-    Right typedDecs -> do
-      evaled <- evalDecsFrontend decs
-      pure $
-        case evaled of
-          Left err -> Left (formatEvalError Nothing Nothing err)
-          Right env -> Right (map (\(v, ty) -> (v, ty, Map.lookup v env)) typedDecs)

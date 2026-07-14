@@ -14,7 +14,6 @@ module Language.Hydrangea.CodegenC
     BenchmarkConfig (..),
     defaultCodegenOptions,
     VarKind (..),
-    ctypeToVarKind,
 
     -- * Shared utilities (used by alternative backends)
     sanitize,
@@ -114,22 +113,6 @@ data ExportSpec = ExportSpec
 -- | Codegen-oriented classification of CFG variables.
 data VarKind = KScalar | KFloat | KArray | KFloatArray | KTuple | KPair CElemType CElemType | KRecord [(BS.ByteString, CType)]
   deriving (Eq, Ord, Show)
-
--- | Classify a 'CType' into a 'VarKind' for codegen.
-ctypeToVarKind :: CType -> Maybe VarKind
-ctypeToVarKind CTInt64 = Just KScalar
-ctypeToVarKind CTDouble = Just KFloat
-ctypeToVarKind CTBool = Just KScalar
-ctypeToVarKind CTUnit = Just KScalar
-ctypeToVarKind CTTuple = Just KTuple
-ctypeToVarKind (CTArray CTDouble) = Just KFloatArray
-ctypeToVarKind (CTArray _) = Just KArray
-ctypeToVarKind (CTPair t1 t2) = do
-  et1 <- ctypeToElemType t1
-  et2 <- ctypeToElemType t2
-  return (KPair et1 et2)
-ctypeToVarKind (CTRecord fields) = Just (KRecord fields)
-ctypeToVarKind CTUnknown = Nothing
 
 -- | Per-procedure environment threaded through statement code generation.
 -- Bundles the classification maps and sets that are invariant within a single

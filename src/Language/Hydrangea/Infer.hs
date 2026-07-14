@@ -2286,42 +2286,6 @@ emitWhereHyps (Just rpred) patBinds = do
     Just preds -> mapM_ emitWhereHyp preds
     Nothing    -> return ()  -- unresolvable; body checking will be conservative
 
--- | Try to decompose a call-site argument expression against a parameter
--- pattern, returning a refinement-variable environment for obligation emission.
--- Returns 'Nothing' if the argument structure does not match the pattern
--- (which causes the obligation to be ungrounded → warning).
-buildCallEnv :: [Pat Range] -> Exp Range -> [(Var, UType)] -> Infer (Maybe (Map Var Term))
-buildCallEnv pats argExp patBinds = do
-  let rfEnv = buildRefineEnv patBinds
-  case (pats, argExp) of
-    ([PPair _ p1 p2], EPair _ e1 e2) -> do
-      m1 <- resolveArgTerm rfEnv p1 e1
-      m2 <- resolveArgTerm rfEnv p2 e2
-      return $ M.union <$> m1 <*> m2
-    ([pat], e) -> do
-      m <- resolveArgTerm rfEnv pat e
-      return m
-    _ -> return Nothing
-
--- | Try to resolve a single pattern component against an expression to a
--- 'Term' mapping.  For scalars, maps the component's rfVar to the expression's
--- value term; for this to be useful the expression must be a variable or literal.
-resolveArgTerm :: Map Var Var -> Pat Range -> Exp Range -> Infer (Maybe (Map Var Term))
-resolveArgTerm rfEnv (PVar _ v) (EInt _ n) =
-  return $ Just $ M.singleton v (TConst (fromIntegral n))
-resolveArgTerm rfEnv (PVar _ v) (EVar _ w) = do
-  mBound <- inferBVal (EVar noRange w)
-  ctx <- ask
-  case M.lookup w ctx of
-    Just wTy -> do
-      wTy' <- instantiate wTy
-      case fst (unwrapRefine wTy') of
-        Just wRfVar -> return $ Just $ M.singleton v (TVar wRfVar)
-        Nothing     -> return Nothing
-    Nothing -> return Nothing
-resolveArgTerm rfEnv (PBound _ v _) e = resolveArgTerm rfEnv (PVar noRange v) e
-resolveArgTerm _ _ _ = return Nothing
-
 -- | Emit where-clause obligations at a call site.
 -- Given the callee's patterns, where-clause predicate, and the INFERRED TYPE
 -- of the actual argument (already fully resolved by type inference), this
@@ -2369,31 +2333,7 @@ patTypeTerm (PVar _ v) ty = do
 patTypeTerm (PBound _ v _) ty = patTypeTerm (PVar noRange v) ty
 patTypeTerm _ _ = return Nothing
 
--- | (Kept for reference; no longer used by 'emitWhereObls'.)
-buildCallArgEnv :: [Pat Range] -> Exp Range -> Infer (Maybe (Map Var Term))
-buildCallArgEnv [PPair _ p1 p2] (EPair _ e1 e2) = do
-  m1 <- patExpToTerm p1 e1
-  m2 <- patExpToTerm p2 e2
-  return $ M.union <$> m1 <*> m2
-buildCallArgEnv [pat] e = patExpToTerm pat e
-buildCallArgEnv _ _ = return Nothing
-
-patExpToTerm :: Pat Range -> Exp Range -> Infer (Maybe (Map Var Term))
-patExpToTerm (PVar _ v) (EInt _ n) =
-  return $ Just $ M.singleton v (TConst (fromIntegral n))
-patExpToTerm (PVar _ v) (EVar _ w) = do
-  ctx <- ask
-  case M.lookup w ctx of
-    Just wPoly -> do
-      wTy <- instantiate wPoly
-      case fst (unwrapRefine wTy) of
-        Just wRfVar -> return $ Just $ M.singleton v (TVar wRfVar)
-        Nothing     -> return Nothing
-    Nothing -> return Nothing
-patExpToTerm (PBound _ v _) e = patExpToTerm (PVar noRange v) e
-patExpToTerm _ _ = return Nothing
-
--- | Resolve a 'RefinePred' to 'Pred's using a 'Map Var Term' (from 'buildCallArgEnv').
+-- | Resolve a 'RefinePred' to 'Pred's using a 'Map Var Term'.
 resolveRefinePredFromTermMap :: Map Var Term -> RefinePred -> Maybe [Pred]
 resolveRefinePredFromTermMap env (RPBound v e) = do
   vt <- M.lookup v env
@@ -2468,42 +2408,6 @@ inferDecs (Dec r var pats mwhere mty e : rest) = do
   rest' <- registerDef $ registerWhere $ withBinding var boundTy $ inferDecs rest
   return $ (var, boundTy) : rest'
 
--- | Extend the typing context with many bindings for the duration of an action.
-withAllBinding :: (MonadReader Ctx m) => [(Var, UPolytype)] -> m a -> m a
-withAllBinding [] m = m
-withAllBinding ((v, t) : ls) m = withBinding v t $ withAllBinding ls m
-
--- | Bind pattern variables to fresh refined types before running an inference action.
-withPats :: [Pat Range] -> Infer a -> Infer a
-withPats [] e = e
-withPats ((PVar _ v) : ps) e = do
-  tyArg <- freshValue
-  withBinding v (Forall [] [] tyArg) $ withPats ps e
-withPats ((PBound _ v _) : ps) e = do
-  tyArg <- freshValue
-  withBinding v (Forall [] [] tyArg) $ withPats ps e
-withPats ((PPair _ p1 p2) : ps) e =
-  withPats [p1] $ withPats [p2] $ withPats ps e
-withPats ((PVec r vs) : ps) e = do
-  tyArgs <- mapM (const freshValue) vs
-  vars <- forM vs $ \p ->
-    case p of
-      PVar _ v   -> return v
-      PBound _ v _ -> return v
-      _ -> throwError $ MiscError (Just r)
-  withAllBinding (zip vars $ map (Forall [] []) tyArgs) $ withPats ps e
-
--- | Infer the type of a unary function body under a fresh binding for its argument.
-inferFun :: Var -> Exp Range -> Infer UType
-inferFun arg e1 = do
-  tyArg <- freshValue
-  withBinding arg (Forall [] [] tyArg) $
-    UTyFun tyArg <$> infer e1
-
--- | Run inference from an empty context and solve the resulting refinement predicates.
-runInfer :: Infer UType -> IO (Either TypeError Polytype)
-runInfer = runInferWithOptions defaultInferOptions
-
 runInferWithOptions :: InferOptions -> Infer UType -> IO (Either TypeError Polytype)
 runInferWithOptions opts e = do
   let result =
@@ -2517,44 +2421,6 @@ runInferWithOptions opts e = do
     action = do
       (ty, preds) <- censor (const []) $ listen (e >>= applyBindings)
       generalizeWithPreds preds ty
-
--- | Run inference with a custom initial context (useful to inject builtins)
-runInferWithCtx :: Ctx -> Infer UType -> IO (Either TypeError Polytype)
-runInferWithCtx = runInferWithCtxOptions defaultInferOptions
-
-runInferWithCtxOptions :: InferOptions -> Ctx -> Infer UType -> IO (Either TypeError Polytype)
-runInferWithCtxOptions opts ctx e = do
-  let result =
-        runIdentity $ evalIntBindingT $ runExceptT $ runWriterT $ runStateT (runReaderT action ctx) initInferState
-  case result of
-    Left err -> return $ Left err
-    Right ((sch, _preds), _st) -> do
-      let poly = fromUPolytype sch
-      fst <$> finalizePolyWithOptions opts poly
-  where
-    action = do
-      (ty, preds) <- censor (const []) $ listen (e >>= applyBindings)
-      generalizeWithPreds preds ty
-
--- | Infer and generalize the type of a single expression.
-inferPolytype :: Exp Range -> IO (Either TypeError Polytype)
-inferPolytype = runInfer . infer
-
--- | Rename the universally-quantified type variables of a 'Polytype' to
--- canonical @a0, a1, …@ names.
-renamePolytype :: Polytype -> Polytype
-renamePolytype pty = evalState (go pty) (0 :: Int, M.empty)
-  where
-    go (Forall vars preds t) = do
-      vars' <- forM vars $ \v -> do
-        (n, m) <- get
-        let v' = BS.pack ("a" ++ show n)
-        put (n + 1, M.insert v v' m)
-        return v'
-      t' <- ycataM rename t
-      return (Forall vars' preds t')
-    rename (TyVar v) = gets (maybe (TyVar v) TyVar . M.lookup v . snd)
-    rename t         = return t
 
 -- | Top-level function declarations are checked at their call sites, where
 -- argument-shape facts are available.  Solving them in isolation rejects
@@ -2617,10 +2483,6 @@ runInferDecsBinderTypes _opts decs = do
         ut' <- applyBindings ut
         pure (v, freeze ut')
       pure $ M.fromList [(v, t) | (v, Just t) <- resolvedPairs]
-
--- | Discharge the predicates attached to a generalized type scheme.
-finalizePoly :: Polytype -> IO (Either TypeError Polytype)
-finalizePoly poly = fst <$> finalizePolyWithOptions defaultInferOptions poly
 
 finalizePolyWithOptions :: InferOptions -> Polytype -> IO (Either TypeError Polytype, [String])
 finalizePolyWithOptions opts poly

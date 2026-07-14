@@ -124,7 +124,6 @@ accumulateArrayUsage :: LoopArrayUsage -> AccessType -> LoopArrayUsage
 accumulateArrayUsage u accessType = case accessType of
   Read      -> u { lauReads  = True }
   Write     -> u { lauWrites = True }
-  ReadWrite -> u { lauReads  = True, lauWrites = True }
 
 -- | Build a per-array read/write summary for all accesses in a loop body.
 collectLoopArrayUsage :: [Stmt] -> Map CVar LoopArrayUsage
@@ -165,7 +164,7 @@ passesConservativeDependenceCheck spec body =
 
     -- Read-read dependences never block parallelism; only consider pairs
     -- where at least one access is a write.
-    isWriteAccess at = at == Write || at == ReadWrite
+    isWriteAccess at = at == Write
     hasWriteEnd d    = isWriteAccess (aaAccessType (depSource d))
                     || isWriteAccess (aaAccessType (depTarget d))
 
@@ -502,16 +501,6 @@ factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body =
       | arr == dest = True
       | lauWrites u = False
       | otherwise   = True
-
-    hasExternalReads dest = any (stmtHasExternalRead dest)
-
-    stmtHasExternalRead dest stmt = case stmt of
-      SAssign _ (RArrayLoad (AVar arr) _) -> arr /= dest
-      SLoop _ inner                       -> hasExternalReads dest inner
-      SParallelRegion body                -> hasExternalReads dest body
-      SIf _ thn els                       ->
-        hasExternalReads dest thn || hasExternalReads dest els
-      _                                   -> False
 
 ------------------------------------------------------------------------
 -- Loop parallelizability

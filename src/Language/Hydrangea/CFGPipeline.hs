@@ -15,7 +15,6 @@ module Language.Hydrangea.CFGPipeline
   , defaultPipelineOptions
     -- * Pipelines
   , preparePolyhedralProgramWithOptions
-  , optimizePipeline
   , optimizePipelineWithTiling
   , vectorizePipeline
   , vectorizePipelineWithWidth
@@ -25,7 +24,6 @@ module Language.Hydrangea.CFGPipeline
   , pipelineWithOptions
   , metalPipeline
   , metalPipelineWithTiling
-  , fullPipeline
   ) where
 
 
@@ -141,10 +139,6 @@ serializeParallelStmts = concatMap go
 serializeParallelProgram :: Program -> Program
 serializeParallelProgram = mapProcBodies serializeParallelStmts
 
--- | Optimization-only pipeline.
-optimizePipeline :: [Stmt] -> [Stmt]
-optimizePipeline = optimizePipelineWithTiling True
-
 -- | Optimization-only pipeline with optional tiling.
 optimizePipelineWithTiling :: Bool -> [Stmt] -> [Stmt]
 optimizePipelineWithTiling enableTiling stmts =
@@ -230,10 +224,3 @@ metalPipeline = metalPipelineWithTiling True
 metalPipelineWithTiling :: Bool -> Program -> Program
 metalPipelineWithTiling enableTiling =
   parallelizeProgram . mapProcBodies (optimizePipelineWithTiling enableTiling)
-
--- | Run the full CFG pipeline: optimize, vectorize, parallelize, then clean up again.
-fullPipeline :: Program -> Program
-fullPipeline prog =
-  case parallelizeProgram (vectorizePipeline prog) of
-    optimized ->
-      mapProcBodies fixpointOpt optimized

@@ -17,7 +17,7 @@ import Language.Hydrangea.CFG
 import Control.Monad (guard)
 
 -- | Kind of memory access performed at a CFG array reference.
-data AccessType = Read | Write | ReadWrite
+data AccessType = Read | Write
   deriving (Eq, Show)
 
 -- | Normalized array access used by dependence analysis.

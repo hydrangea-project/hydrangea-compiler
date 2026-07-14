@@ -126,10 +126,6 @@ tyFloat = Fix TyFloatF
 tyBool :: Fix TypeF
 tyBool = Fix TyBoolF
 
--- | Create a string type node.
-tyString :: Fix TypeF
-tyString = Fix TyStringF
-
 -- | Create a pair type node.
 tyPair :: Fix TypeF -> Fix TypeF -> Fix TypeF
 tyPair t1 t2 = Fix $ TyPairF t1 t2
@@ -145,14 +141,6 @@ tyRecord = Fix . TyRecordF . normalizeRecordFields
 -- | Create an inductive tuple node.
 tyCons :: Fix TypeF -> Fix TypeF -> Fix TypeF
 tyCons t1 t2 = Fix $ TyConsF t1 t2
-
--- | Create an array type node from a shape type and an element type.
-tyArray :: Fix TypeF -> Fix TypeF -> Fix TypeF
-tyArray shape elt = Fix $ TyArrayF shape elt
-
--- | Create a refinement wrapper with the given binder name.
-tyRefine :: Var -> Fix TypeF -> Fix TypeF
-tyRefine v t = Fix $ TyRefineF v t
 
 -- | Create a function type node.
 tyFun :: Fix TypeF -> Fix TypeF -> Fix TypeF

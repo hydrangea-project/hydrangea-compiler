@@ -15,7 +15,6 @@
 --    interfering with compiler-generated binders.
 module Language.Hydrangea.Uniquify
   ( uniquifyExp
-  , uniquifyDec
   , uniquifyDecs
   , uniquifyDecsForce
   , collectVarsExp
@@ -49,12 +48,6 @@ uniquifyExp :: Exp a -> Exp a
 uniquifyExp expr =
   let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = collectVarsExp expr, uniqForce = False}
    in evalState (runUniqM (uniqExp expr)) st
-
--- | Freshen local binders within a single declaration body.
-uniquifyDec :: Dec a -> Dec a
-uniquifyDec dec =
-  let st = UniqState {uniqCounter = 0, uniqEnv = M.empty, uniqUsed = collectVarsDec dec, uniqForce = False}
-   in evalState (runUniqM (uniqTopDec dec)) st
 
 -- | Freshen local binders across a group of declarations using one shared name supply.
 uniquifyDecs :: [Dec a] -> [Dec a]

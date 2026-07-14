@@ -11,34 +11,14 @@ module Language.Hydrangea.Solver where
 
 import Control.Monad (forM)
 import Data.ByteString.Lazy.Char8 qualified as BS
-import Data.List (intercalate)
 import Data.Map (Map)
 import Data.Map qualified as M
-import Data.Set (Set)
 import Data.Set qualified as S
 import Data.SBV
 import Data.SBV.Control
 import Language.Hydrangea.Predicate
 import Language.Hydrangea.Pretty ()
 import Text.PrettyPrint.HughesPJClass (render, pPrint)
-
--- | Check predicates for consistency.
---
--- Returns @Right residual@ when the predicate set is satisfiable; the
--- residual list contains non-constant (symbolic) predicates retained for
--- inclusion in the resulting @Polytype@. If the predicate set is
--- unsatisfiable the original predicate list is returned in @Left@ so the
--- caller can report an @UnsatConstraints@ error.
-checkPredicates :: [Pred] -> IO (Either [Pred] [Pred])
-checkPredicates preds = do
-  let (constPreds, symPreds) = partitionConsts preds
-  case findFalseConst constPreds of
-    Just _ -> return $ Left preds
-    Nothing -> do
-      satResult <- checkSatisfiable symPreds
-      if satResult
-        then pure $ Right symPreds
-        else pure $ Left preds
 
 -- | Partition predicates into constant vs symbolic buckets.
 --
@@ -105,23 +85,6 @@ applyConstMapToPred m p =
     PGe  l r -> PGe  (f l) (f r)
     PGt  l r -> PGt  (f l) (f r)
   where f = applyConstMapToTerm m
-
--- | Check satisfiability of symbolic predicates using SBV.
---
--- Returns @True@ for @Sat@ or @Unk@ (unknown) and @False@ for @Unsat@ so
--- callers treat @Unk@ conservatively as satisfiable.
-checkSatisfiable :: [Pred] -> IO Bool
-checkSatisfiable [] = pure True
-checkSatisfiable preds = runSMT $ do
-  let vars = S.toList $ S.unions (map predVars preds)
-  symVars <- buildVars vars
-  mapM_ (constrain . predToSBV symVars) preds
-  query $ do
-    cs <- checkSat
-    case cs of
-      Sat -> pure True
-      Unk -> pure True
-      _ -> pure False
 
 -- | Build SBV variables for each refinement variable referenced in predicates.
 --
@@ -199,12 +162,6 @@ checkObligation hyps obl = do
         Sat   -> do
           vals <- mapM (\v -> (v,) <$> getValue (symVars M.! v)) vars
           return (Counterexample vals)
-
--- | Collect the set of SMT variables that appear in a predicate's hypotheses.
--- Both @Hyp@ and @WhereHyp@ contribute: within the function that declared the
--- where clause, these are genuine hypotheses that ground the body's obligations.
-hypVars :: [TaggedPred] -> Set Var
-hypVars tagged = S.unions [predVars p | tp <- tagged, case tp of { Obl _ -> False; _ -> True }, let p = untagPred tp]
 
 -- | Check all tagged predicates.
 --

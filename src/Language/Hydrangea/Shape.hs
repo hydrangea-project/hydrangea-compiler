@@ -8,24 +8,12 @@
 -- and do not depend on runtime Value/Interpreter types.
 module Language.Hydrangea.Shape
   ( Shape
-  , shapeInit
-  , shapeLast
   , generateIndicesRowMajor
   , computeOffsetRowMajor
   ) where
 
 -- | Row-major array shape represented as a list of extents.
 type Shape = [Integer]
-
--- | Drop the trailing/rightmost axis from a shape. For empty shapes returns [].
-shapeInit :: Shape -> Shape
-shapeInit [] = []
-shapeInit s = init s
-
--- | Return the trailing/rightmost axis extent. For empty shapes returns 0.
-shapeLast :: Shape -> Integer
-shapeLast [] = 0
-shapeLast s = last s
 
 -- | Generate all valid index vectors for a shape in row-major order
 -- (trailing/rightmost axis varies fastest).

@@ -2419,14 +2419,6 @@ shiftIndexAtom base off = do
   shifted <- freshCVar "idx"
   pure ([SAssign shifted (RBinOp CAdd base off)], AVar shifted)
 
-combineOrAtoms :: [Atom] -> LowerM ([Stmt], Atom)
-combineOrAtoms [] = pure ([], ABool False)
-combineOrAtoms (firstCond : rest) = foldM step ([], firstCond) rest
-  where
-    step (stmts, acc) next = do
-      tmp <- freshCVar "or"
-      pure (stmts ++ [SAssign tmp (RBinOp COr acc next)], AVar tmp)
-
 data StencilDimSegmentKind
   = SegInterior
   | SegLeft Integer
@@ -2529,43 +2521,6 @@ buildFlatIndex2D shapeAtom rowAtom colAtom = do
       ]
     , AVar flat
     )
-
-genDirectStencilLoad1D :: Atom -> Atom -> StencilConstAccess -> LowerM [Stmt]
-genDirectStencilLoad1D arrAtom idxAtom ([offset], resultVar) = do
-  (shiftStmts, loadIdx) <- shiftIndexAtom idxAtom (AInt offset)
-  pure $ shiftStmts ++ [SAssign resultVar (RArrayLoad arrAtom loadIdx)]
-genDirectStencilLoad1D _ _ _ =
-  error "genDirectStencilLoad1D: expected rank-1 constant offsets"
-
-genDirectStencilLoad2D :: Atom -> Atom -> Atom -> Atom -> StencilConstAccess -> LowerM [Stmt]
-genDirectStencilLoad2D arrAtom shapeAtom rowAtom colAtom ([rowOff, colOff], resultVar) = do
-  (rowShiftStmts, rowIdx) <- shiftIndexAtom rowAtom (AInt rowOff)
-  (colShiftStmts, colIdx) <- shiftIndexAtom colAtom (AInt colOff)
-  (flatStmts, flatIdx) <- buildFlatIndex2D shapeAtom rowIdx colIdx
-  pure $ rowShiftStmts ++ colShiftStmts ++ flatStmts ++ [SAssign resultVar (RArrayLoad arrAtom flatIdx)]
-genDirectStencilLoad2D _ _ _ _ _ =
-  error "genDirectStencilLoad2D: expected rank-2 constant offsets"
-
-buildStencilDirectBody1D :: Atom -> Atom -> Atom -> Exp Range -> [StencilConstAccess] -> LowerM [Stmt]
-buildStencilDirectBody1D arrAtom outAtom idxAtom bodyExp constAccesses = do
-  directLoads <- mapM (genDirectStencilLoad1D arrAtom idxAtom) constAccesses
-  (bodyStmts, resultAtom) <- lowerExp bodyExp
-  pure $ concat directLoads ++ bodyStmts ++ [SArrayWrite outAtom idxAtom resultAtom]
-
-buildStencilDirectBody2D
-  :: Atom
-  -> Atom
-  -> Atom
-  -> Atom
-  -> Atom
-  -> Exp Range
-  -> [StencilConstAccess]
-  -> LowerM [Stmt]
-buildStencilDirectBody2D arrAtom shapeAtom outAtom rowAtom colAtom bodyExp constAccesses = do
-  directLoads <- mapM (genDirectStencilLoad2D arrAtom shapeAtom rowAtom colAtom) constAccesses
-  (bodyStmts, resultAtom) <- lowerExp bodyExp
-  (flatStmts, flatIdx) <- buildFlatIndex2D shapeAtom rowAtom colAtom
-  pure $ concat directLoads ++ bodyStmts ++ flatStmts ++ [SArrayWrite outAtom flatIdx resultAtom]
 
 specializeClampIndex1D
   :: Atom
@@ -3610,13 +3565,6 @@ lowerBinOp (LeF _) = CLeF
 lowerBinOp (GtF _) = CGtF
 lowerBinOp (GeF _) = CGeF
 
--- | True for binary operators whose result type is Float.
-isFloatBinOp :: BinOp -> Bool
-isFloatBinOp CAddF = True
-isFloatBinOp CSubF = True
-isFloatBinOp CMulF = True
-isFloatBinOp CDivF = True
-isFloatBinOp _     = False
 
 -- | The result 'CType' of a binary operator, if statically known.
 binopResultCType :: BinOp -> Maybe CType

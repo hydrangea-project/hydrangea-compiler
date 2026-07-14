@@ -20,22 +20,16 @@
 --    loop-invariant computations to the loop pre-header.
 --
 -- The module also provides targeted restructuring passes such as iterate-loop
--- unswitching and allocation hoisting, plus /Inlining/ ('inlineProgram'),
--- which exposes further optimization opportunities.
---
--- These passes are composed and iterated to a fixpoint by 'optimizeProgram'.
+-- unswitching and allocation hoisting.
 module Language.Hydrangea.CFGOpt
   ( -- * Entry points
     optimizeStmts
-  , optimizeProgram
-  , inlineProgram
     -- * Individual passes (exported for testing)
   , copyProp
   , deadAssignElim
   , loopInvariantCodeMotion
   , unswitchLoopInvariantIf
   , sinkUnusedIntoGuard
-  , removeNoOps
   , foldShapeOfAlloc
   , hoistIterateAllocs
   , scalarizeIteratePairs
@@ -718,30 +712,6 @@ unswitchLoopInvariantIf = concatMap goStmt
 -- No-op cleanup
 ------------------------------------------------------------------------
 
--- | Remove trivial no-op statements introduced by other rewrites:
---
--- * self-assignments like @x = x@
--- * loops whose body becomes empty
--- * conditionals whose branches both become empty
-removeNoOps :: [Stmt] -> [Stmt]
-removeNoOps = concatMap goStmt
-  where
-    goStmt :: Stmt -> [Stmt]
-    goStmt stmt = case stmt of
-      SAssign x (RAtom (AVar y))
-        | x == y ->
-            []
-      SLoop spec body ->
-        let body' = removeNoOps body
-        in if null body' then [] else [SLoop spec body']
-      SIf cond thn els ->
-        let thn' = removeNoOps thn
-            els' = removeNoOps els
-        in if null thn' && null els'
-             then []
-             else [SIf cond thn' els']
-      _ ->
-        [stmt]
 
 ------------------------------------------------------------------------
 -- Iterate-loop allocation hoisting
@@ -1175,89 +1145,6 @@ scalarizeZeroDimArrayRoundtrips = rewriteBlock
       _ -> False
 
 ------------------------------------------------------------------------
--- Function inlining
-------------------------------------------------------------------------
-
--- | Structural statement count for a procedure body (recursing into
--- nested loops and conditionals).
-procSize :: [Stmt] -> Int
-procSize = sum . map stmtSize
-  where
-    stmtSize (SLoop _ body)  = 1 + procSize body
-    stmtSize (SIf _ thn els) = 1 + procSize thn + procSize els
-    stmtSize _               = 1
-
--- | A procedure is inlineable when its body is small (≤ 5 by 'procSize')
--- and it does not call itself recursively.
-isInlineable :: Proc -> Map ByteString Proc -> Bool
-isInlineable Proc { procName = name, procBody = body } _allProcs =
-  procSize body <= 5 && not (callsItself name body)
-  where
-    callsItself :: ByteString -> [Stmt] -> Bool
-    callsItself target = any (stmtCallsTarget target)
-
-    stmtCallsTarget t (SAssign _ (RCall fn _)) = fn == t
-    stmtCallsTarget t (SLoop _ body')          = callsItself t body'
-    stmtCallsTarget t (SIf _ thn els)          = callsItself t thn || callsItself t els
-    stmtCallsTarget _ _                        = False
-
--- | Inline a single call to @proc@ by substituting each parameter with
--- the corresponding argument atom throughout the procedure body.
-inlineCall :: Proc -> [Atom] -> [Stmt]
-inlineCall Proc { procParams = params, procBody = body } args =
-  let paramMap = M.fromList (zip params args)
-  in  map (substStmt paramMap) body
-  where
-    substStmt env (SAssign v rhs)           = SAssign v (substRHS env rhs)
-    substStmt env (SArrayWrite arr idx val)  =
-      SArrayWrite (substAtom env arr) (substAtom env idx) (substAtom env val)
-    substStmt env (SLoop spec loopBody)     = SLoop spec (map (substStmt env) loopBody)
-    substStmt env (SParallelRegion body)    = SParallelRegion (map (substStmt env) body)
-    substStmt env (SIf cond thn els)        =
-      SIf (substAtom env cond) (map (substStmt env) thn) (map (substStmt env) els)
-    substStmt env (SReturn a)               = SReturn (substAtom env a)
-    substStmt _   SBreak                    = SBreak
-
--- | Inline all calls to inlineable procedures throughout a statement list.
-inlineStmts :: Map ByteString Proc -> [Stmt] -> [Stmt]
-inlineStmts procs = concatMap inlineOne
-  where
-    inlineOne stmt = case stmt of
-      SAssign v (RCall fn args)
-        | Just proc <- M.lookup fn procs
-        , isInlineable proc procs ->
-            let inlined = inlineCall proc args
-                retAtom = case reverse inlined of
-                  SReturn a : _ -> a
-                  _             -> AInt 0
-                prefix  = if null inlined then [] else init inlined
-            in  prefix ++ [SAssign v (RAtom retAtom)]
-      SLoop spec body  -> [SLoop spec (inlineStmts procs body)]
-      SIf cond thn els -> [SIf cond (inlineStmts procs thn) (inlineStmts procs els)]
-      _                -> [stmt]
-
--- | Perform one pass of inlining, substituting calls to all
--- inlineable procedures.  Dead procedures are not removed; that is left
--- to a separate pass if required.
-inlineProgramOnce :: [Proc] -> [Proc]
-inlineProgramOnce [] = []
-inlineProgramOnce procs =
-  let procMap       = M.fromList [(procName p, p) | p <- procs]
-      inlineableMap = M.filter (`isInlineable` procMap) procMap
-  in  map (\p -> p { procBody = inlineStmts inlineableMap (procBody p) }) procs
-
--- | Inline small procedures to a fixpoint (or until the iteration limit
--- of 50 is reached).  Dead procedures are not removed.
-inlineProgram :: Program -> Program
-inlineProgram (Program procs) = go 50 procs
-  where
-    go :: Int -> [Proc] -> Program
-    go 0 ps = Program ps
-    go n ps =
-      let ps' = inlineProgramOnce ps
-      in  if ps' == ps then Program ps else go (n - 1) ps'
-
-------------------------------------------------------------------------
 -- Sink pure assignments inside a trailing guarded SIf
 ------------------------------------------------------------------------
 
@@ -1429,9 +1316,3 @@ optimizeFixpoint = go 100
 optimizeStmts :: [Stmt] -> [Stmt]
 optimizeStmts = optimizeFixpoint
 
--- | Optimize a full program: inline small procedures, then run the
--- scalar optimization pipeline over every procedure body.
-optimizeProgram :: Program -> Program
-optimizeProgram prog =
-  let Program procs = inlineProgram prog
-  in  Program [p { procBody = optimizeStmts (procBody p) } | p <- procs]
