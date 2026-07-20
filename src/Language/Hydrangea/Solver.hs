@@ -72,6 +72,8 @@ applyConstMapToTerm m t =
     TMul l r     -> TMul (f l) (f r)
     TNeg x       -> TNeg (f x)
     TMax l r     -> TMax (f l) (f r)
+    TDiv l r     -> TDiv (f l) (f r)
+    TMod l r     -> TMod (f l) (f r)
   where f = applyConstMapToTerm m
 
 -- | Substitute known constant values into a predicate.
@@ -124,6 +126,9 @@ termToSBV env term =
     TDim arr ix -> lookupVar (dimVarName arr ix)
     TValBoundDim arr i -> lookupVar (valBoundDimName arr i)
     TMax l r -> smax (termToSBV env l) (termToSBV env r)
+    -- sQuot/sRem: truncated division, matching the C backend's / and %.
+    TDiv l r -> termToSBV env l `sQuot` termToSBV env r
+    TMod l r -> termToSBV env l `sRem` termToSBV env r
   where
     lookupVar v =
       case M.lookup v env of
@@ -183,7 +188,16 @@ checkTaggedPredicates tagged = do
   -- (e.g. coo → packed_keys → perm → sorted_* → canonical → csr) accumulate
   -- O(k) copies of every predicate for a k-step chain.  Deduplication here is
   -- O(n log n) and avoids redundant Z3 calls for duplicate Obl predicates.
-  let tagged' = S.toList (S.fromList tagged)
+  let deduped = S.toList (S.fromList tagged)
+      -- Call-site hypotheses (argument bounds/links emitted at applications)
+      -- are only sound while their refinement variable receives facts from a
+      -- single application site; a shared monomorphic function scheme would
+      -- otherwise conjoin facts from unrelated calls.  Keep single-site
+      -- variables, drop the rest (their obligations degrade to warnings).
+      callSites = M.fromListWith S.union
+        [(v, S.singleton site) | CallHyp v site _ <- deduped]
+      multiSite v = maybe False ((> 1) . S.size) (M.lookup v callSites)
+      tagged' = [tp | tp <- deduped, case tp of { CallHyp v _ _ -> not (multiSite v); _ -> True }]
       hyps = [p | tp <- tagged', case tp of { Obl _ -> False; _ -> True }, let p = untagPred tp]
       obls = [p | Obl p <- tagged']
       hVars = S.unions (map predVars hyps)

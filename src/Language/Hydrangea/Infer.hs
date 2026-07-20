@@ -50,7 +50,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Predicate
   ( Pred (..), TaggedPred (..), Term (..)
-  , predBindVars, substTaggedPredVars, untagPred
+  , evalTermConst, predBindVars, substTaggedPredVars, untagPred
   , RefinePred (..), RefineTerm (..), RelOp (..)
   )
 import Language.Hydrangea.Solver
@@ -123,6 +123,11 @@ data InferState = InferState
     -- ^ Maps variables with @[i bound E]@ annotations to their exclusive
     --   upper bound term.  Used by 'inferValBound' to compute output bounds
     --   from generator body expressions.
+  , exactScalarCtx :: Map Var Term
+    -- ^ Maps helper parameters to the exact caller-side term of the argument
+    --   during per-call-site helper-body analysis.  Consulted by 'inferBVal'
+    --   before 'valBoundCtx' so parameter references are substituted with the
+    --   argument term instead of leaking the (call-site-shared) parameter name.
   , inferWarnings  :: [String]
     -- ^ Non-fatal diagnostic messages (e.g. unverifiable bound annotations).
   , defBodyEnv     :: Map Var ([Var], Exp Range)
@@ -145,6 +150,7 @@ initInferState :: InferState
 initInferState = InferState
   { predVarCounter = 0
   , valBoundCtx    = M.empty
+  , exactScalarCtx = M.empty
   , inferWarnings  = []
   , defBodyEnv     = M.empty
   , wherePrecondEnv = M.empty
@@ -267,6 +273,15 @@ freshPredVar = do
   let n = predVarCounter st
   lift $ put st {predVarCounter = n + 1}
   return $ BS.pack $ "p" ++ show n
+
+-- | Allocate a unique application-site identifier for 'CallHyp' tagging.
+-- Shares the predicate-variable counter; only uniqueness matters.
+freshAppSite :: Infer Int
+freshAppSite = do
+  st <- lift get
+  let n = predVarCounter st
+  lift $ put st {predVarCounter = n + 1}
+  return n
 
 -- | Errors reported by type inference and refinement checking.
 data TypeError where
@@ -517,6 +532,17 @@ withValBound :: Var -> Term -> Infer a -> Infer a
 withValBound v t m = do
   emitHyp (PLe (TConst 0) (TVar v))
   emitHyp (PLt (TVar v) t)
+  withValBoundCtxOnly v t m
+
+-- | Like 'withValBound' but without emitting hypotheses.  Used by per-call-site
+-- helper-body analysis, where the bound term is already expressed in caller-side
+-- variables and flows into results by substitution.  Emitting name-keyed
+-- hypotheses there would attach per-call facts to the helper's (shared)
+-- parameter names, so two call sites with different arguments would make the
+-- global hypothesis set contradictory (e.g. @imod _ 3@ and @imod _ 5@ folding
+-- to the absurd @3 = 5@).
+withValBoundCtxOnly :: Var -> Term -> Infer a -> Infer a
+withValBoundCtxOnly v t m = do
   old <- gets valBoundCtx
   modify (\s -> s { valBoundCtx = M.insert v t old })
   x <- m
@@ -528,10 +554,16 @@ withValBound v t m = do
 -- This is used for named helper-call propagation: when a helper is called with
 -- an exact scalar argument such as @shift_by 1 i@, we want the body to see that
 -- parameter as the exact term @1@ rather than only an upper bound like @< 2@.
+-- The substitution lives in 'exactScalarCtx' (consulted by 'inferBVal') rather
+-- than being emitted as a hypothesis, for the same reason as
+-- 'withValBoundCtxOnly': the parameter name is shared across call sites.
 withExactScalar :: Var -> Term -> Infer a -> Infer a
 withExactScalar v t m = do
-  emitHyp (PEq (TVar v) t)
-  withBinding v (Forall [] [] (UTyRefine v UTyInt)) m
+  old <- gets exactScalarCtx
+  modify (\s -> s { exactScalarCtx = M.insert v t old })
+  x <- m
+  modify (\s -> s { exactScalarCtx = old })
+  return x
 
 collectNamedCall :: Exp Range -> Maybe (Var, [Exp Range])
 collectNamedCall = go []
@@ -609,6 +641,8 @@ termFromExp expr =
         Plus _ -> return $ TAdd t1 t2
         Minus _ -> return $ TSub t1 t2
         Times _ -> return $ TMul t1 t2
+        Divide _ -> emitDivisorNonZero t2 >> return (TDiv t1 t2)
+        Mod _ -> emitDivisorNonZero t2 >> return (TMod t1 t2)
         _ -> TVar <$> freshPredVar
     _ -> do
       -- Infer the expression type and extract its refinement variable as the
@@ -620,6 +654,16 @@ termFromExp expr =
         Nothing -> case expr of
           EVar _ v -> return (TVar v)  -- source-name fallback if no refinement wrapper
           _        -> TVar <$> freshPredVar
+
+-- | Emit the divisor-nonzero obligation for a 'TDiv'/'TMod' term.  Division by
+-- zero is undefined behaviour in the generated C, so translated divisions are
+-- only sound under this side condition.  Skipped for nonzero constants; a
+-- literal zero divisor becomes the constant-false obligation @0 <> 0@.
+emitDivisorNonZero :: Term -> Infer ()
+emitDivisorNonZero t =
+  case evalTermConst t of
+    Just k | k /= 0 -> return ()
+    _ -> emitObl (PNeq t (TConst 0))
 
 -- | Interpret index expressions as a list of refinement terms.
 -- Vector indices map to per-dimension terms; scalars become singleton lists.
@@ -713,18 +757,22 @@ bvalMax (ExactVal c1) (ExactVal c2) = ExactVal  (TMax c1 c2)
 bvalMax (BoundOf b)   (ExactVal c)  = BoundOf   (TMax b (TAdd c (TConst 1)))
 bvalMax (ExactVal c)  (BoundOf b)   = BoundOf   (TMax (TAdd c (TConst 1)) b)
 
+-- | Bind helper parameters to caller-side argument facts for the duration of a
+-- helper-body analysis.  Context-only (no hypothesis emission): see
+-- 'withValBoundCtxOnly' for why per-call-site facts must not be attached to
+-- the shared parameter names.
 withHelperArgBounds :: [(Var, BVal)] -> Infer a -> Infer a
 withHelperArgBounds [] m = m
 withHelperArgBounds ((v, bval) : rest) m =
   let bindNext = withHelperArgBounds rest m
   in case bval of
        ExactVal t -> withExactScalar v t bindNext
-       BoundOf t -> withValBound v t bindNext
+       BoundOf t -> withValBoundCtxOnly v t bindNext
 
 withHelperTrailingBounds :: [(Var, Term)] -> Infer a -> Infer a
 withHelperTrailingBounds [] m = m
 withHelperTrailingBounds ((v, t) : rest) m =
-  withValBound v t (withHelperTrailingBounds rest m)
+  withValBoundCtxOnly v t (withHelperTrailingBounds rest m)
 
 inferNamedHelperBValWithArgs :: Var -> [BVal] -> Infer (Maybe BVal)
 inferNamedHelperBValWithArgs f argBounds = do
@@ -771,12 +819,16 @@ lookupRefinedScalarTerm v = do
 inferBVal :: Exp Range -> Infer (Maybe BVal)
 inferBVal expr = case expr of
   EVar _ v -> do
-    mb <- lookupValBound v
-    case mb of
-      Just b -> pure $ Just $ BoundOf b
+    mExact <- gets (M.lookup v . exactScalarCtx)
+    case mExact of
+      Just t -> pure $ Just $ ExactVal t
       Nothing -> do
-        mRefined <- lookupRefinedScalarTerm v
-        pure $ Just $ ExactVal (fromMaybe (TVar v) mRefined)
+        mb <- lookupValBound v
+        case mb of
+          Just b -> pure $ Just $ BoundOf b
+          Nothing -> do
+            mRefined <- lookupRefinedScalarTerm v
+            pure $ Just $ ExactVal (fromMaybe (TVar v) mRefined)
   EInt _ n -> return $ Just $ ExactVal (TConst n)
   EApp _ (EApp _ (EVar _ "max") e1) e2 -> do
     -- Saturated application of the built-in `max` function.
@@ -981,12 +1033,17 @@ freshRefined ty = do
 -- | Emit refinement equalities between a function parameter type and an
 -- argument type. Arrays use per-dimension equality; other refined values
 -- link their refinement variables directly.
-emitRefineLink :: Range -> UType -> UType -> Infer ()
-emitRefineLink r expected actual = do
+-- | Link a callee parameter's refinement variable to the argument's at an
+-- application site.  Emitted as 'CallHyp' keyed by the parameter-side variable:
+-- monomorphic schemes share parameter variables across call sites, and the
+-- solver only assumes call-site facts for variables fed by a single site.
+emitRefineLink :: Int -> Range -> UType -> UType -> Infer ()
+emitRefineLink site r expected actual = do
   expected' <- applyBindings expected
   actual' <- applyBindings actual
   let (mvExp, innerExp) = unwrapRefine expected'
       (mvAct, innerAct) = unwrapRefine actual'
+      emitCall vExp p = tell [CallHyp vExp site p]
   case (mvExp, mvAct) of
     (Just vExp, Just vAct) ->
       case (stripRefineTop innerExp, stripRefineTop innerAct) of
@@ -994,16 +1051,16 @@ emitRefineLink r expected actual = do
           _ <- wrange r $ s1 =:= s2
           rank <- shapeArityFromType r s1
           forM_ [0 .. rank - 1] $ \i -> do
-            emitPred (PEq (TDim vExp i) (TDim vAct i))
-            emitPred (PEq (TValBoundDim vExp i) (TValBoundDim vAct i))
-        _ -> emitPred (PEq (TVar vExp) (TVar vAct))
+            emitCall vExp (PEq (TDim vExp i) (TDim vAct i))
+            emitCall vExp (PEq (TValBoundDim vExp i) (TValBoundDim vAct i))
+        _ -> emitCall vExp (PEq (TVar vExp) (TVar vAct))
     -- For pair types there is no outer refinement variable to link, but we
     -- can recurse into each component to propagate bounds transitively.
     _ ->
       case (stripRefineTop innerExp, stripRefineTop innerAct) of
         (UTyPair te1 te2, UTyPair ta1 ta2) -> do
-          emitRefineLink r te1 ta1
-          emitRefineLink r te2 ta2
+          emitRefineLink site r te1 ta1
+          emitRefineLink site r te2 ta2
         _ -> return ()
 
 -- | Decompose a type into its two pair (or cons-tuple) components.
@@ -1130,18 +1187,22 @@ infer (EApp r e1 e2) = do
   ty1' <- applyBindings ty1
   case stripRefineTop ty1' of
     UTyFun argTy resTy -> do
-      emitRefineLink r argTy ty2
+      site <- freshAppSite
+      emitRefineLink site r argTy ty2
       -- Propagate scalar value bounds from the argument to the parameter's
       -- refinement variable.  This grounds parameter-dependent obligations in
       -- the callee when the argument has a statically inferrable bound (e.g.
       -- from iota-produced values, arithmetic like i%N, or PBound indices).
+      -- Emitted as 'CallHyp' so facts from distinct call sites of a shared
+      -- monomorphic scheme are never conjoined (see 'CallHyp').
       mBound <- inferBVal e2
       argTy' <- applyBindings argTy
       forM_ mBound $ \bval ->
         case fst (unwrapRefine argTy') of
-          Just pParam -> do
-            emitHyp (PLe (TConst 0) (TVar pParam))
-            emitHyp (PLt (TVar pParam) (toBound bval))
+          Just pParam -> tell
+            [ CallHyp pParam site (PLe (TConst 0) (TVar pParam))
+            , CallHyp pParam site (PLt (TVar pParam) (toBound bval))
+            ]
           Nothing -> return ()
       -- Emit where-clause proof obligations for the callee (if it has a
       -- where clause).  We try to decompose the argument expression against
@@ -2276,15 +2337,18 @@ relOpToPred RNeq = PNeq
 
 -- | Emit where-clause hypotheses inside the body scope of a declaration.
 -- Uses 'buildRefineEnv' from 'patBinds' to resolve each 'RefinePred' to
--- concrete 'Pred's and emits them as 'Hyp's.  Unresolvable terms are silently
--- skipped (they would produce ungrounded obligations anyway).
+-- concrete 'Pred's and emits them as 'Hyp's.  Unresolvable clauses are
+-- ignored for checking, but warned about so the annotation is never
+-- silently dead (e.g. a where clause on a zero-argument binding).
 emitWhereHyps :: Maybe RefinePred -> [(Var, UType)] -> Infer ()
 emitWhereHyps Nothing      _        = return ()
 emitWhereHyps (Just rpred) patBinds = do
   let env = buildRefineEnv patBinds
   case resolveRefinePred env rpred of
     Just preds -> mapM_ emitWhereHyp preds
-    Nothing    -> return ()  -- unresolvable; body checking will be conservative
+    Nothing    -> emitWarning $
+      "note: where clause ignored — it references names that are not "
+      ++ "refinement-tracked parameters of the declaration"
 
 -- | Emit where-clause obligations at a call site.
 -- Given the callee's patterns, where-clause predicate, and the INFERRED TYPE

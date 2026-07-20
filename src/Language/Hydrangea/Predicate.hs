@@ -47,6 +47,15 @@ data Term
     -- ^ @TMax a b@ is the larger of two terms.  Used as the bound of
     --   @if-then-else@ and @max@ expressions: if @x < a@ and @y < b@ then
     --   @max(x,y) < max(a,b)@.
+  | TDiv Term Term
+    -- ^ Integer division with C truncated semantics (Haskell @quot@, SMT
+    --   @bvsdiv@-style rounding toward zero), matching the generated C code's
+    --   @/@.  Division by zero is undefined behaviour in C; sites that emit
+    --   'TDiv' also emit a divisor-nonzero obligation.
+  | TMod Term Term
+    -- ^ Integer remainder with C truncated semantics (Haskell @rem@),
+    --   matching the generated C code's @%@.  Same divisor-nonzero obligation
+    --   as 'TDiv'.
   deriving (Eq, Ord, Show, Generic)
 
 -- | Predicates over refinement terms.
@@ -76,6 +85,16 @@ data TaggedPred
   = Hyp      Pred  -- ^ A known structural fact (shape equality, declared bound).
   | WhereHyp Pred  -- ^ A where-clause hypothesis (local to the declaring function).
   | Obl      Pred  -- ^ A safety obligation (must be entailed by hypotheses).
+  | CallHyp Var Int Pred
+    -- ^ @CallHyp v site p@: a hypothesis about refinement variable @v@ emitted
+    --   at application site @site@ (argument bounds and argument links).  A
+    --   monomorphic function scheme shares its parameter refinement variables
+    --   across all call sites, so these facts are sound to assume only while
+    --   @v@ receives them from a single site: conjoining facts from different
+    --   applications would check the callee body against the *intersection* of
+    --   its call sites' argument facts, and collapse distinct arguments into
+    --   contradictions (e.g. @3 = 5@).  The solver keeps call hypotheses for
+    --   variables with exactly one emitting site and drops the rest.
   deriving (Eq, Ord, Show, Generic)
 
 -- | Extract the underlying predicate from a tagged predicate.
@@ -83,6 +102,7 @@ untagPred :: TaggedPred -> Pred
 untagPred (Hyp      p) = p
 untagPred (WhereHyp p) = p
 untagPred (Obl      p) = p
+untagPred (CallHyp _ _ p) = p
 
 -- | Negate a predicate (used to form the check @H ∧ ¬S@ for validity).
 negatePred :: Pred -> Pred
@@ -98,6 +118,7 @@ substTaggedPredVars :: (Var -> Var) -> TaggedPred -> TaggedPred
 substTaggedPredVars f (Hyp      p) = Hyp      (substPredVars f p)
 substTaggedPredVars f (WhereHyp p) = WhereHyp (substPredVars f p)
 substTaggedPredVars f (Obl      p) = Obl      (substPredVars f p)
+substTaggedPredVars f (CallHyp v site p) = CallHyp (f v) site (substPredVars f p)
 
 -- | Convert a dimension projection into a synthetic variable name used in the solver.
 dimVarName :: Var -> Int -> Var
@@ -124,6 +145,8 @@ termVars term =
     TDim arr ix -> S.singleton (dimVarName arr ix)
     TValBoundDim arr i -> S.singleton (valBoundDimName arr i)
     TMax l r -> termVars l <> termVars r
+    TDiv l r -> termVars l <> termVars r
+    TMod l r -> termVars l <> termVars r
 
 -- | Collect binder variables referenced by a term.
 termBindVars :: Term -> Set Var
@@ -138,6 +161,8 @@ termBindVars term =
     TDim arr _ -> S.singleton arr
     TValBoundDim arr _ -> S.singleton arr
     TMax l r -> termBindVars l <> termBindVars r
+    TDiv l r -> termBindVars l <> termBindVars r
+    TMod l r -> termBindVars l <> termBindVars r
 
 -- | Collect solver variables referenced by a predicate.
 predVars :: Pred -> Set Var
@@ -174,6 +199,8 @@ substTermVars f term =
     TDim arr ix -> TDim (f arr) ix
     TValBoundDim arr i -> TValBoundDim (f arr) i
     TMax l r -> TMax (substTermVars f l) (substTermVars f r)
+    TDiv l r -> TDiv (substTermVars f l) (substTermVars f r)
+    TMod l r -> TMod (substTermVars f l) (substTermVars f r)
 
 -- | Substitute variables inside a predicate.
 substPredVars :: (Var -> Var) -> Pred -> Pred
@@ -199,6 +226,15 @@ evalTermConst term =
     TDim _ _ -> Nothing
     TValBoundDim _ _ -> Nothing
     TMax l r -> max <$> evalTermConst l <*> evalTermConst r
+    -- quot/rem (truncated) to match the C backend's / and %.
+    TDiv l r -> do
+      a <- evalTermConst l
+      b <- evalTermConst r
+      if b == 0 then Nothing else Just (a `quot` b)
+    TMod l r -> do
+      a <- evalTermConst l
+      b <- evalTermConst r
+      if b == 0 then Nothing else Just (a `rem` b)
 
 -- | Evaluate a predicate to a constant if both sides are constant.
 evalPredConst :: Pred -> Maybe Bool

@@ -1680,3 +1680,97 @@ spec = describe "gather bounds checking" $ do
             ]
         )
         (isInfixOf "UnsatConstraints")
+
+  describe "call-site fact isolation" $ do
+
+    -- Facts about a shared (monomorphic) helper's parameters must not be
+    -- conjoined across call sites.  Before the CallHyp fix, the two moduli
+    -- pinned one parameter variable to both constants and the solver rejected
+    -- the program with an absurd constant contradiction (e.g. "3 = 5").
+    it "accepts a local helper applied with two different constant arguments" $ do
+      expectDecsOk $ BS.unlines
+        [ "let main ="
+        , "  let n = get_env_int \"N\" in"
+        , "  let imod x m = x - ((x / m) * m) in"
+        , "  let a = generate [n] (let f [i] = imod i 3 in f) in"
+        , "  let b = generate [n] (let g [i] = imod i 5 in g) in"
+        , "  index () (reduce (+) 0 a) + index () (reduce (+) 0 b)"
+        ]
+
+    -- kde_chain pattern: one helper called through wrappers with distinct
+    -- phase constants, feeding separate generates.
+    it "accepts a helper called via wrappers with distinct constant phases" $ do
+      expectDecsOk $ BS.unlines
+        [ "let main ="
+        , "  let n = get_env_int \"N\" in"
+        , "  let shift p [k] = k + p in"
+        , "  let s0 idx = shift 2 idx in"
+        , "  let s1 idx = shift 7 idx in"
+        , "  let a = generate [n] s0 in"
+        , "  let b = generate [n] s1 in"
+        , "  index () (reduce (+) 0 a) + index () (reduce (+) 0 b)"
+        ]
+
+    -- Single-call-site helpers keep their call-site facts: the index helper's
+    -- parameter bound still grounds the gather-style obligation, and an
+    -- actually-unsafe single call site is still rejected.
+    it "still rejects an unsafe single call site of a helper" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let arr = generate [4] (fn [i] => i)"
+            , "let pick j = index [j] arr"
+            , "let main = pick 9"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+  describe "division and modulo in index obligations" $ do
+
+    -- TDiv/TMod carry C truncated semantics into the solver (sQuot/sRem), so
+    -- index expressions with division no longer become fresh unconstrained
+    -- variables and can be discharged by Z3.
+    it "verifies index [i / 2] into a same-length array" $ do
+      expectDecsOk $ BS.unlines
+        [ "let arr = generate [8] (fn [i] => i)"
+        , "let main = generate [8] (fn [i] => index [i / 2] arr)"
+        ]
+
+    it "verifies index [i % 8] into an 8-element array" $ do
+      expectDecsOk $ BS.unlines
+        [ "let arr = generate [8] (fn [i] => i)"
+        , "let main = generate [100] (fn [i] => index [i % 8] arr)"
+        ]
+
+    it "rejects index [i % 8] into a 7-element array" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let arr = generate [7] (fn [i] => i)"
+            , "let main = generate [100] (fn [i] => index [i % 8] arr)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- Division by a literal zero is undefined behaviour in the generated C;
+    -- the divisor-nonzero side condition rejects it outright.
+    it "rejects a literal zero divisor in an index expression" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let arr = generate [8] (fn [i] => i)"
+            , "let main = generate [8] (fn [i] => index [i / 0] arr)"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    -- The `bound` annotation's solver fallback now survives division: the
+    -- obligation ships the actual (i*bins)/n term instead of a fresh variable.
+    it "verifies a bound-annotated bucket index computed with division" $ do
+      expectDecsOk $ BS.unlines
+        [ "let main ="
+        , "  let n = get_env_int \"N\" in"
+        , "  let bins = get_env_int \"BINS\" in"
+        , "  let hist ="
+        , "    scatter (+) (fill [bins] 0)"
+        , "      (generate [n] (let f [i] = let b bound bins = (i * bins) / n in b in f))"
+        , "      (generate [n] (let g [i] = 1 in g)) in"
+        , "  index () (reduce (+) 0 hist)"
+        ]

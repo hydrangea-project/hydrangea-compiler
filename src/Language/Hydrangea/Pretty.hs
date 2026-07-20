@@ -103,6 +103,8 @@ instance Pretty Term where
       TDim v i -> text "dim" <> parens (text (unpack v) <> text "," <+> int i)
       TValBoundDim v i -> text "vbound" <> parens (text (unpack v) <> text "," <+> int i)
       TMax l r -> text "max" <> parens (pPrint l <> text "," <+> pPrint r)
+      TDiv l r -> parens (pPrint l <+> text "/" <+> pPrint r)
+      TMod l r -> parens (pPrint l <+> text "%" <+> pPrint r)
 
 instance Pretty Pred where
   pPrint pred' =
@@ -110,6 +112,7 @@ instance Pretty Pred where
       PLt l r -> pPrint l <+> text "<" <+> pPrint r
       PLe l r -> pPrint l <+> text "<=" <+> pPrint r
       PEq l r -> pPrint l <+> text "=" <+> pPrint r
+      PNeq l r -> pPrint l <+> text "<>" <+> pPrint r
       PGe l r -> pPrint l <+> text ">=" <+> pPrint r
       PGt l r -> pPrint l <+> text ">" <+> pPrint r
 
