@@ -677,11 +677,11 @@ unswitchLoopInvariantIf = concatMap goStmt
 --
 -- This avoids re-allocating every temporal iteration.
 
--- | Split a @LoopIterate@ whose loop-carried state is a pair into one
--- carried variable per component, so downstream passes (and in particular
--- polyhedral temporal-alias detection) see a plain @cur = next@ swap for
--- every component array. Coupled-field steps (e.g. FDTD-style e/h updates)
--- lower to this shape:
+-- | Split a @LoopIterate@ whose loop-carried state is a (possibly nested)
+-- pair into one carried variable per component, so downstream passes (and in
+-- particular polyhedral temporal-alias detection) see a plain @cur = next@
+-- swap for every component array. Coupled-field steps (e.g. FDTD-style e/h
+-- updates) lower to this shape:
 --
 -- >   cur = <pair init>                     cur = <pair init>
 -- >   for iter_t:                           tf = fst cur
@@ -697,9 +697,11 @@ unswitchLoopInvariantIf = concatMap goStmt
 -- iteration. Fires only when @cur@ and @p@ have no other reads or writes
 -- in the body.
 --
--- ponytail: one pair level only — nested-pair state (three or more arrays)
--- stays opaque; generalize with a carried-var-keyed fixpoint when
--- FDTD-2D-style triples matter.
+-- Nested-pair state (three or more carried arrays, e.g. FDTD-2D-style
+-- triples) is split recursively: a pair level is descended when its old
+-- value is decomposed by exactly one @fst@ and one @snd@ extraction and its
+-- new value is built by a single-assignment 'RPairMake'; any level that
+-- fails this stays a single opaque carried leaf.
 scalarizeIteratePairs :: [Stmt] -> [Stmt]
 scalarizeIteratePairs = go
   where
@@ -714,44 +716,80 @@ scalarizeIteratePairs = go
     go (s : rest) = s : go rest
 
     splitPairState spec body = do
-      ( SAssign cur (RAtom (AVar p))
-        : SAssign p' (RPairMake tagA tagB x y)
-        : revMid
-        ) <- Just (reverse body)
-      guard (p' == p)
+      (SAssign cur (RAtom (AVar root)) : revMid) <- Just (reverse body)
       let mid0 = reverse revMid
-      [(tf, tagF)] <- Just [(v, tag) | SAssign v (RPairFst tag (AVar c)) <- mid0, c == cur]
-      [(ts, tagS)] <- Just [(v, tag) | SAssign v (RPairSnd tag (AVar c)) <- mid0, c == cur]
-      let isExtraction s = case s of
-            SAssign v (RPairFst _ (AVar c)) -> c == cur && v == tf
-            SAssign v (RPairSnd _ (AVar c)) -> c == cur && v == ts
+          defCounts = countAssignedVars mid0
+          singleDef v = M.findWithDefault (0 :: Int) v defCounts == 1
+          -- Grow the carried-state tree keyed on each level's old-value var
+          -- and new-value atom.  Returns (new-value atom for the parent
+          -- rebuild, extraction stmts top-down, rebuild stmts bottom-up,
+          -- carried leaves in order).  @seen@ breaks descent cycles on
+          -- malformed input.
+          grow seen evar atom
+            | AVar m <- atom
+            , m `S.notMember` seen
+            , singleDef m
+            , [(tagA, tagB, a, b)] <-
+                [(tA, tB, x, y) | SAssign v (RPairMake tA tB x y) <- mid0, v == m]
+            , [(vf, tagF)] <- [(v, t) | SAssign v (RPairFst t (AVar c)) <- mid0, c == evar]
+            , [(vs, tagS)] <- [(v, t) | SAssign v (RPairSnd t (AVar c)) <- mid0, c == evar]
+            , let seen' = S.insert m seen
+            , (aAtom, aExt, aReb, aLeaves) <- grow seen' vf a
+            , (bAtom, bExt, bReb, bLeaves) <- grow seen' vs b =
+                ( AVar m
+                , SAssign vf (RPairFst tagF (AVar evar))
+                    : SAssign vs (RPairSnd tagS (AVar evar))
+                    : aExt ++ bExt
+                , aReb ++ bReb ++ [SAssign m (RPairMake tagA tagB aAtom bAtom)]
+                , aLeaves ++ bLeaves
+                )
+            | otherwise = (AVar evar, [], [], [(evar, atom)])
+          (_, extracts, rebuilds, leaves) = grow S.empty cur (AVar root)
+      guard (not (null extracts))
+      let extractVars = [v | SAssign v _ <- extracts]
+          makeVars = [v | SAssign v _ <- rebuilds]
+          leafVars = map fst leaves
+          interiorVars = filter (`notElem` leafVars) extractVars
+          deadVars = cur : makeVars ++ interiorVars
+          names = cur : extractVars ++ makeVars
+      guard (length names == S.size (S.fromList names))
+      let isRemoved s = case s of
+            SAssign v RPairMake {} -> v `elem` makeVars
+            SAssign _ RPairFst {} -> s `elem` extracts
+            SAssign _ RPairSnd {} -> s `elem` extracts
             _ -> False
-          mid = filter (not . isExtraction) mid0
+          mid = filter (not . isRemoved) mid0
           midUsed = usedVarsStmts mid
           midDefined = definedVarsStmts mid
-      guard (tf /= ts)
-      guard (all (`notElem` [cur, p]) [tf, ts])
-      guard (all (`S.notMember` midUsed) [cur, p])
-      guard (all (`S.notMember` midDefined) [cur, p, tf, ts])
-      guard (all (`notElem` [AVar cur, AVar p]) [x, y])
+      guard (all (`S.notMember` midUsed) deadVars)
+      guard (all (`S.notMember` midDefined) (deadVars ++ leafVars))
+      -- The tail assigns the leaves sequentially, so a leaf's new value may
+      -- not read another leaf's carried var (a rotation would see the new
+      -- epoch instead of the old), nor anything that dies with the pair
+      -- structure.
+      let badLeafAtom (lv, a) =
+            any
+              (\v -> v `elem` deadVars || (v /= lv && v `elem` leafVars))
+              (S.toList (usedVarsAtom a))
+      guard (not (any badLeafAtom leaves))
       -- Shapes of the carried arrays are iterate-invariant (an iterate step
       -- preserves its state shape — the same assumption the single-array
       -- ping-pong hoist makes), so their reads can move before the loop,
       -- where invariant-branch unswitching can reach the boundary guards
       -- computed from them.
-      let defCounts = countAssignedVars mid
-          isCarriedShape s = case s of
+      let isCarriedShape s = case s of
             SAssign sv (RArrayShape (AVar v)) ->
-              v `elem` [tf, ts] && M.findWithDefault (0 :: Int) sv defCounts == 1
+              v `elem` leafVars && singleDef sv
             _ -> False
           (shapeStmts, midRest) = partition isCarriedShape mid
+          -- The root level rebuilds straight into @cur@; @root@ dies.
+          post = case reverse rebuilds of
+            SAssign _ rootMake : restReb -> reverse restReb ++ [SAssign cur rootMake]
+            [] -> []
       pure
-        ( [ SAssign tf (RPairFst tagF (AVar cur))
-          , SAssign ts (RPairSnd tagS (AVar cur))
-          ]
-            ++ shapeStmts
-        , SLoop spec (midRest ++ [SAssign tf (RAtom x), SAssign ts (RAtom y)])
-        , [SAssign cur (RPairMake tagA tagB (AVar tf) (AVar ts))]
+        ( extracts ++ shapeStmts
+        , SLoop spec (midRest ++ [SAssign lv (RAtom a) | (lv, a) <- leaves])
+        , post
         )
 
 hoistIterateAllocs :: [Stmt] -> [Stmt]

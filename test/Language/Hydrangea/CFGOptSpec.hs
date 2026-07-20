@@ -452,6 +452,40 @@ spec = do
               `shouldBe` False
         other -> expectationFailure ("unexpected shape: " ++ show other)
 
+    it "splits nested-pair iterate state into per-leaf swaps" $ do
+      let inner = CEPair CEArray CEArray
+          body =
+            [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
+            , SAssign "ti" (RPairSnd inner (AVar "cur"))
+            , SAssign "ta" (RPairFst CEArray (AVar "ti"))
+            , SAssign "tb" (RPairSnd CEArray (AVar "ti"))
+            , SAssign "x" (RArrayCopy (AVar "tf"))
+            , SAssign "y" (RArrayCopy (AVar "ta"))
+            , SAssign "z" (RArrayCopy (AVar "tb"))
+            , SAssign "q" (RPairMake CEArray CEArray (AVar "y") (AVar "z"))
+            , SAssign "p" (RPairMake CEArray inner (AVar "x") (AVar "q"))
+            , SAssign "cur" (RAtom (AVar "p"))
+            ]
+          loop = SLoop (LoopSpec ["t"] [IVar "k"] Serial Nothing LoopIterate []) body
+          result = scalarizeIteratePairs [loop]
+      case result of
+        [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
+          , SAssign "ti" (RPairSnd (CEPair CEArray CEArray) (AVar "cur"))
+          , SAssign "ta" (RPairFst CEArray (AVar "ti"))
+          , SAssign "tb" (RPairSnd CEArray (AVar "ti"))
+          , SLoop _ body'
+          , SAssign "q" (RPairMake CEArray CEArray (AVar "ta") (AVar "tb"))
+          , SAssign "cur" (RPairMake CEArray (CEPair CEArray CEArray) (AVar "tf") (AVar "q"))
+          ] -> do
+            drop (length body' - 3) body'
+              `shouldBe` [ SAssign "tf" (RAtom (AVar "x"))
+                         , SAssign "ta" (RAtom (AVar "y"))
+                         , SAssign "tb" (RAtom (AVar "z"))
+                         ]
+            any (\s -> case s of SAssign _ (RPairFst {}) -> True; SAssign _ (RPairMake {}) -> True; _ -> False) body'
+              `shouldBe` False
+        other -> expectationFailure ("unexpected shape: " ++ show other)
+
     it "leaves single-array iterate state alone" $ do
       let body =
             [ SAssign "x" (RArrayCopy (AVar "cur"))
