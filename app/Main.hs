@@ -336,7 +336,7 @@ main = do
               Nothing -> putStrLn $ unpack v ++ " : evaluation error"
               Just val -> do
                 let typeStr = render (text (unpack v) <+> prettyTy (Just p))
-                    valStr = render (text " = " <+> pPrint val)
+                    valStr = render (text " =" <+> pPrint val)
                 putStrLn (typeStr ++ valStr)
       when printFused $ do
         _ <- runCheckedInference

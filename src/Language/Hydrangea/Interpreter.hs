@@ -97,7 +97,10 @@ evalExp expr env = case expr of
   EInt _ n -> pure $ VInt n
   EFloat _ f -> pure $ VFloat f
   EBool _ b -> pure $ VBool b
-  EString _ s -> pure $ VString s
+  -- A 'VString' always holds the unquoted payload; the lexer keeps the
+  -- surrounding quotes in the literal, so strip them here rather than at
+  -- every use site.
+  EString _ s -> pure $ VString (stripStringQuotes s)
   EUnit _ -> pure VUnit
   EVec _ es -> VTuple <$> mapM (`evalExp` env) es
   EVar _ v -> case Map.lookup v env of
@@ -827,7 +830,7 @@ parseCSVFloats = parseDelimitedValues "read_array_float" readMaybe
 expectStringValue :: String -> String -> Value -> EvalM String
 expectStringValue opName what val =
   case val of
-    VString s -> pure $ BS.unpack (stripStringQuotes s)
+    VString s -> pure $ BS.unpack s
     _ -> throwError $ TypeError (opName ++ ": " ++ what ++ " must be a string")
 
 readCSVArray
@@ -1114,17 +1117,19 @@ instance Pretty Value where
   pPrint (VBool b) = text $ if b then "true" else "false"
   pPrint (VString s) = doubleQuotes (text (unpack s))
   pPrint VUnit = text "()"
-  pPrint (VTuple vals) = parens (sep (punctuate (text ",") (map pPrint vals)))
+  pPrint (VTuple vals) = parens (hsep (punctuate (text ",") (map pPrint vals)))
   pPrint (VPair v1 v2) = parens (pPrint v1 <> text ", " <> pPrint v2)
   pPrint (VRecord fields) =
-    braces (sep (punctuate comma [text (unpack field) <+> text "=" <+> pPrint fieldVal | (field, fieldVal) <- fields]))
+    braces (hsep (punctuate comma [text (unpack field) <+> text "=" <+> pPrint fieldVal | (field, fieldVal) <- fields]))
   pPrint (VClosure _ _ _) = text "<closure>"
   pPrint (VPrimOp (Just v) op) = parens (pPrint v <+> text (operatorToString op))
   pPrint (VPrimOp Nothing op) = text (operatorToString op)
   pPrint (VStencilAcc _ _ _ _ _) = text "<stencil-acc>"
   pPrint (VArray shape vals) =
-    text "array" <+> brackets (sep (punctuate (text ",") (map integer shape)))
-      <+> brackets (sep (punctuate (text ",") (map pPrint vals)))
+    -- 'hsep', not 'sep': a rendered value gets concatenated onto an
+    -- already-rendered type, so any line break lands at the wrong indent.
+    text "array" <+> brackets (hsep (punctuate (text ",") (map integer shape)))
+      <+> brackets (hsep (punctuate (text ",") (map pPrint vals)))
 
 -- | Convert an operator to a string representation
 operatorToString :: Operator () -> String
