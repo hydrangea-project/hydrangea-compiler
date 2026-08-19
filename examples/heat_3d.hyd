@@ -1,0 +1,20 @@
+(* 3D iterate + stencil example: two Jacobi-style smoothing steps on a 3x3x3 grid. *)
+(* Uses a 6-neighbour clamp stencil so it exercises a genuine temporal 3D kernel. *)
+
+let init =
+  generate [3,3,3] (let f [i,j,k] = float_of ((i * 9) + (j * 3) + k) in f)
+
+let step arr =
+  stencil clamp
+    (fn acc =>
+      ( acc (-1) 0 0
+      +. acc 1 0 0
+      +. acc 0 (-1) 0
+      +. acc 0 1 0
+      +. acc 0 0 (-1)
+      +. acc 0 0 1
+      +. acc 0 0 0
+      ) /. 7.0)
+    arr
+
+let result = iterate 2 init step

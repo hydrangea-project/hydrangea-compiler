@@ -58,6 +58,7 @@ import Language.Hydrangea.Interpreter
 import Language.Hydrangea.ErrorFormat (formatTypeError, formatEvalError)
 import Language.Hydrangea.Fusion
 import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, normalizeShapesDecs)
+import Language.Hydrangea.TemporalTiling (rewriteTemporalDecs)
 import Language.Hydrangea.Uniquify
 import Language.Hydrangea.Specialize (monomorphizeDecs, polymorphicFnNames)
 import Language.Hydrangea.CFG qualified as CFG
@@ -97,7 +98,8 @@ preprocessDecsWithOptions :: FrontendOptions -> [Dec Range] -> [Dec Range]
 preprocessDecsWithOptions opts decs =
   let u = uniquifyDecs decs
       n = normalizeShapesDecs u
-  in if frontendSkipFusion opts then n else fuseDecs n
+      f = if frontendSkipFusion opts then n else fuseDecs n
+  in rewriteTemporalDecs f
 
 formatInferResult :: Either err a -> (err -> String) -> Either String a
 formatInferResult result formatErr =
@@ -387,4 +389,3 @@ readAndEval str =
       pure $ case res of
         Left err -> Left (formatEvalError Nothing Nothing err)
         Right v -> Right v
-

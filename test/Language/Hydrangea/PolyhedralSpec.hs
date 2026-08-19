@@ -247,6 +247,19 @@ spec = describe "Polyhedral" $ do
     countWavefrontRingAllocsInStmts body `shouldSatisfy` (> 0)
     hasVectorLoopInStmts body `shouldBe` True
 
+  it "collapses source-level 3D clamp iterate kernels into the wavefront path" $ do
+    body <-
+      loadPolyhedralProcBodyFromSource
+        "result"
+        (BS.pack $ unlines
+          [ "let step arr = stencil clamp"
+          , "  (let acc_fn acc = (acc (-1) 0 0 +. acc 1 0 0 +. acc 0 0 0) /. 3.0 in acc_fn)"
+          , "  arr"
+          , "let result = iterate 2 (generate [3, 3, 3] (let f [i, j, k] = 1.0 in f)) step"
+          ])
+    countWavefrontRingAllocsInStmts body `shouldSatisfy` (> 0)
+    hasParallelLoopInStmts body `shouldBe` True
+
   it "guards small source-level 2D clamp iterate kernels with a tiled wavefront profitability check" $ do
     body <-
       loadTiledProcBodyFromSource
@@ -1543,6 +1556,67 @@ wavefrontSkewingSpec = describe "wavefront skewing" $ do
 
 wavefrontCollapseSpec :: Spec
 wavefrontCollapseSpec = describe "wavefront collapse" $ do
+  it "records a first-class temporal wavefront plan on tiled iterate kernels" $ do
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "x" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate [])
+            [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+            , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+            , innerLoop
+            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+            ]
+        proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
+    case extractProcScops proc of
+      [scop] ->
+        case ssTemporalTilePlan (tileScop scop) of
+          Just (TemporalWavefront plan) -> do
+            wfpIterT plan `shouldBe` "iter_t"
+            wfpCurArray plan `shouldBe` "arr_cur"
+            wfpNextArray plan `shouldBe` "arr_next"
+          other ->
+            expectationFailure ("expected wavefront temporal plan, got: " <> show other)
+      other ->
+        expectationFailure ("expected one scop, got: " <> show (length other))
+
+  it "records a first-class temporal diamond plan on tiled 1D stencil iterates" $ do
+    let innerLoop =
+          SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+            [ SAssign "im1" (C.RBinOp C.CSub (C.AVar "i") (C.AInt 1))
+            , SAssign "ip1" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "left" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "im1"))
+            , SAssign "right" (C.RArrayLoad (C.AVar "arr_cur") (C.AVar "ip1"))
+            , SAssign "x" (C.RBinOp C.CAddF (C.AVar "left") (C.AVar "right"))
+            , SArrayWrite (C.AVar "arr_next") (C.AVar "i") (C.AVar "x")
+            ]
+        outerLoop =
+          SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate [])
+            [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
+            , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
+            , innerLoop
+            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
+            ]
+        proc =
+          (mkProc "p" ["T", "n", "arr_cur"] [outerLoop])
+            { procStencilFacts = Map.fromList [("i", StencilFact 1 1)]
+            }
+    case extractProcScops proc of
+      [scop] ->
+        case ssTemporalTilePlan (tileScop scop) of
+          Just (TemporalDiamond plan) -> do
+            dpTimeIter plan `shouldBe` "iter_t"
+            dpAxes plan `shouldBe` [DiamondAxis "i" 1]
+            dpCurArray plan `shouldBe` "arr_cur"
+            dpNextArray plan `shouldBe` "arr_next"
+          other ->
+            expectationFailure ("expected diamond temporal plan, got: " <> show other)
+      other ->
+        expectationFailure ("expected one scop, got: " <> show (length other))
+
   it "collapses constant-trip iterate/map kernels into a ring-buffer wavefront on the polyhedral path" $ do
     let innerLoop =
           SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])

@@ -30,6 +30,7 @@ library
                    , Language.Hydrangea.Specialize
                    , Language.Hydrangea.Fusion
                    , Language.Hydrangea.ShapeNormalize
+                   , Language.Hydrangea.TemporalTiling
                    , Language.Hydrangea.CLI
                    , Language.Hydrangea.Frontend
                    , Language.Hydrangea.Interpreter

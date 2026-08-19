@@ -188,3 +188,20 @@ spec = describe "stencil" $ do
         "let arr = fill [2,2] 1 in \
         \stencil (constant 0) (fn acc => acc (-1) 0) arr"
         (VArray [2,2] [VInt 0, VInt 0, VInt 1, VInt 1])
+
+  -- -------------------------------------------------------------------------
+  -- 3D stencil
+  -- -------------------------------------------------------------------------
+  describe "3D clamp" $ do
+    it "zero-offset 3D stencil is identity" $
+      expectEval
+        "let arr = generate [2,2,2] (let f [i,j,k] = (i * 4) + (j * 2) + k in f) in \
+        \stencil clamp (fn acc => acc 0 0 0) arr"
+        (VArray [2,2,2] [VInt 0, VInt 1, VInt 2, VInt 3, VInt 4, VInt 5, VInt 6, VInt 7])
+
+  describe "3D constant" $ do
+    it "3D OOB returns the constant value" $
+      expectEval
+        "let arr = fill [2,2,2] 1 in \
+        \stencil (constant 9) (fn acc => acc 0 0 (-1)) arr"
+        (VArray [2,2,2] [VInt 9, VInt 1, VInt 9, VInt 1, VInt 9, VInt 1, VInt 9, VInt 1])

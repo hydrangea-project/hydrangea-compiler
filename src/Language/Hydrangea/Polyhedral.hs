@@ -37,6 +37,10 @@ module Language.Hydrangea.Polyhedral
   , AffineSchedule(..)
   , Scop(..)
   , ScheduledScop(..)
+  , TemporalTilePlan(..)
+  , WavefrontPlan(..)
+  , DiamondAxis(..)
+  , DiamondPlan(..)
   , ScopRejectReason(..)
   , ScopDiagnostic(..)
   , affineExprFromIndexExpr
@@ -91,6 +95,52 @@ data AffineExpr = AffineExpr
   , aeConstant :: Integer
   }
   deriving (Eq, Show)
+
+wavefrontKernelToPlan :: WavefrontKernel -> WavefrontPlan
+wavefrontKernelToPlan kernel =
+  WavefrontPlan
+    { wfpIterT = wfkIterT kernel
+    , wfpIterBound = wfkIterBound kernel
+    , wfpCurArray = wfkCurArray kernel
+    , wfpNextArray = wfkNextArray kernel
+    , wfpAllocShape = wfkAllocShape kernel
+    , wfpPreallocatedNext = wfkPreallocatedNext kernel
+    , wfpInitTracker = wfkInitTracker kernel
+    , wfpHoistedPrefix = wfkHoistedPrefix kernel
+    , wfpStageSuffix = wfkStageSuffix kernel
+    , wfpInnerSpec = wfkInnerSpec kernel
+    , wfpInnerBody = wfkInnerBody kernel
+    , wfpSkewCoeff = wfkSkewCoeff kernel
+    , wfpStageWidth = wfkStageWidth kernel
+    , wfpStageExec = wfkStageExec kernel
+    }
+
+-- | First diamond-plan matcher: single spatial-axis stencil iterates whose
+-- tiled execution is already carried by the current frontier executor.  This
+-- records the richer temporal geometry now, while the next implementation step
+-- will split the spatial domain into multiple adjacent diamonds.
+diamondPlanFromKernel :: ScheduledScop -> WavefrontKernel -> Maybe DiamondPlan
+diamondPlanFromKernel scheduled kernel = do
+  [_] <- pure (lsIters (wfkInnerSpec kernel))
+  (logicalIter, fact) <- listToMaybe (M.toList (scStencilFacts (ssOriginal scheduled)))
+  guard (M.size (scStencilFacts (ssOriginal scheduled)) == 1)
+  let radius = sfBackward fact
+  guard (radius > 0)
+  pure
+    DiamondPlan
+      { dpTimeIter = wfkIterT kernel
+      , dpTimeBound = wfkIterBound kernel
+      , dpAxes = [DiamondAxis logicalIter radius]
+      , dpInnerSpec = wfkInnerSpec kernel
+      , dpInnerBody = wfkInnerBody kernel
+      , dpCurArray = wfkCurArray kernel
+      , dpNextArray = wfkNextArray kernel
+      , dpAllocShape = wfkAllocShape kernel
+      , dpPreallocatedNext = wfkPreallocatedNext kernel
+      , dpInitTracker = wfkInitTracker kernel
+      , dpTimeTileDepth = wfkStageWidth kernel
+      , dpFrontierExec = wfkStageExec kernel
+      }
 
 newtype AffineConstraint = AffineConstraint
   { acExpr :: IndexExpr
@@ -292,10 +342,70 @@ data ScheduledScop = ScheduledScop
   { ssOriginal :: Scop
   , ssAffineSchedule :: AffineSchedule
   , ssSchedule :: ScheduleTree
+  , ssTemporalTilePlan :: Maybe TemporalTilePlan
   , ssReplacement :: Maybe [Stmt]
   , ssTypeOverrides :: Map CVar CType
   , ssArrayFactOverrides :: Map CVar ArrayFact
   , ssVectorAccessFactOverrides :: Map CVar VectorAccessFact
+  }
+  deriving (Eq, Show)
+
+-- | Replacement-style temporal tiling plans.  Keep richer temporal shapes out
+-- of the generic loop-band skew/origin vocabulary; wavefront and diamond
+-- lowering can then share one explicit hook without overloading 'lbOrigins'.
+data TemporalTilePlan
+  = TemporalWavefront WavefrontPlan
+  | TemporalDiamond DiamondPlan
+  deriving (Eq, Show)
+
+-- | Stable carrier for the current wavefront replacement path.  This mirrors
+-- the information already required by 'WavefrontKernel', but lives in the
+-- schedule result so future temporal tilers (diamonds, trapezoids, etc.) can
+-- share one representation family.
+data WavefrontPlan = WavefrontPlan
+  { wfpIterT :: CVar
+  , wfpIterBound :: IndexExpr
+  , wfpCurArray :: CVar
+  , wfpNextArray :: CVar
+  , wfpAllocShape :: Atom
+  , wfpPreallocatedNext :: Bool
+  , wfpInitTracker :: Maybe CVar
+  , wfpHoistedPrefix :: [Stmt]
+  , wfpStageSuffix :: [Stmt]
+  , wfpInnerSpec :: LoopSpec
+  , wfpInnerBody :: [Stmt]
+  , wfpSkewCoeff :: Integer
+  , wfpStageWidth :: Integer
+  , wfpStageExec :: ExecPolicy
+  }
+  deriving (Eq, Show)
+
+-- | One logical spatial axis participating in a diamond transform.  The
+-- radius coefficient comes from the stencil footprint and determines how the
+-- logical iterator contributes to the positive/negative frontier planes.
+data DiamondAxis = DiamondAxis
+  { daLogicalIter :: CVar
+  , daRadiusCoeff :: Integer
+  }
+  deriving (Eq, Show)
+
+-- | First-class plan for a diamond temporal tile.  This is intentionally
+-- closer to 'WavefrontPlan' than to 'LoopBand': diamond lowering is expected
+-- to emit a replacement CFG nest, not to piggyback on generic origin/skew
+-- reification.
+data DiamondPlan = DiamondPlan
+  { dpTimeIter :: CVar
+  , dpTimeBound :: IndexExpr
+  , dpAxes :: [DiamondAxis]
+  , dpInnerSpec :: LoopSpec
+  , dpInnerBody :: [Stmt]
+  , dpCurArray :: CVar
+  , dpNextArray :: CVar
+  , dpAllocShape :: Atom
+  , dpPreallocatedNext :: Bool
+  , dpInitTracker :: Maybe CVar
+  , dpTimeTileDepth :: Integer
+  , dpFrontierExec :: ExecPolicy
   }
   deriving (Eq, Show)
 
@@ -454,6 +564,7 @@ buildScheduledScop scop affineSchedule scheduleTree =
     { ssOriginal = scop
     , ssAffineSchedule = affineSchedule
     , ssSchedule = scheduleTree
+    , ssTemporalTilePlan = Nothing
     , ssReplacement = Nothing
     , ssTypeOverrides = M.empty
     , ssArrayFactOverrides = M.empty
@@ -2546,11 +2657,18 @@ buildTiledWavefrontScop scheduled = do
           ]
   kernel <- matchWavefrontKernel strengthened
   fallback <- reifyScheduleTree stmtMap (ssSchedule strengthened)
+  let temporalPlan =
+        case diamondPlanFromKernel strengthened kernel of
+          Just diamondPlan -> TemporalDiamond diamondPlan
+          Nothing -> TemporalWavefront (wavefrontKernelToPlan kernel)
   replacement <-
     evalState
-      (buildTiledWavefrontReplacement kernel fallback)
+      (buildTemporalTileReplacement temporalPlan kernel fallback)
       (collectScopNames scop, 0)
-  pure strengthened { ssReplacement = Just replacement }
+  pure strengthened
+    { ssTemporalTilePlan = Just temporalPlan
+    , ssReplacement = Just replacement
+    }
 
 strengthenWavefrontScheduled :: ScheduledScop -> ScheduledScop
 strengthenWavefrontScheduled scheduled =
@@ -2854,7 +2972,41 @@ buildTiledWavefrontReplacement kernel fallback = do
       Just <$> buildWavefrontBody kernel
     WavefrontProfitGuard guardStmts guardAtom -> do
       wavefrontBody <- buildWavefrontBody kernel
-      pure (Just (guardStmts ++ [SIf guardAtom wavefrontBody fallback]))
+      let guardFreeVars =
+            usedVarsStmts guardStmts `S.difference` definedVarsStmts guardStmts
+          (guardPrelude, _) =
+            extractReductionPrelude guardFreeVars [] (wfkHoistedPrefix kernel)
+      pure (Just (guardPrelude ++ guardStmts ++ [SIf guardAtom wavefrontBody fallback]))
+
+buildTemporalTileReplacement
+  :: TemporalTilePlan
+  -> WavefrontKernel
+  -> [Stmt]
+  -> TileM (Maybe [Stmt])
+buildTemporalTileReplacement plan kernel fallback = case plan of
+  TemporalWavefront {} ->
+    buildTiledWavefrontReplacement kernel fallback
+  TemporalDiamond diamondPlan ->
+    buildDiamondReplacement diamondPlan kernel fallback
+
+buildDiamondReplacement :: DiamondPlan -> WavefrontKernel -> [Stmt] -> TileM (Maybe [Stmt])
+buildDiamondReplacement plan kernel fallback
+  | [DiamondAxis _ coeff] <- dpAxes plan = do
+      profitability <- wavefrontProfitabilityForTiledPath kernel
+      case profitability of
+        WavefrontProfitReject ->
+          pure Nothing
+        WavefrontProfitAccept ->
+          Just <$> buildSingleAxisDiamondBody coeff kernel
+        WavefrontProfitGuard guardStmts guardAtom -> do
+          diamondBody <- buildSingleAxisDiamondBody coeff kernel
+          let guardFreeVars =
+                usedVarsStmts guardStmts `S.difference` definedVarsStmts guardStmts
+              (guardPrelude, _) =
+                extractReductionPrelude guardFreeVars [] (wfkHoistedPrefix kernel)
+          pure (Just (guardPrelude ++ guardStmts ++ [SIf guardAtom diamondBody fallback]))
+  | otherwise =
+      buildTiledWavefrontReplacement kernel fallback
 
 buildWavefrontBody :: WavefrontKernel -> TileM [Stmt]
 buildWavefrontBody kernel = do
@@ -2925,6 +3077,96 @@ buildWavefrontBody kernel = do
              , lsRole = LoopPlain
              }
           guardedInner
+      stageLoopBody = stageSelection ++ [frontierLoop] ++ suffixBody
+      stageLoop =
+        SLoop
+          LoopSpec
+            { lsIters = [stageIter]
+            , lsBounds = [IVar (smdTileLen timeBlock)]
+            , lsOrigins = []
+            , lsExec = Serial
+            , lsRed = Nothing
+            , lsRole = LoopMap
+            }
+          stageLoopBody
+      blockLoop =
+        SLoop
+          LoopSpec
+            { lsIters = [smdTileIter timeBlock]
+            , lsBounds = [tileCountExpr (wfkIterBound kernel) (wfkStageWidth kernel)]
+            , lsOrigins = []
+            , lsExec = Serial
+            , lsRed = Nothing
+            , lsRole = LoopPlain
+            }
+          ( setupStripDim timeBlock
+              ++ stageTimeSetup
+              ++ [stageLoop]
+              ++ rotations
+          )
+  cleanup <- fmap concat (mapM (buildWavefrontCleanup kernel) cleanupTargets)
+  pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
+
+buildSingleAxisDiamondBody :: Integer -> WavefrontKernel -> TileM [Stmt]
+buildSingleAxisDiamondBody _radiusCoeff kernel = do
+  timeBlock <- buildForcedStripDim (wfkIterT kernel) (wfkIterBound kernel) (wfkStageWidth kernel)
+  diagIter <- freshLike (wavefrontHeadIter (wfkInnerSpec kernel)) "__diamond"
+  stageIter <- freshLike (wfkIterT kernel) "__wf_stage"
+  stageTimeVars <-
+    mapM
+      (\n -> freshLike (wfkIterT kernel) ("__wf_time" <> BS.pack (show n)))
+      [0 .. wfkStageWidth kernel - 1]
+  extraBuffers <-
+    mapM
+      (\n -> freshLike (wfkNextArray kernel) ("__wf_ring" <> BS.pack (show n)))
+      [2 .. wfkStageWidth kernel]
+  let stageBuffers = [wfkCurArray kernel, wfkNextArray kernel] ++ extraBuffers
+  rotations <- buildWavefrontRotation stageBuffers (smdTileLen timeBlock)
+  (stageSelection, curStageBuf, nextStageBuf, stageTimeVar) <-
+    buildWavefrontStageSelection kernel stageIter stageBuffers stageTimeVars
+  let allocTargets =
+        if wfkPreallocatedNext kernel
+          then extraBuffers
+          else drop 1 stageBuffers
+      allocs =
+        [ SAssign arr (RArrayCopy (AVar (wfkCurArray kernel)))
+        | arr <- allocTargets
+        ]
+      stageTimeSetup =
+        [ SAssign tVar (RBinOp CAdd (AVar (smdTileStart timeBlock)) (AInt offset))
+        | (offset, tVar) <- zip [0 ..] stageTimeVars
+        ]
+      substEnv =
+        M.fromList
+          [ (wfkCurArray kernel, AVar curStageBuf)
+          , (wfkNextArray kernel, AVar nextStageBuf)
+          , (wfkIterT kernel, AVar stageTimeVar)
+          ]
+      innerBody =
+        collapseWavefrontInnerLoop
+          (wavefrontFrontierInnerExec kernel)
+          diagIter
+          (wfkInnerSpec kernel)
+          (substStmts substEnv (wfkInnerBody kernel))
+      suffixBody = substStmts substEnv (wfkStageSuffix kernel)
+      cleanupTargets =
+        if wfkPreallocatedNext kernel
+          then extraBuffers
+          else drop 1 stageBuffers
+      frontierLoop =
+        SLoop
+          LoopSpec
+            { lsIters = [diagIter]
+            , lsBounds = [wavefrontHeadBound (wfkInnerSpec kernel)]
+            -- The collapsed inner body still contains the skew undoing
+            -- `head = diag - wfkSkewCoeff * t`, so the frontier coordinate
+            -- must use the kernel's scheduled skew, not the stencil radius.
+            , lsOrigins = [IMul (IConst (wfkSkewCoeff kernel)) (IVar stageTimeVar)]
+            , lsExec = wavefrontFrontierOuterExec kernel
+            , lsRed = Nothing
+            , lsRole = LoopPlain
+            }
+          innerBody
       stageLoopBody = stageSelection ++ [frontierLoop] ++ suffixBody
       stageLoop =
         SLoop

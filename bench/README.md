@@ -238,6 +238,41 @@ This is a named `run_quick.sh` variant of `jacobi_2d` with wider default sizes
 (`JACOBI_WF_H=64`, `JACOBI_WF_W=1024`, `JACOBI_WF_ITERS=20`) chosen so the
 tiled polyhedral path uses the guarded full wavefront schedule at runtime rather
 than falling back to the ordinary scheduled loop nest. It reuses the same
+
+### Temporal tiling eval harness (`stencil/run_temporal_eval.sh`)
+For the temporal-tiling work specifically, use:
+
+```bash
+bench/stencil/run_temporal_eval.sh
+BENCH_WARMUP=0 BENCH_ITERS=1 JACOBI1D_N=256 JACOBI1D_ITERS=8 JACOBI_H=16 JACOBI_W=32 JACOBI_ITERS=4 bench/stencil/run_temporal_eval.sh
+```
+
+This writes `bench/results/temporal_tiling.csv` with `jacobi_1d` and
+`jacobi_2d` rows, each containing:
+
+- untiled Hydrangea (`--no-parallel`)
+- scheduled-but-untiled polyhedral Hydrangea (`--polyhedral --no-parallel`)
+- tiled serial Hydrangea (`--tiling --polyhedral --no-parallel`)
+- tiled parallel Hydrangea (`--tiling --polyhedral`)
+
+and placeholder baseline columns for Pluto, Halide, and Futhark.
+
+Optional hook env vars let you fill those external baselines without hardcoding
+their build systems into this repo:
+
+```bash
+export TEMPORAL_PLUTO_HOOK=/path/to/pluto_runner
+export TEMPORAL_HALIDE_HOOK=/path/to/halide_runner
+export TEMPORAL_FUTHARK_HOOK=/path/to/futhark_runner
+```
+
+Each hook is called as:
+
+```bash
+hook <kernel-name> <size-label> <warmup-iters> <timed-iters>
+```
+
+and should print a single minimum-time measurement in milliseconds.
 Hydrangea, Repa, Accelerate, and C reference kernels as `jacobi_2d`; only the
 default problem size changes. The alias is opt-in: it is available via
 `./bench/run_quick.sh jacobi_2d_wavefront`, but is not part of the default full

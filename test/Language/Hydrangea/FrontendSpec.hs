@@ -1,5 +1,6 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -- | Frontend-focused tests covering parsing, typing, lowering, and code
 -- generation helpers used throughout the compiler pipeline.
@@ -148,8 +149,223 @@ countStandaloneInt64Decls src =
     , not ("(" `isInfixOf` line)
     ]
 
+anyExp :: (Exp a -> Bool) -> Exp a -> Bool
+anyExp p expr
+  | p expr = True
+  | otherwise =
+      case expr of
+        EInt {} -> False
+        EFloat {} -> False
+        EVar {} -> False
+        EString {} -> False
+        EUnit {} -> False
+        EBool {} -> False
+        EOp {} -> False
+        EVec _ es -> any (anyExp p) es
+        EApp _ f x -> anyExp p f || anyExp p x
+        EIfThen _ c t -> anyExp p c || anyExp p t
+        EIfThenElse _ c t f -> anyExp p c || anyExp p t || anyExp p f
+        ENeg _ e -> anyExp p e
+        EBinOp _ l _ r -> anyExp p l || anyExp p r
+        EUnOp _ _ e -> anyExp p e
+        ELetIn _ (Dec _ _ _ _ _ b) e -> anyExp p b || anyExp p e
+        EProj _ _ e -> anyExp p e
+        EPair _ e1 e2 -> anyExp p e1 || anyExp p e2
+        ERecord _ fields -> any (anyExp p . snd) fields
+        ERecordProj _ e _ -> anyExp p e
+        EGenerate _ s f -> anyExp p s || anyExp p f
+        EMap _ f arr -> anyExp p f || anyExp p arr
+        EZipWith _ f x y -> anyExp p f || anyExp p x || anyExp p y
+        EAppend _ x y -> anyExp p x || anyExp p y
+        EReduce _ f z arr -> anyExp p f || anyExp p z || anyExp p arr
+        EReduceGenerate _ f z s g -> anyExp p f || anyExp p z || anyExp p s || anyExp p g
+        EIterate _ n i f -> anyExp p n || anyExp p i || anyExp p f
+        EFoldl _ f z arr -> anyExp p f || anyExp p z || anyExp p arr
+        EFoldlWhile _ pred' f z arr -> anyExp p pred' || anyExp p f || anyExp p z || anyExp p arr
+        EScan _ f z arr -> anyExp p f || anyExp p z || anyExp p arr
+        EScanInclusive _ f z arr -> anyExp p f || anyExp p z || anyExp p arr
+        EScanR _ f z arr -> anyExp p f || anyExp p z || anyExp p arr
+        EScanRInclusive _ f z arr -> anyExp p f || anyExp p z || anyExp p arr
+        ESegmentedReduce _ f z offsets vals -> anyExp p f || anyExp p z || anyExp p offsets || anyExp p vals
+        ESortIndices _ arr -> anyExp p arr
+        EIota _ n -> anyExp p n
+        EMakeIndex _ n arr -> anyExp p n || anyExp p arr
+        ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
+          anyExp p nrows || anyExp p ncols || anyExp p nnz || anyExp p rows || anyExp p cols || anyExp p vals
+        ECSRFromSortedCOO _ nrows ncols nnz rows cols vals ->
+          anyExp p nrows || anyExp p ncols || anyExp p nnz || anyExp p rows || anyExp p cols || anyExp p vals
+        EPermute _ c d perm arr -> anyExp p c || anyExp p d || anyExp p perm || anyExp p arr
+        EScatter _ c d idx vals -> anyExp p c || anyExp p d || anyExp p idx || anyExp p vals
+        EScatterGuarded _ c d idx vals guardArr ->
+          anyExp p c || anyExp p d || anyExp p idx || anyExp p vals || anyExp p guardArr
+        EScatterGenerate _ c d idx f -> anyExp p c || anyExp p d || anyExp p idx || anyExp p f
+        EScatterChain _ c d phases ->
+          anyExp p c || anyExp p d
+            || any (\ph -> anyExp p (spIndex ph) || anyExp p (spValues ph) || maybe False (anyExp p) (spGuard ph)) phases
+        EScatterGen _ c d phases ->
+          anyExp p c || anyExp p d
+            || any (\ph -> anyExp p (sgpShape ph) || anyExp p (sgpIndexFn ph) || anyExp p (sgpValueFn ph)
+                            || maybe False (anyExp p) (sgpGuardFn ph)) phases
+        EGather _ idx arr -> anyExp p idx || anyExp p arr
+        EIndex _ idx arr -> anyExp p idx || anyExp p arr
+        ECheckIndex _ idx def arr -> anyExp p idx || anyExp p def || anyExp p arr
+        EFill _ s v -> anyExp p s || anyExp p v
+        EShapeOf _ arr -> anyExp p arr
+        EReplicate _ dims arr -> any (anyShapeDim p) dims || anyExp p arr
+        ESlice _ dims arr -> any (anySliceDim p) dims || anyExp p arr
+        EReshape _ s arr -> anyExp p s || anyExp p arr
+        EReadArray _ s f -> anyExp p s || anyExp p f
+        EReadArrayFloat _ s f -> anyExp p s || anyExp p f
+        EWriteArray _ arr f -> anyExp p arr || anyExp p f
+        EWriteArrayFloat _ arr f -> anyExp p arr || anyExp p f
+        EGetEnvInt _ e -> anyExp p e
+        EGetEnvString _ e -> anyExp p e
+        EStencil _ bnd f arr ->
+          (case bnd of BConst e -> anyExp p e; _ -> False)
+            || anyExp p f || anyExp p arr
+        EBoundLetIn _ _ boundExp rhs body -> anyExp p boundExp || anyExp p rhs || anyExp p body
+        EReify _ e -> anyExp p e
+
+anyShapeDim :: (Exp a -> Bool) -> ShapeDim a -> Bool
+anyShapeDim p = \case
+  ShapeAll _ -> False
+  ShapeAny _ e -> anyExp p e
+  ShapeDim _ e -> anyExp p e
+
+anySliceDim :: (Exp a -> Bool) -> SliceDim a -> Bool
+anySliceDim p = \case
+  SliceAll _ -> False
+  SliceRange _ s l -> anyExp p s || anyExp p l
+
+countNodes :: (Exp a -> Bool) -> Exp a -> Int
+countNodes p expr =
+  let self = if p expr then 1 else 0
+      kids = case expr of
+        EInt {} -> 0
+        EFloat {} -> 0
+        EVar {} -> 0
+        EString {} -> 0
+        EUnit {} -> 0
+        EBool {} -> 0
+        EOp {} -> 0
+        EVec _ es -> sum (map (countNodes p) es)
+        EApp _ f x -> countNodes p f + countNodes p x
+        EIfThen _ c t -> countNodes p c + countNodes p t
+        EIfThenElse _ c t f -> countNodes p c + countNodes p t + countNodes p f
+        ENeg _ e -> countNodes p e
+        EBinOp _ l _ r -> countNodes p l + countNodes p r
+        EUnOp _ _ e -> countNodes p e
+        ELetIn _ (Dec _ _ _ _ _ b) e -> countNodes p b + countNodes p e
+        EProj _ _ e -> countNodes p e
+        EPair _ e1 e2 -> countNodes p e1 + countNodes p e2
+        ERecord _ fields -> sum (map (countNodes p . snd) fields)
+        ERecordProj _ e _ -> countNodes p e
+        EGenerate _ s f -> countNodes p s + countNodes p f
+        EMap _ f arr -> countNodes p f + countNodes p arr
+        EZipWith _ f x y -> countNodes p f + countNodes p x + countNodes p y
+        EAppend _ x y -> countNodes p x + countNodes p y
+        EReduce _ f z arr -> countNodes p f + countNodes p z + countNodes p arr
+        EReduceGenerate _ f z s g -> countNodes p f + countNodes p z + countNodes p s + countNodes p g
+        EIterate _ n i f -> countNodes p n + countNodes p i + countNodes p f
+        EFoldl _ f z arr -> countNodes p f + countNodes p z + countNodes p arr
+        EFoldlWhile _ pred' f z arr -> countNodes p pred' + countNodes p f + countNodes p z + countNodes p arr
+        EScan _ f z arr -> countNodes p f + countNodes p z + countNodes p arr
+        EScanInclusive _ f z arr -> countNodes p f + countNodes p z + countNodes p arr
+        EScanR _ f z arr -> countNodes p f + countNodes p z + countNodes p arr
+        EScanRInclusive _ f z arr -> countNodes p f + countNodes p z + countNodes p arr
+        ESegmentedReduce _ f z offsets vals -> countNodes p f + countNodes p z + countNodes p offsets + countNodes p vals
+        ESortIndices _ arr -> countNodes p arr
+        EIota _ n -> countNodes p n
+        EMakeIndex _ n arr -> countNodes p n + countNodes p arr
+        ECOOSumDuplicates _ nrows ncols nnz rows cols vals ->
+          sum (map (countNodes p) [nrows, ncols, nnz, rows, cols, vals])
+        ECSRFromSortedCOO _ nrows ncols nnz rows cols vals ->
+          sum (map (countNodes p) [nrows, ncols, nnz, rows, cols, vals])
+        EPermute _ c d perm arr -> sum (map (countNodes p) [c, d, perm, arr])
+        EScatter _ c d idx vals -> sum (map (countNodes p) [c, d, idx, vals])
+        EScatterGuarded _ c d idx vals guardArr -> sum (map (countNodes p) [c, d, idx, vals, guardArr])
+        EScatterGenerate _ c d idx f -> sum (map (countNodes p) [c, d, idx, f])
+        EScatterChain _ c d phases ->
+          countNodes p c + countNodes p d
+            + sum [countNodes p (spIndex ph) + countNodes p (spValues ph) + maybe 0 (countNodes p) (spGuard ph) | ph <- phases]
+        EScatterGen _ c d phases ->
+          countNodes p c + countNodes p d
+            + sum [countNodes p (sgpShape ph) + countNodes p (sgpIndexFn ph) + countNodes p (sgpValueFn ph) + maybe 0 (countNodes p) (sgpGuardFn ph) | ph <- phases]
+        EGather _ idx arr -> countNodes p idx + countNodes p arr
+        EIndex _ idx arr -> countNodes p idx + countNodes p arr
+        ECheckIndex _ idx def arr -> countNodes p idx + countNodes p def + countNodes p arr
+        EFill _ s v -> countNodes p s + countNodes p v
+        EShapeOf _ arr -> countNodes p arr
+        EReplicate _ dims arr -> sum (map (countShapeNodes p) dims) + countNodes p arr
+        ESlice _ dims arr -> sum (map (countSliceNodes p) dims) + countNodes p arr
+        EReshape _ s arr -> countNodes p s + countNodes p arr
+        EReadArray _ s f -> countNodes p s + countNodes p f
+        EReadArrayFloat _ s f -> countNodes p s + countNodes p f
+        EWriteArray _ arr f -> countNodes p arr + countNodes p f
+        EWriteArrayFloat _ arr f -> countNodes p arr + countNodes p f
+        EGetEnvInt _ e -> countNodes p e
+        EGetEnvString _ e -> countNodes p e
+        EStencil _ bnd f arr ->
+          (case bnd of BConst e -> countNodes p e; _ -> 0) + countNodes p f + countNodes p arr
+        EBoundLetIn _ _ boundExp rhs body -> countNodes p boundExp + countNodes p rhs + countNodes p body
+        EReify _ e -> countNodes p e
+  in self + kids
+  where
+    countShapeNodes p' dim = case dim of
+      ShapeAll _ -> 0
+      ShapeAny _ e -> countNodes p' e
+      ShapeDim _ e -> countNodes p' e
+    countSliceNodes p' dim = case dim of
+      SliceAll _ -> 0
+      SliceRange _ s l -> countNodes p' s + countNodes p' l
+
 spec :: Spec
 spec = do
+  describe "preprocessing" $ do
+    it "rewrites supported 1D constant-boundary iterates into halo decomposition" $ do
+      decs <- parseDecsOrFail $ BS.unlines
+        [ "let init = generate [16] (fn [i] => float_of i)"
+        , "let step arr = stencil (constant 0.0) (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0) arr"
+        , "let result = iterate 2 init step"
+        ]
+      let pre = preprocessDecs decs
+          resultBody =
+            case [body | Dec _ name _ _ _ body <- pre, name == "result"] of
+              [body] -> fmap (const ()) body
+              other -> error ("unexpected result bodies: " ++ show (length other))
+      countNodes (\case EIterate {} -> True; _ -> False) resultBody `shouldBe` 2
+      countNodes (\case ESlice {} -> True; _ -> False) resultBody `shouldBe` 4
+      anyExp (\case EAppend {} -> True; _ -> False) resultBody `shouldBe` True
+
+    it "does not rewrite clamp-boundary iterates into halo decomposition" $ do
+      decs <- parseDecsOrFail $ BS.unlines
+        [ "let init = generate [16] (fn [i] => float_of i)"
+        , "let step arr = stencil clamp (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0) arr"
+        , "let result = iterate 2 init step"
+        ]
+      let pre = preprocessDecs decs
+          resultBody =
+            case [body | Dec _ name _ _ _ body <- pre, name == "result"] of
+              [body] -> fmap (const ()) body
+              other -> error ("unexpected result bodies: " ++ show (length other))
+      countNodes (\case EIterate {} -> True; _ -> False) resultBody `shouldBe` 1
+      anyExp (\case EAppend {} -> True; _ -> False) resultBody `shouldBe` False
+
+    it "does not rewrite dynamic-trip iterates into halo decomposition" $ do
+      decs <- parseDecsOrFail $ BS.unlines
+        [ "let n = get_env_int \"N\""
+        , "let init = generate [16] (fn [i] => float_of i)"
+        , "let step arr = stencil (constant 0.0) (fn acc => (acc (-1) +. acc 0 +. acc 1) /. 3.0) arr"
+        , "let result = iterate n init step"
+        ]
+      let pre = preprocessDecs decs
+          resultBody =
+            case [body | Dec _ name _ _ _ body <- pre, name == "result"] of
+              [body] -> fmap (const ()) body
+              other -> error ("unexpected result bodies: " ++ show (length other))
+      countNodes (\case EIterate {} -> True; _ -> False) resultBody `shouldBe` 1
+      anyExp (\case EAppend {} -> True; _ -> False) resultBody `shouldBe` False
+
   describe "typechecking" $ do
     it "typechecks simple arithmetic expressions" $ do
       expectType "40 + 2" (Forall [] [] TyInt)

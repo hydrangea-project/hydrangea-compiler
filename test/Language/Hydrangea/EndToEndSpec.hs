@@ -391,6 +391,40 @@ spec = do
           , "  input"
           ])
 
+    it "compiles and runs polyhedral 3D iterate stencil clamp and matches the interpreter" $ withCC $
+      checkInlineSrcWithOptions
+        defaultInferOptions
+        defaultPipelineOptions
+          { poEnableTiling = True
+          , poEnablePolyhedral = True
+          , poEnableExplicitVectorization = False
+          , poEnableParallelization = False
+          }
+        (BS.pack $ unlines
+          [ "let init = generate [3, 3, 3] (let f [i, j, k] = float_of ((i * 9) + (j * 3) + k) in f)"
+          , "let step arr = stencil clamp"
+          , "  (fn acc => (acc (-1) 0 0 +. acc 1 0 0 +. acc 0 0 0) /. 3.0)"
+          , "  arr"
+          , "let result = iterate 2 init step"
+          ])
+
+    it "compiles and runs 3D constant-boundary stencil kernels and matches the interpreter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let input = generate [2, 2, 2] (let f [i, j, k] = (i * 4) + (j * 2) + k + 1 in f)"
+        , "let result = stencil (constant 0)"
+        , "  (fn acc => acc 0 0 (-1) + acc 0 0 0)"
+        , "  input"
+        ]
+
+    it "compiles and runs 3D iterate stencil kernels and matches the interpreter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let init = generate [3, 3, 3] (let f [i, j, k] = float_of ((i * 9) + (j * 3) + k) in f)"
+        , "let step arr = stencil clamp"
+        , "  (fn acc => (acc 0 0 (-1) +. acc 0 0 0 +. acc 0 0 1) /. 3.0)"
+        , "  arr"
+        , "let result = iterate 2 init step"
+        ]
+
     it "emits wavefront-tiled jacobi interior C and matches the untiled polyhedral path" $ withCC $
       withSystemTempDirectory "hydrangea-jacobi" $ \tmp -> do
         src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"
@@ -682,6 +716,7 @@ spec = do
           , ("scatter_guarded_fused.hyd",      "guarded scatter fusion example")
           , ("stencil_1d.hyd",                 "1D stencil with clamp boundary")
           , ("stencil_2d.hyd",                 "2D Laplacian stencil")
+          , ("heat_3d.hyd",                    "3D iterate + stencil smoothing example")
           , ("scan_prefix_sum.hyd",            "exclusive scan / offsets example")
           , ("sort_indices_gather.hyd",        "permutation sort plus gather example")
           , ("coo_sort_row_major.hyd",         "record-based COO canonical sort example")
@@ -697,6 +732,21 @@ spec = do
   -- ---- Iterate temporal laws (proposal-temporal-tiling.md) -----------------
 
   describe "iterate temporal laws" $ do
+
+    it "compiler-generated halo decomposition for constant-boundary iterate compiles and matches" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let init = generate [16] (let f [i] = float_of ((i * i) + 8) *. 0.25 in f)"
+        , "let step arr = stencil (constant 0.0) (let s acc = (acc (-1) +. acc 0 +. acc 1) /. 3.0 in s) arr"
+        , "let result = iterate 2 init step"
+        ]
+
+    it "compiler-generated halo decomposition preserves shared init consumers" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let init = generate [16] (let f [i] = float_of ((i * i) + 8) *. 0.25 in f)"
+        , "let step arr = stencil (constant 0.0) (let s acc = (acc (-1) +. acc 0 +. acc 1) /. 3.0 in s) arr"
+        , "let iter = iterate 2 init step"
+        , "let result = zipwith (let sub x y = x -. y in sub) iter init"
+        ]
 
     -- Shares one init array between an iterate and two halo tiles; guards
     -- against the iterate ping-pong clobbering/freeing shared init buffers
