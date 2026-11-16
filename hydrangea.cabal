@@ -50,6 +50,7 @@ library
                    , Language.Hydrangea.CodegenC
                    , Language.Hydrangea.CodegenMSL
                    , Language.Hydrangea.Dependence
+                   , Language.Hydrangea.GuardBounds
                    , Language.Hydrangea.ErrorFormat
                    , Language.Hydrangea.Util
     build-depends:   base  >= 4.17 && < 5
@@ -117,6 +118,7 @@ test-suite hydrangea-test
        , Language.Hydrangea.RecordSpec
        , Language.Hydrangea.StencilSpec
        , Language.Hydrangea.GatherBoundsSpec
+       , Language.Hydrangea.GuardBoundsSpec
        , Language.Hydrangea.WherePrecondSpec
        , Language.Hydrangea.SpecializeSpec
     type:             exitcode-stdio-1.0

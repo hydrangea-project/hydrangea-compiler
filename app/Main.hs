@@ -108,6 +108,7 @@ usage = unwords
   , "[--export-kernel=<name>]"
   , "[" ++ allTopLevelProcsFlag ++ "]"
    , "[--no-parallel]"
+   , "[--no-guard-bounds]"
    , "[--no-fusion]"
    , "[--tiling]"
    , "[--polyhedral]"
@@ -200,7 +201,9 @@ main = do
               , codegenExportKernel = Just (BS.pack name)
               , codegenBenchmark = benchmarkConfig
               })
-        { codegenSimdWidth = simdWidth }
+        { codegenSimdWidth = simdWidth
+        , codegenGuardBounds = not ("--no-guard-bounds" `elem` flags)
+        }
       writeGeneratedC outPath csrc = do
         writeFile outPath csrc
         putStrLn $ "Wrote C to " ++ outPath

@@ -772,6 +772,30 @@ spec = do
         , "let r = iterate 5 parent0 step"
         ]
 
+  describe "Guard-derived loop bounds" $ do
+
+    it "ragged rows (k < len[j]) with a sum scatter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let lens = generate [300] (let f [j] = ((j * 37) % 81) - 8 in f)"
+        , "let r = scatter_guarded (+) (fill [300] 0) (generate [300, 64] (let f [j, k] = (j + k) % 300 in f)) (generate [300, 64] (let f [j, k] = j * k in f)) (generate [300, 64] (let f [j, k] = k < index [j] lens in f))"
+        ]
+
+    it "ragged rows under a row bound, with a min scatter and <=" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let lens = generate [300] (let f [j] = ((j * 37) % 81) - 8 in f)"
+        , "let mn a b = if a < b then a else b"
+        , "let r = scatter_guarded mn (fill [300] 999999) (generate [300, 64] (let f [j, k] = (j * 7 + k) % 300 in f)) (generate [300, 64] (let f [j, k] = j + 3 * k in f)) (generate [300, 64] (let f [j, k] = (j < 211) & ((index [j] lens) >= k) in f))"
+        ]
+
+    it "triangular nest (k < j)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let r = scatter_guarded (+) (fill [64] 0) (generate [64, 64] (let f [j, k] = k in f)) (generate [64, 64] (let f [j, k] = j in f)) (generate [64, 64] (let f [j, k] = k < j in f))"
+        ]
+
+    it "1-D loop clamped by an invariant bound" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let r = scatter_guarded (+) (fill [500] 0) (generate [500] (let f [j] = (j * 13) % 500 in f)) (generate [500] (let f [j] = j in f)) (generate [500] (let f [j] = j < 377 in f))"
+        ]
   -- ---- Example programs (file-based) ---------------------------------------
 
   describe "Example programs" $ do

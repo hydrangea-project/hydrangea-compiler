@@ -45,6 +45,7 @@ import Language.Hydrangea.CFG qualified as CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsAtom, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom (..), BinOp (..), CElemType (..), CType (..), CVar, RHS (..), Redop (..), UnOp (..), ctypeToElemType)
 import Language.Hydrangea.CFGTyping (CallParamTypes, TypeEnv, buildCallParamTypes, inferProgramReturnTypes, recoverProcTypeEnv)
+import Language.Hydrangea.GuardBounds qualified as GB
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Text.PrettyPrint.HughesPJClass
 import Prelude hiding ((<>))
@@ -62,7 +63,10 @@ data CodegenOptions = CodegenOptions
     -- | SIMD vector lane width (2 or 4; default 4)
     codegenSimdWidth :: Int,
     -- | Use float instead of double for scalar types
-    codegenUseFloat :: Bool
+    codegenUseFloat :: Bool,
+    -- | Run guard-limited loops over only the iterations their guard can
+    -- admit (see "Language.Hydrangea.GuardBounds").
+    codegenGuardBounds :: Bool
   }
   deriving (Eq, Show)
 
@@ -84,7 +88,8 @@ defaultCodegenOptions =
       codegenExportKernel = Nothing,
       codegenBenchmark = Nothing,
       codegenSimdWidth = defaultVectorWidth,
-      codegenUseFloat = False
+      codegenUseFloat = False,
+      codegenGuardBounds = True
     }
 
 data ExportSpec = ExportSpec
@@ -117,7 +122,9 @@ data CodegenEnv = CodegenEnv
     ceFloatArrVars :: Set CVar,
     ceVecVars :: Map CVar Int,
     ceTupleDefs :: Map CVar [Atom],
-    ceInsideParallelRegion :: Bool
+    ceInsideParallelRegion :: Bool,
+    -- | Loops that run over fewer iterations than their bound, by iterator.
+    ceRaggedLoops :: Map CVar GB.RaggedLoop
   }
 
 -- | Derive the classification sets/maps used by genStmts from a type environment.
@@ -617,7 +624,11 @@ genMain mBench retKinds retTypes procs =
 genProc :: CodegenOptions -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> CFG.Proc -> Doc
 genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = name, CFG.procParams = params, CFG.procBody = body}) =
   let mBench = codegenBenchmark opts
-      typeEnv = recoverProcTypeEnv retTypes callParamTypes proc
+      typeEnv0 = recoverProcTypeEnv retTypes callParamTypes proc
+      (raggedLoopMap, raggedTypes)
+        | codegenGuardBounds opts = GB.raggedLoops typeEnv0 body
+        | otherwise = (Map.empty, Map.empty)
+      typeEnv = typeEnv0 `Map.union` raggedTypes
       -- Authoritative classification from the recovered type environment.
       (arrVarsTE, tupVarsTE, pairVarsTE, recordVarsTE, floatVarsTE, floatArrVarsTE) = typeEnvToVarSets typeEnv
       arrayElemTypes = inferArrayElemTypesFromStmts retTypes body (Map.fromList [(v, eltTy) | (v, CTArray eltTy) <- Map.toList typeEnv])
@@ -694,7 +705,8 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
             ceFloatArrVars = floatArrVars,
             ceVecVars = vecVars,
             ceTupleDefs = tupleDefs,
-            ceInsideParallelRegion = False
+            ceInsideParallelRegion = False,
+            ceRaggedLoops = raggedLoopMap
           }
       returnedArrayVars retAtom =
         case retAtom of
@@ -981,7 +993,18 @@ genLoop env declared spec body =
       bounds = CFG.lsBounds spec
       red = CFG.lsRed spec
       role = CFG.lsRole spec
-      (hoistedMemoCalls, loopBody) = hoistMemoizedZeroArgArrayCalls (ceRetKinds env) (ceRetTypes env) body
+      (hoistedMemoCalls, loopBody0) = hoistMemoizedZeroArgArrayCalls (ceRetKinds env) (ceRetTypes env) body
+      -- In a ragged nest the row and column are loop iterators already, so
+      -- the body's @nd = flat_to_nd(i, (N, M))@ (a division and a modulus
+      -- per iteration) becomes the tuple of the two.
+      loopBody = case (iters, mRagged >>= GB.rlInner) of
+        ([i], Just rn) ->
+          [ case st of
+              CFG.SAssign nd (RFlatToNd (AVar i') _)
+                | i' == i -> CFG.SAssign nd (RTuple [AVar (GB.inRowIter rn), AVar (GB.inColIter rn)])
+              _ -> st
+          | st <- loopBody0 ]
+        _ -> loopBody0
       hoistedMemoVars =
         S.fromList [v | CFG.SAssign v (RCall _ args) <- hoistedMemoCalls, isZeroArgCallArgs args]
       declaredWithHoisted = declared `S.union` hoistedMemoVars
@@ -1013,7 +1036,7 @@ genLoop env declared spec body =
               _             -> empty
             schedClause
               | role == CFG.LoopSegRedOuter = text " schedule(dynamic)"
-              | otherwise                  = empty
+              | otherwise                  = raggedSched
             basePragma = case CFG.lsExec spec of
               CFG.Workshare {} ->
                 if ceInsideParallelRegion env
@@ -1041,6 +1064,78 @@ genLoop env declared spec body =
         CFG.IConst n -> Just n
         _ -> Nothing
       shouldEmitSimd ie = maybe True (>= minSimdTripCount) (constantTripCount ie)
+      -- Guard-derived bounds (see "Language.Hydrangea.GuardBounds").  Only
+      -- single-iterator loops from 0 without a reduction or SIMD clause
+      -- qualify.
+      mRagged = case (iters, red) of
+        ([i], Nothing)
+          | raggedExecOk (CFG.lsExec spec), originFor 0 == CFG.IConst 0 ->
+              Map.lookup i (ceRaggedLoops env)
+        _ -> Nothing
+      raggedExecOk ex = case ex of
+        CFG.Serial -> True
+        CFG.Parallel p -> CFG.psSimdLen p == Nothing
+        CFG.Workshare p -> CFG.psSimdLen p == Nothing
+        _ -> False
+      -- Rows of a ragged nest have different lengths.
+      raggedSched = case mRagged of
+        Just rg | Just _ <- GB.rlInner rg -> text " schedule(dynamic, 64)"
+        _ -> empty
+      -- A single-iterator loop around @loopBodyDoc@: the plain header, or the
+      -- guard-bounded one when this loop has an entry in 'ceRaggedLoops'.
+      singleFor pragma ci b loopBodyDoc = case mRagged of
+        Nothing ->
+          pragma
+            $$ text "for (int64_t" <+> text ci <+> text "=" <+> originDoc 0 <> text ";"
+               <+> text ci <+> text "<" <+> endDoc 0 b <> text ";"
+               <+> text ci <> text "++) {"
+            $$ nest 4 loopBodyDoc
+            $$ text "}"
+        Just rg -> raggedFor rg pragma ci b loopBodyDoc
+      -- @var = min(var, limit)@, evaluating the limit's prelude only when
+      -- @cond@ holds (the original loop ran at least once).
+      clampTo var mCond lim =
+        maybe (text "{") (\cond -> text "if (" <> cond <> text ") {") mCond
+          $$ nest 4
+               ( genStmts env declared (usedVarsAtom (GB.limAtom lim)) (GB.limPrelude lim)
+                   $$ text "int64_t __gb_lim =" <+> genAtom (GB.limAtom lim)
+                        <> (if GB.limPlusOne lim then text " + 1" else empty) <> text ";"
+                   $$ text "if (__gb_lim <" <+> text var <> text ")" <+> text var <+> text "= __gb_lim;"
+               )
+          $$ text "}"
+      raggedFor rg pragma ci b loopBodyDoc = case GB.rlInner rg of
+        Nothing ->
+          let lim = ci ++ "_gb_n"
+           in text "/* guard-bounded loop */"
+                $$ text "int64_t" <+> text lim <+> text "=" <+> genIndexExpr b <> text ";"
+                $$ maybe empty (clampTo lim (Just (text lim <+> text "> 0"))) (GB.rlOuterLimit rg)
+                $$ pragma
+                $$ text "for (int64_t" <+> text ci <+> text "= 0;" <+> text ci <+> text "<" <+> text lim <> text ";"
+                     <+> text ci <> text "++) {"
+                $$ nest 4 loopBodyDoc
+                $$ text "}"
+        Just rn ->
+          let rows = ci ++ "_gb_rows"
+              cols = ci ++ "_gb_cols"
+              r = sanitize (GB.inRowIter rn)
+              c = sanitize (GB.inColIter rn)
+              m = genAtom (GB.inCols rn)
+           in text "/* guard-bounded ragged loop */"
+                $$ text "int64_t" <+> text rows <+> text "= (" <> m <+> text "> 0) ?" <+> genAtom (GB.inRows rn) <+> text ": 0;"
+                $$ maybe empty (clampTo rows (Just (text rows <+> text "> 0"))) (GB.rlOuterLimit rg)
+                $$ pragma
+                $$ text "for (int64_t" <+> text r <+> text "= 0;" <+> text r <+> text "<" <+> text rows <> text ";"
+                     <+> text r <> text "++) {"
+                $$ nest 4
+                     ( text "int64_t" <+> text cols <+> text "=" <+> m <> text ";"
+                         $$ maybe empty (clampTo cols Nothing) (GB.inLimit rn)
+                         $$ text "for (int64_t" <+> text c <+> text "= 0;" <+> text c <+> text "<" <+> text cols <> text ";"
+                              <+> text c <> text "++) {"
+                         $$ nest 4 (text "int64_t" <+> text ci <+> text "=" <+> text r <+> text "*" <+> m <+> text "+" <+> text c <> text ";"
+                                      $$ loopBodyDoc)
+                         $$ text "}"
+                     )
+                $$ text "}"
       -- A scatter whose final store is one OpenMP atomic: an update
       -- (@+=@) for an atomic add, or a write for a plain overwrite.
       atomicStoreBodyDoc detect pragma op elemTy declared' =
@@ -1250,21 +1345,13 @@ genLoop env declared spec body =
                               <+> text "* (size_t)"
                               <> sizeVar
                               <> text ";"
-                              $$ text "#pragma omp for"
-                              $$ text "for (int64_t"
-                              <+> text ci
-                              <+> text "=" <+> originDoc 0 <> text ";"
-                              <+> text ci
-                              <+> text "<"
-                              <+> endDoc 0 bound
-                              <> text ";"
-                              <+> text ci
-                              <> text "++) {"
-                              $$ nest 4
-                                ( genStmts env declared' outerLiveAfter outerPrefix
-                                    $$ guardedPrivUpdate
-                                )
-                              $$ text "}"
+                              $$ singleFor
+                                   (text "#pragma omp for" <> raggedSched)
+                                   ci
+                                   bound
+                                   ( genStmts env declared' outerLiveAfter outerPrefix
+                                       $$ guardedPrivUpdate
+                                   )
                               $$ text "#pragma omp for"
                               $$ text "for (int64_t"
                               <+> mergeIx
@@ -1483,20 +1570,11 @@ genLoop env declared spec body =
            in text "/* parallel"
                 <+> roleComment
                 <+> text "*/"
-                $$ parallelPragma empty
-                $$ text "for (int64_t"
-                <+> text ci
-                <+> text "=" <+> originDoc 0 <> text ";"
-                <+> text ci
-                <+> text "<"
-                <+> endDoc 0 b
-                <> text ";"
-                <+> text ci
-                <> text "++) {"
-                $$ nest
-                  4
+                $$ singleFor
+                  (parallelPragma empty)
+                  ci
+                  b
                   execBodyDoc
-                $$ text "}"
         (execPolicy, _, _, _) | isOmpLoopExec execPolicy ->
           text "/* parallel"
             <+> roleComment
@@ -1507,6 +1585,8 @@ genLoop env declared spec body =
               bounds
               origins
               execBodyDoc
+        (CFG.Serial, Nothing, [i], [b])
+          | Just _ <- mRagged -> singleFor empty (sanitize i) b (bodyDoc declaredWithHoisted)
         (_, _, _, _) -> genNestedLoops iters bounds origins (bodyDoc declaredWithHoisted)
   where
     isOmpLoopExec execPolicy = case execPolicy of

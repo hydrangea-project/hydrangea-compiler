@@ -863,6 +863,15 @@ spec = do
       csrc <- emitCFromSource guardReadsTarget
       csrc `shouldSatisfy` isInfixOf "snap"
 
+    it "runs a row-bounded 2-D scatter as a dynamically scheduled ragged nest" $ do
+      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+        [ "let lens = generate [100] (let f [j] = j % 17 in f)"
+        , "let mn new_ old = if new_ < old then new_ else old"
+        , "let main = scatter_guarded mn (fill [100] 999) (generate [100, 32] (let f [j, k] = (j + k) % 100 in f)) (generate [100, 32] (let f [j, k] = j * k in f)) (generate [100, 32] (let f [j, k] = k < index [j] lens in f))"
+        ]
+      csrc `shouldSatisfy` isInfixOf "guard-bounded ragged loop"
+      csrc `shouldSatisfy` isInfixOf "schedule(dynamic, 64) /* scatter-rmw-cas-int */"
+
     it "emits OpenMP parallel loops for injective scatter kernels" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
         [ "let main = scatter (+) (fill [8] 0)"
