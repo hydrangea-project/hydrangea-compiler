@@ -680,13 +680,23 @@ evalExp expr env = case expr of
       _ -> throwError $ TypeError "Gather requires index array and source array"
   EReplicate _ shapeDims arrExpr -> do
     varr <- evalExp arrExpr env
+    -- Nothing keeps a source dimension; Just n adds one of size n.
+    dims <- forM shapeDims $ \dim -> case dim of
+      ShapeAll _ -> pure Nothing
+      ShapeAny _ e -> Just <$> evalSize e
+      ShapeDim _ e -> Just <$> evalSize e
     case varr of
       VArray srcShape srcVals -> do
-        (outShape, consumeMap) <- liftEither $ buildReplicateShape shapeDims srcShape
+        (outShape, consumeMap) <- liftEither $ buildReplicateShape dims srcShape
         outVals <- liftEither $ replicateValues consumeMap srcShape srcVals outShape
         pure $ VArray outShape outVals
       _ -> throwError $ TypeError "Replicate requires an array"
     where
+      evalSize e = do
+        v <- evalExp e env
+        case v of
+          VInt n -> pure n
+          _ -> throwError $ TypeError "Replicate dimension must be an integer"
       buildReplicateShape dims shape = go dims 0
         where
           go [] srcIdx =
@@ -695,26 +705,15 @@ evalExp expr env = case expr of
               else Left $ InvalidArrayOperation "Replicate: shape spec does not match source rank"
           go (dim : rest) srcIdx =
             case dim of
-              ShapeAll _ ->
+              Nothing ->
                 if srcIdx < length shape
                   then do
                     (os, cm) <- go rest (srcIdx + 1)
                     pure (shape !! srcIdx : os, True : cm)
                   else Left $ InvalidArrayOperation "Replicate: too many ShapeAll dimensions"
-              ShapeAny _ e -> do
-                v <- evalExpPure e env
-                case v of
-                  VInt n -> do
-                    (os, cm) <- go rest srcIdx
-                    pure (n : os, False : cm)
-                  _ -> Left $ TypeError "Replicate dimension must be an integer"
-              ShapeDim _ e -> do
-                v <- evalExpPure e env
-                case v of
-                  VInt n -> do
-                    (os, cm) <- go rest srcIdx
-                    pure (n : os, False : cm)
-                  _ -> Left $ TypeError "Replicate dimension must be an integer"
+              Just n -> do
+                (os, cm) <- go rest srcIdx
+                pure (n : os, False : cm)
   ESlice _ sliceDims arrExpr -> do
     varr <- evalExp arrExpr env
     case varr of
@@ -903,16 +902,6 @@ lookupEnvironmentVariable varName = do
     Nothing ->
       throwError $ RuntimeError $
         "environment variable not found: " ++ varName
-
--- | Evaluate a constant sub-expression (integer literal or variable) without IO.
--- Used for shape dimension expressions in @replicate@ where IO is unavailable.
-evalExpPure :: Exp () -> Env -> Either EvalError Value
-evalExpPure expr env = case expr of
-  EInt _ n -> pure $ VInt n
-  EVar _ v -> case Map.lookup v env of
-    Just val -> pure val
-    Nothing -> Left $ UnboundVariable v
-  _ -> Left $ TypeError "Complex expression in shape dimension"
 
 -- | Replicate a source array into a larger shape by projecting each output index
 -- back onto the consumed source axes.

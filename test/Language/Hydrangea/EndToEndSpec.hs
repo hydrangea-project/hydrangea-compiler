@@ -1683,6 +1683,77 @@ spec = do
         , "let f = reduce_generate mnf 1000.0 [10000] (fn [i] => float_of ((i * 31) % 997) *. 0.5)"
         ]
 
+  -- A scatter's index stream may hold index tuples, which the target is
+  -- indexed by after flattening against its shape.
+  describe "scatter with tuple indices" $ do
+
+    it "scatters into a 1-D target" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let r = scatter (fn x y => x) (generate [3] (fn [i] => i * 10)) (generate [2] (fn [k] => [k + 1])) (generate [2] (fn [k] => 100 + k))"
+        ]
+
+    it "scatters into a 2-D target" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let r = scatter (+) (generate [3, 4] (fn [i, j] => 0)) (generate [5] (fn [k] => [k / 2, k % 4])) (generate [5] (fn [k] => k + 1))"
+        , "let g = scatter_guarded (+) (generate [3, 4] (fn [i, j] => 0)) (generate [5] (fn [k] => [k / 2, k % 4]))"
+        , "          (generate [5] (fn [k] => k + 1)) (generate [5] (fn [k] => k > 1))"
+        ]
+
+    it "scatters from a 2-D index stream" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let r = scatter (+) (generate [3, 4] (fn [i, j] => 0)) (generate [2, 2] (fn [a, b] => [a + 1, b * 3])) (generate [2, 2] (fn [a, b] => a * 10 + b))"
+        ]
+
+    it "scatters from a materialised index array" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let idx = generate [4] (fn [k] => [k % 3, 3 - k])"
+        , "let r = scatter (+) (generate [3, 4] (fn [i, j] => 0)) idx (generate [4] (fn [k] => k + 1))"
+        ]
+
+  describe "slice" $ do
+
+    it "slices along each dimension" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let a = generate [4, 3] (fn [i, j] => i * 10 + j)"
+        , "let rows = slice [[1, 2], All] a"
+        , "let cols = slice [All, [1, 2]] a"
+        , "let v = slice [[2, 3]] (generate [6] (fn [i] => i * i))"
+        , "let c = slice [[1, 1], All, [0, 2]] (generate [2, 3, 4] (fn [i, j, k] => i * 100 + j * 10 + k))"
+        ]
+
+    it "slices a view and feeds a scatter" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let v = slice [[1, 2]] (reshape [6] (generate [2, 3] (fn [i, j] => i * 3 + j)))"
+        , "let s ="
+        , "  let t = slice [[1, 2]] (generate [5] (fn [i] => i)) in"
+        , "  scatter (+) t (generate [2] (fn [k] => k)) (generate [2] (fn [k] => 100))"
+        , "let m ="
+        , "  let a = generate [4, 3] (fn [i, j] => i * 10 + j) in"
+        , "  map (fn x => x + 1) (slice [[1, 2], All] a)"
+        ]
+
+  describe "replicate" $ do
+
+    it "adds dimensions around the source's" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let outer = replicate [3, All] (generate [2] (fn [i] => i + 1))"
+        , "let inner = replicate [All, 2] (generate [3] (fn [i] => i * 10))"
+        , "let mixed = replicate [2, All, 3, All] (generate [2, 2] (fn [i, j] => i * 10 + j))"
+        ]
+
+    it "feeds a reduce and a map" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let r = let a = generate [3] (fn [i] => i + 1) in reduce (+) 0 (replicate [All, 4] a)"
+        , "let m = let a = generate [3] (fn [i] => i + 1) in map (fn x => x * 2) (replicate [2, All] a)"
+        ]
+
+    it "takes computed sizes" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let a = let n = 1 + 2 in replicate [n, All] (generate [2] (fn [i] => i))"
+        , "let b = let v = generate [4] (fn [i] => i) in replicate [index [3] v, All] (generate [2] (fn [i] => i * 5))"
+        , "let c = replicate [Any 2, All] (generate [3] (fn [i] => i))"
+        ]
+
 -- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
 checkWithRcCheck :: BS.ByteString -> IO ()
 checkWithRcCheck src =

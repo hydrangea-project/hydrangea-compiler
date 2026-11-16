@@ -35,6 +35,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
 import Language.Hydrangea.CFGAnalysis (definedVarsStmt, hasArrayLeaves, usedVarsStmt, usedVarsStmts)
+import Language.Hydrangea.CFGTyping (recoverProcTypeEnv)
 import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Util (stripStringQuotes, unsnoc)
@@ -199,6 +200,8 @@ lowerDec (Dec _ name pats _ _ body) = do
                     , lsStencilFacts = M.empty
                     }
   (stmts, result) <- lowerExp body
+  typeEnv0 <- gets lsTypeEnv
+  body' <- flattenTupleIndices typeEnv0 (sinkScatterOwns (stmts ++ [SReturn result]))
   typeEnv <- gets lsTypeEnv
   arrayFacts <- gets lsArrayFacts
   vectorAccessFacts <- gets lsVectorAccessFacts
@@ -210,7 +213,7 @@ lowerDec (Dec _ name pats _ _ body) = do
   pure Proc
     { procName    = name
     , procParams  = params
-    , procBody    = sinkScatterOwns (stmts ++ [SReturn result])
+    , procBody    = body'
     , procTypeEnv = typeEnv
     , procArrayFacts = arrayFacts
     , procVectorAccessFacts = vectorAccessFacts
@@ -2122,61 +2125,51 @@ lowerExpDefault expr = case expr of
     pure (sa ++ [SAssign t (RArrayShape aa)], AVar t)
 
   ESlice _ dims arrExp -> do
+    -- slice [d0, d1, ...] a: each dimension is All or [start, len]; the
+    -- result has the lens as its shape and reads a at start + its index.
     (sa, aa) <- lowerExp arrExp
-    srcShp <- freshCVar "srcShp"
+    arrTy <- ctypeOfAtom aa
+    srcShp <- freshCVar "sshp"
+    registerCType srcShp CTTuple
+    bounds <- forM (zip [0 :: Integer ..] dims) $ \(k, d) -> case d of
+      SliceAll _ -> do
+        len <- freshCVar "slen"
+        registerCType len CTInt64
+        pure ([SAssign len (RProj k (AVar srcShp))], AInt 0, AVar len)
+      SliceRange _ startExp lenExp -> do
+        (ss, as') <- lowerExp startExp
+        (sl, al) <- lowerExp lenExp
+        pure (ss ++ sl, as', al)
     outArr <- freshCVar "outArr"
     outShp <- freshCVar "outShp"
     outN <- freshCVar "outN"
     i <- freshIterVar "i"
-    outIdx <- freshCVar "outIdx"
+    nd <- freshCVar "nd"
     srcTuple <- freshCVar "srcTuple"
     flatSrc <- freshCVar "flatSrc"
     val <- freshCVar "val"
-    arrTy <- ctypeOfAtom aa
-    case arrTy of
-      CTArray eltTy -> do
-        registerCType outArr (CTArray eltTy)
-        registerCType val eltTy
-      _ ->
-        pure ()
-    -- Per output dimension: prelude statements, extent atom (output shape),
-    -- and start-offset atom (0 for All dims).
-    dimInfo <- mapM
-      (\(d, dim) -> case dim of
-          SliceAll _ -> do
-            ext <- freshCVar ("ext" <> BS.pack (show (d :: Int)))
-            pure ([SAssign ext (RProj (fromIntegral d) (AVar srcShp))], AVar ext, AInt 0)
-          SliceRange _ startE lenE -> do
-            (ss, sAtom) <- lowerExp startE
-            (ls, lAtom) <- lowerExp lenE
-            pure (ss ++ ls, lAtom, sAtom))
-      (zip [(0 :: Int) ..] dims)
-    let dimPrelude = concatMap (\(stmts, _, _) -> stmts) dimInfo
-        extents = map (\(_, ext, _) -> ext) dimInfo
-        starts = map (\(_, _, start) -> start) dimInfo
-    -- Per output dimension, inside the copy loop: project the nd coordinate
-    -- and add the slice start to get the source coordinate.
-    srcIdx <- mapM
-      (\(d, start) -> do
-          od <- freshCVar ("od" <> BS.pack (show (d :: Int)))
-          sd <- freshCVar ("sd" <> BS.pack (show d))
-          pure ( [ SAssign od (RProj (fromIntegral d) (AVar outIdx))
-                 , SAssign sd (RBinOp CAdd start (AVar od))
-                 ]
-               , sd ))
-      (zip [(0 :: Int) ..] starts)
-    let srcIdxStmts = concatMap fst srcIdx
-        srcVars = map snd srcIdx
+    registerCType outArr arrTy
+    mapM_ (`registerCType` CTTuple) [outShp, nd, srcTuple]
+    mapM_ (`registerCType` CTInt64) [outN, flatSrc]
+    markArrayFreshWriteOnce outArr
+    noteReadOnlyAtom aa
+    noteIndirectReadAtom aa
+    coords <- forM (zip [0 :: Integer ..] bounds) $ \(k, (_, start, _)) -> do
+      p <- freshCVar "sp"
+      c <- freshCVar "sc"
+      registerCType p CTInt64
+      registerCType c CTInt64
+      pure ([SAssign p (RProj k (AVar nd)), SAssign c (RBinOp CAdd (AVar p) start)], AVar c)
     pure ( sa
          ++ [SAssign srcShp (RArrayShape aa)]
-         ++ dimPrelude
-         ++ [ SAssign outShp (RTuple extents)
+         ++ concat [st | (st, _, _) <- bounds]
+         ++ [ SAssign outShp (RTuple [len | (_, _, len) <- bounds])
             , SAssign outArr (RArrayAlloc (AVar outShp))
             , SAssign outN (RShapeSize (AVar outShp))
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar outN)] Serial Nothing LoopPlain [])
-                ( [SAssign outIdx (RFlatToNd (AVar i) (AVar outShp))]
-                  ++ srcIdxStmts
-                  ++ [ SAssign srcTuple (RTuple (map AVar srcVars))
+                ( [SAssign nd (RFlatToNd (AVar i) (AVar outShp))]
+                  ++ concatMap fst coords
+                  ++ [ SAssign srcTuple (RTuple (map snd coords))
                      , SAssign flatSrc (RNdToFlat (AVar srcTuple) (AVar srcShp))
                      , SAssign val (RArrayLoad aa (AVar flatSrc))
                      , SArrayWrite (AVar outArr) (AVar i) (AVar val)
@@ -2199,31 +2192,54 @@ lowerExpDefault expr = case expr of
          )
 
   EReplicate _ dims arrExp -> do
+    -- replicate [d0, d1, ...] a: each All keeps the next dimension of a, and
+    -- each other entry adds a dimension of the given size; an element reads
+    -- a at its coordinates in the All positions.
     (sa, aa) <- lowerExp arrExp
-    shpSrc <- freshCVar "shp"
-    outShp <- freshCVar "oshp"
+    arrTy <- ctypeOfAtom aa
+    srcShp <- freshCVar "sshp"
+    registerCType srcShp CTTuple
+    let srcDimOf = snd (foldl (\(k, acc) d -> case d of
+                                 ShapeAll _ -> (k + 1, acc ++ [Just k])
+                                 _ -> (k, acc ++ [Nothing]))
+                              (0 :: Integer, []) dims)
+    lens <- forM (zip dims srcDimOf) $ \(d, mk) -> case (d, mk) of
+      (_, Just k) -> do
+        len <- freshCVar "rlen"
+        registerCType len CTInt64
+        pure ([SAssign len (RProj k (AVar srcShp))], AVar len)
+      (ShapeAny _ e, _) -> lowerExp e
+      (ShapeDim _ e, _) -> lowerExp e
+      (ShapeAll _, Nothing) -> error "replicate: All without a source dimension"
     arr <- freshCVar "arr"
+    outShp <- freshCVar "oshp"
     n <- freshCVar "n"
     i <- freshIterVar "i"
-    outIdx <- freshCVar "oidx"
+    nd <- freshCVar "nd"
+    srcTuple <- freshCVar "st"
     flatSrc <- freshCVar "fs"
     val <- freshCVar "val"
-    let srcPositions = [j | (j, d) <- zip [0 :: Integer ..] dims, isShapeAllDim d]
-    projStmts <- mapM (\(_, j) -> do
-        p <- freshCVar "p"
-        pure (p, [SAssign p (RProj (fromInteger j) (AVar outIdx))])) (zip [0 :: Integer ..] srcPositions)
-    let projVars = map fst projStmts
-        projAssigns = concatMap snd projStmts
-    srcTuple <- freshCVar "st"
+    registerCType arr arrTy
+    mapM_ (`registerCType` CTTuple) [outShp, nd, srcTuple]
+    mapM_ (`registerCType` CTInt64) [n, flatSrc]
+    markArrayFreshWriteOnce arr
+    noteReadOnlyAtom aa
+    noteIndirectReadAtom aa
+    coords <- forM [p | (p, Just _) <- zip [0 :: Integer ..] srcDimOf] $ \p -> do
+      c <- freshCVar "rc"
+      registerCType c CTInt64
+      pure (SAssign c (RProj p (AVar nd)), AVar c)
     pure ( sa
-         ++ [ SAssign shpSrc (RArrayShape aa)
-            , SAssign outShp (RCall "__replicate_shape" [AVar shpSrc])
+         ++ [SAssign srcShp (RArrayShape aa)]
+         ++ concatMap fst lens
+         ++ [ SAssign outShp (RTuple (map snd lens))
             , SAssign arr (RArrayAlloc (AVar outShp))
             , SAssign n (RShapeSize (AVar outShp))
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                ( projAssigns
-                  ++ [ SAssign srcTuple (RTuple (map AVar projVars))
-                     , SAssign flatSrc (RNdToFlat (AVar srcTuple) aa)
+                ( [SAssign nd (RFlatToNd (AVar i) (AVar outShp))]
+                  ++ map fst coords
+                  ++ [ SAssign srcTuple (RTuple (map snd coords))
+                     , SAssign flatSrc (RNdToFlat (AVar srcTuple) (AVar srcShp))
                      , SAssign val (RArrayLoad aa (AVar flatSrc))
                      , SArrayWrite (AVar arr) (AVar i) (AVar val)
                      ]
@@ -4450,9 +4466,6 @@ handleApp fn arg = case fn of
         t <- freshCVar "t"
         pure (sf ++ sa ++ [SAssign t (RCall "__apply" [af, aa])], AVar t)
 
-isShapeAllDim :: ShapeDim a -> Bool
-isShapeAllDim (ShapeAll _) = True
-isShapeAllDim _ = False
 
 ctypeOfAtom :: Atom -> LowerM CType
 ctypeOfAtom (AFloat _)  = pure CTDouble
@@ -4990,6 +5003,37 @@ lowerScatterTarget lower defaultsExp = do
       RArrayAlloc _ -> True
       RCall "hyd_array_own" _ -> True
       _ -> False
+
+-- | Index an array by its flat offset wherever the lowering indexed it by an
+-- index tuple.  A scatter's index stream can hold tuples (@fn [k] => [k]@,
+-- or a 2-D target's @[r, c]@), and every scatter form loads and writes its
+-- target at the index as given, so each such access gets
+-- @shp = shape(a); flat = nd_to_flat(idx, shp)@ in front of it.
+flattenTupleIndices :: Map CVar CType -> [Stmt] -> LowerM [Stmt]
+flattenTupleIndices typeEnv body = goBlock body
+  where
+    tys = recoverProcTypeEnv M.empty M.empty
+            Proc { procName = "", procParams = [], procBody = body, procTypeEnv = typeEnv
+                 , procArrayFacts = M.empty, procVectorAccessFacts = M.empty }
+    isTuple v = M.lookup v tys == Just CTTuple
+    goBlock = fmap concat . mapM goStmt
+    goStmt stmt = case stmt of
+      SAssign x (RArrayLoad a (AVar t)) | isTuple t -> do
+        (pre, flat) <- flatten a t
+        pure (pre ++ [SAssign x (RArrayLoad a flat)])
+      SArrayWrite a (AVar t) v | isTuple t -> do
+        (pre, flat) <- flatten a t
+        pure (pre ++ [SArrayWrite a flat v])
+      SLoop spec b -> (\b' -> [SLoop spec b']) <$> goBlock b
+      SParallelRegion b -> (\b' -> [SParallelRegion b']) <$> goBlock b
+      SIf c thn els -> (\t' e' -> [SIf c t' e']) <$> goBlock thn <*> goBlock els
+      _ -> pure [stmt]
+    flatten a t = do
+      shp <- freshCVar "ishp"
+      flat <- freshCVar "iflat"
+      registerCType shp CTTuple
+      registerCType flat CTInt64
+      pure ([SAssign shp (RArrayShape a), SAssign flat (RNdToFlat (AVar t) (AVar shp))], AVar flat)
 
 -- | Move each scatter's @dst = hyd_array_own(t)@ down to the first statement
 -- that uses @dst@, normally the scatter loop itself.
