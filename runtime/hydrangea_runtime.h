@@ -1,6 +1,11 @@
 #ifndef HYDRANGEA_RUNTIME_H
 #define HYDRANGEA_RUNTIME_H
 
+/* clock_gettime under -std=c99. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
