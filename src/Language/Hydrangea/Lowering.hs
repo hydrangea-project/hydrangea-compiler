@@ -36,7 +36,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
 import Language.Hydrangea.CFGAnalysis (definedVarsStmt, hasArrayLeaves, usedVarsStmt, usedVarsStmts)
-import Language.Hydrangea.CFGTyping (recoverProcTypeEnv)
+import Language.Hydrangea.CFGTyping (inferBinOpResultType, recoverProcTypeEnv)
 import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Util (stripStringQuotes, unsnoc)
@@ -458,6 +458,9 @@ emitScalarExprAt target env0 idxParam idxVar expr0 = do
         (Just lVar, Just rVar) -> do
           result <- lift $ freshCVar "fuse_scalar"
           let bop = lowerBinOp op
+          -- A consumer such as the gather case reads this type to choose
+          -- between a scalar and a tuple index.
+          lift $ mapM_ (registerCType result) (inferBinOpResultType bop)
           appendFusionBody [SAssign result (RBinOp bop (AVar lVar) (AVar rVar))]
           pure (Just result)
         _ ->
@@ -2767,7 +2770,13 @@ lowerExpDefault expr = case expr of
     -- Mirrors the per-phase structure of EScatterChain combined with the
     -- inline-generator structure of EScatterGenerate.
     (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
-    phaseStmts <- forM phases $ \(ScatterGenPhase shpExp idxFnExp valFnExp mGuardFnExp) -> do
+    -- A phase's streams are evaluated in the outer environment.  Once an
+    -- earlier phase has written the target, a read of the defaults is no read
+    -- of the target ('targetAliasesWith').  And a defaults variable that a
+    -- later phase reads stays live past the @own@, which therefore copies, so
+    -- an earlier phase can read that variable directly instead of a snapshot.
+    -- The phases are lowered last to first to know what the later ones read.
+    phaseStmts <- forPhasesBackward phases $ \written later (ScatterGenPhase shpExp idxFnExp valFnExp mGuardFnExp) -> do
       (sshp, ashp) <- lowerExp shpExp
       shp1D <- is1DShapeM shpExp
       n <- freshCVar "n"
@@ -2796,7 +2805,7 @@ lowerExpDefault expr = case expr of
               pure (gs, Just (AVar guardVal))
           (hoistedCalls, kernelStmts0) <-
             hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts ++ guardStmts)
-          (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+          (kernelGroups, snapSetup) <- privatizePhaseStreams written later ad (sd ++ hoistedCalls) [kernelStmts0]
           let kernelStmts = concat kernelGroups
           pure ( sshp
                ++ hoistedCalls
@@ -2820,7 +2829,7 @@ lowerExpDefault expr = case expr of
               pure (gs, Just (AVar guardVal))
           (hoistedCalls, kernelStmts0) <-
             hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts ++ guardStmts)
-          (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+          (kernelGroups, snapSetup) <- privatizePhaseStreams written later ad (sd ++ hoistedCalls) [kernelStmts0]
           let kernelStmts = concat kernelGroups
           pure ( sshp
                ++ hoistedCalls
@@ -5089,7 +5098,14 @@ sinkScatterOwns = foldr step []
 -- O(iteration space).  Which is cheaper depends on the program, and only the
 -- former is available once the streams have already been fused in.
 privatizeScatterStreams :: Atom -> [Stmt] -> [[Stmt]] -> LowerM ([[Stmt]], [Stmt])
-privatizeScatterStreams target defs groups = case target of
+privatizeScatterStreams = privatizePhaseStreams False S.empty
+
+-- | 'privatizeScatterStreams' for one phase of a phased scatter.  @written@
+-- says an earlier phase has written the target, and @later@ holds the
+-- variables the later phases read.  A defaults variable @t@ in @later@ is
+-- live past @own(t)@, so the target is a copy and @t@ needs no snapshot.
+privatizePhaseStreams :: Bool -> Set CVar -> Atom -> [Stmt] -> [[Stmt]] -> LowerM ([[Stmt]], [Stmt])
+privatizePhaseStreams written later target defs groups = case target of
   AVar _ | not (S.null touched) -> do
       (snapV, setup) <- snapshotArray target
       let redirect g = foldr (\a acc -> renameReadVarInStmts a snapV acc) g (S.toList touched)
@@ -5097,9 +5113,12 @@ privatizeScatterStreams target defs groups = case target of
   _ -> pure (groups, [])
   where
     touched =
-      (S.unions (map usedVarsStmts groups) `S.intersection` targetAliases target defs)
+      (S.unions (map usedVarsStmts groups) `S.intersection` targetAliasesWith written target defs)
         `S.difference` assignedVars
+        `S.difference` (later `S.intersection` ownSources)
     assignedVars = S.fromList [v | SAssign v _ <- concat groups]
+    ownSources = S.fromList
+      [src | SAssign w (RCall "hyd_array_own" [AVar src]) <- defs, AVar w == target]
 
 -- | Names that certainly denote the same buffer as @target@ here: the target
 -- itself, anything copied from it, and any other call to the same zero-argument
@@ -5109,13 +5128,31 @@ privatizeScatterStreams target defs groups = case target of
 -- own buffer, so @t@'s aliases count too.  Redirecting the streams' reads of
 -- @t@ to a snapshot also keeps @t@ from being read after the scatter starts,
 -- which is what lets it die at the @own@ and be written in place.
+--
+-- That holds only while the owned buffer is unwritten.  Once an earlier
+-- scatter in @defs@ has written it (@scatter c (scatter c t ...) ...@), it
+-- no longer holds @t@'s value, and a snapshot of it would show the streams
+-- the earlier writes.  Their reads of @t@ then stay reads of @t@, which keeps
+-- @t@ alive past the @own@, so the @own@ copies.
 targetAliases :: Atom -> [Stmt] -> Set CVar
-targetAliases target defs = case target of
+targetAliases = targetAliasesWith False
+
+-- | 'targetAliases', told whether something outside @defs@ (an earlier phase)
+-- has already written the target.
+targetAliasesWith :: Bool -> Atom -> [Stmt] -> Set CVar
+targetAliasesWith written target defs = case target of
   AVar t ->
     let viaCall = case listToMaybe [f | SAssign w (RCall f []) <- defs, w == t] of
           Just fn -> S.fromList [w | SAssign w (RCall f' []) <- defs, f' == fn]
           Nothing -> S.empty
-        viaOwn = S.unions [targetAliases src defs | SAssign w (RCall "hyd_array_own" [src]) <- defs, w == t]
+        writtenAfterOwn = written || any writes defs
+        writes s = case s of
+          SAssign w _ | w == t -> False
+          _ -> t `S.member` definedVarsStmt s
+        viaOwn
+          | writtenAfterOwn = S.empty
+          | otherwise =
+              S.unions [targetAliases src defs | SAssign w (RCall "hyd_array_own" [src]) <- defs, w == t]
         direct = S.insert t viaCall
         viaCopy = S.fromList [w | SAssign w (RAtom (AVar v)) <- defs, v `S.member` direct]
     in direct `S.union` viaCopy `S.union` viaOwn
@@ -5134,6 +5171,16 @@ privatizeScatterOperands target defs operands
     aliases = targetAliases target defs
     aliased (AVar v) = S.member v aliases
     aliased _        = False
+
+-- | 'forM' over a scatter's phases, run last to first.  Each step learns
+-- whether an earlier phase exists (every phase writes the target) and which
+-- variables the later phases' statements use.  The results are in phase order.
+forPhasesBackward :: Monad m => [a] -> (Bool -> Set CVar -> a -> m [Stmt]) -> m [[Stmt]]
+forPhasesBackward xs f = fst <$> foldM step ([], S.empty) (reverse (zip [0 :: Int ..] xs))
+  where
+    step (acc, later) (k, x) = do
+      s <- f (k > 0) later x
+      pure (s : acc, later `S.union` usedVarsStmts s)
 
 hoistZeroArgValueProcCalls :: [Stmt] -> LowerM ([Stmt], [Stmt])
 hoistZeroArgValueProcCalls = hoistZeroArgValueProcCallsWith []

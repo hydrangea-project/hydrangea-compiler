@@ -1768,6 +1768,49 @@ spec = do
     it "truncates integer division toward zero" $ withCC $
       checkInlineSrc "let a = (0 - 7) / 2\nlet b = (0 - 7) % 2\n"
 
+  describe "scatter nests" $ do
+
+    -- The outer scatter's guard reads p, which the inner scatter writes.  The
+    -- guard must see p as it was before either scatter: [0, 0, -1], not
+    -- [0, 0, 1].
+    let nestedScatterReadingP = BS.pack $ unlines
+          [ "let srcs = generate [2] (let f [e] = 2 * e in f)"
+          , "let dsts = generate [2] (let f [e] = 1 in f)"
+          , "let step p ="
+          , "  let ready a b = (a <> (-1)) & (b = (-1)) in"
+          , "  let overwrite new_ old_ = new_ in"
+          , "  let fwd = zipwith ready (gather srcs p) (gather dsts p) in"
+          , "  let bwd = zipwith ready (gather dsts p) (gather srcs p) in"
+          , "  scatter_guarded overwrite (scatter_guarded overwrite p dsts srcs fwd) srcs dsts bwd"
+          , "let main = step (generate [3] (let f [i] = if i = 0 then 0 else (-1) in f))" ]
+        localLetNest = BS.pack $ unlines
+          [ "let main ="
+          , "  let srcs = generate [2] (let f [e] = 2 * e in f) in"
+          , "  let dsts = generate [2] (let f [e] = 1 in f) in"
+          , "  let p = generate [3] (let f [i] = if i = 0 then 0 else (-1) in f) in"
+          , "  let ready a b = (a <> (-1)) & (b = (-1)) in"
+          , "  let overwrite new_ old_ = new_ in"
+          , "  let fwd = zipwith ready (gather srcs p) (gather dsts p) in"
+          , "  let bwd = zipwith ready (gather dsts p) (gather srcs p) in"
+          , "  scatter_guarded overwrite (scatter_guarded overwrite p dsts srcs fwd) srcs dsts bwd" ]
+        noFusion = defaultFrontendOptions { frontendSkipFusion = True }
+        check opts src = case readDecs src of
+          Left perr -> expectationFailure ("Parse error: " ++ perr)
+          Right decs ->
+            checkDecsWithCFlags ["-DHYD_RC_CHECK"] opts defaultInferOptions defaultPipelineOptions decs
+
+    it "keeps the outer streams reading the original target" $ withCC $
+      check defaultFrontendOptions nestedScatterReadingP
+
+    it "keeps the outer streams reading the original target (no fusion)" $ withCC $
+      check noFusion nestedScatterReadingP
+
+    it "handles the nest over local-let arrays" $ withCC $
+      check defaultFrontendOptions localLetNest
+
+    it "handles the nest over local-let arrays (no fusion)" $ withCC $
+      check noFusion localLetNest
+
 -- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
 checkWithRcCheck :: BS.ByteString -> IO ()
 checkWithRcCheck src =

@@ -23,6 +23,7 @@
 module Language.Hydrangea.CFGTyping
   ( TypeEnv
   , inferAtomType
+  , inferBinOpResultType
   , lookupArrayElemType
   , recoverProcTypeEnv
   , inferProgramReturnTypes
