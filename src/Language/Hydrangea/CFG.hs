@@ -237,6 +237,11 @@ data LoopRole
   | LoopReduction
   | LoopMapReduction
   | LoopIterate
+  | LoopCopy         -- ^ Contiguous element-wise copy of a whole buffer
+                     --   (a privatization snapshot).  Kept serial: it is a
+                     --   memcpy the C compiler recognises, and the buffers
+                     --   that get snapshotted are usually far too small for an
+                     --   OpenMP region per copy to pay for itself.
   | LoopSegRedOuter  -- ^ Outer loop over segments in a segmented reduction;
                      --   parallelized with dynamic scheduling for load balance.
   deriving (Eq, Show)

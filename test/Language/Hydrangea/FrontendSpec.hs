@@ -9,7 +9,7 @@ module Language.Hydrangea.FrontendSpec (spec) where
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.List (isInfixOf, isPrefixOf, isSuffixOf, tails)
-import Language.Hydrangea.CFG (Program(..), Proc(..), Stmt(..))
+import Language.Hydrangea.CFG (LoopRole(..), LoopSpec(..), Program(..), Proc(..), Stmt(..))
 import Language.Hydrangea.CFGCore (RHS(..))
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
@@ -84,6 +84,11 @@ emitCFromSource src = parseDecsOrFail src >>= compileToCOptIO False
 emitParallelCFromSource :: ByteString -> IO String
 emitParallelCFromSource src = parseDecsOrFail src >>= compileToCOptParallelIO False
 
+lowerParallelFromSource :: ByteString -> IO Program
+lowerParallelFromSource src = do
+  decs <- parseDecsOrFail src
+  optimizeParallelCFG <$> lowerToCFGWithTypes decs
+
 emitExportArtifactsFromSource :: ByteString -> ByteString -> IO CodegenArtifacts
 emitExportArtifactsFromSource kernel src = do
   decs <- parseDecsOrFail src
@@ -110,6 +115,39 @@ lookupProc name (Program procs) =
 countArrayAllocs :: Proc -> Int
 countArrayAllocs Proc { procBody = stmts } =
   length [() | SAssign _ (RArrayAlloc _) <- stmts]
+
+-- | Top-level allocations, fresh or copied.
+countBufferAllocs :: Proc -> Int
+countBufferAllocs Proc { procBody = stmts } =
+  length [() | SAssign _ rhs <- stmts, isAlloc rhs]
+  where
+    isAlloc rhs = case rhs of
+      RArrayAlloc _ -> True
+      RArrayCopy _  -> True
+      _             -> False
+
+countLoopArrayAllocs :: Proc -> Int
+countLoopArrayAllocs Proc { procBody = stmts } = sum (map go stmts)
+  where
+    go stmt = case stmt of
+      SLoop _ body ->
+        length [() | SAssign _ (RArrayAlloc _) <- body] + sum (map go body)
+      SIf _ thn els ->
+        sum (map go thn) + sum (map go els)
+      _ ->
+        0
+
+iterateLoopImmediateBodies :: Proc -> [[Stmt]]
+iterateLoopImmediateBodies Proc { procBody = stmts } = concatMap go stmts
+  where
+    go stmt = case stmt of
+      SLoop spec body
+        | lsRole spec == LoopIterate -> [body]
+        | otherwise -> concatMap go body
+      SIf _ thn els ->
+        concatMap go thn ++ concatMap go els
+      _ ->
+        []
 
 countZeroArgCallsInLoops :: ByteString -> Proc -> Int
 countZeroArgCallsInLoops name Proc { procBody = stmts } = sum (map go stmts)
@@ -807,6 +845,24 @@ spec = do
       csrc `shouldSatisfy` isInfixOf "int64_t h(void)"
       csrc `shouldSatisfy` isInfixOf "int64_t w(void)"
 
+    -- A scatter's streams are evaluated against the pre-scatter target, so a
+    -- guard that reads the target must read a snapshot of it.  The route is
+    -- not the identity, so one lane can write a cell another lane's guard
+    -- reads.
+    let guardReadsTarget = BS.pack $ unlines
+          [ "let p0 = generate [8] (let f [i] = i in f)"
+          , "let main ="
+          , "  let ow a b = a in"
+          , "  scatter_guarded ow p0"
+          , "    (generate [8] (let fi [e] = (e + 1) % 8 in fi))"
+          , "    (generate [8] (let fv [e] = e * 2 in fv))"
+          , "    (generate [8] (let fg [e] = index [e] p0 = 0 in fg))"
+          ]
+
+    it "snapshots the scatter target when the guard reads it" $ do
+      csrc <- emitCFromSource guardReadsTarget
+      csrc `shouldSatisfy` isInfixOf "snap"
+
     it "emits OpenMP parallel loops for injective scatter kernels" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
         [ "let main = scatter (+) (fill [8] 0)"
@@ -1307,3 +1363,41 @@ spec = do
                   (TyCons (TyVar "b") (TyCons (TyVar "a") TyUnit))
               )
           )
+
+  describe "Bellman-Ford scatter lowering" $ do
+    it "fuses Bellman-Ford-style rounds to snapshot plus one edge loop" $ do
+      prog <- lowerParallelFromSource $ BS.unlines
+        [ "let n = 8"
+        , "let degree = 2"
+        , "let iters = 3"
+        , "let nnz = n * degree"
+        , "let srcs = generate [nnz] (let f [e] = e / degree in f)"
+        , "let dsts = generate [nnz] (let f [e] ="
+        , "      let s = e / degree in"
+        , "      let k = e % degree in"
+        , "      (s + 1 + k) % n"
+        , "    in f)"
+        , "let weights = generate [nnz] (let f [e] = 1 + ((e * 17 + 13) % 9) in f)"
+        , "let inf = n * 9 + 1"
+        , "let dist0 = generate [n] (let f [i] = if i = 0 then 0 else inf in f)"
+        , "let step dist ="
+        , "  let srcDist = gather srcs dist in"
+        , "  let dstDist = gather dsts dist in"
+        , "  let cand = zipwith (let add a b = a + b in add) srcDist weights in"
+        , "  let active = map (let reachable x = x < inf in reachable) srcDist in"
+        , "  let improve = zipwith (let lt x y = x < y in lt) cand dstDist in"
+        , "  let guard = zipwith (let both a b = a & b in both) active improve in"
+        , "  let mn new_ old = if new_ < old then new_ else old in"
+        , "  scatter_guarded mn dist dsts cand guard"
+        , "let main = reduce (+) 0 (iterate iters dist0 step)"
+        ]
+      let mainProc = lookupProc "main" prog
+          iterateBodies = iterateLoopImmediateBodies mainProc
+          immediateLoopCounts = map (\body -> length [() | SLoop {} <- body]) iterateBodies
+      iterateBodies `shouldSatisfy` (not . null)
+      countBufferAllocs mainProc `shouldSatisfy` (>= 2)
+      countLoopArrayAllocs mainProc `shouldBe` 0
+      countZeroArgCallsInLoops "dsts" mainProc `shouldBe` 0
+      countZeroArgCallsInLoops "srcs" mainProc `shouldBe` 0
+      countZeroArgCallsInLoops "weights" mainProc `shouldBe` 0
+      immediateLoopCounts `shouldContain` [2]

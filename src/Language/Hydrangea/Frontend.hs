@@ -186,11 +186,17 @@ rankOfPolytype (Forall _ _ _)   = Nothing
 -- | Compute top-level type and rank maps from type inference.
 inferTopLevelTypesAndRanksWithOptions
   :: InferOptions -> [Dec Range] -> IO (Map.Map Var CType, Map.Map Var Int)
-inferTopLevelTypesAndRanksWithOptions opts decs = do
+inferTopLevelTypesAndRanksWithOptions opts decs =
+  maybe (Map.empty, Map.empty) id <$> inferTopLevelEnvs opts decs
+
+-- | Top-level type and rank maps, or 'Nothing' when inference fails.
+inferTopLevelEnvs
+  :: InferOptions -> [Dec Range] -> IO (Maybe (Map.Map Var CType, Map.Map Var Int))
+inferTopLevelEnvs opts decs = do
   res <- runInferDecsWithOptions opts decs
-  case res of
-    Left _ -> pure (Map.empty, Map.empty)
-    Right (pairs, _) -> pure
+  pure $ case res of
+    Left _ -> Nothing
+    Right (pairs, _) -> Just
       ( M.fromList [(v, ct) | (v, poly) <- pairs, Just ct <- [typeOfPolytype poly]]
       , M.fromList [(v, r)  | (v, poly) <- pairs, Just r  <- [rankOfPolytype poly]]
       )
@@ -237,7 +243,10 @@ inferAndLowerToCFGWithFrontendOptions frontOpts opts decs = do
   -- Recover concrete per-binder types and top-level types/ranks from the
   -- monomorphic program that we actually lower.
   binderEnv <- inferBinderTypeEnvWithOptions opts mono
-  (typeEnv, rankEnv) <- inferTopLevelTypesAndRanksWithOptions opts mono
+  -- Fusion can produce terms inference rejects (a 1-D index by a scalar, for
+  -- instance); the source program then supplies the top-level types and ranks.
+  monoEnvs <- inferTopLevelEnvs opts mono
+  (typeEnv, rankEnv) <- maybe (inferTopLevelTypesAndRanksWithOptions opts decs) pure monoEnvs
   let prog = lowerDecsWithEnvs typeEnv rankEnv binderEnv mono
   pure prog
 

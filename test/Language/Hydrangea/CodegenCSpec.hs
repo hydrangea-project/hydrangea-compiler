@@ -256,6 +256,34 @@ spec = describe "CodegenC" $ do
     c `shouldSatisfy` (\out -> "->data[" `isInfixOf` out || "(((" `isInfixOf` out)
     c `shouldSatisfy` isInfixOf "for (int64_t i = 0; i < 10LL; i++)"
 
+  it "memoizes zero-arg benchmark dependencies outside the timed kernel" $ do
+    let arrProc =
+          (mkProc "arr" []
+            [ SAssign "shp" (C.RTuple [C.AInt 4])
+            , SAssign "arr_buf" (C.RArrayAlloc (C.AVar "shp"))
+            , SReturn (C.AVar "arr_buf")
+            ])
+            { procTypeEnv =
+                Map.fromList
+                  [ ("shp", C.CTTuple)
+                  , ("arr_buf", C.CTArray C.CTInt64)
+                  ]
+            }
+        mainProc =
+          (mkProc "main" []
+            [ SAssign "res" (C.RCall "arr" [])
+            , SReturn (C.AVar "res")
+            ])
+            { procTypeEnv = Map.fromList [("res", C.CTArray C.CTInt64)] }
+        prog = Program [arrProc, mainProc]
+        opts =
+          defaultCodegenOptions
+            { codegenBenchmark = Just (BenchmarkConfig "main" 1 1)
+            }
+        c = either error codegenSource (codegenProgramWithOptions opts prog)
+    c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_arr = NULL;"
+    c `shouldSatisfy` isInfixOf "__cache_arr == NULL"
+
   it "emits tuple construction from RTuple" $ do
     let prog = Program
           [ mkProc "p" []
@@ -390,7 +418,7 @@ spec = describe "CodegenC" $ do
     c `shouldSatisfy` containsInOrder
       ["hyd_vec_loadu_f64x4", "hyd_vec_add_f64x4", "hyd_vec_storeu_f64x4"]
 
-  it "disables memoization for pure zero-arg array procs in benchmark closure" $ do
+  it "keeps memoization for pure zero-arg array procs in benchmark closure" $ do
     let inputProc =
           (mkProc "input_data" []
              [ SAssign "arr" (C.RArrayAlloc (C.AInt 8))
@@ -414,9 +442,9 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldNotSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+        c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
 
-  it "keeps memoization for benchmark-closure zero-arg array procs that perform IO" $ do
+  it "does not memoize benchmark-closure zero-arg array procs that perform IO" $ do
     let inputProc =
           (mkProc "input_data" []
              [ SAssign "arr" (C.RCall "hyd_read_array_csv" [C.AString "input.csv"])
@@ -440,7 +468,7 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+        c `shouldNotSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
 
   it "strips benchmark IO writes from benchmark kernel body only" $ do
     let kernelProc =

@@ -34,6 +34,7 @@ import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
+import Language.Hydrangea.CFGAnalysis (usedVarsStmts)
 import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Util (stripStringQuotes, unsnoc)
@@ -230,10 +231,570 @@ shapeRankM expr = case expr of
   EShapeOf _ (EVar _ v) -> gets (M.lookup v . lsArrayRankEnv)
   _                 -> pure Nothing
 
+-- | Peel the let spine off an expression, returning its bindings by name and
+-- the expression underneath.
+collectLetEnv :: Exp a -> (Map Var (Dec a), Exp a)
+collectLetEnv = go M.empty
+  where
+    go env (ELetIn _ dec body) = go (M.insert (decName dec) dec env) body
+    go env (EBoundLetIn a v _ rhs body) =
+      go (M.insert v (Dec a v [] Nothing Nothing rhs) env) body
+    go env core = (env, core)
+
+-- | Resolve a variable bound in the let environment: a value binding is
+-- expanded in place, a function binding becomes its local definition.
+resolveValueExp :: Map Var (Dec a) -> Exp a -> Exp a
+resolveValueExp env exp0 = case exp0 of
+  EVar a v
+    | Just dec@(Dec _ _ pats _ _ rhs) <- M.lookup v env ->
+        if null pats
+          then expandZeroArgLet env rhs
+          else ELetIn a dec (EVar a v)
+  _ -> exp0
+
+-- | Substitute every zero-argument binding of the environment into an
+-- expression.
+expandZeroArgLet :: Map Var (Dec a) -> Exp a -> Exp a
+expandZeroArgLet env = go
+  where
+    go expr = case expr of
+      EVar _ v
+        | Just (Dec _ _ pats _ _ rhs) <- M.lookup v env
+        , null pats ->
+            go rhs
+      EApp a f x -> EApp a (go f) (go x)
+      EIfThen a c t -> EIfThen a (go c) (go t)
+      EIfThenElse a c t e -> EIfThenElse a (go c) (go t) (go e)
+      ENeg a e -> ENeg a (go e)
+      EBinOp a l op r -> EBinOp a (go l) op (go r)
+      EUnOp a op e -> EUnOp a op (go e)
+      EVec a es -> EVec a (map go es)
+      EProj a i e -> EProj a i (go e)
+      EPair a l r -> EPair a (go l) (go r)
+      ERecord a fields -> ERecord a [(f, go e) | (f, e) <- fields]
+      ERecordProj a e f -> ERecordProj a (go e) f
+      EGenerate a shp fn -> EGenerate a (go shp) (go fn)
+      EMap a fn arr -> EMap a (go fn) (go arr)
+      EZipWith a fn x y -> EZipWith a (go fn) (go x) (go y)
+      EAppend a x y -> EAppend a (go x) (go y)
+      EReduce a fn z arr -> EReduce a (go fn) (go z) (go arr)
+      EReduceGenerate a fn z shp gen -> EReduceGenerate a (go fn) (go z) (go shp) (go gen)
+      EFoldl a fn z arr -> EFoldl a (go fn) (go z) (go arr)
+      EFoldlWhile a p fn z arr -> EFoldlWhile a (go p) (go fn) (go z) (go arr)
+      EScan a fn z arr -> EScan a (go fn) (go z) (go arr)
+      EScanInclusive a fn z arr -> EScanInclusive a (go fn) (go z) (go arr)
+      EScanR a fn z arr -> EScanR a (go fn) (go z) (go arr)
+      EScanRInclusive a fn z arr -> EScanRInclusive a (go fn) (go z) (go arr)
+      ESegmentedReduce a fn z offs vals -> ESegmentedReduce a (go fn) (go z) (go offs) (go vals)
+      ESortIndices a e -> ESortIndices a (go e)
+      EIota a e -> EIota a (go e)
+      EMakeIndex a n e -> EMakeIndex a (go n) (go e)
+      ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
+        ECOOSumDuplicates a (go nrows) (go ncols) (go nnz) (go rows) (go cols) (go vals)
+      ECSRFromSortedCOO a nrows ncols nnz rows cols vals ->
+        ECSRFromSortedCOO a (go nrows) (go ncols) (go nnz) (go rows) (go cols) (go vals)
+      EPermute a fn d idx vals -> EPermute a (go fn) (go d) (go idx) (go vals)
+      EScatter a fn d idx vals -> EScatter a (go fn) (go d) (go idx) (go vals)
+      EScatterGuarded a fn d idx vals grd ->
+        EScatterGuarded a (go fn) (go d) (go idx) (go vals) (go grd)
+      EScatterGenerate a fn d idx valFn -> EScatterGenerate a (go fn) (go d) (go idx) (go valFn)
+      EScatterChain a fn d phases ->
+        EScatterChain a (go fn) (go d)
+          [ScatterPhase (go i) (go v) (go <$> mg) | ScatterPhase i v mg <- phases]
+      EScatterGen a fn d phases ->
+        EScatterGen a (go fn) (go d)
+          [ ScatterGenPhase (go shp) (go idxFn) (go valFn) (go <$> mg)
+          | ScatterGenPhase shp idxFn valFn mg <- phases
+          ]
+      EGather a idx arr -> EGather a (go idx) (go arr)
+      EIndex a idx arr -> EIndex a (go idx) (go arr)
+      ECheckIndex a idx def arr -> ECheckIndex a (go idx) (go def) (go arr)
+      ECompact a mode filler guardArr arr -> ECompact a mode (go filler) (go guardArr) (go arr)
+      EFill a shp val -> EFill a (go shp) (go val)
+      EStencil a bc fn arr -> EStencil a bc (go fn) (go arr)
+      EReplicate a dims arr -> EReplicate a dims (go arr)
+      ESlice a dims arr -> ESlice a dims (go arr)
+      EReshape a shp arr -> EReshape a (go shp) (go arr)
+      EIterate a n initExp step -> EIterate a (go n) (go initExp) (go step)
+      EBoundLetIn a v b rhs body -> EBoundLetIn a v (go b) (go rhs) (go body)
+      EShapeOf a e -> EShapeOf a (go e)
+      EReadArray a shp file -> EReadArray a (go shp) (go file)
+      EReadArrayFloat a shp file -> EReadArrayFloat a (go shp) (go file)
+      EWriteArray a arr path -> EWriteArray a (go arr) (go path)
+      EWriteArrayFloat a arr path -> EWriteArrayFloat a (go arr) (go path)
+      EGetEnvInt a e -> EGetEnvInt a (go e)
+      EGetEnvString a e -> EGetEnvString a (go e)
+      EReify a e -> EReify a (go e)
+      _ -> expr
+
+------------------------------------------------------------------------
+-- Guarded scatter fusion
+------------------------------------------------------------------------
+
+-- | State for fusing the producers of a guarded scatter into its loop: setup
+-- statements emitted before the loop, statements run per element, and caches
+-- so each source array is materialized, and each producer element computed,
+-- only once.
+data GuardedScatterFusionState = GuardedScatterFusionState
+  { gsfsSetupStmts :: [Stmt]
+  , gsfsBodyStmts  :: [Stmt]
+  , gsfsArrayCache :: Map (Exp ()) (Atom, Atom)
+  , gsfsElemCache  :: Map (CVar, Exp ()) CVar
+    -- ^ Keyed by the index variable as well: one producer read at two
+    -- different indices (@p[srcs[i]]@ and @p[dsts[i]]@) is two values.
+  }
+
+type GuardedScatterFusionM = StateT GuardedScatterFusionState LowerM
+
+initGuardedScatterFusionState :: GuardedScatterFusionState
+initGuardedScatterFusionState = GuardedScatterFusionState [] [] M.empty M.empty
+
+appendFusionSetup :: [Stmt] -> GuardedScatterFusionM ()
+appendFusionSetup stmts =
+  modify' $ \s -> s { gsfsSetupStmts = gsfsSetupStmts s ++ stmts }
+
+appendFusionBody :: [Stmt] -> GuardedScatterFusionM ()
+appendFusionBody stmts =
+  modify' $ \s -> s { gsfsBodyStmts = gsfsBodyStmts s ++ stmts }
+
+-- | Expand an expression's zero-argument bindings and register its local
+-- functions, returning the extended environment and the expression proper.
+resolveProducerExp
+  :: Map Var (Dec Range)
+  -> Exp Range
+  -> GuardedScatterFusionM (Map Var (Dec Range), Exp Range)
+resolveProducerExp env0 expr0 = go env0 expr0
+  where
+    go env expr =
+      case expandZeroArgLet env expr of
+        ELetIn _ dec@(Dec _ name pats _ _ body) rest -> do
+          when (not (null pats)) $ lift $ registerFn name pats body
+          go (M.insert name dec env) rest
+        expr' ->
+          pure (env, expr')
+
+-- | Give @dst@ the element type of array @arr@, when known.
+registerArrayElemType :: CVar -> Atom -> GuardedScatterFusionM ()
+registerArrayElemType dst arr = do
+  arrTy <- lift $ ctypeOfAtom arr
+  case arrTy of
+    CTArray elemTy -> lift $ registerCType dst elemTy
+    _              -> pure ()
+
+-- | Emit the per-element statements computing a scalar index-function body,
+-- with @idxParam@ bound to the loop's @idxVar@.  'Nothing' when the body
+-- has a form this fusion does not handle, or reads the scatter @target@.
+emitScalarExprAt
+  :: CVar
+  -> Map Var (Dec Range)
+  -> CVar
+  -> CVar
+  -> Exp Range
+  -> GuardedScatterFusionM (Maybe CVar)
+emitScalarExprAt target env0 idxParam idxVar expr0 = do
+  (env, expr) <- resolveProducerExp env0 expr0
+  case expr of
+    EVar _ v
+      | v == idxParam ->
+          pure (Just idxVar)
+    EInt _ n -> do
+      result <- lift $ freshCVar "fuse_scalar"
+      lift $ registerCType result CTInt64
+      appendFusionBody [SAssign result (RAtom (AInt n))]
+      pure (Just result)
+    EBool _ b -> do
+      result <- lift $ freshCVar "fuse_scalar"
+      lift $ registerCType result CTBool
+      appendFusionBody [SAssign result (RAtom (ABool b))]
+      pure (Just result)
+    EVec _ [elemExp] ->
+      emitScalarExprAt target env idxParam idxVar elemExp
+    EVec _ elemExps -> do
+      mElems <- mapM (emitScalarExprAt target env idxParam idxVar) elemExps
+      case sequence mElems of
+        Just elemVars -> do
+          result <- lift $ freshCVar "fuse_scalar"
+          lift $ registerCType result CTTuple
+          appendFusionBody [SAssign result (RTuple (map (AVar) elemVars))]
+          pure (Just result)
+        Nothing ->
+          pure Nothing
+    EBinOp _ lhs op rhs -> do
+      mL <- emitScalarExprAt target env idxParam idxVar lhs
+      mR <- emitScalarExprAt target env idxParam idxVar rhs
+      case (mL, mR) of
+        (Just lVar, Just rVar) -> do
+          result <- lift $ freshCVar "fuse_scalar"
+          let bop = lowerBinOp op
+          appendFusionBody [SAssign result (RBinOp bop (AVar lVar) (AVar rVar))]
+          pure (Just result)
+        _ ->
+          pure Nothing
+    EIndex _ idxExp arrExp -> do
+      mIdx <- emitScalarExprAt target env idxParam idxVar idxExp
+      case mIdx of
+        Just indexVar -> emitProducerElem1D target env indexVar arrExp
+        Nothing       -> pure Nothing
+    EApp _ (EOp _ op) argExp -> do
+      mArg <- emitScalarExprAt target env idxParam idxVar argExp
+      case mArg of
+        Just argVar -> do
+          result <- lift $ freshCVar "fuse_scalar"
+          let uop = case op of
+                Plus _    -> Nothing
+                Minus _   -> Just CNeg
+                PlusF _   -> Nothing
+                MinusF _  -> Just CNeg
+                _         -> Nothing
+          case uop of
+            Just op' -> do
+              appendFusionBody [SAssign result (RUnOp op' (AVar argVar))]
+              pure (Just result)
+            Nothing ->
+              pure Nothing
+        Nothing ->
+          pure Nothing
+    EApp _ fnExp argExp -> do
+      mArg <- emitScalarExprAt target env idxParam idxVar argExp
+      case (fnExp, mArg) of
+        (EVar _ name, Just argVar) -> do
+          mFn <- lift $ lookupFn name
+          case mFn of
+            Just ([_], _) -> do
+              result <- lift $ freshCVar "fuse_scalar"
+              stmts <- lift $ inlineScalarFn (EVar noRange name) argVar result
+              appendFusionBody stmts
+              pure (Just result)
+            _ ->
+              pure Nothing
+        (EApp _ (EOp _ op) lhsExp, Just rhsVar) -> do
+          mLhs <- emitScalarExprAt target env idxParam idxVar lhsExp
+          case mLhs of
+            Just lhsVar -> do
+              result <- lift $ freshCVar "fuse_scalar"
+              let bop = lowerBinOp op
+              appendFusionBody [SAssign result (RBinOp bop (AVar lhsVar) (AVar rhsVar))]
+              pure (Just result)
+            Nothing ->
+              pure Nothing
+        (EApp _ (EVar _ name) lhsExp, Just rhsVar) -> do
+          mLhs <- emitScalarExprAt target env idxParam idxVar lhsExp
+          case mLhs of
+            Just lhsVar -> do
+              mFn <- lift $ lookupFn name
+              case mFn of
+                Just (_ : _ : _, _) -> do
+                  result <- lift $ freshCVar "fuse_scalar"
+                  stmts <- lift $ inlineBinaryFn (EVar noRange name) lhsVar rhsVar result
+                  appendFusionBody stmts
+                  pure (Just result)
+                _ ->
+                  pure Nothing
+            Nothing ->
+              pure Nothing
+        _ ->
+          pure Nothing
+    _ -> do
+      if expMentionsVar idxParam expr
+        then pure Nothing
+        else do
+          (stmts, atom) <- lift $ lowerExpDefault expr
+          case atom of
+            AVar v -> do
+              appendFusionBody stmts
+              pure (Just v)
+            AInt n -> do
+              result <- lift $ freshCVar "fuse_scalar"
+              lift $ registerCType result CTInt64
+              appendFusionBody (stmts ++ [SAssign result (RAtom (AInt n))])
+              pure (Just result)
+            ABool b -> do
+              result <- lift $ freshCVar "fuse_scalar"
+              lift $ registerCType result CTBool
+              appendFusionBody (stmts ++ [SAssign result (RAtom (ABool b))])
+              pure (Just result)
+            _ ->
+              pure Nothing
+
+-- | 'emitScalarExprAt' for the index function of a 1-D @generate@.
+emitGeneratedScalarFn1D
+  :: CVar
+  -> Map Var (Dec Range)
+  -> CVar
+  -> Exp Range
+  -> GuardedScatterFusionM (Maybe CVar)
+emitGeneratedScalarFn1D target env0 loopVar fnExp0 = do
+  (env, fnExp) <- resolveProducerExp env0 fnExp0
+  case fnExp of
+    ELetIn _ (Dec _ name pats _ _ body) rest -> do
+      when (not (null pats)) $ lift $ registerFn name pats body
+      emitGeneratedScalarFn1D target env loopVar rest
+    EVar _ name -> do
+      mFn <- lift $ lookupFn name
+      case mFn of
+        Just ([PVar _ idxParam], body) ->
+          emitScalarExprAt target env idxParam loopVar body
+        Just ([PBound _ idxParam _], body) ->
+          emitScalarExprAt target env idxParam loopVar body
+        Just ([PVec _ [PVar _ idxParam]], body) ->
+          emitScalarExprAt target env idxParam loopVar body
+        Just ([PVec _ [PBound _ idxParam _]], body) ->
+          emitScalarExprAt target env idxParam loopVar body
+        _ ->
+          pure Nothing
+    _ ->
+      pure Nothing
+
+-- | Materialize an array the fused loop reads at computed indices, once, in
+-- the setup.  Returns the array and its shape.
+ensureProducerArraySource
+  :: CVar
+  -> Map Var (Dec Range)
+  -> Exp Range
+  -> GuardedScatterFusionM (Maybe (Atom, Atom))
+ensureProducerArraySource target env0 expr0 = do
+  (env, expr) <- resolveProducerExp env0 expr0
+  let key = fmap (const ()) expr
+  cache <- gets gsfsArrayCache
+  case M.lookup key cache of
+    Just cached ->
+      pure (Just cached)
+    Nothing ->
+      case expr of
+        EVar _ _ -> materialize env expr key
+        _
+          | expMentionsVar target expr -> pure Nothing
+          | otherwise                  -> materialize env expr key
+  where
+    materialize _ expr key = do
+      (setup, arr) <- lift $ lowerExpDefault expr
+      shp <- lift $ freshCVar "fuse_shp"
+      lift $ registerCType shp CTTuple
+      lift $ noteReadOnlyAtom arr
+      appendFusionSetup (setup ++ [SAssign shp (RArrayShape arr)])
+      let cached = (arr, AVar shp)
+      modify' $ \s -> s { gsfsArrayCache = M.insert key cached (gsfsArrayCache s) }
+      pure (Just cached)
+
+-- | The iteration shape of a 1-D producer, if it can be fused.
+producerShape1D
+  :: CVar
+  -> Map Var (Dec Range)
+  -> Exp Range
+  -> GuardedScatterFusionM (Maybe Atom)
+producerShape1D target env0 expr0 = do
+  (env, expr) <- resolveProducerExp env0 expr0
+  case expr of
+    EGenerate _ shpExp _ -> do
+      rank <- lift $ shapeRankM shpExp
+      if rank == Just 1
+        then do
+          (sshp, ashp) <- lift $ lowerExpDefault shpExp
+          appendFusionSetup sshp
+          pure (Just ashp)
+        else pure Nothing
+    EMap _ _ srcExp ->
+      producerShape1D target env srcExp
+    EZipWith _ _ srcExp _ ->
+      producerShape1D target env srcExp
+    EGather _ idxExp _ ->
+      producerShape1D target env idxExp
+    EVar _ _
+      | expMentionsVar target expr -> pure Nothing
+      | otherwise -> fmap snd <$> ensureProducerArraySource target env expr
+    _
+      | expMentionsVar target expr -> pure Nothing
+      | otherwise -> fmap snd <$> ensureProducerArraySource target env expr
+
+-- | Emit the statements computing one element of a 1-D producer (generate,
+-- map, zipwith, gather, or a materialized array) at the loop variable.
+emitProducerElem1D
+  :: CVar
+  -> Map Var (Dec Range)
+  -> CVar
+  -> Exp Range
+  -> GuardedScatterFusionM (Maybe CVar)
+emitProducerElem1D target env0 loopVar expr0 = do
+  (env, expr) <- resolveProducerExp env0 expr0
+  let key = (loopVar, fmap (const ()) expr)
+  elemCache <- gets gsfsElemCache
+  case M.lookup key elemCache of
+    Just cached ->
+      pure (Just cached)
+    Nothing ->
+      case expr of
+        EGenerate _ shpExp fnExp -> do
+          rank <- lift $ shapeRankM shpExp
+          if rank == Just 1
+            then do
+              mResult <- emitGeneratedScalarFn1D target env loopVar fnExp
+              case mResult of
+                Just result -> do
+                  modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+                  pure (Just result)
+                Nothing -> do
+                  result <- lift $ freshCVar "fuse_val"
+                  stmts <- lift $ inlineArrayFn1D fnExp loopVar result
+                  appendFusionBody stmts
+                  modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+                  pure (Just result)
+            else pure Nothing
+        EMap _ fnExp srcExp -> do
+          mSrc <- emitProducerElem1D target env loopVar srcExp
+          case mSrc of
+            Nothing -> pure Nothing
+            Just srcV -> do
+              result <- lift $ freshCVar "fuse_val"
+              stmts <- lift $ inlineScalarFn fnExp srcV result
+              appendFusionBody stmts
+              modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+              pure (Just result)
+        EZipWith _ fnExp arr1Exp arr2Exp -> do
+          mV1 <- emitProducerElem1D target env loopVar arr1Exp
+          mV2 <- emitProducerElem1D target env loopVar arr2Exp
+          case (mV1, mV2) of
+            (Just v1, Just v2) -> do
+              result <- lift $ freshCVar "fuse_val"
+              stmts <- lift $ inlineBinaryFn fnExp v1 v2 result
+              appendFusionBody stmts
+              modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+              pure (Just result)
+            _ ->
+              pure Nothing
+        EGather _ idxExp srcExp -> do
+          mIdx <- emitProducerElem1D target env loopVar idxExp
+          mSrc <- ensureProducerArraySource target env srcExp
+          case (mIdx, mSrc) of
+            (Just idxV, Just (srcArr, srcShp)) -> do
+              idxTy <- lift $ ctypeOfAtom (AVar idxV)
+              result <- lift $ freshCVar "fuse_val"
+              registerArrayElemType result srcArr
+              lift $ noteIndirectReadAtom srcArr
+              bodyStmts <-
+                if idxTy == CTInt64
+                  then pure [SAssign result (RArrayLoad srcArr (AVar idxV))]
+                  else do
+                    flat <- lift $ freshCVar "fuse_flat"
+                    pure
+                      [ SAssign flat (RNdToFlat (AVar idxV) srcShp)
+                      , SAssign result (RArrayLoad srcArr (AVar flat))
+                      ]
+              appendFusionBody bodyStmts
+              modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+              pure (Just result)
+            _ ->
+              pure Nothing
+        EVar _ _ -> do
+          mSrc <- ensureProducerArraySource target env expr
+          case mSrc of
+            Just (srcArr, _) -> do
+              result <- lift $ freshCVar "fuse_val"
+              registerArrayElemType result srcArr
+              lift $ noteDenseReadAtom srcArr
+              appendFusionBody [SAssign result (RArrayLoad srcArr (AVar loopVar))]
+              modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+              pure (Just result)
+            Nothing ->
+              pure Nothing
+        _
+          | expMentionsVar target expr -> pure Nothing
+          | otherwise -> do
+              mSrc <- ensureProducerArraySource target env expr
+              case mSrc of
+                Just (srcArr, _) -> do
+                  result <- lift $ freshCVar "fuse_val"
+                  registerArrayElemType result srcArr
+                  lift $ noteDenseReadAtom srcArr
+                  appendFusionBody [SAssign result (RArrayLoad srcArr (AVar loopVar))]
+                  modify' $ \s -> s { gsfsElemCache = M.insert key result (gsfsElemCache s) }
+                  pure (Just result)
+                Nothing ->
+                  pure Nothing
+
+-- | Lower a guarded scatter whose index, value and guard are 1-D producers as
+-- a single loop that computes each stream element in place, with no
+-- intermediate arrays.  Streams that read the target read a snapshot.
+-- 'Nothing' when the expression is not such a scatter.
+lowerFusedGuardedScatter :: Exp Range -> LowerM (Maybe ([Stmt], Atom))
+lowerFusedGuardedScatter expr = do
+  let (env, core0) = collectLetEnv expr
+  mapM_ registerOuterFn (M.elems env)
+  let
+      core = expandZeroArgLet env core0
+  case core of
+    EScatterGuarded _ combExp0 defaultsExp0 idxExp0 valsExp0 guardExp0 -> do
+      let combExp = resolveValueExp env combExp0
+          defaultsExp = expandZeroArgLet env defaultsExp0
+          idxExp = expandZeroArgLet env idxExp0
+          valsExp = expandZeroArgLet env valsExp0
+          guardExp = expandZeroArgLet env guardExp0
+      (sd, ad) <- lowerScatterTarget lowerExpDefault defaultsExp
+      case ad of
+        AVar target -> do
+          oldVal <- freshCVar "old"
+          newVal <- freshCVar "new"
+          combStmtsTemplate <- inlineBinaryFn combExp "__fuse_val" oldVal newVal
+          i <- freshIterVar "i"
+          n <- freshCVar "n"
+          fused <- flip runStateT initGuardedScatterFusionState $ do
+            mShp <- producerShape1D target env idxExp
+            case mShp of
+              Nothing -> pure Nothing
+              Just ashp -> do
+                mIdx <- emitProducerElem1D target env i idxExp
+                mVal <- emitProducerElem1D target env i valsExp
+                mGuard <- emitProducerElem1D target env i guardExp
+                pure $ do
+                  idxV <- mIdx
+                  valV <- mVal
+                  guardV <- mGuard
+                  pure (ashp, idxV, valV, guardV)
+          case fused of
+            (Nothing, _) ->
+              pure Nothing
+            (Just (ashp, idxV, valV, guardV), st) -> do
+              let combStmts = renameVarInStmts "__fuse_val" valV combStmtsTemplate
+              (kernelGroups, snapSetup) <-
+                privatizeScatterStreams ad (sd ++ gsfsSetupStmts st) [gsfsBodyStmts st]
+              let kernelStmts = concat kernelGroups
+              pure $ Just
+                ( sd
+                    ++ gsfsSetupStmts st
+                    ++ snapSetup
+                    ++ [ SAssign n (RShapeSize ashp)
+                       , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
+                           ( kernelStmts
+                             ++ [ SIf (AVar guardV)
+                                    ( [ SAssign oldVal (RArrayLoad ad (AVar idxV)) ]
+                                        ++ combStmts
+                                        ++ [ SArrayWrite ad (AVar idxV) (AVar newVal) ]
+                                    )
+                                    []
+                                ]
+                           )
+                       ]
+                , ad
+                )
+        _ ->
+          pure Nothing
+    _ ->
+      pure Nothing
+  where
+    registerOuterFn (Dec _ name pats _ _ body)
+      | not (null pats) = registerFn name pats body
+      | otherwise       = pure ()
+
 -- | Lower an expression, returning the emitted statements and the atom
 -- that holds the result.
 lowerExp :: Exp Range -> LowerM ([Stmt], Atom)
-lowerExp expr = case expr of
+lowerExp expr = do
+  mbSpecial <- lowerFusedGuardedScatter expr
+  case mbSpecial of
+    Just lowered -> pure lowered
+    Nothing -> lowerExpDefault expr
+
+lowerExpDefault :: Exp Range -> LowerM ([Stmt], Atom)
+lowerExpDefault expr = case expr of
   EInt _ n -> pure ([], AInt n)
   EFloat _ f -> pure ([], AFloat f)
   EBool _ b -> pure ([], ABool b)
@@ -1599,7 +2160,7 @@ lowerExp expr = case expr of
                 (EGenerate ann (EShapeOf ann srcExp) permFnExp) srcExp)
 
   EScatter _ combExp defaultsExp idxArrExp valsExp -> do
-    (sd, ad) <- lowerExp defaultsExp
+    (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
     (si, ai) <- lowerExp idxArrExp
     (sv, av) <- lowerExp valsExp
     shp <- freshCVar "shp"
@@ -1610,12 +2171,16 @@ lowerExp expr = case expr of
     newVal <- freshCVar "new"
     idx <- freshCVar "idx"
     combStmts <- inlineBinaryFn combExp val oldVal newVal
-    pure ( sd ++ si ++ sv
-         ++ [ SAssign shp (RArrayShape ai)
+    (opnds, snapSetup) <- privatizeScatterOperands ad (sd ++ si ++ sv) [ai, av]
+    let (aiP, avP) = case opnds of
+          [x, y] -> (x, y)
+          _      -> (ai, av)
+    pure ( sd ++ si ++ sv ++ snapSetup
+         ++ [ SAssign shp (RArrayShape aiP)
             , SAssign n (RShapeSize (AVar shp))
             , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                ( [ SAssign idx (RArrayLoad ai (AVar i))
-                  , SAssign val (RArrayLoad av (AVar i))
+                ( [ SAssign idx (RArrayLoad aiP (AVar i))
+                  , SAssign val (RArrayLoad avP (AVar i))
                   ] ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                 )
             ]
@@ -1625,7 +2190,7 @@ lowerExp expr = case expr of
   EScatterGuarded _ combExp defaultsExp idxArrExp valsExp guardExp -> do
     case (idxArrExp, valsExp, guardExp) of
       (EGenerate _ shpExp routeFn, EGenerate _ _ valFnExp, EGenerate _ _ guardFnExp) -> do
-        (sd, ad) <- lowerExp defaultsExp
+        (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
         (sshp, ashp) <- lowerExp shpExp
         shp1D <- is1DShapeM shpExp
         n <- freshCVar "n"
@@ -1641,10 +2206,13 @@ lowerExp expr = case expr of
             routeStmts <- inlineArrayFn1D routeFn i idx
             valStmts <- inlineArrayFn1D valFnExp i val
             guardStmts <- inlineArrayFn1D guardFnExp i guardVal
-            (hoistedCalls, kernelStmts) <-
-              hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
+            (hoistedCalls, kernelStmts0) <-
+              hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts ++ guardStmts)
+            (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+            let kernelStmts = concat kernelGroups
             pure ( sd ++ sshp
                  ++ hoistedCalls
+                 ++ snapSetup
                  ++ [ SAssign n (RShapeSize ashp)
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( kernelStmts ++
@@ -1663,10 +2231,13 @@ lowerExp expr = case expr of
             routeStmts <- inlineArrayFn routeFn ndIdx idx
             valStmts <- inlineArrayFn valFnExp ndIdx val
             guardStmts <- inlineArrayFn guardFnExp ndIdx guardVal
-            (hoistedCalls, kernelStmts) <-
-              hoistZeroArgValueProcCalls (routeStmts ++ valStmts ++ guardStmts)
+            (hoistedCalls, kernelStmts0) <-
+              hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts ++ guardStmts)
+            (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+            let kernelStmts = concat kernelGroups
             pure ( sd ++ sshp
                  ++ hoistedCalls
+                 ++ snapSetup
                  ++ [ SAssign n (RShapeSize ashp)
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
@@ -1680,7 +2251,7 @@ lowerExp expr = case expr of
                  , ad
                  )
       _ -> do
-        (sd, ad) <- lowerExp defaultsExp
+        (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
         (si, ai) <- lowerExp idxArrExp
         (sv, av) <- lowerExp valsExp
         (sg, ag) <- lowerExp guardExp
@@ -1693,14 +2264,18 @@ lowerExp expr = case expr of
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
         combStmts <- inlineBinaryFn combExp val oldVal newVal
-        pure ( sd ++ si ++ sv ++ sg
-             ++ [ SAssign shp (RArrayShape ai)
+        (opnds, snapSetup) <- privatizeScatterOperands ad (sd ++ si ++ sv ++ sg) [ai, av, ag]
+        let (aiP, avP, agP) = case opnds of
+              [x, y, z] -> (x, y, z)
+              _         -> (ai, av, ag)
+        pure ( sd ++ si ++ sv ++ sg ++ snapSetup
+             ++ [ SAssign shp (RArrayShape aiP)
                 , SAssign n (RShapeSize (AVar shp))
                 , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                    ( [ SAssign guardVal (RArrayLoad ag (AVar i)) ]
+                    ( [ SAssign guardVal (RArrayLoad agP (AVar i)) ]
                    ++ [ SIf (AVar guardVal)
-                        ( [ SAssign idx (RArrayLoad ai (AVar i))
-                          , SAssign val (RArrayLoad av (AVar i))
+                        ( [ SAssign idx (RArrayLoad aiP (AVar i))
+                          , SAssign val (RArrayLoad avP (AVar i))
                           ] ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
                         )
                         []
@@ -1713,7 +2288,7 @@ lowerExp expr = case expr of
   EScatterGenerate _ combExp defaultsExp idxArrExp valFnExp -> do
     case idxArrExp of
       EGenerate _ shpExp routeFn -> do
-        (sd, ad) <- lowerExp defaultsExp
+        (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
         (sshp, ashp) <- lowerExp shpExp
         shp1D <- is1DShapeM shpExp
         n <- freshCVar "n"
@@ -1727,9 +2302,12 @@ lowerExp expr = case expr of
           then do
             routeStmts <- inlineArrayFn1D routeFn i idx
             valStmts <- inlineArrayFn1D valFnExp i val
-            (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+            (hoistedCalls, kernelStmts0) <- hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts)
+            (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+            let kernelStmts = concat kernelGroups
             pure ( sd ++ sshp
                  ++ hoistedCalls
+                 ++ snapSetup
                  ++ [ SAssign n (RShapeSize ashp)
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts )
@@ -1742,9 +2320,12 @@ lowerExp expr = case expr of
             noteDenseLinearIndex ndIdx i
             routeStmts <- inlineArrayFn routeFn ndIdx idx
             valStmts <- inlineArrayFn valFnExp ndIdx val
-            (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+            (hoistedCalls, kernelStmts0) <- hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts)
+            (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+            let kernelStmts = concat kernelGroups
             pure ( sd ++ sshp
                  ++ hoistedCalls
+                 ++ snapSetup
                  ++ [ SAssign n (RShapeSize ashp)
                     , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                         ( [ SAssign ndIdx (RFlatToNd (AVar i) ashp)
@@ -1754,7 +2335,7 @@ lowerExp expr = case expr of
                  , ad
                  )
       EMap _ routeFn srcArrExp -> do
-        (sd, ad) <- lowerExp defaultsExp
+        (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
         (ssrc, asrc) <- lowerExp srcArrExp
         shp <- freshCVar "shp"
         n <- freshCVar "n"
@@ -1769,12 +2350,15 @@ lowerExp expr = case expr of
         idx <- freshCVar "idx"
         routeStmts <- inlineScalarFn routeFn elem' idx
         valStmts <- inlineArrayFn valFnExp ndIdx val
-        (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+        (hoistedCalls, kernelStmts0) <- hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts)
+        (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+        let kernelStmts = concat kernelGroups
         combStmts <- inlineBinaryFn combExp val oldVal newVal
         noteReadOnlyAtom asrc
         noteDenseReadAtom asrc
         pure ( sd ++ ssrc
              ++ hoistedCalls
+             ++ snapSetup
              ++ [ SAssign shp (RArrayShape asrc)
                 , SAssign n (RShapeSize (AVar shp))
                 , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
@@ -1786,7 +2370,7 @@ lowerExp expr = case expr of
              , ad
              )
       _ -> do
-        (sd, ad) <- lowerExp defaultsExp
+        (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
         (si, ai) <- lowerExp idxArrExp
         shp <- freshCVar "shp"
         n <- freshCVar "n"
@@ -1799,10 +2383,13 @@ lowerExp expr = case expr of
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
         valStmts <- inlineArrayFn valFnExp ndIdx val
-        (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls valStmts
+        (hoistedCalls, kernelStmts0) <- hoistZeroArgValueProcCallsWith sd valStmts
+        (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+        let kernelStmts = concat kernelGroups
         combStmts <- inlineBinaryFn combExp val oldVal newVal
         pure ( sd ++ si
              ++ hoistedCalls
+             ++ snapSetup
              ++ [ SAssign shp (RArrayShape ai)
                 , SAssign n (RShapeSize (AVar shp))
                 , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
@@ -1815,8 +2402,11 @@ lowerExp expr = case expr of
              )
 
   EScatterChain _ combExp defaultsExp phases -> do
-    -- Lower the initial buffer once; all phases write into the same allocation.
-    (sd, ad) <- lowerExp defaultsExp
+    -- Lower the initial buffer once; all phases write into the same
+    -- allocation.  Unless the defaults allocate a fresh buffer,
+    -- 'lowerScatterTarget' gives the chain a copy, so every phase's streams
+    -- keep reading the pre-chain array and need no snapshot.
+    (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
     phaseStmts <- forM phases $ \(ScatterPhase idxArrExp valsExp mGuardExp) -> do
       n <- freshCVar "n"
       i <- freshIterVar "i"
@@ -1993,7 +2583,7 @@ lowerExp expr = case expr of
     -- all phases write into the single buffer initialised from defaults.
     -- Mirrors the per-phase structure of EScatterChain combined with the
     -- inline-generator structure of EScatterGenerate.
-    (sd, ad) <- lowerExp defaultsExp
+    (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
     phaseStmts <- forM phases $ \(ScatterGenPhase shpExp idxFnExp valFnExp mGuardFnExp) -> do
       (sshp, ashp) <- lowerExp shpExp
       shp1D <- is1DShapeM shpExp
@@ -2004,30 +2594,33 @@ lowerExp expr = case expr of
       newVal <- freshCVar "new"
       idx <- freshCVar "idx"
       combStmts <- inlineBinaryFn combExp val oldVal newVal
-      let loopBody kernelStmts mGuardStmts mGuardAtom =
-            case (mGuardStmts, mGuardAtom) of
-              (Nothing, _) ->
-                kernelStmts ++ scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
-              (Just gStmts, Just gAtom) ->
-                kernelStmts ++ gStmts ++
-                [ SIf gAtom (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts) [] ]
-              _ -> kernelStmts
+      -- The guard is part of the stream block that is hoisted and privatized
+      -- with the index and value; only its atom gates the accumulation.
+      let accumStmts = scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
+          loopBody kernelStmts mGuardAtom =
+            case mGuardAtom of
+              Nothing    -> kernelStmts ++ accumStmts
+              Just gAtom -> kernelStmts ++ [ SIf gAtom accumStmts [] ]
       if shp1D
         then do
           routeStmts <- inlineArrayFn1D idxFnExp i idx
           valStmts <- inlineArrayFn1D valFnExp i val
-          (mGuardStmts, mGuardAtom) <- case mGuardFnExp of
-            Nothing -> pure (Nothing, Nothing)
+          (guardStmts, mGuardAtom) <- case mGuardFnExp of
+            Nothing -> pure ([], Nothing)
             Just guardFnExp -> do
               guardVal <- freshCVar "guard"
               gs <- inlineArrayFn1D guardFnExp i guardVal
-              pure (Just gs, Just (AVar guardVal))
-          (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+              pure (gs, Just (AVar guardVal))
+          (hoistedCalls, kernelStmts0) <-
+            hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts ++ guardStmts)
+          (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+          let kernelStmts = concat kernelGroups
           pure ( sshp
                ++ hoistedCalls
+               ++ snapSetup
                ++ [ SAssign n (RShapeSize ashp)
                   , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
-                      (loopBody kernelStmts mGuardStmts mGuardAtom)
+                      (loopBody kernelStmts mGuardAtom)
                   ]
                )
         else do
@@ -2036,19 +2629,23 @@ lowerExp expr = case expr of
           noteDenseLinearIndex ndIdx i
           routeStmts <- inlineArrayFn idxFnExp ndIdx idx
           valStmts <- inlineArrayFn valFnExp ndIdx val
-          (mGuardStmts, mGuardAtom) <- case mGuardFnExp of
-            Nothing -> pure (Nothing, Nothing)
+          (guardStmts, mGuardAtom) <- case mGuardFnExp of
+            Nothing -> pure ([], Nothing)
             Just guardFnExp -> do
               guardVal <- freshCVar "guard"
               gs <- inlineArrayFn guardFnExp ndIdx guardVal
-              pure (Just gs, Just (AVar guardVal))
-          (hoistedCalls, kernelStmts) <- hoistZeroArgValueProcCalls (routeStmts ++ valStmts)
+              pure (gs, Just (AVar guardVal))
+          (hoistedCalls, kernelStmts0) <-
+            hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts ++ guardStmts)
+          (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
+          let kernelStmts = concat kernelGroups
           pure ( sshp
                ++ hoistedCalls
+               ++ snapSetup
                ++ [ SAssign n (RShapeSize ashp)
                   , SLoop (LoopSpec [i] [atomToIndexExpr (AVar n)] Serial Nothing LoopPlain [])
                       ( SAssign ndIdx (RFlatToNd (AVar i) ashp)
-                          : loopBody kernelStmts mGuardStmts mGuardAtom
+                          : loopBody kernelStmts mGuardAtom
                       )
                   ]
                )
@@ -4120,11 +4717,190 @@ renameVarInStmt old new stmt =
 renameVarInStmts :: CVar -> CVar -> [Stmt] -> [Stmt]
 renameVarInStmts old new = map (renameVarInStmt old new)
 
+renameReadVarInStmt :: CVar -> CVar -> Stmt -> Stmt
+renameReadVarInStmt old new stmt =
+  case stmt of
+    SAssign v rhs -> SAssign v (renameVarInRHS old new rhs)
+    SArrayWrite arr idx val ->
+      SArrayWrite arr (renameVarInAtom old new idx) (renameVarInAtom old new val)
+    SLoop spec body ->
+      SLoop (renameLoopSpec old new spec) (map (renameReadVarInStmt old new) body)
+    SParallelRegion body ->
+      SParallelRegion (map (renameReadVarInStmt old new) body)
+    SIf cond tBranch eBranch ->
+      SIf
+        (renameVarInAtom old new cond)
+        (map (renameReadVarInStmt old new) tBranch)
+        (map (renameReadVarInStmt old new) eBranch)
+    SReturn a -> SReturn (renameVarInAtom old new a)
+    SBreak -> SBreak
+
+renameReadVarInStmts :: CVar -> CVar -> [Stmt] -> [Stmt]
+renameReadVarInStmts old new = map (renameReadVarInStmt old new)
+
+------------------------------------------------------------------------
+-- Scatter target privatization
+------------------------------------------------------------------------
+
+-- | Allocate a private copy of an array and fill it with that array's current
+-- contents, returning the copy's variable and the statements that build it.
+--
+-- The fill is an IR loop rather than a runtime memcpy call so that the usual
+-- pipeline still applies: it vectorizes, and (because the buffer is marked
+-- fresh and write-once) it is eligible for 'hoistLoopArrayTemps' inside an
+-- @iterate@.  Its 'LoopCopy' role keeps it serial: the C compiler turns it
+-- into a memcpy, which is cheaper than an OpenMP region for the buffer sizes
+-- that get snapshotted.
+snapshotArray :: Atom -> LowerM (CVar, [Stmt])
+snapshotArray src = do
+  shpV  <- freshCVar "snap_shp"
+  nV    <- freshCVar "snap_n"
+  snapV <- freshCVar "snap"
+  elemV <- freshCVar "snap_elem"
+  k     <- freshIterVar "k"
+  srcTy <- ctypeOfAtom src
+  let elemTy = case srcTy of
+        CTArray et -> et
+        _          -> CTInt64
+  registerCType shpV CTTuple
+  registerCType nV CTInt64
+  registerCType elemV elemTy
+  registerCType snapV (CTArray elemTy)
+  markArrayFreshWriteOnce snapV
+  markContiguousWriteArray snapV
+  pure
+    ( snapV
+    , [ SAssign shpV (RArrayShape src)
+      , SAssign snapV (RArrayAlloc (AVar shpV))
+      , SAssign nV (RShapeSize (AVar shpV))
+      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar nV)] Serial Nothing LoopCopy [])
+          [ SAssign elemV (RArrayLoad src (AVar k))
+          , SArrayWrite (AVar snapV) (AVar k) (AVar elemV)
+          ]
+      ]
+    )
+
+-- | Lower a scatter's defaults to a buffer the scatter may write in place.
+--
+-- A scatter builds a new array, but its lowering writes straight into the
+-- defaults buffer.  That is only faithful when nothing else can observe the
+-- buffer afterwards.  An expression that allocates its result (a @fill@, a
+-- @generate@, another scatter, ...) hands over a buffer nobody else names.
+-- Anything else -- a variable, a pair projection, a top-level value (whose
+-- buffer is cached and shared), a loop's state -- may still be read after the
+-- scatter, so the scatter writes into a copy.  Its streams keep reading the
+-- original, which the copy leaves untouched, so no stream snapshot is needed.
+lowerScatterTarget :: (Exp Range -> LowerM ([Stmt], Atom)) -> Exp Range -> LowerM ([Stmt], Atom)
+lowerScatterTarget lower defaultsExp = do
+  (sd, ad) <- lower defaultsExp
+  if allocatesResult defaultsExp
+    then pure (sd, ad)
+    else case ad of
+      AVar _ -> do
+        (copyV, copyStmts) <- snapshotArray ad
+        pure (sd ++ copyStmts, AVar copyV)
+      _ -> pure (sd, ad)
+
+-- | Does this expression's lowering always return a buffer it just allocated?
+-- Conservative: views ('ESlice', 'EReshape') and anything that can return an
+-- existing buffer ('EVar', projections, 'EIf', 'EIterate' of zero steps, ...)
+-- answer 'False'.
+allocatesResult :: Exp a -> Bool
+allocatesResult e = case e of
+  EGenerate {}         -> True
+  EMap {}              -> True
+  EZipWith {}          -> True
+  EAppend {}           -> True
+  EScan {}             -> True
+  EScanInclusive {}    -> True
+  EScanR {}            -> True
+  EScanRInclusive {}   -> True
+  ESegmentedReduce {}  -> True
+  ESortIndices {}      -> True
+  EIota {}             -> True
+  EPermute {}          -> True
+  EScatter {}          -> True
+  EScatterGuarded {}   -> True
+  EScatterGenerate {}  -> True
+  EScatterChain {}     -> True
+  EScatterGen {}       -> True
+  EGather {}           -> True
+  ECompact {}          -> True
+  EFill {}             -> True
+  EReplicate {}        -> True
+  EReadArray {}        -> True
+  EReadArrayFloat {}   -> True
+  EStencil {}          -> True
+  EReify _ inner       -> allocatesResult inner
+  _                    -> False
+
+-- | Break a read-write aliasing hazard inside a scatter.
+--
+-- A scatter denotes \"evaluate the index\/value\/guard streams, then apply the
+-- writes to a copy of the defaults\", but we execute it in place, writing
+-- straight into the defaults buffer.  That is only faithful while nothing in
+-- the loop body /reads/ that buffer: if a stream does, later iterations
+-- observe earlier iterations' writes and the scatter silently degrades from a
+-- snapshot-then-write (Jacobi) step into a cascading (Gauss-Seidel) one.
+-- Fusing a producer that reads the target into the scatter makes this
+-- reachable from source.
+--
+-- So when the streams do read the target, snapshot it and point their reads at
+-- the snapshot.  The accumulator's own read-modify-write must keep addressing
+-- the live buffer, so only the stream statements handed in here are redirected
+-- -- never the combine.
+--
+-- The snapshot is O(target); materialising the streams instead would be
+-- O(iteration space).  Which is cheaper depends on the program, and only the
+-- former is available once the streams have already been fused in.
+privatizeScatterStreams :: Atom -> [Stmt] -> [[Stmt]] -> LowerM ([[Stmt]], [Stmt])
+privatizeScatterStreams target defs groups = case target of
+  AVar _ | not (S.null touched) -> do
+      (snapV, setup) <- snapshotArray target
+      let redirect g = foldr (\a acc -> renameReadVarInStmts a snapV acc) g (S.toList touched)
+      pure (map redirect groups, setup)
+  _ -> pure (groups, [])
+  where
+    touched =
+      (S.unions (map usedVarsStmts groups) `S.intersection` targetAliases target defs)
+        `S.difference` assignedVars
+    assignedVars = S.fromList [v | SAssign v _ <- concat groups]
+
+-- | Names that certainly denote the same buffer as @target@ here: the target
+-- itself, anything copied from it, and any other call to the same zero-argument
+-- value proc (those are cached, so every call returns one shared buffer).
+targetAliases :: Atom -> [Stmt] -> Set CVar
+targetAliases target defs = case target of
+  AVar t ->
+    let viaCall = case listToMaybe [f | SAssign w (RCall f []) <- defs, w == t] of
+          Just fn -> S.fromList [w | SAssign w (RCall f' []) <- defs, f' == fn]
+          Nothing -> S.empty
+        direct = S.insert t viaCall
+        viaCopy = S.fromList [w | SAssign w (RAtom (AVar v)) <- defs, v `S.member` direct]
+    in direct `S.union` viaCopy
+  _ -> S.empty
+
+-- | 'privatizeScatterStreams' for scatters whose streams are already
+-- materialised arrays: there are no statements to rewrite, just operand atoms
+-- that may name the target buffer itself (@scatter c p p vals@).
+privatizeScatterOperands :: Atom -> [Stmt] -> [Atom] -> LowerM ([Atom], [Stmt])
+privatizeScatterOperands target defs operands
+  | not (any aliased operands) = pure (operands, [])
+  | otherwise = do
+      (snapV, setup) <- snapshotArray target
+      pure (map (\a -> if aliased a then AVar snapV else a) operands, setup)
+  where
+    aliases = targetAliases target defs
+    aliased (AVar v) = S.member v aliases
+    aliased _        = False
+
 hoistZeroArgValueProcCalls :: [Stmt] -> LowerM ([Stmt], [Stmt])
 hoistZeroArgValueProcCalls = hoistZeroArgValueProcCallsWith []
 
 -- | 'hoistZeroArgValueProcCalls', reusing the calls already made in
--- @priorStmts@ rather than calling those procedures again.
+-- @priorStmts@.  A cached zero-argument procedure returns the same buffer on
+-- every call, so reusing its name keeps that aliasing visible to
+-- 'privatizeScatterStreams'.
 hoistZeroArgValueProcCallsWith :: [Stmt] -> [Stmt] -> LowerM ([Stmt], [Stmt])
 hoistZeroArgValueProcCallsWith priorStmts stmts = go seedCache M.empty [] [] stmts
   where
@@ -4249,6 +5025,26 @@ is1DShapeExp _            = False
 -- ranks inference recorded.
 is1DShapeM :: Exp a -> LowerM Bool
 is1DShapeM shpExp = (== Just 1) <$> shapeRankM shpExp
+
+-- | Does an expression mention the variable @v@?  Cheap: only the forms that
+-- appear in index arithmetic are inspected, anything else counts as no.
+expMentionsVar :: Var -> Exp a -> Bool
+expMentionsVar v = go
+  where
+    go e = case e of
+      EVar _ w        -> w == v
+      EIndex _ i a    -> go i || go a
+      ECheckIndex _ i d a -> go i || go d || go a
+      EGather _ i a   -> go i || go a
+      EBinOp _ l _ r  -> go l || go r
+      EUnOp _ _ e1    -> go e1
+      ENeg _ e1       -> go e1
+      EVec _ es       -> any go es
+      EApp _ f x      -> go f || go x
+      EProj _ _ e1    -> go e1
+      EIfThen _ c t   -> go c || go t
+      EIfThenElse _ c t e1 -> go c || go t || go e1
+      _               -> False
 
 -- | Extract the single variable bound by a simple (PVar/PBound) pattern.
 patVar :: Pat a -> Maybe Var

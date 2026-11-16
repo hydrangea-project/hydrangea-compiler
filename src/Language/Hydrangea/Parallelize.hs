@@ -29,6 +29,7 @@ module Language.Hydrangea.Parallelize
   , parallelizeStmts
   ) where
 
+import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (isJust)
@@ -519,16 +520,35 @@ factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body =
 -- | Every definition of each variable anywhere in a procedure body.
 type DefEnv = Map CVar [RHS]
 
+-- | The 'DefEnv' of a procedure body.  The buffer swap that ends a
+-- double-buffered @iterate@ body is left out: it makes the two buffers copies
+-- of each other, but within one iteration they are distinct, and every check
+-- here concerns races inside a loop that runs within one iteration.
 collectDefEnv :: [Stmt] -> DefEnv
 collectDefEnv = go M.empty
   where
     go = foldl' goStmt
     goStmt acc stmt = case stmt of
       SAssign v rhs         -> M.insertWith (flip (++)) v [rhs] acc
+      SLoop spec body
+        | lsRole spec == LoopIterate -> go acc (dropBufferSwap body)
       SLoop _ body          -> go acc body
       SParallelRegion body  -> go acc body
       SIf _ thn els         -> go (go acc thn) els
       _                     -> acc
+
+-- | Strip the trailing @cur = next; next = tmp; tmp = cur@ swap that
+-- 'Language.Hydrangea.CFGOpt.hoistIterateAllocs' appends to a
+-- double-buffered iterate body.
+dropBufferSwap :: [Stmt] -> [Stmt]
+dropBufferSwap body = case splitAt (length body - 3) body of
+  ( prefix
+    , [ SAssign c (RAtom (AVar n))
+      , SAssign n' (RAtom (AVar t))
+      , SAssign t' (RAtom (AVar c'))
+      ] )
+    | n == n', t == t', c == c', "__iter_tmp" `BS.isSuffixOf` t -> prefix
+  _ -> body
 
 -- | Does the value of this atom depend, through the definitions in @defs@, on
 -- the contents of array @arr@?  A variable with no definition (a parameter)
@@ -719,6 +739,7 @@ shouldParallelizeLoop insideLoop spec = case lsRole spec of
   LoopReductionWrapper -> not insideLoop && lsRed spec /= Nothing
   LoopFold             -> False  -- foldl/scan loops carry an accumulator; never parallelizable
   LoopIterate          -> False  -- iterate temporal loop carries array state; never parallelizable
+  LoopCopy             -> False  -- privatization snapshot; lowered as a serial memcpy
   LoopSegRedOuter      -> not insideLoop  -- segmented reduce outer; always eligible
   _                    -> not insideLoop
 
@@ -792,7 +813,7 @@ parallelizeLoop arrayFacts defEnv typeEnv allocSizes procStmts insideLoop spec b
       | otherwise                            = ParallelGeneric
 
     canParallelizeWithFacts =
-      lsRole spec == LoopMap
+      lsRole spec `elem` [LoopMap, LoopMapReduction]
       && isParallelTripCount (loopTripCount spec)
       && factsPermitParallelLoop arrayFacts body
     canParallelizeDirectScatter = factsPermitDirectScatterLoop arrayFacts spec body

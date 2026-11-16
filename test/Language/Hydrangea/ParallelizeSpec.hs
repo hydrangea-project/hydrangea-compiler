@@ -62,6 +62,31 @@ spec = describe "Parallelize" $ do
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
       _ -> expectationFailure "Expected a single fact-parallelized loop"
 
+  it "keeps fresh LoopMap writes on the generic parallel path even with concrete types" $ do
+    let loop =
+          SLoop
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopMap [])
+            [ SAssign "x" (RArrayLoad (AVar "src") (AVar "i"))
+            , SArrayWrite (AVar "out") (AVar "i") (AVar "x")
+            ]
+        proc =
+          (mkProc "p" [] [loop])
+            { procArrayFacts =
+                Map.fromList
+                  [ ("src", ArrayFact False False True)
+                  , ("out", ArrayFact True True False)
+                  ]
+            , procTypeEnv =
+                Map.fromList
+                  [ ("src", CTArray CTInt64)
+                  , ("out", CTArray CTInt64)
+                  , ("x", CTInt64)
+                  ]
+            }
+    case procBody (parallelizeProc proc) of
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
+      _ -> expectationFailure "Expected a single generic fact-parallelized loop"
+
   it "does not use procArrayFacts to justify read-write updates of the same array" $ do
     let loop =
           SLoop
@@ -320,6 +345,33 @@ spec = describe "Parallelize" $ do
         lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         lsExec innerSpec `shouldBe` Serial
       _ -> expectationFailure "Expected nested map-reduction structure"
+
+  it "keeps fresh LoopMapReduction writes on the generic path instead of atomic-write fallback" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])
+            [SAssign "acc" (RBinOp CAdd (AVar "acc") (AInt 1))]
+        outer =
+          SLoop
+            (LoopSpec ["j"] [IConst 8] Serial Nothing LoopMapReduction [])
+            [ SAssign "acc" (RAtom (AInt 0))
+            , inner
+            , SArrayWrite (AVar "out") (AVar "j") (AVar "acc")
+            ]
+        proc =
+          (mkProc "p" [] [outer])
+            { procArrayFacts = Map.fromList [("out", ArrayFact True True False)]
+            , procTypeEnv =
+                Map.fromList
+                  [ ("out", CTArray CTInt64)
+                  , ("acc", CTInt64)
+                  ]
+            }
+    case procBody (parallelizeProc proc) of
+      [SLoop outerSpec [_, SLoop innerSpec _, _]] -> do
+        lsExec outerSpec `shouldBe` Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
+        lsExec innerSpec `shouldBe` Serial
+      _ -> expectationFailure "Expected fact-guided generic outer map-reduction loop"
 
   it "does not parallelize scalar reduction wrapper loops" $ do
     let inner = SLoop (LoopSpec ["k"] [IVar "n"] Serial (Just (ReductionSpec "acc" (IConst 0) RAdd)) LoopReduction [])

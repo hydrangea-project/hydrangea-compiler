@@ -34,6 +34,7 @@ module Language.Hydrangea.CFGOpt
   , hoistIterateAllocs
   , hoistLoopArrayTemps
   , scalarizeIteratePairs
+  , freeLoopArrayTemps
     -- * Atom/statement substitution utilities
   , substAtom
   , substRHS
@@ -955,13 +956,67 @@ hoistLoopArrayTemps facts = go
     go [] = []
     go (SLoop spec body : rest) =
       let body' = go body
-          (hoisted, kept) = partition (hoistable spec body') body'
+          (hoisted, kept) = hoistScratchAllocs spec body'
       in hoisted ++ (SLoop spec kept : go rest)
     go (SParallelRegion body : rest) = SParallelRegion (go body) : go rest
     go (SIf c thn els : rest) = SIf c (go thn) (go els) : go rest
     go (s : rest) = s : go rest
 
-    hoistable spec body st = case st of
+    hoistScratchAllocs :: LoopSpec -> [Stmt] -> ([Stmt], [Stmt])
+    hoistScratchAllocs spec body =
+      case hoistableShapeAllocs spec body of
+        [] ->
+          partition (hoistableAlloc spec body) body
+        pairs ->
+          let hoistedIdxs = S.fromList (concatMap (\(si, ai) -> [si, ai]) pairs)
+              hoisted = concatMap (\(si, ai) -> [body !! si, body !! ai]) pairs
+              kept = [stmt | (ix, stmt) <- zip [0 ..] body, ix `S.notMember` hoistedIdxs]
+          in (hoisted, kept)
+
+    hoistableShapeAllocs :: LoopSpec -> [Stmt] -> [(Int, Int)]
+    hoistableShapeAllocs spec body
+      | lsRole spec /= LoopIterate = []
+      | otherwise =
+          [ (shapeIx, allocIx)
+          | (allocIx, SAssign arr (RArrayAlloc (AVar shp))) <- zip [0 ..] body
+          , Just shapeIx <- [lookupShapeDef shp]
+          , iterateShapeSource (body !! shapeIx)
+          , hoistableAllocFromIterateShape body shapeIx arr
+          ]
+      where
+        lookupShapeDef shp =
+          fst <$> listToMaybe
+            [ (ix, ())
+            | (ix, SAssign shp' (RArrayShape _)) <- zip [0 ..] body
+            , shp' == shp
+            ]
+        iterateShapeSource stmt = case stmt of
+          SAssign _ (RArrayShape (AVar src)) -> src == iterateStateVar body
+          _ -> False
+
+    hoistableAllocFromIterateShape :: [Stmt] -> Int -> CVar -> Bool
+    hoistableAllocFromIterateShape body shapeIx v =
+      case M.lookup v facts of
+        Just fact ->
+          afFreshAlloc fact
+            && afWriteOnce fact
+            && not (arrayPointerEscapes v body)
+            && shapeIx < length body
+        Nothing ->
+          False
+
+    iterateStateVar :: [Stmt] -> CVar
+    iterateStateVar stmts = case reverse stmts of
+      (SAssign cur (RAtom (AVar _)) : _) -> cur
+      _ -> BS.pack "__no_iter_state"
+
+    -- Only @LoopIterate@ loops qualify.  Sharing one buffer across iterations
+    -- is safe exactly when the iterations cannot run concurrently, and an
+    -- iterate loop carries array state so 'Parallelize' never parallelizes it
+    -- (see its 'roleIsParallelizable': @LoopIterate -> False@).  Hoisting out
+    -- of a loop that later became an @omp parallel for@ would instead hand
+    -- every thread the same scratch buffer.
+    hoistableAlloc spec body st = case st of
       SAssign v (RArrayAlloc shp) | lsRole spec == LoopIterate ->
         let loopDefined = definedVarsStmts body `S.union` S.fromList (lsIters spec)
         in case M.lookup v facts of
@@ -972,6 +1027,41 @@ hoistLoopArrayTemps facts = go
                  && not (arrayPointerEscapes v body)
              Nothing -> False
       _ -> False
+
+-- | Free a loop-local array temporary at the end of each iteration.
+--
+-- The companion to 'hoistLoopArrayTemps', for buffers that pass its escape
+-- test but not its loop-invariant-shape test, such as a privatization
+-- snapshot shaped by the array it copies.  Those cannot share one allocation
+-- across trips, and the procedure-exit cleanup only frees the last one.
+-- Applied after hoisting, so hoistable buffers are already gone from the body.
+freeLoopArrayTemps :: [Stmt] -> [Stmt]
+freeLoopArrayTemps = go
+  where
+    go [] = []
+    go (SLoop spec body : rest) =
+      let body' = go body
+          rest' = go rest
+          liveLater = usedVarsStmts rest'
+          freeable =
+            [ v
+            | SAssign v (RArrayAlloc _) <- body'
+            , not (arrayPointerEscapes v body')
+            , not (S.member v liveLater)
+            ]
+          frees = [SAssign "__hyd_discard" (RArrayFree (AVar v)) | v <- freeable]
+          -- A break would jump past the frees; leave those bodies alone.
+          body'' = if bodyHasBreak body' then body' else body' ++ frees
+      in SLoop spec body'' : rest'
+    go (SParallelRegion body : rest) = SParallelRegion (go body) : go rest
+    go (SIf c thn els : rest) = SIf c (go thn) (go els) : go rest
+    go (s : rest) = s : go rest
+
+    bodyHasBreak = any hasBreak
+    hasBreak SBreak = True
+    hasBreak (SIf _ t e) = any hasBreak t || any hasBreak e
+    hasBreak (SParallelRegion b) = any hasBreak b
+    hasBreak _ = False
 
 ------------------------------------------------------------------------
 -- Common subexpression elimination (CSE)

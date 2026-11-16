@@ -229,24 +229,6 @@ pruneProgram opts True prog@(CFG.Program procs) =
                   new = succs `S.difference` visited'
                 in go (rest `S.union` new) visited'
 
-procCallEdges :: [CFG.Proc] -> Map CVar (Set CVar)
-procCallEdges procs = Map.fromList [(CFG.procName p, calledByProc p) | p <- procs]
-  where
-    procNames = S.fromList (map CFG.procName procs)
-    calledByProc (CFG.Proc {CFG.procBody = body}) = foldMap (stmtCalledNames procNames) body
-
-stmtCalledNames :: Set CVar -> CFG.Stmt -> Set CVar
-stmtCalledNames procNames st = case st of
-  CFG.SAssign _ rhs -> rhsCalledNames procNames rhs
-  CFG.SLoop _ body' -> foldMap (stmtCalledNames procNames) body'
-  CFG.SIf _ thn els -> foldMap (stmtCalledNames procNames) thn `S.union` foldMap (stmtCalledNames procNames) els
-  _ -> S.empty
-
-rhsCalledNames :: Set CVar -> RHS -> Set CVar
-rhsCalledNames procNames rhs = case rhs of
-  RCall fn _ | fn `S.member` procNames && fn /= "__apply" -> S.singleton fn
-  _ -> S.empty
-
 procUsesIO :: [CFG.Stmt] -> Bool
 procUsesIO = any stmtUsesIO
   where
@@ -275,24 +257,11 @@ stripBenchmarkIOStmts = mapMaybe stripStmt
       fn == "hyd_write_array_csv" || fn == "hyd_write_array_csv_float"
     rhsIsBenchmarkIO _ = False
 
-reachableClosure :: Map CVar (Set CVar) -> Set CVar -> Set CVar
-reachableClosure edges roots = go roots S.empty
-  where
-    go frontier visited
-      | S.null frontier = visited
-      | otherwise =
-          let (x, rest) = S.deleteFindMin frontier
-              visited' = S.insert x visited
-              succs = Map.findWithDefault S.empty x edges
-              new = succs `S.difference` visited'
-           in go (rest `S.union` new) visited'
-
 genProgram :: CodegenOptions -> CFG.Program -> Either String CodegenArtifacts
 genProgram opts prog@(CFG.Program procs) = do
   let retKinds = procReturnKinds prog
       retTypes = inferProgramReturnTypes prog
       callParamTypes = buildCallParamTypes retTypes procs
-      callEdges = procCallEdges procs
       missingArrayElemVars = collectMissingArrayElemVars retTypes callParamTypes procs
       needsOmp = any (\(CFG.Proc {CFG.procBody = body}) -> hasParallelStmt body) procs
       needsMath = any (\(CFG.Proc {CFG.procBody = body}) -> hasMathOp body) procs
@@ -302,7 +271,6 @@ genProgram opts prog@(CFG.Program procs) = do
       timeInclude = case mBench of
         Nothing -> empty
         Just _ -> text "#include <time.h>"
-      benchReachable = fmap (\bc -> reachableClosure callEdges (S.singleton (bcKernelName bc))) mBench
       recoveredEnvs = map (recoverProcTypeEnv retTypes callParamTypes) procs
       pairStructs = genPairStructDefs opts prog recoveredEnvs
       recordStructs = genRecordStructDefs prog
@@ -357,7 +325,7 @@ genProgram opts prog@(CFG.Program procs) = do
           $$ structuredArrayPrints
           $$ text ""
           $$ benchCacheGlobal
-          $$ vcat (punctuate (text "") (map (genProc opts benchReachable retKinds retTypes callParamTypes) procs))
+          $$ vcat (punctuate (text "") (map (genProc opts retKinds retTypes callParamTypes) procs))
           $$ maybe empty (\spec -> text "" $$ genExportWrapper spec) exportSpec
           $$ if codegenEmitMain opts
             then text "" $$ genMain mBench retKinds retTypes procs
@@ -646,8 +614,8 @@ genMain mBench retKinds retTypes procs =
               KFloat -> invoke "double" (text "hyd_print_double" <> parens (text result) <> text ";")
               KScalar -> invoke "int64_t" (text "hyd_print_int" <> parens (text result) <> text ";")
 
-genProc :: CodegenOptions -> Maybe (Set CVar) -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> CFG.Proc -> Doc
-genProc opts mBenchReachable retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = name, CFG.procParams = params, CFG.procBody = body}) =
+genProc :: CodegenOptions -> Map CVar VarKind -> Map CVar CType -> CallParamTypes -> CFG.Proc -> Doc
+genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = name, CFG.procParams = params, CFG.procBody = body}) =
   let mBench = codegenBenchmark opts
       typeEnv = recoverProcTypeEnv retTypes callParamTypes proc
       -- Authoritative classification from the recovered type environment.
@@ -694,9 +662,7 @@ genProc opts mBenchReachable retKinds retTypes callParamTypes proc@(CFG.Proc {CF
       isBenchKernel = case mBench of
         Just bc -> bcKernelName bc == name
         Nothing -> False
-      benchClosureHit = maybe False (name `S.member`) mBenchReachable
-      benchmarkUsesMemo = benchClosureHit && not (procUsesIO body)
-      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel && not benchmarkUsesMemo
+      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel && not (procUsesIO body)
       -- Scalar zero-arg procs (e.g. getenv-based config procs like iters(), w_f()) are
       -- memoized with a static bool+value pair so callers inside hot loops don't re-invoke
       -- the body (which may call getenv) on every iteration.
@@ -1066,6 +1032,7 @@ genLoop env declared spec body =
         CFG.LoopMapReduction -> text "map-reduction outer loop"
         CFG.LoopIterate -> text "iterate temporal loop"
         CFG.LoopSegRedOuter -> text "segmented-reduce outer loop"
+        CFG.LoopCopy -> text "privatization snapshot copy"
       defaultSimdLen = case CFG.lsExec spec of
         CFG.Vector v -> CFG.vsWidth v
         _ -> 1
@@ -2196,7 +2163,8 @@ collectPairTypesFromCType _ = []
 genPairStructDefs :: CodegenOptions -> CFG.Program -> [TypeEnv] -> Doc
 genPairStructDefs opts (CFG.Program procs) recoveredEnvs =
   let allPairs = concatMap transitivePairTypes topLevelTypes
-      ordered = nubBy (\a b -> fst a == fst b && snd a == snd b) allPairs
+      -- Pairs that differ only in an array field's element type share a struct.
+      ordered = nubBy (\a b -> uncurry pairStructName a == uncurry pairStructName b) allPairs
    in if null ordered
         then empty
         else text "" $$ vcat (map (uncurry (genPairStructDef opts)) ordered)

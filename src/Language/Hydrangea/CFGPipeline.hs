@@ -161,13 +161,14 @@ preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
 preparePolyhedralProgramWithOptions _opts (Program procs) =
   Program [proc { procBody = prepare proc } | proc <- procs]
   where
-    -- Loop scratch buffers are hoisted here because it needs the procedure's
-    -- array facts.
+    -- Loop scratch buffers are hoisted (or freed each trip) here because
+    -- hoisting needs the procedure's array facts.
     prepare proc =
       normalizeIterateBodies
         (optimizeStmts
-          (hoistLoopArrayTemps (procArrayFacts proc)
-            (optimizePipelineWithTiling False (procBody proc))))
+          (freeLoopArrayTemps
+            (hoistLoopArrayTemps (procArrayFacts proc)
+              (optimizePipelineWithTiling False (procBody proc)))))
 
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program

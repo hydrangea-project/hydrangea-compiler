@@ -21,16 +21,20 @@ import Text.Printf (printf)
 import Language.Hydrangea.Frontend
   ( readDecs
   , compileToCOptIO
-  , compileToCOptParallelIO
+  , compileToCOptIOWithAllOptions
   , compileToCOptIOWithPipelineOptionsAndCodegenOptions
+  , compileToCOptParallelIO
   , evalDecsFrontend
+  , FrontendOptions(..)
+  , defaultFrontendOptions
   )
 import Language.Hydrangea.Interpreter (Value(..))
 import qualified Data.Map as Map
 import Data.Char (isDigit)
 import Data.List (intercalate, dropWhileEnd, isInfixOf)
 import Text.Read (readMaybe)
-import Language.Hydrangea.Syntax (Dec(..))
+import Language.Hydrangea.Syntax (Dec(..), Exp(..), ScatterPhase(..))
+import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions)
 import Language.Hydrangea.CFGPipeline (PipelineOptions(..), defaultPipelineOptions)
 import Language.Hydrangea.CodegenC (defaultCodegenOptions)
@@ -120,83 +124,90 @@ checkInlineSrc =
 -- | Parse, interpret and C-compile a source program with explicit pipeline
 -- options; assert the interpreter and compiled outputs agree.
 checkInlineSrcWithOptions :: InferOptions -> PipelineOptions -> BS.ByteString -> IO ()
-checkInlineSrcWithOptions inferOpts pipelineOpts src = do
+checkInlineSrcWithOptions inferOpts pipelineOpts src =
   case readDecs src of
     Left perr -> expectationFailure $ "Parse error: " ++ perr
-    Right decs -> do
-      eres <- evalDecsFrontend decs
-      case eres of
-        Left err -> expectationFailure $ "Interpreter error: " ++ show err
-        Right env -> do
-          let zeroVars = [v | Dec _ v pats _ _ _ <- decs, null pats]
-              lookupVal v = Map.lookup v env
-              formatElem (VInt n)    = show n
-              formatElem (VFloat f)  = stripTrailingZerosG (printf "%.17g" f)
-              formatElem (VString s) = BS.unpack s
-              formatElem (VPair a b) = "(" ++ formatElem a ++ ", " ++ formatElem b ++ ")"
-              formatElem (VArray shape vals) =
-                case traverse formatArrayElem vals of
-                  Just elems ->
-                    "[" ++ intercalate ", " elems
-                      ++ "] (shape: [" ++ intercalate ", " (map show shape) ++ "])"
-                  Nothing -> "<unprintable>"
-              formatElem _           = "<unprintable>"
-              -- Strip trailing zeros from %g output to match C printf("%.17g")
-              -- which never emits trailing zeros or a trailing decimal point.
-              stripTrailingZerosG s
-                | '.' `elem` s && 'e' `notElem` s && 'E' `notElem` s =
-                    let s' = dropWhileEnd (== '0') s
-                    in if last s' == '.' then init s' else s'
-                | otherwise = s
-              formatArrayElem (VInt n)    = Just (show n)
-              formatArrayElem (VFloat f)  = Just (stripTrailingZerosG (printf "%.17g" f))
-              formatArrayElem (VString s) = Just (BS.unpack s)
-              formatArrayElem (VPair a b) = do
-                a' <- formatArrayElem a
-                b' <- formatArrayElem b
-                pure $ "(" ++ a' ++ ", " ++ b' ++ ")"
-              formatArrayElem (VRecord fields) = do
-                fields' <- traverse (\(field, val) -> do
-                  val' <- formatArrayElem val
-                  pure $ BS.unpack field ++ " = " ++ val') fields
-                pure $ "{" ++ intercalate ", " fields' ++ "}"
-              formatArrayElem _           = Nothing
-              formatVal (VInt n)    = show n ++ "\n"
-              formatVal (VFloat f)  = stripTrailingZerosG (printf "%.17g" f) ++ "\n"
-              formatVal (VString s) = BS.unpack s ++ "\n"
-              formatVal (VPair a b) = "(" ++ formatElem a ++ ", " ++ formatElem b ++ ")\n"
-              formatVal (VTuple vs) = "(" ++ intercalate ", " (map formatElem vs) ++ ")\n"
-              formatVal (VArray shape vals) =
-                case traverse formatArrayElem vals of
-                  Just elems ->
-                    let shp = intercalate ", " (map show shape)
-                    in "[" ++ intercalate ", " elems ++ "] (shape: [" ++ shp ++ "])\n"
-                  Nothing -> "<unprintable>\n"
-              formatVal _ = "<unprintable>\n"
-              -- Filter out declarations whose interpreter value cannot be printed
-              -- by the C runtime (e.g. closures). The C codegen either inlines such
-              -- declarations or omits them from the main, so they produce no output.
-              isPrintable v = case lookupVal v of
-                Just val -> formatVal val /= "<unprintable>\n"
-                Nothing  -> True   -- keep "<eval error>" entries to surface bugs
-              expected = concat [ maybe "<eval error>\n" formatVal (lookupVal v)
-                                | v <- zeroVars, isPrintable v ]
-          csrc <-
-            compileToCOptIOWithPipelineOptionsAndCodegenOptions
-              inferOpts
-              pipelineOpts
-              defaultCodegenOptions
-              False
-              decs
-          ec <- compileAndRunC csrc True False False
-          case ec of
-            ExitFailure _ -> expectationFailure "C compilation or execution failed"
-            ExitSuccess -> do
-              (exit, out, _) <- readProcessWithExitCode "./hydrangea_out" [] ""
-              case exit of
-                ExitFailure _ -> expectationFailure "Running generated executable failed"
-                ExitSuccess   ->
-                  normalizeFloatTokens out `shouldBe` normalizeFloatTokens expected
+    Right decs -> checkDecsWithOptions defaultFrontendOptions inferOpts pipelineOpts decs
+
+-- | Interpret and C-compile already-parsed declarations; assert the two outputs
+-- agree.  Lets a test hand the backend a term the surface syntax cannot write.
+checkDecsWithOptions
+  :: FrontendOptions -> InferOptions -> PipelineOptions -> [Dec Range] -> IO ()
+checkDecsWithOptions frontOpts inferOpts pipelineOpts decs = do
+  eres <- evalDecsFrontend decs
+  case eres of
+    Left err -> expectationFailure $ "Interpreter error: " ++ show err
+    Right env -> do
+      let zeroVars = [v | Dec _ v pats _ _ _ <- decs, null pats]
+          lookupVal v = Map.lookup v env
+          formatElem (VInt n)    = show n
+          formatElem (VFloat f)  = stripTrailingZerosG (printf "%.17g" f)
+          formatElem (VString s) = BS.unpack s
+          formatElem (VPair a b) = "(" ++ formatElem a ++ ", " ++ formatElem b ++ ")"
+          formatElem (VArray shape vals) =
+            case traverse formatArrayElem vals of
+              Just elems ->
+                "[" ++ intercalate ", " elems
+                  ++ "] (shape: [" ++ intercalate ", " (map show shape) ++ "])"
+              Nothing -> "<unprintable>"
+          formatElem _           = "<unprintable>"
+          -- Strip trailing zeros from %g output to match C printf("%.17g")
+          -- which never emits trailing zeros or a trailing decimal point.
+          stripTrailingZerosG s
+            | '.' `elem` s && 'e' `notElem` s && 'E' `notElem` s =
+                let s' = dropWhileEnd (== '0') s
+                in if last s' == '.' then init s' else s'
+            | otherwise = s
+          formatArrayElem (VInt n)    = Just (show n)
+          formatArrayElem (VFloat f)  = Just (stripTrailingZerosG (printf "%.17g" f))
+          formatArrayElem (VString s) = Just (BS.unpack s)
+          formatArrayElem (VPair a b) = do
+            a' <- formatArrayElem a
+            b' <- formatArrayElem b
+            pure $ "(" ++ a' ++ ", " ++ b' ++ ")"
+          formatArrayElem (VRecord fields) = do
+            fields' <- traverse (\(field, val) -> do
+              val' <- formatArrayElem val
+              pure $ BS.unpack field ++ " = " ++ val') fields
+            pure $ "{" ++ intercalate ", " fields' ++ "}"
+          formatArrayElem _           = Nothing
+          formatVal (VInt n)    = show n ++ "\n"
+          formatVal (VFloat f)  = stripTrailingZerosG (printf "%.17g" f) ++ "\n"
+          formatVal (VString s) = BS.unpack s ++ "\n"
+          formatVal (VPair a b) = "(" ++ formatElem a ++ ", " ++ formatElem b ++ ")\n"
+          formatVal (VTuple vs) = "(" ++ intercalate ", " (map formatElem vs) ++ ")\n"
+          formatVal (VArray shape vals) =
+            case traverse formatArrayElem vals of
+              Just elems ->
+                let shp = intercalate ", " (map show shape)
+                in "[" ++ intercalate ", " elems ++ "] (shape: [" ++ shp ++ "])\n"
+              Nothing -> "<unprintable>\n"
+          formatVal _ = "<unprintable>\n"
+          -- Filter out declarations whose interpreter value cannot be printed
+          -- by the C runtime (e.g. closures). The C codegen either inlines such
+          -- declarations or omits them from the main, so they produce no output.
+          isPrintable v = case lookupVal v of
+            Just val -> formatVal val /= "<unprintable>\n"
+            Nothing  -> True   -- keep "<eval error>" entries to surface bugs
+          expected = concat [ maybe "<eval error>\n" formatVal (lookupVal v)
+                            | v <- zeroVars, isPrintable v ]
+      csrc <-
+        compileToCOptIOWithAllOptions
+          frontOpts
+          inferOpts
+          pipelineOpts
+          defaultCodegenOptions
+          False
+          decs
+      ec <- compileAndRunC csrc True False False
+      case ec of
+        ExitFailure _ -> expectationFailure "C compilation or execution failed"
+        ExitSuccess -> do
+          (exit, out, _) <- readProcessWithExitCode "./hydrangea_out" [] ""
+          case exit of
+            ExitFailure _ -> expectationFailure "Running generated executable failed"
+            ExitSuccess   ->
+              normalizeFloatTokens out `shouldBe` normalizeFloatTokens expected
 
 -- | C's printf("%.17g") and Haskell's printf "%.17g" can render the same
 -- double as different digit strings (C converts the exact binary value;
@@ -696,6 +707,69 @@ spec = do
     it "record arrays print correctly when returned from main" $ withCC $
       checkInlineSrc $ BS.pack $ unlines
         [ "let main = generate [3] (let f [i] = {x = i, y = i + 1} in f)"
+        ]
+
+  describe "Scatter targets and loop state" $ do
+
+    it "scatter into a top-level array that is read again afterwards" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let idx = generate [8] (let f [i] = (i * 3) % 8 in f)"
+        , "let p0 = generate [8] (let f [i] = i in f)"
+        , "let p2 = scatter (+) p0 idx (fill [8] 1)"
+        , "let r = zipwith (let g x y = if x < y then 1 else 0 in g) p0 p2"
+        ]
+
+    it "iterate step that reads its state after scattering into it" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let idx = generate [8] (let f [i] = (i * 3) % 8 in f)"
+        , "let r = iterate 2 (generate [8] (let f [i] = i in f))"
+        , "  (fn p => zipwith (let g x y = x + y in g) p (scatter (+) p idx (fill [8] 1)))"
+        ]
+
+    -- EScatterChain is not surface syntax, so build one from a nested scatter.
+    -- The second phase's values are the chain's own target; the chain must
+    -- write into a copy so that phase still reads the pre-chain array.  Fusion
+    -- is off so the lowering sees the chain as built.
+    it "scatter chain whose phase reads the chain's target" $ withCC $
+      case readDecs $ BS.pack $ unlines
+             [ "let main ="
+             , "  let p = reify (generate [8] (fn [i] => i)) in"
+             , "  let i1 = reify (generate [8] (fn [i] => (i + 1) % 8)) in"
+             , "  let w1 = reify (generate [8] (fn [i] => 100)) in"
+             , "  let i2 = reify (generate [8] (fn [i] => (i + 3) % 8)) in"
+             , "  scatter (+) (scatter (+) p i1 w1) i2 p" ] of
+        Left perr -> expectationFailure ("Parse error: " ++ perr)
+        Right decs ->
+          checkDecsWithOptions defaultFrontendOptions { frontendSkipFusion = True }
+            defaultInferOptions defaultPipelineOptions (map chainDec decs)
+
+    it "iterate over a pair of int and bool arrays, one passed through" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a0 = generate [8] (let f [i] = i in f)"
+        , "let r = fst (iterate 3 (a0, generate [8] (let f [i] = i < 3 in f))"
+        , "  (fn st => (map (let f x = x + 1 in f) (fst st), snd st)))"
+        ]
+
+    it "iterate over a pair whose step compares old and new state" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let idx = generate [8] (let f [i] = (i * 3) % 8 in f)"
+        , "let r = map (let f b = if b then 1 else 0 in f)"
+        , "  (snd (iterate 3 (generate [8] (let f [i] = i in f), fill [8] false)"
+        , "    (fn st => let p = fst st in let p2 = scatter (+) p idx (fill [8] 1) in"
+        , "              (p2, zipwith (let g x y = x < y in g) p p2))))"
+        ]
+
+    it "guard reading one array at two gathered indices (BFS on a tree)" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let n = 31"
+        , "let srcs = generate [n - 1] (let f [e] = e / 2 in f)"
+        , "let dsts = generate [n - 1] (let f [e] = e + 1 in f)"
+        , "let parent0 = generate [n] (let f [i] = if i = 0 then 0 else (-1) in f)"
+        , "let step p ="
+        , "  let ready a b = (a <> (-1)) & (b = (-1)) in"
+        , "  let overwrite new_ old_ = new_ in"
+        , "  scatter_guarded overwrite p dsts srcs (zipwith ready (gather srcs p) (gather dsts p))"
+        , "let r = iterate 5 parent0 step"
         ]
 
   -- ---- Example programs (file-based) ---------------------------------------
@@ -1307,11 +1381,14 @@ spec = do
       csrc <- compileToCOptIO False decs
       csrc `shouldSatisfy` isInfixOf "break;"
 
-  describe "Pair-of-arrays loop state" $ do
-
-    it "iterate over a pair of int and bool arrays, one passed through" $ withCC $
-      checkInlineSrc $ BS.pack $ unlines
-        [ "let a0 = generate [8] (let f [i] = i in f)"
-        , "let r = fst (iterate 3 (a0, generate [8] (let f [i] = i < 3 in f))"
-        , "  (fn st => (map (let f x = x + 1 in f) (fst st), snd st)))"
-        ]
+-- | Turn the nested scatter at the end of a declaration's let spine into an
+-- 'EScatterChain' with the same combine.
+chainDec :: Dec Range -> Dec Range
+chainDec (Dec a v pats ty sch body) = Dec a v pats ty sch (go body)
+  where
+    go e = case e of
+      ELetIn b d rest -> ELetIn b d (go rest)
+      EBoundLetIn b x t rhs rest -> EBoundLetIn b x t rhs (go rest)
+      EScatter b c (EScatter _ _ d i1 v1) i2 v2 ->
+        EScatterChain b c d [ScatterPhase i1 v1 Nothing, ScatterPhase i2 v2 Nothing]
+      _ -> e
