@@ -34,13 +34,16 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (isJust)
 import Data.Set (Set)
 import Data.Set qualified as S
-import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..))
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), rhsAtoms)
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGTyping (recoverProcTypeEnv)
 import Language.Hydrangea.CFGAnalysis
-  ( isParallelTripCount
+  ( definedVarsStmts
+  , isParallelTripCount
   , loopTripCount
   , tripCountValue
+  , usedVarsAtom
+  , usedVarsStmts
   )
 import Language.Hydrangea.Dependence
   ( findDependences
@@ -69,6 +72,13 @@ data ScatterKernelInfo = ScatterKernelInfo
 data ScatterAtomicAddInfo = ScatterAtomicAddInfo
   { saDestArray :: CVar
   , saValueType :: CType
+  }
+
+-- | Result of identifying an overwrite scatter kernel: the destination array
+-- and the element type.
+data ScatterAtomicWriteInfo = ScatterAtomicWriteInfo
+  { swDestArray :: CVar
+  , swValueType :: CType
   }
 
 ------------------------------------------------------------------------
@@ -503,6 +513,199 @@ factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body =
       | otherwise   = True
 
 ------------------------------------------------------------------------
+-- Overwrite and read-modify-write scatters
+------------------------------------------------------------------------
+
+-- | Every definition of each variable anywhere in a procedure body.
+type DefEnv = Map CVar [RHS]
+
+collectDefEnv :: [Stmt] -> DefEnv
+collectDefEnv = go M.empty
+  where
+    go = foldl' goStmt
+    goStmt acc stmt = case stmt of
+      SAssign v rhs         -> M.insertWith (flip (++)) v [rhs] acc
+      SLoop _ body          -> go acc body
+      SParallelRegion body  -> go acc body
+      SIf _ thn els         -> go (go acc thn) els
+      _                     -> acc
+
+-- | Does the value of this atom depend, through the definitions in @defs@, on
+-- the contents of array @arr@?  A variable with no definition (a parameter)
+-- is independent unless it is @arr@ itself.
+atomDependsOnArray :: DefEnv -> CVar -> Set CVar -> Atom -> Bool
+atomDependsOnArray defs arr seen atom = case atom of
+  AVar v
+    | v == arr          -> True
+    | v `S.member` seen -> False
+    | otherwise         -> maybe False (any (rhsDependsOnArray defs arr (S.insert v seen))) (M.lookup v defs)
+  _ -> False
+
+-- | 'atomDependsOnArray' for a right-hand side.  An allocation or a shape
+-- query does not read an array's contents, so a buffer allocated with the
+-- destination's shape is not a dependence on it.
+rhsDependsOnArray :: DefEnv -> CVar -> Set CVar -> RHS -> Bool
+rhsDependsOnArray defs arr seen rhs = case rhs of
+  RArrayAlloc _ -> False
+  RArrayShape _ -> False
+  _             -> any (atomDependsOnArray defs arr seen) (rhsAtoms rhs)
+
+-- | Identify an overwrite scatter: a loop that stores an already-computed
+-- value into a destination array, where neither the value nor the index
+-- depends on the destination's contents.
+detectScatterAtomicWriteKernel
+  :: DefEnv -> Map CVar CType -> LoopSpec -> [Stmt] -> Maybe ScatterAtomicWriteInfo
+detectScatterAtomicWriteKernel defEnv typeEnv spec body = do
+  let (_, coreBody) = scatterAtomicAddBody body
+  (destArr, idxAtom, valVar) <- case
+    [ (arr, idxAtom, v)
+    | SArrayWrite (AVar arr) idxAtom (AVar v) <- coreBody
+    ] of
+      [single] -> Just single
+      _        -> Nothing
+  let independent =
+        not (atomDependsOnArray defEnv destArr S.empty (AVar valVar))
+          && not (atomDependsOnArray defEnv destArr S.empty idxAtom)
+  if not independent
+    then Nothing
+    else case M.lookup destArr typeEnv of
+      Just (CTArray ty)
+        | ty == CTInt64 || ty == CTDouble
+        , isParallelTripCount (loopTripCount spec) -> Just (ScatterAtomicWriteInfo destArr ty)
+      _ -> Nothing
+
+-- | Names that denote the same buffer as @root@, through copy assignments in
+-- either direction (such as the renames around an iterate's loop state).
+copyAliases :: DefEnv -> CVar -> Set CVar
+copyAliases defs root = go (S.singleton root) [root]
+  where
+    reverseCopies = [(u, k) | (k, rhss) <- M.toList defs, RAtom (AVar u) <- rhss]
+    go seen [] = seen
+    go seen (v : vs) =
+      let fwd = [u | Just rhss <- [M.lookup v defs], RAtom (AVar u) <- rhss]
+          bwd = [k | (u, k) <- reverseCopies, u == v]
+          new = filter (`S.notMember` seen) (fwd ++ bwd)
+      in  go (foldr S.insert seen new) (new ++ vs)
+
+-- | True when, from this loop onwards, @body@ holds every write in the
+-- procedure to @dest@ or one of its aliases: nothing else can race with the
+-- loop's writes.  Writes before the loop fill the buffer and are done.
+destWrittenOnlyIn :: DefEnv -> CVar -> [Stmt] -> [Stmt] -> Bool
+destWrittenOnlyIn defEnv dest procStmts body =
+  countAliasWrites fromLoop == countAliasWrites body
+  where
+    fromLoop = case break containsBody procStmts of
+      (_, rest@(_ : _)) -> rest
+      _                 -> procStmts
+    containsBody st = any isThisLoop (allStmtsRec [st])
+    isThisLoop (SLoop _ b) = b == body
+    isThisLoop _           = False
+    aliasSet = copyAliases defEnv dest
+    countAliasWrites = length . filter isAliasWrite . allStmtsRec
+    isAliasWrite (SArrayWrite (AVar w) _ _) = w `S.member` aliasSet
+    isAliasWrite _                          = False
+
+-- | Every statement, including those nested in loops, branches and regions.
+allStmtsRec :: [Stmt] -> [Stmt]
+allStmtsRec = concatMap go
+  where
+    go stmt = stmt : case stmt of
+      SLoop _ b           -> allStmtsRec b
+      SParallelRegion b   -> allStmtsRec b
+      SIf _ thn els       -> allStmtsRec thn ++ allStmtsRec els
+      _                   -> []
+
+-- | True when an overwrite scatter loop may run in parallel with an atomic
+-- store: the destination is exclusive to the loop (a fresh write-once buffer,
+-- or one no other statement writes) and no other array is written.
+factsPermitAtomicWriteScatterLoop
+  :: ArrayFacts -> DefEnv -> Map CVar CType -> [Stmt] -> LoopSpec -> [Stmt] -> Bool
+factsPermitAtomicWriteScatterLoop arrayFacts defEnv typeEnv procStmts spec body =
+  case detectScatterAtomicWriteKernel defEnv typeEnv spec body of
+    Nothing   -> False
+    Just info ->
+      let dest   = swDestArray info
+          elemTy = swValueType info
+          usage  = collectLoopArrayUsage body
+          destWrites = maybe False lauWrites (M.lookup dest usage)
+          destTypeOk = case M.lookup dest typeEnv of
+            Just (CTArray ty) -> ty == elemTy
+            _                 -> False
+          destExclusive = case M.lookup dest arrayFacts of
+            Just fact | afFreshAlloc fact && afWriteOnce fact -> True
+            _ -> destWrittenOnlyIn defEnv dest procStmts body
+      in     destWrites && destTypeOk && destExclusive
+          && and [ not (lauWrites u) | (arr, u) <- M.toList usage, arr /= dest ]
+
+-- | Where a buffer comes from: a local allocation, the result of a
+-- zero-argument procedure (which may be cached and so shared), or unknown.
+data BufferOrigin = OLocal CVar | OCall CVar | OUnknown
+  deriving (Eq, Ord, Show)
+
+isCallOrigin :: BufferOrigin -> Bool
+isCallOrigin (OCall _) = True
+isCallOrigin _         = False
+
+bufferOrigins :: DefEnv -> CVar -> Set BufferOrigin
+bufferOrigins defEnv v =
+  let found = S.fromList
+        [ o
+        | a <- S.toList (copyAliases defEnv v)
+        , Just rhss <- [M.lookup a defEnv]
+        , rhs <- rhss
+        , Just o <- [originOf a rhs] ]
+  in if S.null found then S.singleton OUnknown else found
+  where
+    originOf a rhs = case rhs of
+      RArrayAlloc _ -> Just (OLocal a)
+      RCall f []    -> Just (OCall f)
+      RCall _ _     -> Just OUnknown
+      RAtom _       -> Nothing  -- a copy, followed by 'copyAliases'
+      _             -> Just OUnknown
+
+-- | The element type of a read-modify-write scatter loop that may run in
+-- parallel as a CAS loop.  The streams (index, guard, value and combine
+-- inputs) must not depend on the destination, the destination must be
+-- exclusive to the loop and not alias any array it reads, and no other array
+-- may be written.
+factsPermitRMWScatterLoop
+  :: ArrayFacts -> DefEnv -> Map CVar CType -> [Stmt] -> LoopSpec -> [Stmt] -> Maybe CType
+factsPermitRMWScatterLoop arrayFacts defEnv typeEnv procStmts spec body = do
+  rmw <- decomposeRMWScatter body
+  dest <- case rmwArray rmw of
+    AVar d -> Just d
+    _      -> Nothing
+  elemTy <- case M.lookup dest typeEnv of
+    Just (CTArray ty) | ty == CTInt64 || ty == CTDouble -> Just ty
+    _                                                   -> Nothing
+  let old = rmwOld rmw
+      streamStmts = rmwOuterPrefix rmw ++ rmwBranchPrefix rmw
+      inputs = S.unions
+        [ usedVarsStmts streamStmts
+        , maybe S.empty usedVarsAtom (rmwGuard rmw)
+        , usedVarsAtom (rmwIndex rmw)
+        , usedVarsStmts (rmwCombine rmw) `S.difference` definedVarsStmts (rmwCombine rmw)
+        ]
+        `S.difference` S.singleton old
+      independent = not (any (atomDependsOnArray defEnv dest S.empty . AVar) (S.toList inputs))
+      usage = collectLoopArrayUsage body
+      destOrigins = bufferOrigins defEnv dest
+      readsCannotAlias = and
+        [ S.null (S.intersection ro destOrigins)
+            && not (OUnknown `S.member` ro && any isCallOrigin (S.toList destOrigins))
+        | (arr, u) <- M.toList usage, arr /= dest, lauReads u
+        , let ro = bufferOrigins defEnv arr ]
+      destExclusive = case M.lookup dest arrayFacts of
+        Just fact | afFreshAlloc fact && afWriteOnce fact -> True
+        _ -> not (OUnknown `S.member` destOrigins) && readsCannotAlias
+               && destWrittenOnlyIn defEnv dest procStmts body
+      otherArraysReadOnly = and [ not (lauWrites u) | (arr, u) <- M.toList usage, arr /= dest ]
+  if independent && destExclusive && otherArraysReadOnly
+       && isParallelTripCount (loopTripCount spec)
+    then Just elemTy
+    else Nothing
+
+------------------------------------------------------------------------
 -- Loop parallelizability
 ------------------------------------------------------------------------
 
@@ -537,13 +740,15 @@ bodyContainsBreak = any go
 -- and chosen strategy) together with the (unchanged) body.
 parallelizeLoop
   :: ArrayFacts
+  -> DefEnv         -- ^ definitions in the whole procedure
   -> Map CVar CType
   -> Map CVar Integer
+  -> [Stmt]         -- ^ the whole procedure body
   -> Bool
   -> LoopSpec
   -> [Stmt]
   -> Maybe (LoopSpec, [Stmt])
-parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
+parallelizeLoop arrayFacts defEnv typeEnv allocSizes procStmts insideLoop spec body
   | execIsUnsupported                          = Nothing
   | not (shouldParallelizeLoop insideLoop spec) = Nothing
   | bodyContainsBreak body                     = Nothing
@@ -568,6 +773,8 @@ parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
       || canParallelizeDirectScatter
       || isJust privatizedScatterTy
       || canParallelizeAtomicScatter
+      || canParallelizeAtomicWriteScatter
+      || isJust rmwScatterTy
       || passesConservativeDependenceCheck spec body
 
     strategy
@@ -577,6 +784,11 @@ parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
       | canParallelizeAtomicScatter          = case detectScatterAtomicAddKernel spec body of
           Just info | saValueType info == CTDouble -> ParallelScatterAtomicAddFloat
           _                                        -> ParallelScatterAtomicAddInt
+      | canParallelizeAtomicWriteScatter     = case detectScatterAtomicWriteKernel defEnv typeEnv spec body of
+          Just info | swValueType info == CTDouble -> ParallelScatterAtomicWriteFloat
+          _                                        -> ParallelScatterAtomicWriteInt
+      | Just CTDouble <- rmwScatterTy        = ParallelScatterRMWFloat
+      | Just _        <- rmwScatterTy        = ParallelScatterRMWInt
       | otherwise                            = ParallelGeneric
 
     canParallelizeWithFacts =
@@ -586,6 +798,17 @@ parallelizeLoop arrayFacts typeEnv allocSizes insideLoop spec body
     canParallelizeDirectScatter = factsPermitDirectScatterLoop arrayFacts spec body
     privatizedScatterTy         = factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body
     canParallelizeAtomicScatter = factsPermitAtomicScatterLoop arrayFacts typeEnv spec body
+    -- The cheaper strategies come first: an ordinary map loop also has the
+    -- shape of an overwrite scatter, and must not pay for atomics.
+    cheaperStrategy =
+      canParallelizeWithFacts || canParallelizeDirectScatter
+        || isJust privatizedScatterTy || canParallelizeAtomicScatter
+    canParallelizeAtomicWriteScatter =
+      not cheaperStrategy
+        && factsPermitAtomicWriteScatterLoop arrayFacts defEnv typeEnv procStmts spec body
+    rmwScatterTy
+      | cheaperStrategy || canParallelizeAtomicWriteScatter = Nothing
+      | otherwise = factsPermitRMWScatterLoop arrayFacts defEnv typeEnv procStmts spec body
 
 ------------------------------------------------------------------------
 -- Statement and procedure traversal
@@ -595,6 +818,8 @@ parallelizeProcWithFacts
   :: ArrayFacts -> Map CVar CType -> Map CVar Integer -> [Stmt] -> [Stmt]
 parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
   where
+    defEnv = collectDefEnv stmts
+
     -- insideParallel: True only when we are inside a loop that will receive
     -- #pragma omp parallel for.  Being inside a *serial* loop (e.g. the foldl
     -- outer loop) does not block inner LoopMap loops from being parallelized.
@@ -604,7 +829,7 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
       SLoop spec body ->
         -- Tentatively check whether this loop will be parallelized (using the
         -- original body) so we can set the correct context for the inner loops.
-        let outerWillParallel = case parallelizeLoop arrayFacts typeEnv allocSizes
+        let outerWillParallel = case parallelizeLoop arrayFacts defEnv typeEnv allocSizes stmts
                                        insideParallel spec body of
               Just _  -> True
               Nothing -> False
@@ -616,7 +841,7 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
             -- Recurse into body with updated context.
             body' = go (insideParallel || outerBlocksInner) body
         -- Now apply parallelization to the outer loop using the traversed body.
-        in case parallelizeLoop arrayFacts typeEnv allocSizes insideParallel spec body' of
+        in case parallelizeLoop arrayFacts defEnv typeEnv allocSizes stmts insideParallel spec body' of
              Just (spec', _) -> [SLoop spec' body']
              Nothing         -> [SLoop spec  body']
       SParallelRegion body ->

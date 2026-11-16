@@ -1023,25 +1023,11 @@ genLoop env declared spec body =
         genStmts env declared (usedVarsStmts loopBody) hoistedMemoCalls
       bodyDoc d = genStmts env d S.empty loopBody
       parallelPolicyClause = case CFG.lsExec spec of
-        CFG.Parallel p ->
-          let strategyComment = case CFG.psStrategy p of
-                CFG.ParallelGeneric -> empty
-                CFG.ParallelScatterDirect -> text " /* scatter-direct */"
-                CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
-                CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
-                CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
-                CFG.ParallelScatterPrivatizedFloatAdd -> text " /* scatter-privatized-float-add */"
-           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
-        CFG.Workshare p ->
-          let strategyComment = case CFG.psStrategy p of
-                CFG.ParallelGeneric -> empty
-                CFG.ParallelScatterDirect -> text " /* scatter-direct */"
-                CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
-                CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
-                CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
-                CFG.ParallelScatterPrivatizedFloatAdd -> text " /* scatter-privatized-float-add */"
-           in strategyComment <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
+        CFG.Parallel p -> policyClause p
+        CFG.Workshare p -> policyClause p
         _ -> empty
+      policyClause p =
+        strategyComment (CFG.psStrategy p) <> maybe empty (\pol -> space <> text (BS.unpack pol)) (CFG.psPolicy p)
       origins = CFG.lsOrigins spec
       collapseClause
         | length iters > 1 = space <> text "collapse(" <> int (length iters) <> text ")"
@@ -1088,8 +1074,10 @@ genLoop env declared spec body =
         CFG.IConst n -> Just n
         _ -> Nothing
       shouldEmitSimd ie = maybe True (>= minSimdTripCount) (constantTripCount ie)
-      atomicScatterBodyDoc elemTy declared' =
-        case detectAtomicScatterAddLoop loopBody of
+      -- A scatter whose final store is one OpenMP atomic: an update
+      -- (@+=@) for an atomic add, or a write for a plain overwrite.
+      atomicStoreBodyDoc detect pragma op elemTy declared' =
+        case detect loopBody of
           Just (outerPrefix, branchPrefix, mGuard, arr, idx, val) ->
             let arrIdxVal =
                   usedVarsAtom arr
@@ -1101,9 +1089,9 @@ genLoop env declared spec body =
                     `S.union` arrIdxVal
                 branchLiveAfter = arrIdxVal
                 atomicUpdate =
-                  text "#pragma omp atomic update"
+                  text pragma
                     $$ genArrayAccess elemTy arr idx
-                    <+> text "+="
+                    <+> text op
                     <+> genAtom val
                     <> text ";"
                 guardedUpdate =
@@ -1123,6 +1111,74 @@ genLoop env declared spec body =
              in genStmts env declared' outerLiveAfter outerPrefix $$ guardedUpdate
           Nothing ->
             bodyDoc declared'
+      atomicScatterBodyDoc =
+        atomicStoreBodyDoc detectAtomicScatterAddLoop "#pragma omp atomic update" "+="
+      atomicScatterWriteBodyDoc =
+        atomicStoreBodyDoc detectAtomicScatterWriteLoop "#pragma omp atomic write" "="
+      -- A read-modify-write scatter with any pure combine: one CAS loop per
+      -- contribution.  The combine runs on a private copy of the cell, and
+      -- the CAS publishes its result only if the cell still holds the value
+      -- the combine read; otherwise it retries.  Integers skip the store when
+      -- the combine left the cell unchanged; doubles always CAS, so -0.0 and
+      -- NaN payloads are stored exactly as computed.
+      rmwScatterBodyDoc elemTy declared' =
+        case CFG.decomposeRMWScatter loopBody of
+          Just rmw ->
+            let old = CFG.rmwOld rmw
+                oldName = text (sanitize old)
+                ty = text (cTypeName elemTy)
+                arr = CFG.rmwArray rmw
+                idx = CFG.rmwIndex rmw
+                res = CFG.rmwResult rmw
+                comb = CFG.rmwCombine rmw
+                combineLive = usedVarsAtom res `S.union` S.singleton old
+                casLoop declaredIn =
+                  let declaredComb = S.insert old declaredIn
+                  in text "{"
+                      $$ nest 4
+                           ( ty <> text "* __hyd_rmw_p = &" <> genArrayAccess elemTy arr idx <> text ";"
+                             $$ ty <+> oldName <> text ";"
+                             $$ text "__atomic_load(__hyd_rmw_p, &" <> oldName <> text ", __ATOMIC_RELAXED);"
+                             $$ text "for (;;) {"
+                             $$ nest 4
+                                  ( genStmts env declaredComb combineLive comb
+                                    $$ ty <+> text "__hyd_rmw_new =" <+> genAtom res <> text ";"
+                                    $$ (if elemTy == CTInt64
+                                          then text "if (__hyd_rmw_new ==" <+> oldName <> text ") break;"
+                                          else empty)
+                                    $$ text "if (__atomic_compare_exchange(__hyd_rmw_p, &" <> oldName
+                                         <> text ", &__hyd_rmw_new, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;"
+                                  )
+                             $$ text "}"
+                           )
+                      $$ text "}"
+                streamLive =
+                  usedVarsAtom arr `S.union` usedVarsAtom idx
+                    `S.union` (usedVarsStmts comb `S.difference` S.singleton old)
+                outerLive =
+                  maybe S.empty usedVarsAtom (CFG.rmwGuard rmw)
+                    `S.union` usedVarsStmts (CFG.rmwBranchPrefix rmw)
+                    `S.union` streamLive
+                outerDoc = genStmts env declared' outerLive (CFG.rmwOuterPrefix rmw)
+                outerDeclared = S.union declared' (definedVarsStmts (CFG.rmwOuterPrefix rmw))
+                branchDoc =
+                  genStmts env outerDeclared streamLive (CFG.rmwBranchPrefix rmw)
+                    $$ casLoop (S.union outerDeclared (definedVarsStmts (CFG.rmwBranchPrefix rmw)))
+             in outerDoc
+                  $$ case CFG.rmwGuard rmw of
+                       Nothing -> branchDoc
+                       Just cond -> text "if (" <> genAtom cond <> text ") {" $$ nest 4 branchDoc $$ text "}"
+          Nothing -> bodyDoc declared'
+      -- The loop body, with the scatter idiom the parallel strategy asks for.
+      execBodyDoc = case CFG.lsExec spec of
+        CFG.Parallel p -> strategyBodyDoc p
+        CFG.Workshare p -> strategyBodyDoc p
+        _ -> bodyDoc declaredWithHoisted
+      strategyBodyDoc p
+        | Just elemTy <- atomicScatterElemType p = atomicScatterBodyDoc elemTy declaredWithHoisted
+        | Just elemTy <- atomicScatterWriteElemType p = atomicScatterWriteBodyDoc elemTy declaredWithHoisted
+        | Just elemTy <- rmwScatterElemType p = rmwScatterBodyDoc elemTy declaredWithHoisted
+        | otherwise = bodyDoc declaredWithHoisted
       privatizedScatterLoopDoc elemTy declared' iter bound =
         case detectAtomicScatterAddLoop loopBody of
           Just (outerPrefix, branchPrefix, mGuard, arr, idx, val) ->
@@ -1472,13 +1528,7 @@ genLoop env declared spec body =
                 <> text "++) {"
                 $$ nest
                   4
-                  ( case CFG.lsExec spec of
-                      CFG.Parallel p
-                        | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
-                      CFG.Workshare p
-                        | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
-                      _ -> bodyDoc declaredWithHoisted
-                  )
+                  execBodyDoc
                 $$ text "}"
         (execPolicy, _, _, _) | isOmpLoopExec execPolicy ->
           text "/* parallel"
@@ -1489,13 +1539,7 @@ genLoop env declared spec body =
               iters
               bounds
               origins
-              ( case CFG.lsExec spec of
-                  CFG.Parallel p
-                    | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
-                  CFG.Workshare p
-                    | Just elemTy <- atomicScatterElemType p -> atomicScatterBodyDoc elemTy declaredWithHoisted
-                  _ -> bodyDoc declaredWithHoisted
-              )
+              execBodyDoc
         (_, _, _, _) -> genNestedLoops iters bounds origins (bodyDoc declaredWithHoisted)
   where
     isOmpLoopExec execPolicy = case execPolicy of
@@ -1622,6 +1666,52 @@ atomicScatterElemType p = case CFG.psStrategy p of
   CFG.ParallelScatterAtomicAddInt -> Just CTInt64
   CFG.ParallelScatterAtomicAddFloat -> Just CTDouble
   _ -> Nothing
+
+-- | Destructure a guarded or unguarded overwrite scatter loop body, which
+-- stores an already-computed value without reading the old one.  Same result
+-- shape as 'detectAtomicScatterAddLoop'.
+detectAtomicScatterWriteLoop
+  :: [CFG.Stmt]
+  -> Maybe ([CFG.Stmt], [CFG.Stmt], Maybe Atom, Atom, Atom, Atom)
+detectAtomicScatterWriteLoop body =
+  case reverse body of
+    (CFG.SIf cond thn [] : revPrefix) -> do
+      (branchPrefix, arrWrite, idxWrite, val) <- core thn
+      pure (reverse revPrefix, branchPrefix, Just cond, arrWrite, idxWrite, val)
+    _ -> do
+      (prefix, arrWrite, idxWrite, val) <- core body
+      pure (prefix, [], Nothing, arrWrite, idxWrite, val)
+  where
+    core stmts = case reverse stmts of
+      (CFG.SArrayWrite arrWrite idxWrite val@(AVar _) : revPrefix) ->
+        Just (reverse revPrefix, arrWrite, idxWrite, val)
+      _ -> Nothing
+
+atomicScatterWriteElemType :: CFG.ParallelSpec -> Maybe CType
+atomicScatterWriteElemType p = case CFG.psStrategy p of
+  CFG.ParallelScatterAtomicWriteInt -> Just CTInt64
+  CFG.ParallelScatterAtomicWriteFloat -> Just CTDouble
+  _ -> Nothing
+
+rmwScatterElemType :: CFG.ParallelSpec -> Maybe CType
+rmwScatterElemType p = case CFG.psStrategy p of
+  CFG.ParallelScatterRMWInt   -> Just CTInt64
+  CFG.ParallelScatterRMWFloat -> Just CTDouble
+  _                           -> Nothing
+
+-- | The C comment naming a parallel strategy in its pragma.
+strategyComment :: CFG.ParallelStrategy -> Doc
+strategyComment s = case s of
+  CFG.ParallelGeneric -> empty
+  CFG.ParallelScatterDirect -> text " /* scatter-direct */"
+  CFG.ParallelScatterAtomicAddInt -> text " /* scatter-atomic-add-int */"
+  CFG.ParallelScatterAtomicAddFloat -> text " /* scatter-atomic-add-float */"
+  CFG.ParallelScatterPrivatizedIntAdd -> text " /* scatter-privatized-int-add */"
+  CFG.ParallelScatterPrivatizedFloatAdd -> text " /* scatter-privatized-float-add */"
+  CFG.ParallelScatterAtomicWriteInt -> text " /* scatter-atomic-write-int */"
+  CFG.ParallelScatterAtomicWriteFloat -> text " /* scatter-atomic-write-float */"
+  CFG.ParallelScatterRMWInt -> text " /* scatter-rmw-cas-int */"
+  CFG.ParallelScatterRMWFloat -> text " /* scatter-rmw-cas-float */"
 
 privatizedScatterStrategyType :: CFG.ParallelStrategy -> Maybe CType
 privatizedScatterStrategyType s = case s of

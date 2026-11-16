@@ -310,7 +310,7 @@ codegenMSLSingle opts prog@(CFG.Program procs) = do
 isGpuLoopSpec :: CFG.LoopSpec -> Bool
 isGpuLoopSpec spec =
   CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
-    || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
+    || (case CFG.lsExec spec of CFG.Parallel p -> not (isRMWStrategy p); _ -> False)
 
 -- | GPU loops anywhere in a statement list, descending through @SIf@ guards but
 -- not into a loop's own body (that body is the kernel). Pre-order. This finds
@@ -1855,17 +1855,20 @@ findKernelProc opts procs =
                 _ -> Right (last candidates)
   where
     procHasMapLoop = any isKernelLoopStmt
-    isKernelLoopStmt (CFG.SLoop spec _) =
-      CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
-        || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
-    isKernelLoopStmt _ = False
 
 -- | True when a top-level statement is a GPU-offloadable (kernel-eligible) loop.
 isKernelLoopStmt :: CFG.Stmt -> Bool
-isKernelLoopStmt (CFG.SLoop spec _) =
-  CFG.lsRole spec `elem` [CFG.LoopMap, CFG.LoopMapReduction]
-    || (case CFG.lsExec spec of CFG.Parallel _ -> True; _ -> False)
+isKernelLoopStmt (CFG.SLoop spec _) = isGpuLoopSpec spec
 isKernelLoopStmt _ = False
+
+-- | Read-modify-write scatters (CAS loops on the CPU) are never offloaded:
+-- Metal has no 64-bit compare-exchange, and a kernel without one would lose
+-- updates.
+isRMWStrategy :: CFG.ParallelSpec -> Bool
+isRMWStrategy p = case CFG.psStrategy p of
+  CFG.ParallelScatterRMWInt   -> True
+  CFG.ParallelScatterRMWFloat -> True
+  _                           -> False
 
 -- | True when a loop is a scatter we offload to the GPU as the kernel, running
 -- any trailing reduce on the CPU.  The scatter is the work the benchmark

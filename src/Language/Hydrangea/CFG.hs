@@ -40,6 +40,8 @@ module Language.Hydrangea.CFG
   , mkProc
   , rewriteStmtsWith
   , rewriteStmtsWithM
+  , RMWScatter(..)
+  , decomposeRMWScatter
   ) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
@@ -48,7 +50,7 @@ import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
-import Language.Hydrangea.CFGCore (Atom, CType, CVar, RHS, Redop)
+import Language.Hydrangea.CFGCore (Atom(..), CType, CVar, RHS(..), Redop)
 
 -- | Structural index expression language for loop bounds and dependence analysis.
 -- Use 'simplifyIndexExpr' to obtain a canonical form suitable for comparison.
@@ -188,6 +190,10 @@ data ParallelStrategy
   | ParallelScatterAtomicAddFloat      -- ^ Scatter with atomic float addition.
   | ParallelScatterPrivatizedIntAdd    -- ^ int64 scatter via thread-private accumulators.
   | ParallelScatterPrivatizedFloatAdd  -- ^ double scatter via thread-private accumulators.
+  | ParallelScatterAtomicWriteInt      -- ^ int64 overwrite scatter via an atomic store.
+  | ParallelScatterAtomicWriteFloat    -- ^ double overwrite scatter via an atomic store.
+  | ParallelScatterRMWInt              -- ^ int64 read-modify-write scatter via a CAS loop.
+  | ParallelScatterRMWFloat            -- ^ double read-modify-write scatter via a CAS loop.
   deriving (Eq, Show)
 
 -- | Parallel execution parameters for a loop.
@@ -387,3 +393,64 @@ mkProc name params body = Proc
   , procVectorAccessFacts = Map.empty
   , procStencilFacts = Map.empty
   }
+
+-- | A read-modify-write scatter loop body, split into the parts that the
+-- parallelizer checks and codegen turns into a compare-and-swap loop:
+--
+-- > outerPrefix
+-- > if (guard) {            -- optional
+-- >   branchPrefix
+-- >   old = arr[idx]
+-- >   combine               -- pure: assignments and ifs only, no memory access
+-- >   arr[idx] = result
+-- > }
+--
+-- Any pure combine fits (min, max, write-once, ...): a scatter folds the
+-- contributions to a cell in some order, and a CAS loop realises one.
+data RMWScatter = RMWScatter
+  { rmwOuterPrefix  :: [Stmt]
+  , rmwGuard        :: Maybe Atom
+  , rmwBranchPrefix :: [Stmt]
+  , rmwArray        :: Atom
+  , rmwIndex        :: Atom
+  , rmwOld          :: CVar
+  , rmwCombine      :: [Stmt]
+  , rmwResult       :: Atom
+  }
+  deriving (Eq, Show)
+
+-- | Recognise a read-modify-write scatter body (see 'RMWScatter').  Purely
+-- structural; the parallelizer adds the dependence and exclusivity checks.
+decomposeRMWScatter :: [Stmt] -> Maybe RMWScatter
+decomposeRMWScatter body = case reverse body of
+  SIf cond thn [] : revPrefix -> do
+    (pre, arr, idx, old, comb, res) <- core thn
+    pure (RMWScatter (reverse revPrefix) (Just cond) pre arr idx old comb res)
+  _ -> do
+    (pre, arr, idx, old, comb, res) <- core body
+    pure (RMWScatter [] Nothing pre arr idx old comb res)
+  where
+    core stmts = case reverse stmts of
+      SArrayWrite arr@(AVar _) idx res : revRest -> do
+        let rest = reverse revRest
+            isLoad (SAssign _ (RArrayLoad a i)) = a == arr && i == idx
+            isLoad _                            = False
+        (pre, loadStmt, comb) <- case break isLoad rest of
+          (pre, l : comb) -> Just (pre, l, comb)
+          _               -> Nothing
+        old <- case loadStmt of
+          SAssign v _ -> Just v
+          _           -> Nothing
+        if all pureStmt comb && not (null comb) then Just (pre, arr, idx, old, comb, res) else Nothing
+      _ -> Nothing
+
+    pureStmt st = case st of
+      SAssign _ rhs -> pureRHS rhs
+      SIf _ thn els -> all pureStmt thn && all pureStmt els
+      _             -> False
+
+    pureRHS rhs = case rhs of
+      RAtom _      -> True
+      RBinOp _ _ _ -> True
+      RUnOp _ _    -> True
+      _            -> False

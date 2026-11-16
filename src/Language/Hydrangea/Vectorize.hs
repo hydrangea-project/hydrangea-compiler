@@ -133,6 +133,56 @@ isLegalVectorize body = not hasBlocking
     deps = findDependences accesses
     hasBlocking = any (\d -> depIsLoopCarried d && depDirection d /= DDForward) deps
 
+-- | True when some array is both read and written in the loop body at an
+-- index other than the loop iterator.  The dependence check treats accesses
+-- at syntactically equal indices as a same-iteration dependence, which only
+-- holds when the index is injective in the iterator: a computed index
+-- @t = f(i)@ can repeat across iterations, so @a[t] = g(a[t])@ is a
+-- read-modify-write that SIMD lanes would race on.
+readWriteAtNonIteratorIndex :: [CVar] -> [Stmt] -> Bool
+readWriteAtNonIteratorIndex iters body =
+  or [ True
+     | arr <- written
+     , arr `elem` readArrs
+     , any (\a -> aaArrayVar a == arr && not (isIterIndex (aaIndex a))) accesses ]
+  where
+    accesses = extractAccesses body
+    written = [aaArrayVar a | a <- accesses, aaAccessType a == Write]
+    readArrs = [aaArrayVar a | a <- accesses, aaAccessType a == Read]
+    isIterIndex ie = case simplifyIndexExpr ie of
+      IVar v -> injective S.empty v
+      _      -> False
+    -- Definitions made inside the body; anything else is loop-invariant.
+    defs = collectDefs body
+    collectDefs = concatMap $ \st -> case st of
+      SAssign v rhs -> [(v, rhs)]
+      SIf _ thn els -> collectDefs thn ++ collectDefs els
+      _             -> []
+    invariantAtom a = case a of
+      AVar v -> v `notElem` map fst defs && v `notElem` iters
+      _      -> True
+    -- An injective function of the iterator: the iterator itself, the
+    -- iterator plus or minus an invariant, or times a nonzero constant.
+    injective seen v
+      | v `elem` iters = True
+      | v `S.member` seen = False
+      | otherwise = case [rhs | (w, rhs) <- defs, w == v] of
+          [C.RAtom (AVar u)] -> injective (S.insert v seen) u
+          [C.RBinOp op a b] -> case op of
+            CAdd -> injAtom (S.insert v seen) a && invariantAtom b
+                      || invariantAtom a && injAtom (S.insert v seen) b
+            CSub -> injAtom (S.insert v seen) a && invariantAtom b
+            CMul -> injAtom (S.insert v seen) a && nonzeroConst b
+                      || nonzeroConst a && injAtom (S.insert v seen) b
+            _    -> False
+          _ -> False
+    injAtom seen a = case a of
+      AVar u -> injective seen u
+      _      -> False
+    nonzeroConst a = case a of
+      AInt n -> n /= 0
+      _      -> False
+
 chooseVectorWidthWith :: Int -> LoopSpec -> Int
 chooseVectorWidthWith w spec = case analyzeLoop (SLoop spec []) of
   Just info -> if isVectorizableLoop info then w else 1
@@ -146,6 +196,7 @@ vectorCandidate w ctx spec body
   | lsRole spec == LoopReductionWrapper = Nothing
   | not (hasSupportedBounds spec) = Nothing
   | not (isLegalVectorize body) = Nothing
+  | readWriteAtNonIteratorIndex (lsIters spec) body = Nothing
   | width <= 1 = Nothing
   | not preferSimdHere = Nothing
   | otherwise =

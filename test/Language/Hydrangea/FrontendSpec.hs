@@ -21,6 +21,7 @@ import Language.Hydrangea.Frontend
 import Language.Hydrangea.Infer (defaultInferOptions, InferOptions(..))
 import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Syntax
+import Language.Hydrangea.TestUtil (containsAll)
 import Test.Hspec
 
 parseExpOrFail :: ByteString -> IO (Exp Range)
@@ -878,6 +879,36 @@ spec = do
       csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-float-add */"
       csrc `shouldSatisfy` isInfixOf "double* __hyd_priv_grids_"
       csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic update"
+
+    it "runs a write-once scatter as a CAS loop, not an unprotected atomic store" $ do
+      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+        [ "let dsts = generate [64] (let f [e] = e % 8 in f)"
+        , "let vals = generate [64] (let f [e] = e in f)"
+        , "let unset = generate [8] (let f [i] = 0 - 1 in f)"
+        , "let keepFirst new_ old = if old = (0 - 1) then new_ else old"
+        , "let main = scatter keepFirst unset dsts vals"
+        ]
+      csrc `shouldSatisfy` containsAll ["scatter-rmw-cas-int", "__atomic_compare_exchange"]
+      csrc `shouldNotSatisfy` isInfixOf "scatter-atomic-write-int"
+
+    it "runs a min scatter as a CAS loop" $ do
+      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+        [ "let dsts = generate [64] (let f [e] = e % 8 in f)"
+        , "let vals = generate [64] (let f [e] = (e * 7) % 13 in f)"
+        , "let big = generate [8] (let f [i] = 1000 in f)"
+        , "let mn new_ old = if new_ < old then new_ else old"
+        , "let main = scatter mn big dsts vals"
+        ]
+      csrc `shouldSatisfy` isInfixOf "scatter-rmw-cas-int"
+
+    it "runs an overwrite scatter with an atomic store" $ do
+      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+        [ "let dsts = generate [64] (let f [e] = e % 8 in f)"
+        , "let vals = generate [64] (let f [e] = e in f)"
+        , "let last new_ old = new_"
+        , "let main = scatter last (fill [8] 0) dsts vals"
+        ]
+      csrc `shouldSatisfy` containsAll ["scatter-atomic-write-int", "#pragma omp atomic write"]
 
     it "emits array-valued hyd_main with array return type" $ do
       csrc <- emitCFromSource "let main = fill [3] 1"

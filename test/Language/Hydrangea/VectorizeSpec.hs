@@ -73,6 +73,35 @@ spec = describe "Vectorize" $ do
     hasRHS (\rhs -> case rhs of C.RVecReduce {} -> True; _ -> False) lowered `shouldBe` True
     hasLoop (\ls -> lsExec ls == Serial && lsRole ls == LoopReduction) lowered `shouldBe` True
 
+  it "does not SIMD a read-modify-write at a computed, non-injective index" $ do
+    -- a[t] = g(a[t]) with t = (i + 1) % 4: two iterations can hit the same
+    -- cell, so SIMD lanes would race.
+    let inner =
+          SLoop
+            (LoopSpec ["i"] [IConst 16] Serial Nothing LoopPlain [])
+            [ SAssign "t0" (C.RBinOp C.CAdd (C.AVar "i") (C.AInt 1))
+            , SAssign "t" (C.RBinOp C.CMod (C.AVar "t0") (C.AInt 4))
+            , SAssign "old" (C.RArrayLoad (C.AVar "out") (C.AVar "t"))
+            , SAssign "new" (C.RBinOp C.CAdd (C.AVar "old") (C.AInt 1))
+            , SArrayWrite (C.AVar "out") (C.AVar "t") (C.AVar "new")
+            ]
+        outer = SLoop (LoopSpec ["r"] [IConst 3] Serial Nothing LoopPlain []) [inner]
+        out = vectorizeWithTypes [("out", C.CTArray C.CTInt64)] [outer]
+    hasLoop (\sp -> case lsExec sp of Vector _ -> True; _ -> False) out `shouldBe` False
+
+  it "still SIMDs an in-place update at an index injective in the iterator" $ do
+    let inner =
+          SLoop
+            (LoopSpec ["i"] [IConst 16] Serial Nothing LoopPlain [])
+            [ SAssign "t" (C.RBinOp C.CAdd (C.AVar "base") (C.AVar "i"))
+            , SAssign "old" (C.RArrayLoad (C.AVar "out") (C.AVar "t"))
+            , SAssign "new" (C.RBinOp C.CAdd (C.AVar "old") (C.AInt 1))
+            , SArrayWrite (C.AVar "out") (C.AVar "t") (C.AVar "new")
+            ]
+        outer = SLoop (LoopSpec ["r"] [IConst 3] Serial Nothing LoopPlain []) [inner]
+        out = vectorizeWithTypes [("out", C.CTArray C.CTInt64), ("base", C.CTInt64)] [outer]
+    hasLoop (\sp -> case lsExec sp of Vector _ -> True; _ -> False) out `shouldBe` True
+
   it "keeps reduction wrapper loops scalar" $ do
     let wrapper =
           SLoop

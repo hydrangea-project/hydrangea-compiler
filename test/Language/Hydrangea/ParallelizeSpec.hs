@@ -150,7 +150,38 @@ spec = describe "Parallelize" $ do
       [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterPrivatizedIntAdd Nothing Nothing)
       _ -> expectationFailure "Expected non-injective integer scatter-add loop to use privatized strategy"
 
-  it "keeps unsupported colliding scatter combines serial" $ do
+  it "does not treat a conditional read of the destination as an independent overwrite" $ do
+    -- r := val in one branch, r := old in the other: a read-modify-write,
+    -- which must use the CAS loop rather than an atomic store.
+    let loop =
+          SLoop
+            (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
+            [ SAssign "idx" (RArrayLoad (AVar "routes") (AVar "i"))
+            , SAssign "val" (RArrayLoad (AVar "vals") (AVar "i"))
+            , SAssign "old" (RArrayLoad (AVar "out") (AVar "idx"))
+            , SAssign "unset" (RBinOp CEq (AVar "old") (AInt (-1)))
+            , SIf (AVar "unset") [SAssign "r" (RAtom (AVar "val"))] [SAssign "r" (RAtom (AVar "old"))]
+            , SIf (AVar "unset") [SAssign "q" (RAtom (AVar "old"))] [SAssign "q" (RAtom (AVar "val"))]
+            , SArrayWrite (AVar "out") (AVar "idx") (AVar "q")
+            ]
+        proc =
+          (mkProc "p" [] [loop])
+            { procArrayFacts =
+                Map.fromList
+                  [ ("out", ArrayFact True True False)
+                  , ("routes", ArrayFact False False True)
+                  , ("vals", ArrayFact False False True)
+                  ]
+            , procTypeEnv =
+                Map.fromList
+                  [ ("out", CTArray CTInt64), ("idx", CTInt64), ("val", CTInt64)
+                  , ("old", CTInt64), ("unset", CTBool), ("r", CTInt64), ("q", CTInt64) ]
+            }
+    case procBody (parallelizeProc proc) of
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterRMWInt Nothing Nothing)
+      _ -> expectationFailure "Expected the conditional read-modify-write to use the CAS-loop strategy"
+
+  it "parallelizes a colliding scatter with any pure combine via a CAS loop" $ do
     let loop =
           SLoop
             (LoopSpec ["i"] [IConst 8] Serial Nothing LoopPlain [])
@@ -178,8 +209,8 @@ spec = describe "Parallelize" $ do
                   ]
             }
     case procBody (parallelizeProc proc) of
-      [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
-      _ -> expectationFailure "Expected unsupported colliding scatter loop to stay serial"
+      [SLoop spec' _] -> lsExec spec' `shouldBe` Parallel (ParallelSpec ParallelScatterRMWInt Nothing Nothing)
+      _ -> expectationFailure "Expected colliding multiply scatter to use the CAS-loop strategy"
 
   it "uses privatized scatter for guarded colliding integer add kernels" $ do
     let loop =
