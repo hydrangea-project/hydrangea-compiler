@@ -32,6 +32,7 @@ module Language.Hydrangea.CFGOpt
   , sinkUnusedIntoGuard
   , foldShapeOfAlloc
   , hoistIterateAllocs
+  , hoistLoopArrayTemps
   , scalarizeIteratePairs
     -- * Atom/statement substitution utilities
   , substAtom
@@ -905,6 +906,72 @@ restructureIterateBody spec body = do
           mkResult (S.singleton allocIdx) [SAssign nextVar (RArrayCopy (AVar curVar))]
 
     _ -> Nothing
+
+------------------------------------------------------------------------
+-- Loop-invariant array temporary hoisting
+------------------------------------------------------------------------
+
+-- | Does @v@ occur anywhere the buffer pointer itself could be captured, as
+-- opposed to having its elements read or written?  Loads, stores, shape reads
+-- and frees do not outlive the statement; any other use (a copy, a tuple
+-- component, a call argument, a return) counts as an escape.
+arrayPointerEscapes :: CVar -> [Stmt] -> Bool
+arrayPointerEscapes v = any escStmt
+  where
+    isV (AVar w)    = w == v
+    isV (AVecVar w) = w == v
+    isV _           = False
+
+    escStmt st = case st of
+      SAssign _ rhs          -> escRHS rhs
+      SArrayWrite _ ix val   -> isV ix || isV val
+      SLoop spec body        -> escSpec spec || any escStmt body
+      SParallelRegion body   -> any escStmt body
+      SIf c thn els          -> isV c || any escStmt thn || any escStmt els
+      SReturn a              -> isV a
+      SBreak                 -> False
+
+    escSpec spec = any (S.member v . usedVarsIndexExpr) (lsBounds spec ++ lsOrigins spec)
+
+    escRHS rhs = case rhs of
+      RArrayLoad _ ix        -> isV ix
+      RArrayShape _          -> False
+      RArrayFree _           -> False
+      RVecLoad _ ix          -> isV ix
+      RVecStore _ ix val     -> isV ix || isV val
+      other                  -> S.member v (usedVarsRHS other)
+
+-- | Hoist a scratch-buffer allocation out of the iterate loop that fills it,
+-- so each trip reuses one cache-warm buffer instead of allocating a new one.
+--
+-- This is sound when the buffer's shape is loop-invariant, every element is
+-- written before it is read ('afWriteOnce'), and the pointer never escapes.
+-- Only 'LoopIterate' loops qualify: they are never parallelized, so no two
+-- iterations share the buffer concurrently.  A double-buffered iterate's
+-- @next@ buffer escapes through its swap, so 'hoistIterateAllocs' handles it.
+hoistLoopArrayTemps :: Map CVar ArrayFact -> [Stmt] -> [Stmt]
+hoistLoopArrayTemps facts = go
+  where
+    go [] = []
+    go (SLoop spec body : rest) =
+      let body' = go body
+          (hoisted, kept) = partition (hoistable spec body') body'
+      in hoisted ++ (SLoop spec kept : go rest)
+    go (SParallelRegion body : rest) = SParallelRegion (go body) : go rest
+    go (SIf c thn els : rest) = SIf c (go thn) (go els) : go rest
+    go (s : rest) = s : go rest
+
+    hoistable spec body st = case st of
+      SAssign v (RArrayAlloc shp) | lsRole spec == LoopIterate ->
+        let loopDefined = definedVarsStmts body `S.union` S.fromList (lsIters spec)
+        in case M.lookup v facts of
+             Just fact ->
+               afFreshAlloc fact
+                 && afWriteOnce fact
+                 && S.null (usedVarsAtom shp `S.intersection` loopDefined)
+                 && not (arrayPointerEscapes v body)
+             Nothing -> False
+      _ -> False
 
 ------------------------------------------------------------------------
 -- Common subexpression elimination (CSE)

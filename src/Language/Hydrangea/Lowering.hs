@@ -462,7 +462,9 @@ lowerExp expr = case expr of
     arr  <- freshCVar "arr"
     idx  <- freshCVar "idx"
     _val <- freshCVar "val"
-    (setupStmts, loopStmt) <- case shapeRankExp shape of
+    -- The rank inference recorded also covers shapes like @shape_of xs@.
+    genRank <- shapeRankM shape
+    (setupStmts, loopStmt) <- case genRank of
       -- 1D: flat loop, pass flat index directly to the body function.
       Just 1 -> do
         i <- freshIterVar "i"
@@ -1251,8 +1253,11 @@ lowerExp expr = case expr of
         aiTy <- ctypeOfAtom ai
         -- Fast path: if the index is already a flat int64 (e.g. because we
         -- are inside the rank-1 reduction loop and the parameter was bound as
-        -- the loop iteration variable), skip the nd_to_flat round-trip.
-        if aiTy == CTInt64
+        -- the loop iteration variable), skip the nd_to_flat round-trip.  A
+        -- scalar index whose type is not recorded (an element loaded from an
+        -- index array, say) can only index a rank-1 array, so it is flat too.
+        aiScalar <- isAtomConfirmedScalar si ai
+        if aiTy == CTInt64 || aiScalar
           then do
             whenM (atomHasDenseLinearOrigin ai) (noteDenseReadAtom aa)
             pure (si ++ sa ++ [SAssign val (RArrayLoad aa ai)], AVar val)
@@ -1445,6 +1450,7 @@ lowerExp expr = case expr of
       (EGenerate _ shpExp routeFn, EGenerate _ _ valFnExp, EGenerate _ _ guardFnExp) -> do
         (sd, ad) <- lowerExp defaultsExp
         (sshp, ashp) <- lowerExp shpExp
+        shp1D <- is1DShapeM shpExp
         n <- freshCVar "n"
         i <- freshIterVar "i"
         guardVal <- freshCVar "guard"
@@ -1453,7 +1459,7 @@ lowerExp expr = case expr of
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
         combStmts <- inlineBinaryFn combExp val oldVal newVal
-        if is1DShapeExp shpExp
+        if shp1D
           then do
             routeStmts <- inlineArrayFn1D routeFn i idx
             valStmts <- inlineArrayFn1D valFnExp i val
@@ -1532,6 +1538,7 @@ lowerExp expr = case expr of
       EGenerate _ shpExp routeFn -> do
         (sd, ad) <- lowerExp defaultsExp
         (sshp, ashp) <- lowerExp shpExp
+        shp1D <- is1DShapeM shpExp
         n <- freshCVar "n"
         i <- freshIterVar "i"
         val <- freshCVar "val"
@@ -1539,7 +1546,7 @@ lowerExp expr = case expr of
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
         combStmts <- inlineBinaryFn combExp val oldVal newVal
-        if is1DShapeExp shpExp
+        if shp1D
           then do
             routeStmts <- inlineArrayFn1D routeFn i idx
             valStmts <- inlineArrayFn1D valFnExp i val
@@ -1646,10 +1653,11 @@ lowerExp expr = case expr of
         -- directly into the scatter loop, avoiding intermediate array allocation.
         (EGenerate _ shpExp routeFn, EGenerate _ _ valFnExp) -> do
           (sshp, ashp) <- lowerExp shpExp
+          shp1D <- is1DShapeM shpExp
           case mGuardExp of
             -- Unguarded: inline route + val only.
             Nothing ->
-              if is1DShapeExp shpExp
+              if shp1D
                 then do
                   routeStmts <- inlineArrayFn1D routeFn i idx
                   valStmts   <- inlineArrayFn1D valFnExp i val
@@ -1683,7 +1691,7 @@ lowerExp expr = case expr of
             -- Guarded where guard is also a generate: inline all three.
             Just (EGenerate _ _ guardFnExp) -> do
               guardVal <- freshCVar "guard"
-              if is1DShapeExp shpExp
+              if shp1D
                 then do
                   routeStmts  <- inlineArrayFn1D routeFn i idx
                   valStmts    <- inlineArrayFn1D valFnExp i val
@@ -1726,7 +1734,7 @@ lowerExp expr = case expr of
             Just guardArrExp -> do
               (sg, ag) <- lowerExp guardArrExp
               guardVal <- freshCVar "guard"
-              if is1DShapeExp shpExp
+              if shp1D
                 then do
                   routeStmts <- inlineArrayFn1D routeFn i idx
                   valStmts   <- inlineArrayFn1D valFnExp i val
@@ -1811,6 +1819,7 @@ lowerExp expr = case expr of
     (sd, ad) <- lowerExp defaultsExp
     phaseStmts <- forM phases $ \(ScatterGenPhase shpExp idxFnExp valFnExp mGuardFnExp) -> do
       (sshp, ashp) <- lowerExp shpExp
+      shp1D <- is1DShapeM shpExp
       n <- freshCVar "n"
       i <- freshIterVar "i"
       val <- freshCVar "val"
@@ -1826,7 +1835,7 @@ lowerExp expr = case expr of
                 kernelStmts ++ gStmts ++
                 [ SIf gAtom (scatterCombineWrite ad (AVar idx) oldVal newVal combStmts) [] ]
               _ -> kernelStmts
-      if is1DShapeExp shpExp
+      if shp1D
         then do
           routeStmts <- inlineArrayFn1D idxFnExp i idx
           valStmts <- inlineArrayFn1D valFnExp i val
@@ -4048,6 +4057,11 @@ lowerReductionStep fnExp acc elem' = case fnExp of
 is1DShapeExp :: Exp a -> Bool
 is1DShapeExp (EVec _ [_]) = True
 is1DShapeExp _            = False
+
+-- | Rank-1 test that also accepts @shape_of xs@ for a 1-D @xs@, using the
+-- ranks inference recorded.
+is1DShapeM :: Exp a -> LowerM Bool
+is1DShapeM shpExp = (== Just 1) <$> shapeRankM shpExp
 
 -- | Extract the single variable bound by a simple (PVar/PBound) pattern.
 patVar :: Pat a -> Maybe Var

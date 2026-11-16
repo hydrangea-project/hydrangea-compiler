@@ -91,6 +91,7 @@ anyExp p expr
           (case bnd of BConst e -> anyExp p e; _ -> False)
             || anyExp p f || anyExp p arr
         EIterate _ n i f -> anyExp p n || anyExp p i || anyExp p f
+        EReify _ arr -> anyExp p arr
 
 anyShapeDim :: (Exp a -> Bool) -> ShapeDim a -> Bool
 anyShapeDim p = \case
@@ -507,6 +508,17 @@ spec = do
             hasZipWith fused `shouldBe` False
             hasFill fused `shouldBe` False
             hasGenerate fused `shouldBe` True)
+
+    it "fuses a zipwith of two gathers from a materialized array" $
+      expectFusionSensible
+        ( "let xs = reify (generate [4] (let f [i] = i * 10 in f)) in"
+          <> " let a = generate [4] (let g [i] = [3 - i] in g) in"
+          <> " let b = generate [4] (let h [i] = [i] in h) in"
+          <> " zipwith (+) (gather a xs) (gather b xs)"
+        )
+        (\fused -> do
+            hasGather fused `shouldBe` False
+            hasZipWith fused `shouldBe` False)
 
   -- ---- Tests for new fusion rules (T1, T3, T4) ----
 

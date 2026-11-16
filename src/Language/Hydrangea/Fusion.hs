@@ -770,7 +770,13 @@ asProducer expr =
         then pure $ Producer (producerShape p1) (KApp (KApp (KConst f) (producerElem p1)) (producerElem p2))
         else Nothing
     EGather a idx arr -> do
-      pArr <- asProducer arr
+      -- A plain array variable is read in place at the computed index, as in
+      -- 'asScatterProducer', so a gather from a materialized array still fuses.
+      srcElem <-
+        case asProducer arr of
+          Just pArr -> Just (producerElem pArr)
+          Nothing | EVar {} <- arr -> Just (KIndex (KVar 0) (KConst arr))
+          Nothing -> Nothing
       let pIdx = asProducer idx
           idxAtOut =
             case pIdx of
@@ -780,7 +786,7 @@ asProducer expr =
             case pIdx of
               Just q -> producerShape q
               Nothing -> EShapeOf a idx
-      pure $ Producer shape (kComposeUnary (producerElem pArr) idxAtOut)
+      pure $ Producer shape (kComposeUnary srcElem idxAtOut)
     EReplicate a dims arr -> do
       pArr <- asProducer arr
       let srcPositions = [j | (j, d) <- zip [0 :: Int ..] dims, isShapeAll d]
@@ -1898,8 +1904,10 @@ fuseZipWith a f a1 a2 =
           let s1 = producerShape p1
               s2 = producerShape p2
           -- Compare shapes modulo annotations so equal shapes still fuse when
-          -- they carry different source ranges.
-          if fmap (const ()) s1 == fmap (const ()) s2
+          -- they carry different source ranges.  Inference unifies the operand
+          -- shapes of a zipwith, so two array operands whose shapes are spelled
+          -- differently (@shape_of xs@ vs @shape_of ys@) still agree.
+          if fmap (const ()) s1 == fmap (const ()) s2 || (isArrayExp a1 && isArrayExp a2)
             then emitProducer a $ Producer s1 (KApp (KApp (KConst f) (producerElem p1)) (producerElem p2))
             else do
               -- Fall back to local rewrites when producer fusion does not apply.

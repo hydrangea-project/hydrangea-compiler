@@ -158,8 +158,16 @@ optimizePipelineWithTiling enableTiling stmts =
 -- the allocation to stay inside the SCoP, making the wavefront use an
 -- undeclared variable.
 preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
-preparePolyhedralProgramWithOptions _opts =
-  mapProcBodies (normalizeIterateBodies . optimizePipelineWithTiling False)
+preparePolyhedralProgramWithOptions _opts (Program procs) =
+  Program [proc { procBody = prepare proc } | proc <- procs]
+  where
+    -- Loop scratch buffers are hoisted here because it needs the procedure's
+    -- array facts.
+    prepare proc =
+      normalizeIterateBodies
+        (optimizeStmts
+          (hoistLoopArrayTemps (procArrayFacts proc)
+            (optimizePipelineWithTiling False (procBody proc))))
 
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
