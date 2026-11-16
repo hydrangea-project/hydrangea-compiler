@@ -47,13 +47,13 @@ import Data.Map qualified as M
 import Data.Maybe
 import Data.Set (Set, (\\))
 import Data.Set qualified as S
-import Language.Hydrangea.Lexer (Range, noRange)
+import Language.Hydrangea.BoundsCheck (BoundsIssue (..), IssueKind (..), checkProgramBounds, checkProgramBoundsWith)
+import Language.Hydrangea.Lexer (AlexPosn (..), Range (..), noRange)
 import Language.Hydrangea.Predicate
   ( Pred (..), TaggedPred (..), Term (..)
   , evalTermConst, predBindVars, substTaggedPredVars, untagPred
   , RefinePred (..), RefineTerm (..), RelOp (..)
   )
-import Language.Hydrangea.Solver
 import Language.Hydrangea.Syntax
 
 -- | Pattern synonym for the unification-level integer type.
@@ -292,6 +292,9 @@ data TypeError where
   DuplicateRecordField :: Maybe Range -> ByteString -> TypeError
   MissingRecordField :: Maybe Range -> ByteString -> TypeError
   UnsatConstraints :: [Pred] -> Maybe [(Var, Integer)] -> TypeError
+  -- | An array access that the bounds checker refuted: location, what is
+  -- accessed, and a counterexample.
+  BoundsViolation :: Maybe Range -> String -> String -> TypeError
   MiscError :: Maybe Range -> TypeError
   deriving (Show)
 
@@ -1302,7 +1305,7 @@ infer (EGenerate _ shapeExp fn) = do
       mOutBound <- withValBound idxVar idxBoundTerm $ inferBodyBound fn
       case mOutBound of
         Just outBound -> emitPred (PEq (TValBoundDim arrVar 0) outBound)
-        Nothing -> emitWarning "note: generator body value bound not statically inferred"
+        Nothing -> return ()
     Nothing ->
       -- Try per-component bounds when the body is an EVec literal.
       -- Bind the first index variable from the parameter pattern so that
@@ -2544,7 +2547,16 @@ runInferDecsWithOptions opts decs = do
             return (v, res, solverWs)
           else return (v, Right poly, [])
       let warnings = inferWarnings st ++ concatMap (\(_, _, ws) -> ws) pairs
-      return $ fmap (, warnings) $ traverse (\(v, res, _) -> fmap (v,) res) pairs
+          typed = traverse (\(v, res, _) -> fmap (v,) res) pairs
+      case typed of
+        Left err -> return (Left err)
+        Right tys
+          | not (inferSolveRefinements opts) -> return (Right (tys, warnings))
+          | otherwise -> do
+              issues <- checkProgramBounds decs
+              case [i | i <- issues, biKind i == IssueError] of
+                (i : _) -> return (Left (BoundsViolation (Just (biRange i)) (biWhat i) (biDetail i)))
+                [] -> return (Right (tys, warnings ++ map boundsWarning issues))
 
 -- | Infer the program and return a map from every value binder (function and
 -- lambda parameters, pattern bindings, and monomorphic let bindings) to its
@@ -2577,8 +2589,28 @@ finalizePolyWithOptions :: InferOptions -> Polytype -> IO (Either TypeError Poly
 finalizePolyWithOptions opts poly
   | not (inferSolveRefinements opts) = return (Right poly, [])
   | otherwise = do
-  let Forall xs tagged ty = poly
-  checked <- checkTaggedPredicates tagged
-  case checked of
-    Left (failing, mWitness) -> return (Left (UnsatConstraints failing mWitness), [])
-    Right (residual, warnings) -> return (Right (Forall xs residual ty), warnings)
+  -- Index and shape safety are checked by 'checkProgramBounds' over the whole
+  -- program.  The refinement predicates gathered during inference come from
+  -- an interval analysis whose hypotheses are not proved, so they are dropped
+  -- rather than checked.
+  let Forall xs _ ty = poly
+  return (Right (Forall xs [] ty), [])
+
+-- | Render a bounds-checking warning.
+boundsWarning :: BoundsIssue -> String
+boundsWarning i =
+  let Range (AlexPn _ line col) _ = biRange i
+   in "note: could not verify " ++ biWhat i ++ " at " ++ show line ++ ":" ++ show col
+        ++ " (" ++ biDetail i ++ ")"
+
+-- | Check the array accesses of a single expression, as if it were a
+-- top-level declaration.  Refuted accesses are errors.
+checkExpBounds :: InferOptions -> Exp Range -> IO (Maybe TypeError)
+checkExpBounds opts e
+  | not (inferSolveRefinements opts) = pure Nothing
+  | otherwise = do
+      -- A lone expression that is a function is an entry point.
+      issues <- checkProgramBoundsWith True [Dec (firstParam e) "it" [] Nothing noDecAnn e]
+      pure $ case [i | i <- issues, biKind i == IssueError] of
+        (i : _) -> Just (BoundsViolation (Just (biRange i)) (biWhat i) (biDetail i))
+        [] -> Nothing

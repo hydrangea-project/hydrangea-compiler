@@ -116,17 +116,16 @@ for (int64_t i_tile = 0; i_tile < (h + 31) / 32; i_tile++) {
 
 ## Static bounds checking
 
-Hydrangea uses *refinement type inference* to prove array-safety conditions at compile time. Rather than inserting runtime guards, the compiler tries to verify statically that every index stays within bounds, that scatter targets are in range, and that gather sources are large enough.
-
-Bounds flow through the type system as refinement predicates on integer variables. For example, annotating a precondition on a wrapper function:
+Hydrangea proves array-safety conditions at compile time instead of inserting runtime guards. The checker evaluates the program symbolically, inlining functions at their calls, and asks an SMT solver to prove that every index, gather and scatter route stays within bounds and that combined arrays agree in shape. Each obligation is checked under its path condition: the ranges of the enclosing `generate` indices, the branches taken by enclosing `if`s, and scatter guards.
 
 ```hydrangea
-let take (n, arr) where bound n (dim arr 0) = gather (iota n) arr
+let take n arr = gather (iota n) arr
+let xs = generate [6] (fn [i] => i * 10)
+let ok = take 3 xs    (* proved safe *)
+let bad = take 7 xs   (* rejected: gather may be out of bounds, counterexample: i = 6 *)
 ```
 
-tells the solver that `n` satisfies `0 ≤ n < dim arr 0`. It propagates that fact through to the `gather` call and discharges the index-safety obligation without any runtime check.
-
-When the checker cannot discharge an obligation it emits a note and falls back gracefully; `--no-solver-check` disables the solver entirely. Full details and patterns are in [`docs/static-bounds-checking.md`](docs/static-bounds-checking.md).
+An access the solver refutes is a compile error with a counterexample. One it cannot decide, typically because the index depends on data the checker does not track, such as array contents read at runtime, produces a note instead. `--no-solver-check` disables the checker. Full details and patterns are in [`docs/static-bounds-checking.md`](docs/static-bounds-checking.md).
 
 ## Backends
 
@@ -134,7 +133,7 @@ The primary backend generates C99 with SIMDE-based vector intrinsics and optiona
 
 ## How the compiler is organized
 
-The source pipeline is: parse → type inference and refinement checking → `Uniquify` → `ShapeNormalize` → `Fusion` → lower to CFG with concrete types and ranks → CFG optimization passes → code generation. The C path applies tiling, explicit SIMD lowering, and optional parallelization; the Metal path optimizes and parallelizes without the SIMD layer.
+The source pipeline is: parse → type inference and static bounds checking → `Uniquify` → `ShapeNormalize` → `Fusion` → lower to CFG with concrete types and ranks → CFG optimization passes → code generation. The C path applies tiling, explicit SIMD lowering, and optional parallelization; the Metal path optimizes and parallelizes without the SIMD layer.
 
 The main source files are `app/Main.hs` (CLI), `src/Language/Hydrangea/Frontend.hs` (pipeline orchestration), `src/Language/Hydrangea/CFGPipeline.hs` (pass ordering), and `src/Language/Hydrangea/CodegenC.hs` / `CodegenMSL.hs` (code generation).
 

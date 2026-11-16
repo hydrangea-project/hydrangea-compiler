@@ -37,6 +37,10 @@ typeErrorSummary err =
              Just ws -> "  counterexample: "
                         ++ intercalate ", " [prettyVar v ++ " = " ++ show n | (v, n) <- ws]
       )
+    BoundsViolation mr what detail ->
+      ( mr
+      , "UnsatConstraints: " ++ what ++ " may be out of bounds\n  " ++ detail
+      )
     MiscError mr -> (mr, "Type error")
 
 -- | Demangle a synthetic SMT variable name for human-readable counterexample output.

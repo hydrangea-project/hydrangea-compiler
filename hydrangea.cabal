@@ -23,7 +23,7 @@ library
                    , Language.Hydrangea.Syntax
                    , Language.Hydrangea.Prune
                    , Language.Hydrangea.Predicate
-                   , Language.Hydrangea.Solver
+                   , Language.Hydrangea.BoundsCheck
                    , Language.Hydrangea.Pretty
                    , Language.Hydrangea.Infer
                    , Language.Hydrangea.Uniquify

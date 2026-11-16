@@ -277,28 +277,24 @@ spec = describe "where-clause refinement annotations" $ do
   -- rather than a false-positive silent pass.
   describe "indirect call: bare wrapper without where clause" $ do
 
-    it "issues a warning for a bare wrapper with an unsafe call" $ do
-      -- The checker cannot verify safety (no path to ground the bounds), so it
-      -- warns rather than silently passing.  This is case 3 of the three-case model
-      -- (lacks information → warn), not case 1 (proved safe) as before the fix.
-      expectDecsWarning
+    it "rejects an unsafe call through a bare wrapper" $ do
+      -- Functions are checked where they are called, so a wrapper without a
+      -- where clause is transparent: the precondition is checked against the
+      -- arguments the wrapper passes on.
+      expectDecsError
         ( BS.unlines
             [ "let my_gather (idx, src) where elem idx <= dim src 0 = gather idx src"
             , "let forward p = my_gather p"
             , "let main = forward (iota 15, generate [10] (let f [i] = i in f))"
             ]
         )
-        ("could not verify" `isInfixOf`)
+        ("UnsatConstraints" `isInfixOf`)
 
-    it "issues a warning for a bare wrapper even with a safe call" $ do
-      -- Without a where clause, the checker cannot distinguish safe from unsafe
-      -- calls through the wrapper; it always warns (case 3).  Users should add
-      -- a where clause to the wrapper to get precise checking.
-      expectDecsWarning
+    it "accepts a safe call through a bare wrapper" $ do
+      expectDecsOk
         ( BS.unlines
             [ "let my_gather (idx, src) where elem idx <= dim src 0 = gather idx src"
             , "let forward p = my_gather p"
             , "let main = forward (iota 5, generate [10] (let f [i] = i in f))"
             ]
         )
-        ("could not verify" `isInfixOf`)

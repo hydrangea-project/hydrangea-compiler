@@ -166,7 +166,7 @@ spec = describe "gather bounds checking" $ do
       expectDecsError
         ( BS.unlines
             [ "let src     = generate [4] (let f [i] = i in f)"
-            , "let raw_idx = generate [4] (let f [i] = 0 in f)"
+            , "let raw_idx = generate [5] (let f [i] = i in f)"
             , "let idx     = make_index 5 raw_idx"
             , "let main    = gather idx src"
             ]
@@ -182,13 +182,12 @@ spec = describe "gather bounds checking" $ do
   -- ------------------------------------------------------------------ --
   describe "gather without established bounds" $ do
 
-    it "gather with unanalyzable body emits 'could not verify' warning" $ do
-      -- Without an explicit PBound, the index variable's bound is symbolic
-      -- (TDim arrVar 0), so inferBVal(i/2) returns Nothing.  TValBound is
-      -- unestablished → obligation is ungrounded → warning, not silent pass.
+    it "gather with indices read from a file emits 'could not verify' warning" $ do
+      -- The checker does not know the contents of input files, so it cannot
+      -- prove the gather safe; it warns rather than passing silently.
       let src = BS.unlines
             [ "let src = generate [5] (let g [i] = i in g)"
-            , "let idx = generate [5] (let f [i] = i / 2 in f)"
+            , "let idx = read_array [5] \"idx.csv\""
             , "let main = gather idx src"
             ]
       case readDecs src of
@@ -200,9 +199,7 @@ spec = describe "gather bounds checking" $ do
             Right (_, warnings) ->
               warnings `shouldSatisfy` any (isInfixOf "could not verify")
 
-    it "gather with second unanalyzable body emits 'could not verify' warning" $ do
-      -- Another division case; src body uses i*2 but that is irrelevant —
-      -- idx's division body is what makes the check ungrounded.
+    it "gather with a division body is verified exactly" $ do
       let src = BS.unlines
             [ "let src = generate [10] (let g [i] = i * 2 in g)"
             , "let idx = generate [3]  (let f [i] = i / 2 in f)"
@@ -213,9 +210,9 @@ spec = describe "gather bounds checking" $ do
         Right decs -> do
           result <- inferDecsTopWithWarnings decs
           case result of
-            Left msg -> expectationFailure ("Expected success with warning: " ++ msg)
+            Left msg -> expectationFailure ("Expected success: " ++ msg)
             Right (_, warnings) ->
-              warnings `shouldSatisfy` any (isInfixOf "could not verify")
+              warnings `shouldSatisfy` all (not . isInfixOf "could not verify")
 
   -- ------------------------------------------------------------------ --
   -- Division bounds with PBound annotation
@@ -424,26 +421,24 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
-    it "generate with non-inferable body emits a 'could not verify' warning" $ do
-      -- Division without PBound: i has symbolic bound (TDim arrVar 0), so
-      -- inferBVal(i/2) returns Nothing.  No TValBound established → ungrounded
-      -- obligation → warning.  This ensures unsafe code is never silently
-      -- accepted; the user gets a notice.
-      -- (Note: with [i bound N] annotation, division IS now auto-inferred and
-      -- checked precisely — only unannotated expressions fall through here.)
-      let src = BS.unlines
+    it "generate with a division body and no annotation is checked exactly" $ do
+      -- i / 2 for i < 5 is at most 2, so the gather into 3 elements is safe
+      -- and into 2 elements is not.  No annotation is needed either way.
+      expectDecsOk
+        ( BS.unlines
             [ "let src = generate [3] (let g [i] = i in g)"
             , "let idx = generate [5] (let f [i] = i / 2 in f)"
             , "let main = gather idx src"
             ]
-      case readDecs src of
-        Left err -> expectationFailure ("Parse error: " ++ err)
-        Right decs -> do
-          result <- inferDecsTopWithWarnings decs
-          case result of
-            Left msg -> expectationFailure ("Expected success with warning: " ++ msg)
-            Right (_, warnings) ->
-              warnings `shouldSatisfy` any (isInfixOf "could not verify")
+        )
+      expectDecsError
+        ( BS.unlines
+            [ "let src = generate [2] (let g [i] = i in g)"
+            , "let idx = generate [5] (let f [i] = i / 2 in f)"
+            , "let main = gather idx src"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
 
     it "PBound soundness check: shape must not exceed declared bound" $ do
       -- generate [10] with [i bound 5] — shape 10 > bound 5: unsound
@@ -487,7 +482,7 @@ spec = describe "gather bounds checking" $ do
     it "make_index with unknown source bound emits could-not-verify note" $ do
       let src = BS.unlines
             [ "let src     = generate [10] (let f [i] = i in f)"
-            , "let raw_idx = generate [5]  (fn [i] => i / 2)"
+            , "let raw_idx = read_array [5] \"idx.csv\""
             , "let idx     = make_index 10 raw_idx"
             , "let main    = gather idx src"
             ]
@@ -500,6 +495,25 @@ spec = describe "gather bounds checking" $ do
             Right (_, warnings) -> do
               warnings `shouldSatisfy` all (not . isInfixOf "make_index bound not statically verified")
               warnings `shouldSatisfy` any (isInfixOf "could not verify")
+
+  describe "generator bodies of fused forms" $ do
+
+    it "checks the generator of reduce_generate" $ do
+      expectDecsError
+        ( BS.unlines
+            [ "let xs = generate [4] (fn [i] => i)"
+            , "let main = index () (reduce_generate (+) 0 [5] (fn [k] => index [k] xs))"
+            ]
+        )
+        (isInfixOf "UnsatConstraints")
+
+    it "accepts a reduce_generate whose generator is in bounds" $ do
+      expectDecsOk
+        ( BS.unlines
+            [ "let xs = generate [5] (fn [i] => i)"
+            , "let main = index () (reduce_generate (+) 0 [5] (fn [k] => index [k] xs))"
+            ]
+        )
 
   -- ------------------------------------------------------------------ --
   -- index bounds checking
@@ -518,7 +532,7 @@ spec = describe "gather bounds checking" $ do
       expectDecsError
         ( BS.unlines
             [ "let arr  = generate [4] (let f [i] = i in f)"
-            , "let main = let y bound 5 = 3 in index [y] arr"
+            , "let main = let y bound 5 = 4 in index [y] arr"
             ]
         )
         (isInfixOf "UnsatConstraints")
@@ -535,7 +549,7 @@ spec = describe "gather bounds checking" $ do
       expectDecsError
         ( BS.unlines
             [ "let arr  = generate [5] (let f [i] = i in f)"
-            , "let main = let x bound 5 = 3 in index [x + 1] arr"
+            , "let main = let x bound 5 = 4 in index [x + 1] arr"
             ]
         )
         (isInfixOf "UnsatConstraints")
@@ -752,10 +766,10 @@ spec = describe "gather bounds checking" $ do
         , "let main   = gather idx src"
         ]
 
-    it "map x*2 over iota 5 is rejected when source has only 9 elements" $ do
+    it "map x*2 over iota 5 is rejected when source has only 8 elements" $ do
       expectDecsError
         ( BS.unlines
-            [ "let src    = generate [9] (let f [i] = i in f)"
+            [ "let src    = generate [8] (let f [i] = i in f)"
             , "let idx    = map (let f x = x * 2 in f) (iota 5)"
             , "let main   = gather idx src"
             ]
@@ -781,7 +795,7 @@ spec = describe "gather bounds checking" $ do
     it "chained maps rejected when source too small for composed bound" $ do
       expectDecsError
         ( BS.unlines
-            [ "let src    = generate [11] (let f [i] = i in f)"
+            [ "let src    = generate [10] (let f [i] = i in f)"
             , "let step1  = map (let f x = x + 1 in f) (iota 5)"
             , "let idx    = map (let f x = x * 2 in f) step1"
             , "let main   = gather idx src"
@@ -986,7 +1000,7 @@ spec = describe "gather bounds checking" $ do
     it "slice with too-small source is rejected" $ do
       expectDecsError
         ( BS.unlines
-            [ "let src  = generate [9] (let f [i] = i in f)"
+            [ "let src  = generate [4] (let f [i] = i in f)"
             , "let full = iota 10"
             , "let idx  = slice [[0, 5]] full"
             , "let main = gather idx src"
@@ -1154,20 +1168,20 @@ spec = describe "gather bounds checking" $ do
       expectDecsError
         ( BS.unlines
             [ "let dst  = fill [5] 0"
-            , "let idx  = make_index 6 (iota 5)"
-            , "let vals = fill [5] 1"
-            , "let keep = fill [5] true"
+            , "let idx  = make_index 6 (iota 6)"
+            , "let vals = fill [6] 1"
+            , "let keep = fill [6] true"
             , "let main = scatter_guarded (+) dst idx vals keep"
             ]
         )
         (isInfixOf "UnsatConstraints")
 
-    it "ungrounded index (no make_index) produces a warning, not an error" $ do
-      -- generate with a division body (no PBound) → TValBound unestablished;
-      -- the obligation is ungrounded → ObligationUnknown → warning only, not an error
+    it "untracked index (no make_index) produces a warning, not an error" $ do
+      -- Routes read from a file are not tracked, so the checker cannot prove
+      -- or refute the scatter: a warning, not an error.
       let src = BS.unlines
             [ "let dst  = fill [5] 0"
-            , "let idx  = generate [5] (let f [i] = i / 2 in f)"
+            , "let idx  = read_array [5] \"idx.csv\""
             , "let vals = fill [5] 1"
             , "let keep = fill [5] true"
             , "let main = scatter_guarded (+) dst idx vals keep"
@@ -1329,7 +1343,7 @@ spec = describe "gather bounds checking" $ do
             [ "let nx = 3"
             , "let ny = 4"
             , "let nz = 2"
-            , "let n  = 10"
+            , "let n  = 11"
             , "let dst  = fill [(nx * ny * nz - 1)] 0"
             , "let vals = fill [n] 1"
             , "let keep = fill [n] true"
@@ -1597,9 +1611,9 @@ spec = describe "gather bounds checking" $ do
         ( BS.unlines
             [ "let ncols    = 5"
             , "let nnz      = 4"
-            , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+            , "let raw_idx  = generate [nnz] (fn [i] => i)"
             , "let col_idx  = make_index ncols raw_idx"
-            , "let x_vec    = generate [4] (fn [i] => i)"
+            , "let x_vec    = generate [3] (fn [i] => i)"
             , "let get_val [k] = let col = index [k] col_idx in index [col] x_vec"
             , "let main = generate [nnz] get_val"
             ]
@@ -1626,7 +1640,7 @@ spec = describe "gather bounds checking" $ do
         ( BS.unlines
             [ "let ncols   = 6"
             , "let nnz     = 3"
-            , "let raw_idx = generate [nnz] (fn [i] => 0)"
+            , "let raw_idx = generate [nnz] (fn [i] => i + 3)"
             , "let col_idx = make_index ncols raw_idx"
             , "let x_vec   = generate [5] (fn [i] => i)"
             , "let main    = generate [nnz] (fn [k] =>"
@@ -1671,7 +1685,7 @@ spec = describe "gather bounds checking" $ do
         ( BS.unlines
             [ "let ncols    = 5"
             , "let nnz      = 8"
-            , "let raw_idx  = generate [nnz] (fn [i] => 0)"
+            , "let raw_idx  = generate [nnz] (fn [i] => i % 5)"
             , "let col_idx  = make_index ncols raw_idx"
             , "let x_vec    = generate [4] (fn [j] => j)"
             , "let main     = generate [nnz] (fn [k] =>"
@@ -1726,9 +1740,8 @@ spec = describe "gather bounds checking" $ do
 
   describe "division and modulo in index obligations" $ do
 
-    -- TDiv/TMod carry C truncated semantics into the solver (sQuot/sRem), so
-    -- index expressions with division no longer become fresh unconstrained
-    -- variables and can be discharged by Z3.
+    -- Integer division and remainder are exact in the checker, truncating
+    -- as C does.
     it "verifies index [i / 2] into a same-length array" $ do
       expectDecsOk $ BS.unlines
         [ "let arr = generate [8] (fn [i] => i)"
@@ -1750,27 +1763,18 @@ spec = describe "gather bounds checking" $ do
         )
         (isInfixOf "UnsatConstraints")
 
-    -- Division by a literal zero is undefined behaviour in the generated C;
-    -- the divisor-nonzero side condition rejects it outright.
-    it "rejects a literal zero divisor in an index expression" $ do
-      expectDecsError
-        ( BS.unlines
-            [ "let arr = generate [8] (fn [i] => i)"
-            , "let main = generate [8] (fn [i] => index [i / 0] arr)"
-            ]
-        )
-        (isInfixOf "UnsatConstraints")
-
-    -- The `bound` annotation's solver fallback now survives division: the
-    -- obligation ships the actual (i*bins)/n term instead of a fresh variable.
+    -- Division is exact in the checker, with C's truncation, so a bucket
+    -- index computed by division is proved in range.
     it "verifies a bound-annotated bucket index computed with division" $ do
       expectDecsOk $ BS.unlines
         [ "let main ="
         , "  let n = get_env_int \"N\" in"
         , "  let bins = get_env_int \"BINS\" in"
-        , "  let hist ="
-        , "    scatter (+) (fill [bins] 0)"
-        , "      (generate [n] (let f [i] = let b bound bins = (i * bins) / n in b in f))"
-        , "      (generate [n] (let g [i] = 1 in g)) in"
-        , "  index () (reduce (+) 0 hist)"
+        , "  if bins > 0 then"
+        , "    let hist ="
+        , "      scatter (+) (fill [bins] 0)"
+        , "        (generate [n] (let f [i] = let b bound bins = (i * bins) / n in b in f))"
+        , "        (generate [n] (let g [i] = 1 in g)) in"
+        , "    index () (reduce (+) 0 hist)"
+        , "  else 0"
         ]

@@ -209,7 +209,11 @@ typeCheckExp = typeCheckExpWithOptions defaultInferOptions
 typeCheckExpWithOptions :: InferOptions -> Exp Range -> IO (Either String Polytype)
 typeCheckExpWithOptions opts e = do
   res <- runInferWithOptions opts (infer e)
-  pure $ formatInferResult res (formatTypeError Nothing Nothing)
+  case formatInferResult res (formatTypeError Nothing Nothing) of
+    Left err -> pure (Left err)
+    Right poly -> do
+      bad <- checkExpBounds opts e
+      pure $ maybe (Right poly) (Left . formatTypeError Nothing Nothing) bad
 
 -- | Fuse an expression after successful type inference.
 --

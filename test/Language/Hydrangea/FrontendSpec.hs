@@ -1000,24 +1000,29 @@ spec = do
         "let f [i] = i + 1 in check_index [3] true (generate [3] f)"
         (isInfixOf "")
     it "checks symbolic bounds for unknown sizes" $ do
-      expectType
+      -- Every size is possible for an argument, including 0, so an
+      -- unconditional read of the first or last element is unsafe.
+      expectTypeError
         "let g n = let f [i] = i in index [0] (generate [n] f) in g"
+        (isInfixOf "UnsatConstraints")
+      expectType
+        "let g n = let f [i] = i in if n > 0 then index [0] (generate [n] f) else 0 in g"
         (Forall [] [] (TyFun TyInt TyInt))
       expectType
-        "let g n = let f [i] = i in index [n - 1] (generate [n] f) in g"
+        "let g n = let f [i] = i in if n > 0 then index [n - 1] (generate [n] f) else 0 in g"
         (Forall [] [] (TyFun TyInt TyInt))
       expectTypeError
         "let g n = let f [i] = i in index [n] (generate [n] f) in g"
         (isInfixOf "UnsatConstraints")
     it "checks symbolic bounds without literals" $ do
       expectType
-        "let h n = let f [i] = i in index [n - n] (generate [n] f) in h"
+        "let h n = let f [i] = i in if n > 0 then index [n - n] (generate [n] f) else 0 in h"
         (Forall [] [] (TyFun TyInt TyInt))
       expectTypeError
         "let h n = let f [i] = i in index [n] (generate [n] f) in h"
         (isInfixOf "UnsatConstraints")
       expectType
-        "let g n m = let f [i,j] = i + j in index [n - n, m - m] (generate [n,m] f) in g"
+        "let g n m = let f [i,j] = i + j in if n > 0 & m > 0 then index [n - n, m - m] (generate [n,m] f) else 0 in g"
         (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))
       expectTypeError
         "let g n m = let f [i,j] = i + j in index [n, m - m] (generate [n,m] f) in g"
