@@ -3480,7 +3480,11 @@ matchBlockedMapReductionKernel scop = do
                   if lsRole reductionSpec /= LoopReduction
                     then Nothing
                     else do
-                      ReductionSpec redAcc _ RAdd <- lsRed reductionSpec
+                      -- The blocked kernel accumulates each cell in order
+                      -- from its initial value, so no partial-result seed
+                      -- arises and both additions qualify.
+                      ReductionSpec redAcc _ redop <- lsRed reductionSpec
+                      if redop `notElem` [RAdd, RAddNeg0] then Nothing else Just ()
                       [reductionIter] <- pure (lsIters reductionSpec)
                       [reductionBound] <- pure (lsBounds reductionSpec)
                       if redAcc /= accVar

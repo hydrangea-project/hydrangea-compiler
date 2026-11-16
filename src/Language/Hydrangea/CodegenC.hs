@@ -1269,6 +1269,14 @@ genLoop env declared spec body =
                   _        -> text "scatter-privatized-int-add"
                 privUpdate =
                   privVar <> text "[" <> genAtom idx <> text "]" <+> text "+=" <+> genAtom val <> text ";"
+                -- Partial sums start at the exact identity of the addition:
+                -- 0 for integers, -0.0 for floats (see 'Redop' in CFGCore).
+                -- Each thread seeds its own buffer.
+                privSeed = case elemTy of
+                  CTDouble ->
+                    text "for (int64_t __hyd_priv_s = 0; __hyd_priv_s <" <+> sizeVar
+                      <> text "; __hyd_priv_s++)" <+> privVar <> text "[__hyd_priv_s] = -0.0;"
+                  _ -> empty
                 outerDeclared =
                   S.union declared' (definedVarsStmts outerPrefix)
                 branchPrefixDoc =
@@ -1341,6 +1349,7 @@ genLoop env declared spec body =
                               <+> text "* (size_t)"
                               <> sizeVar
                               <> text ";"
+                              $$ privSeed
                               $$ singleFor
                                    (text "#pragma omp for" <> raggedSched)
                                    ci
@@ -1446,6 +1455,7 @@ genLoop env declared spec body =
               redClause = case CFG.rsRedop r of
                 RAdd -> text "reduction(+:" <> text cacc <> text ")"
                 RMul -> text "reduction(*:" <> text cacc <> text ")"
+                RAddNeg0 -> text "reduction(hyd_fadd_neg0:" <> text cacc <> text ")"
               accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
                 if alreadyDeclared
@@ -1471,6 +1481,7 @@ genLoop env declared spec body =
               redClause = case CFG.rsRedop r of
                 RAdd -> text "reduction(+:" <> text cacc <> text ")"
                 RMul -> text "reduction(*:" <> text cacc <> text ")"
+                RAddNeg0 -> text "reduction(hyd_fadd_neg0:" <> text cacc <> text ")"
               accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
                 if alreadyDeclared
@@ -1486,6 +1497,7 @@ genLoop env declared spec body =
               redClause = case CFG.rsRedop r of
                 RAdd -> text " reduction(+:" <> text cacc <> text ")"
                 RMul -> text " reduction(*:" <> text cacc <> text ")"
+                RAddNeg0 -> text " reduction(hyd_fadd_neg0:" <> text cacc <> text ")"
               accCType = if CFG.rsAccVar r `S.member` ceFloatVars env then "double" else "int64_t"
               accInit =
                 if CFG.rsAccVar r `S.member` declared

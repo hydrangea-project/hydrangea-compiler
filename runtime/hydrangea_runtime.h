@@ -247,6 +247,12 @@ typedef struct hyd_array_s {
 #endif
 } hyd_array_t;
 
+/* Float addition whose partial results start at -0.0, the exact identity
+ * (see 'Redop' in CFGCore.hs). */
+#ifdef _OPENMP
+#pragma omp declare reduction(hyd_fadd_neg0 : double : omp_out += omp_in) initializer(omp_priv = -0.0)
+#endif
+
 /* Reference-count checker, enabled by compiling with -DHYD_RC_CHECK (the
  * compiler's --cflags=-DHYD_RC_CHECK).  It tracks every live array header
  * and storage, and at exit reports:

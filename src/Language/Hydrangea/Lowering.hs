@@ -231,6 +231,23 @@ shapeRankM expr = case expr of
   EShapeOf _ (EVar _ v) -> gets (M.lookup v . lsArrayRankEnv)
   _                 -> pure Nothing
 
+-- | Record the rank of a local array binding in 'lsArrayRankEnv', which type
+-- inference fills only for top-level bindings.  Names are unique by now, so the
+-- entry cannot capture another binding.
+noteLocalArrayRank :: Var -> Exp a -> LowerM ()
+noteLocalArrayRank v rhs = do
+  mRank <- arrayRankM rhs
+  mapM_ (\r -> modify $ \st -> st { lsArrayRankEnv = M.insert v r (lsArrayRankEnv st) }) mRank
+
+-- | Rank of an array-valued expression, where it is evident from the syntax or
+-- recorded by type inference.
+arrayRankM :: Exp a -> LowerM (Maybe Int)
+arrayRankM expr = case expr of
+  EVar _ v          -> gets (M.lookup v . lsArrayRankEnv)
+  EReify _ e        -> arrayRankM e
+  EGenerate _ shp _ -> shapeRankM shp
+  _                 -> pure Nothing
+
 -- | Peel the let spine off an expression, returning its bindings by name and
 -- the expression underneath.
 collectLetEnv :: Exp a -> (Map Var (Dec a), Exp a)
@@ -987,6 +1004,7 @@ lowerExpDefault expr = case expr of
         registerFn name pats body
         lowerExp rest
     | otherwise -> do
+        noteLocalArrayRank name body
         (sb, ab) <- lowerExp body
         isFn <- aliasFnBinding name ab
         if isFn
@@ -1004,6 +1022,7 @@ lowerExpDefault expr = case expr of
             pure (sb ++ [bindStmt] ++ sr, ar)
 
   EBoundLetIn _ x _ rhs body -> do
+    noteLocalArrayRank x rhs
     (sr, ar) <- lowerExp rhs
     rhsTy <- ctypeOfAtom ar
     when (rhsTy /= CTUnknown) $ registerCType x rhsTy
@@ -1266,7 +1285,7 @@ lowerExpDefault expr = case expr of
     elemB  <- freshCVar "eB"
     (bodyA, mRedopA) <- lowerReductionStep fnExp acc elemA
     (bodyB, _      ) <- lowerReductionStep fnExp acc elemB
-    let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedopA
+    let mReductionSpec = reductionSpecFor acc ai mRedopA
     noteReadOnlyAtom aa
     noteReadOnlyAtom ab
     noteDenseReadAtom aa
@@ -1289,42 +1308,74 @@ lowerExpDefault expr = case expr of
          )
 
   EReduce _ fnExp initExp arrExp -> do
-    (si, ai) <- lowerExp initExp
-    (sa, aa) <- lowerExp arrExp
-    shp <- freshCVar "shp"
-    outShp <- freshCVar "out_shp"
-    redDim <- freshCVar "red_dim"
-    outN <- freshCVar "out_n"
-    outArr <- freshCVar "out_arr"
-    j <- freshIterVar "j"
-    acc <- freshCVar "acc"
-    k <- freshCVar "k"
-    base <- freshCVar "base"
-    flatIn <- freshCVar "flat_in"
-    elem' <- freshCVar "elem"
-    (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-    let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
-    pure ( si ++ sa
-         ++ [ SAssign shp (RArrayShape aa)
-            , SAssign outShp (RShapeInit (AVar shp))
-            , SAssign redDim (RShapeLast (AVar shp))
-            , SAssign outN (RShapeSize (AVar outShp))
-             , SAssign outArr (RArrayAlloc (AVar outShp))
-             , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction [])
-                  ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
-                      , SAssign acc (RAtom ai)
-                      , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
-                          ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
-                           , SAssign elem' (RArrayLoad aa (AVar flatIn))
-                           ]
-                           ++ bodyStmts
-                         )
-                    , SArrayWrite (AVar outArr) (AVar j) (AVar acc)
-                    ]
-                 )
-            ]
-         , AVar outArr
-         )
+    mRank <- arrayRankM arrExp
+    case mRank of
+      Just 1 -> do
+        -- 1-D input: accumulate directly in a scalar over the flat index, as the
+        -- rank-1 'EReduceGenerate' case does, so a reduction over a materialized
+        -- array gets the same parallel schedule as the fused one.  The general
+        -- case below wraps it in a one-trip LoopMapReduction whose trip count is
+        -- only known at runtime, which keeps the reduction serial.
+        (si, ai) <- lowerExp initExp
+        (sa, aa) <- lowerExp arrExp
+        shp <- freshCVar "shp"
+        outShp <- freshCVar "out_shp"
+        redDim <- freshCVar "red_dim"
+        outArr <- freshCVar "out_arr"
+        acc <- freshCVar "acc"
+        k <- freshIterVar "k"
+        elem' <- freshCVar "elem"
+        (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+        let mReductionSpec = reductionSpecFor acc ai mRedop
+        pure ( si ++ sa
+             ++ [ SAssign shp (RArrayShape aa)
+                , SAssign outShp (RShapeInit (AVar shp))
+                , SAssign redDim (RShapeLast (AVar shp))
+                , SAssign outArr (RArrayAlloc (AVar outShp))
+                , SAssign acc (RAtom ai)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
+                    ( SAssign elem' (RArrayLoad aa (AVar k)) : bodyStmts )
+                , SArrayWrite (AVar outArr) (AInt 0) (AVar acc)
+                ]
+             , AVar outArr
+             )
+      _ -> do
+        (si, ai) <- lowerExp initExp
+        (sa, aa) <- lowerExp arrExp
+        shp <- freshCVar "shp"
+        outShp <- freshCVar "out_shp"
+        redDim <- freshCVar "red_dim"
+        outN <- freshCVar "out_n"
+        outArr <- freshCVar "out_arr"
+        j <- freshIterVar "j"
+        acc <- freshCVar "acc"
+        k <- freshCVar "k"
+        base <- freshCVar "base"
+        flatIn <- freshCVar "flat_in"
+        elem' <- freshCVar "elem"
+        (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
+        let mReductionSpec = reductionSpecFor acc ai mRedop
+        pure ( si ++ sa
+             ++ [ SAssign shp (RArrayShape aa)
+                , SAssign outShp (RShapeInit (AVar shp))
+                , SAssign redDim (RShapeLast (AVar shp))
+                , SAssign outN (RShapeSize (AVar outShp))
+                 , SAssign outArr (RArrayAlloc (AVar outShp))
+                 , SLoop (LoopSpec [j] [atomToIndexExpr (AVar outN)] Serial Nothing LoopMapReduction [])
+                      ( [ SAssign base (RBinOp CMul (AVar j) (AVar redDim))
+                          , SAssign acc (RAtom ai)
+                          , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
+                              ( [ SAssign flatIn (RBinOp CAdd (AVar base) (AVar k))
+                               , SAssign elem' (RArrayLoad aa (AVar flatIn))
+                               ]
+                               ++ bodyStmts
+                             )
+                        , SArrayWrite (AVar outArr) (AVar j) (AVar acc)
+                        ]
+                     )
+                ]
+             , AVar outArr
+             )
 
   EReduceGenerate _ fnExp initExp shapeExp genExp -> do
     (si, ai) <- lowerExp initExp
@@ -1346,7 +1397,7 @@ lowerExpDefault expr = case expr of
         elem'  <- freshCVar "elem"
         genStmts <- inlineArrayFn1D genExp k elem'
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-        let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+        let mReductionSpec = reductionSpecFor acc ai mRedop
         pure ( si ++ ss
              ++ [ SAssign outShp (RShapeInit as')
                 , SAssign redDim (RShapeLast as')
@@ -1378,7 +1429,7 @@ lowerExpDefault expr = case expr of
         noteDenseLinearIndex idx k
         genStmts <- inlineArrayFn genExp idx elem'
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-        let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+        let mReductionSpec = reductionSpecFor acc ai mRedop
         pure ( si ++ ss
              ++ [ SAssign outShp (RShapeInit as')
                 , SAssign redDim (RShapeLast as')
@@ -1477,7 +1528,7 @@ lowerExpDefault expr = case expr of
     -- Fix 1: use lowerReductionStep so the inner LoopReduction carries a
     -- ReductionSpec (enables the SIMD reduction clause, same as other sites).
     (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-    let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+    let mReductionSpec = reductionSpecFor acc ai mRedop
     -- Fix 2: fuse a 1D generate directly into the inner loop, avoiding
     -- allocation and two-pass I/O on the intermediate values array.
     -- Register elemIx as CTInt64 so inlineArrayFn1D sees the correct type
@@ -1748,7 +1799,7 @@ lowerExpDefault expr = case expr of
             val    <- freshCVar "val"
             genStmts <- inlineArrayFn1D genExp k elem'
             (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-            let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+            let mReductionSpec = reductionSpecFor acc ai mRedop
             pure ( si ++ ss
                  ++ [ SAssign redDim (RShapeLast as')
                     , SAssign acc (RAtom ai)
@@ -1777,7 +1828,7 @@ lowerExpDefault expr = case expr of
             noteDenseLinearIndex idx k
             genStmts <- inlineArrayFn genExp idx elem'
             (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
-            let mReductionSpec = fmap (ReductionSpec acc (atomToIndexExpr ai)) mRedop
+            let mReductionSpec = reductionSpecFor acc ai mRedop
             outShp <- freshCVar "out_shp"
             pure ( si ++ ss
                  ++ [ SAssign outShp (RShapeInit as')
@@ -4961,10 +5012,20 @@ hoistZeroArgValueProcCallsWith priorStmts stmts = go seedCache M.empty [] [] stm
 reductionRedopFromBinOp :: BinOp -> Maybe Redop
 reductionRedopFromBinOp bop = case bop of
   CAdd  -> Just RAdd
-  CAddF -> Just RAdd
+  CAddF -> Just RAddNeg0
   CMul  -> Just RMul
   CMulF -> Just RMul
   _     -> Nothing
+
+-- | The reduction spec for a step whose accumulator starts at @ai@.  Float
+-- addition is 'RAddNeg0' (partial results seeded at the exact identity
+-- -0.0) unless @ai@ is a float literal other than -0.0, which makes the
+-- built-in +0.0 seed exact too (see 'Redop').
+reductionSpecFor :: CVar -> Atom -> Maybe Redop -> Maybe ReductionSpec
+reductionSpecFor acc ai = fmap (ReductionSpec acc (atomToIndexExpr ai) . seeded)
+  where
+    seeded RAddNeg0 | AFloat x <- ai, not (isNegativeZero x) = RAdd
+    seeded op = op
 
 reductionRedopFromStmts :: [Stmt] -> Maybe Redop
 reductionRedopFromStmts [] = Nothing

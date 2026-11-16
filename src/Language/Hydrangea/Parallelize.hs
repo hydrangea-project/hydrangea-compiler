@@ -161,14 +161,20 @@ collectLoopArrayUsage = foldl' record M.empty . extractAccesses
 --   array accesses (read-read pairs are excluded — they are never blocking),
 -- * no array is both read and written inside the body, and
 -- * no scalar variable exhibits a loop-carried mutation pattern — unless the
---   loop is a 'LoopReduction', whose accumulator is intentionally loop-carried
---   and handled by the OpenMP reduction clause.
+--   loop is a 'LoopReduction' with a 'ReductionSpec', whose accumulator is
+--   intentionally loop-carried and handled by the OpenMP reduction clause.  A
+--   reduction whose combine has no OpenMP operator (a max, say) has no spec,
+--   and its accumulator is an ordinary race; so is the lane accumulator of
+--   an explicitly vectorised reduction, which the scalar check cannot see,
+--   so a 'LoopReduction' without a spec is never parallel.
 passesConservativeDependenceCheck :: LoopSpec -> [Stmt] -> Bool
 passesConservativeDependenceCheck spec body =
   isParallelTripCount (loopTripCount spec)
   && not hasBlockingDependence
   && not hasReadWriteHazard
-  && (lsRole spec == LoopReduction || not (hasScalarCarriedDep spec body))
+  && (if lsRole spec == LoopReduction
+        then lsRed spec /= Nothing
+        else not (hasScalarCarriedDep spec body))
   where
     accesses = extractAccesses body
     deps     = findDependences accesses
@@ -912,8 +918,19 @@ parallelizeProcWithFacts arrayFacts typeEnv allocSizes stmts = go False stmts
             -- Block inner parallelism when:
             --   (a) the outer loop will be parallel (prevents nested omp regions), or
             --   (b) the outer loop is a LoopReductionWrapper (inner LoopReduction must
-            --       use OpenMP reduction semantics, not generic parallel).
-            outerBlocksInner = outerWillParallel || lsRole spec == LoopReductionWrapper
+            --       use OpenMP reduction semantics, not generic parallel) -- unless
+            --       the wrapper runs exactly once, as the 1-D scalar reduction's
+            --       does, and every loop in it has a ReductionSpec: then the inner
+            --       loop is the whole reduction and takes the OpenMP reduction
+            --       path.  A reduction without one (a max, say) has an ordinary
+            --       carried accumulator and must stay serial.
+            onceAroundReductions =
+              lsBounds spec == [IConst 1]
+                && and [ lsRed s /= Nothing | SLoop s _ <- body ]
+                && not (null [ () | SLoop _ _ <- body ])
+            outerBlocksInner =
+              outerWillParallel
+                || (lsRole spec == LoopReductionWrapper && not onceAroundReductions)
             -- Recurse into body with updated context.
             body' = go (insideParallel || outerBlocksInner) body
         -- Now apply parallelization to the outer loop using the traversed body.

@@ -209,7 +209,9 @@ vectorCandidate w ctx spec body
     width = chooseVectorWidthWith w spec
     preferSimdHere =
       case lsRole spec of
-        LoopReduction -> True
+        -- Without a 'ReductionSpec' the accumulator is carried in order,
+        -- which a SIMD loop cannot express.
+        LoopReduction -> lsRed spec /= Nothing
         LoopPlain -> vcInsideLoop ctx || lsRed spec /= Nothing
         LoopFold -> False
         LoopMap -> True
@@ -492,11 +494,16 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
       if accTy /= CTDouble then Nothing else do
         initVal <- initAtom (rsInit red)
         if not (isDoubleCompatibleAtom typeEnv initVal) then Nothing else do
-          redOp <- case rsRedop red of
-            C.RAdd -> Just CAddF
-            C.RMul -> Just CMulF
+          -- Lanes start at the operator's exact identity, and their total
+          -- is combined into the accumulator, which already holds the
+          -- initial value (and, inside a tiled loop, the earlier tiles).
+          (redOp, seed) <- case rsRedop red of
+            C.RAdd -> Just (CAddF, AFloat (-0.0))
+            C.RAddNeg0 -> Just (CAddF, AFloat (-0.0))
+            C.RMul -> Just (CMulF, AFloat 1.0)
           let accVec = vecVarName acc
-              vecInit = SAssign accVec (C.RVecSplat initVal)
+              laneTotal = accVec <> "__total"
+              vecInit = SAssign accVec (C.RVecSplat seed)
               vecEnv0 = M.singleton acc accVec
               ctx = VectorLowerCtx typeEnv accessFacts iter vecBase (laneVaryingVars iter body)
           vecBody <- transformVectorBody ctx vecEnv0 body
@@ -504,11 +511,14 @@ lowerExplicitVectorLoop typeEnv accessFacts spec body = do
             then Nothing
             else do
               let vecLoop = SLoop vecLoopSpec (vecBaseStmt : vecBody)
-                  reduceBack = SAssign acc (C.RVecReduce redOp (AVecVar accVec))
+                  reduceBack =
+                    [ SAssign laneTotal (C.RVecReduce redOp (AVecVar accVec))
+                    , SAssign acc (C.RBinOp redOp (AVar acc) (AVar laneTotal))
+                    ]
                   tailStmts = case vsTail vecSpec of
                     TailNone -> []
                     _ -> tailPrep ++ [SLoop tailLoopSpec tailBody]
-              pure (vecTripsStmt : vecInit : vecLoop : reduceBack : tailStmts)
+              pure (vecTripsStmt : vecInit : vecLoop : reduceBack ++ tailStmts)
     Nothing -> do
       let ctx = VectorLowerCtx typeEnv accessFacts iter vecBase (laneVaryingVars iter body)
       vecBody <- transformVectorBody ctx M.empty body

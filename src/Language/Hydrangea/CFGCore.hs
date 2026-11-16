@@ -235,5 +235,14 @@ mapRHSAtoms f rhs = case rhs of
   RArrayFree a          -> RArrayFree (f a)
 
 -- | Reduction operators used by @ReductionSpec@ in CFG.
-data Redop = RAdd | RMul
+--
+-- Regrouping starts every partial result at a seed.  For 'RMul' the seed
+-- 1 is an exact identity, and for integer 'RAdd' so is 0.  For float
+-- addition the exact identity is -0.0, since +0.0 + -0.0 = +0.0.  The
+-- built-in OpenMP seed +0.0 still gives an exact result whenever the
+-- initial value is known not to be -0.0: a sum is -0.0 only when every
+-- leaf is, so the exact result is then never -0.0, and +0.0 seeds change
+-- no other result.  'RAdd' is used for those; 'RAddNeg0' is float addition
+-- whose partial results must start at -0.0.
+data Redop = RAdd | RMul | RAddNeg0
   deriving (Eq, Show)

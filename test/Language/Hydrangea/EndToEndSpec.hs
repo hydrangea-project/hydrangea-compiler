@@ -1609,6 +1609,50 @@ spec = do
         , "let scalars = (1.5, 2)"
         ]
 
+  describe "Parallel reductions" $ do
+
+    -- A max has no OpenMP reduction operator: run in parallel, its
+    -- accumulator would be a plain data race.
+    it "keeps a reduction without an OpenMP operator serial" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let main = reduce_generate (let mx a b = if a < b then b else a in mx) 0 [4000000]"
+        , "  (fn [i] => (i * 7919) % 1000003)" ]
+      csrc <- compileToCOptParallelIO False decs
+      csrc `shouldNotSatisfy` isInfixOf "omp parallel for"
+
+    it "parallelizes a scalar 1-D sum under index ()" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let xs = generate [4000000] (fn [i] => i % 3)"
+        , "let main = index () (reduce_generate (+) 0 [4000000] (fn [i] => index [i] xs))" ]
+      csrc <- compileToCOptParallelIO False decs
+      lines csrc `shouldSatisfy`
+        any (\l -> "omp parallel for" `isInfixOf` l && "reduction(+:" `isInfixOf` l)
+
+    -- The scatter writes its state in place only when nothing read later can
+    -- reach that buffer, and into a copy otherwise, so its inputs that come
+    -- from the carried state cannot be the buffer it writes.
+    it "runs a scatter inside iterate in parallel when its inputs come from the carried state" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let n = 1000"
+        , "let idx = generate [n] (fn [i] => (i * 7) % n)"
+        , "let step st ="
+        , "  let k = snd st in"
+        , "  let mn a b = if a < b then a else b in"
+        , "  let p2 = scatter_guarded mn (fst st) idx (fill [n] k) (generate [n] (fn [i] => i < k)) in"
+        , "  (p2, index () (reduce_generate (+) 0 [n] (fn [i] => index [i] p2)) % 97)"
+        , "let main = fst (iterate 3 (fill [n] 5000, 50) step)" ]
+      csrc <- compileToCOptParallelIO True decs
+      csrc `shouldSatisfy` isInfixOf "scatter-rmw-cas-int"
+
+    it "parallelizes a scalar sum over a local 1-D array" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let main ="
+        , "  let xs = reify (generate [4000000] (fn [i] => i % 3)) in"
+        , "  reduce (+) 0 xs" ]
+      csrc <- compileToCOptParallelIO False decs
+      lines csrc `shouldSatisfy`
+        any (\l -> "omp parallel for" `isInfixOf` l && "reduction(+:" `isInfixOf` l)
+
 -- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
 checkWithRcCheck :: BS.ByteString -> IO ()
 checkWithRcCheck src =
@@ -1617,6 +1661,7 @@ checkWithRcCheck src =
     Right decs ->
       checkDecsWithCFlags ["-DHYD_RC_CHECK"]
         defaultFrontendOptions defaultInferOptions defaultPipelineOptions decs
+
 
 -- | The C a source program compiles to.
 emitC :: BS.ByteString -> IO String
