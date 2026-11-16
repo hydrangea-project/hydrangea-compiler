@@ -80,6 +80,7 @@ import Language.Hydrangea.Syntax
   scatter_guarded { L.RangedToken L.ScatterGuarded _ }
   gather     { L.RangedToken L.Gather _ }
   iterate    { L.RangedToken L.Iterate _ }
+  iterate_until { L.RangedToken L.IterateUntil _ }
   stencil    { L.RangedToken L.Stencil _ }
   reify      { L.RangedToken L.Reify _ }
   clamp      { L.RangedToken L.Clamp _ }
@@ -338,6 +339,10 @@ expspecial :: { Exp L.Range }
   | get_env_int atom           { EGetEnvInt (L.rtRange $1 <-> info $2) $2 }
   | get_env_string atom        { EGetEnvString (L.rtRange $1 <-> info $2) $2 }
   | iterate atom atom atom     { EIterate (L.rtRange $1 <-> info $4) $2 $3 $4 }
+  -- iterate_until n init step stop: at most n steps, stopping before any step
+  -- whose input satisfies stop.
+  | iterate_until atom atom atom atom
+      { mkIterateUntil (L.rtRange $1 <-> info $5) $1 $2 $3 $4 $5 }
   | stencil boundary atom atom { EStencil (L.rtRange $1 <-> info $4) $2 $3 $4 }
   | reify atom                 { EReify (L.rtRange $1 <-> info $2) $2 }
 
@@ -501,6 +506,21 @@ mkTyVec ty1 ty2 =
       rebuild [] = tyUnit
       rebuild (t:ts) = tyCons t (rebuild ts)
     in rebuild (flatten ty1 ++ flatten ty2)
+
+-- | Desugar @iterate_until n init step stop@ into @iterate n init
+-- (fn s => if stop s then s else step s)@, naming the step after the token.
+-- Once @stop@ holds every remaining step is the identity, which lowering
+-- turns into an early exit.
+mkIterateUntil
+  :: L.Range -> L.RangedToken -> Exp L.Range -> Exp L.Range -> Exp L.Range -> Exp L.Range
+  -> Exp L.Range
+mkIterateUntil r tok n initE stepE stopE =
+  let L.Range (L.AlexPn _ line col) _ = L.rtRange tok
+      suffix = show line ++ "_" ++ show col
+      fnName = BS.pack ("__until_" ++ suffix)
+      st = BS.pack ("__until_state_" ++ suffix)
+      body = EIfThenElse r (EApp r stopE (EVar r st)) (EVar r st) (EApp r stepE (EVar r st))
+  in EIterate r n initE (ELetIn r (Dec r fnName [PVar r st] Nothing Nothing body) (EVar r fnName))
 
 -- | Generate a fresh lambda name from the source position of the 'fn' token.
 -- Uses line and column so every lambda in the source gets a unique name.

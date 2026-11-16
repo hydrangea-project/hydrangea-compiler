@@ -2224,7 +2224,7 @@ mslElemCType CEInt = "long"
 mslElemCType CEFloat = "float" -- demoted from double
 mslElemCType CEBool = "int"
 mslElemCType (CEPair ct1 ct2) = mslPairStructName ct1 ct2
-mslElemCType CEArray = "long" -- can't have arrays inside MSL structs
+mslElemCType (CEArray _) = "long" -- can't have arrays inside MSL structs
 
 -- ---------------------------------------------------------------------------
 -- MSL type helpers

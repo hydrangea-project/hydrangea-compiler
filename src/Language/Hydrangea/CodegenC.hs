@@ -627,7 +627,7 @@ genMain mBench retKinds retTypes procs =
                   invoke "hyd_array_t*" (text "(void)" <> parens (text result) <> text ";")
             -- Print a pair using the recovered component types.  This is the
             -- accurate path: unlike 'KPair' (which collapses any array component
-            -- to CEArray and so cannot tell int arrays from float arrays), the
+            -- to an array type and loses nested component types), the
             -- return type carries each component's full 'CType', which is needed
             -- to print, e.g., a pair of reduce results (each a 0-D array).
             Just ty@(CTPair c1 c2)
@@ -904,21 +904,28 @@ genStmt env declared liveAfter stmt = case stmt of
   CFG.SAssign v rhs
     | v `S.member` declared ->
         -- When a declared pair-of-arrays variable is overwritten, free the old
-        -- array components first to prevent a heap leak.
-        let freeOldPair = case Map.lookup v (cePairVars env) of
-              Just (CEArray, CEArray) ->
-                text "hyd_array_free("
-                  <> text (sanitize v)
-                  <> text ".fst);"
-                  $$ text "hyd_array_free("
-                  <> text (sanitize v)
-                  <> text ".snd);"
-              Just (CEArray, _) ->
-                text "hyd_array_free(" <> text (sanitize v) <> text ".fst);"
-              Just (_, CEArray) ->
-                text "hyd_array_free(" <> text (sanitize v) <> text ".snd);"
-              _ -> empty
-         in freeOldPair $$ text (sanitize v) <+> text "=" <+> genAssignRHS rhs <> text ";"
+        -- array components the new value no longer holds.  A loop step may
+        -- pass a component through unchanged, so the pairs can share arrays.
+        let cv = text (sanitize v)
+            newV = text (sanitize v ++ "__new")
+            arrFields = case Map.lookup v (cePairVars env) of
+              Just (ct1, ct2) -> [f | (f, ct) <- [("fst", ct1), ("snd", ct2)], isArrayElem ct]
+              Nothing -> []
+            freeIfDropped f =
+              text "if ("
+                <> hsep (punctuate (text " &&")
+                     [cv <> text ("." ++ f) <+> text "!=" <+> newV <> text ("." ++ g) | g <- arrFields])
+                <> text ") hyd_array_free(" <> cv <> text ("." ++ f) <> text ");"
+         in if null arrFields
+              then cv <+> text "=" <+> genAssignRHS rhs <> text ";"
+              else
+                text "{"
+                  $+$ nest 4
+                    ( varDecl env v rhs <+> newV <+> text "=" <+> genAssignRHS rhs <> text ";"
+                        $$ vcat (map freeIfDropped arrFields)
+                        $$ cv <+> text "=" <+> newV <> text ";"
+                    )
+                  $+$ text "}"
     | otherwise ->
         let cv = sanitize v
             decl = varDecl env v rhs
@@ -1707,7 +1714,7 @@ localArrayVarsProc typeEnv (CFG.Proc {CFG.procBody = body}) =
         [ v
         | CFG.SAssign _ (RPairMake ct1 ct2 a1 a2) <- body,
           (ct, a) <- [(ct1, a1), (ct2, a2)],
-          ct == CEArray,
+          isArrayElem ct,
           AVar v <- [a]
         ]
     explicitlyFreedLocals =
@@ -1736,13 +1743,13 @@ discardedArrayPairComponentDoc stmts retAtom pairVars =
           [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".fst);"
           | CFG.SAssign rv (RPairSnd _ (AVar pairVar)) <- stmts,
             rv == retVar,
-            Just (CEArray, _) <- [Map.lookup pairVar pairVars]
+            Just (CEArray _, _) <- [Map.lookup pairVar pairVars]
           ]
         sndFrees =
           [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".snd);"
           | CFG.SAssign rv (RPairFst _ (AVar pairVar)) <- stmts,
             rv == retVar,
-            Just (_, CEArray) <- [Map.lookup pairVar pairVars]
+            Just (_, CEArray _) <- [Map.lookup pairVar pairVars]
           ]
     _ -> empty
 
@@ -2030,12 +2037,16 @@ recordStructName fields = "hyd_record_" ++ concatMap (\(field, fieldTy) -> sanit
 
 -- | Letter abbreviation for a CElemType, used in struct name mangling.
 -- For nested pairs this recurses: CEPair CEFloat CEInt → "pfi".
+isArrayElem :: CElemType -> Bool
+isArrayElem (CEArray _) = True
+isArrayElem _ = False
+
 celemTypeLetter :: CElemType -> String
 celemTypeLetter CEInt = "i"
 celemTypeLetter CEFloat = "f"
 celemTypeLetter CEBool = "b"
 celemTypeLetter (CEPair ct1 ct2) = "p" ++ celemTypeLetter ct1 ++ celemTypeLetter ct2
-celemTypeLetter CEArray = "a"
+celemTypeLetter (CEArray _) = "a"
 
 -- | C type string for a CElemType.
 celemTypeCType :: CElemType -> String
@@ -2043,7 +2054,7 @@ celemTypeCType CEInt = "int64_t"
 celemTypeCType CEFloat = "double"
 celemTypeCType CEBool = "int64_t"
 celemTypeCType (CEPair ct1 ct2) = pairStructName ct1 ct2
-celemTypeCType CEArray = "hyd_array_t*"
+celemTypeCType (CEArray _) = "hyd_array_t*"
 
 -- | Struct typedef name for a pair type, e.g. @hyd_pair_fi_t@.
 pairStructName :: CElemType -> CElemType -> String
@@ -2067,7 +2078,7 @@ celemTypeCType' opts CEInt = "int64_t"
 celemTypeCType' opts CEFloat = if codegenUseFloat opts then "float" else "double"
 celemTypeCType' opts CEBool = "int64_t"
 celemTypeCType' opts (CEPair ct1 ct2) = pairStructName ct1 ct2
-celemTypeCType' opts CEArray = "hyd_array_t*"
+celemTypeCType' opts (CEArray _) = "hyd_array_t*"
 
 -- | Collect the transitive closure of sub-pair types used by a CElemType.
 -- Returns all (ct1, ct2) pairs that need struct definitions, in dependency order

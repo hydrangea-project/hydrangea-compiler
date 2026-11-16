@@ -429,20 +429,20 @@ spec = do
   describe "CFGOpt - scalarizeIteratePairs" $ do
     it "splits pair-typed iterate state into per-component swaps" $ do
       let body =
-            [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
-            , SAssign "ts" (RPairSnd CEArray (AVar "cur"))
+            [ SAssign "tf" (RPairFst (CEArray CTDouble) (AVar "cur"))
+            , SAssign "ts" (RPairSnd (CEArray CTDouble) (AVar "cur"))
             , SAssign "x" (RArrayCopy (AVar "tf"))
             , SAssign "y" (RArrayCopy (AVar "ts"))
-            , SAssign "p" (RPairMake CEArray CEArray (AVar "x") (AVar "y"))
+            , SAssign "p" (RPairMake (CEArray CTDouble) (CEArray CTDouble) (AVar "x") (AVar "y"))
             , SAssign "cur" (RAtom (AVar "p"))
             ]
           loop = SLoop (LoopSpec ["t"] [IVar "k"] Serial Nothing LoopIterate []) body
           result = scalarizeIteratePairs [loop]
       case result of
-        [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
-          , SAssign "ts" (RPairSnd CEArray (AVar "cur"))
+        [ SAssign "tf" (RPairFst (CEArray CTDouble) (AVar "cur"))
+          , SAssign "ts" (RPairSnd (CEArray CTDouble) (AVar "cur"))
           , SLoop _ body'
-          , SAssign "cur" (RPairMake CEArray CEArray (AVar "tf") (AVar "ts"))
+          , SAssign "cur" (RPairMake (CEArray CTDouble) (CEArray CTDouble) (AVar "tf") (AVar "ts"))
           ] -> do
             drop (length body' - 2) body'
               `shouldBe` [ SAssign "tf" (RAtom (AVar "x"))
@@ -453,29 +453,29 @@ spec = do
         other -> expectationFailure ("unexpected shape: " ++ show other)
 
     it "splits nested-pair iterate state into per-leaf swaps" $ do
-      let inner = CEPair CEArray CEArray
+      let inner = CEPair (CEArray CTDouble) (CEArray CTDouble)
           body =
-            [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
+            [ SAssign "tf" (RPairFst (CEArray CTDouble) (AVar "cur"))
             , SAssign "ti" (RPairSnd inner (AVar "cur"))
-            , SAssign "ta" (RPairFst CEArray (AVar "ti"))
-            , SAssign "tb" (RPairSnd CEArray (AVar "ti"))
+            , SAssign "ta" (RPairFst (CEArray CTDouble) (AVar "ti"))
+            , SAssign "tb" (RPairSnd (CEArray CTDouble) (AVar "ti"))
             , SAssign "x" (RArrayCopy (AVar "tf"))
             , SAssign "y" (RArrayCopy (AVar "ta"))
             , SAssign "z" (RArrayCopy (AVar "tb"))
-            , SAssign "q" (RPairMake CEArray CEArray (AVar "y") (AVar "z"))
-            , SAssign "p" (RPairMake CEArray inner (AVar "x") (AVar "q"))
+            , SAssign "q" (RPairMake (CEArray CTDouble) (CEArray CTDouble) (AVar "y") (AVar "z"))
+            , SAssign "p" (RPairMake (CEArray CTDouble) inner (AVar "x") (AVar "q"))
             , SAssign "cur" (RAtom (AVar "p"))
             ]
           loop = SLoop (LoopSpec ["t"] [IVar "k"] Serial Nothing LoopIterate []) body
           result = scalarizeIteratePairs [loop]
       case result of
-        [ SAssign "tf" (RPairFst CEArray (AVar "cur"))
-          , SAssign "ti" (RPairSnd (CEPair CEArray CEArray) (AVar "cur"))
-          , SAssign "ta" (RPairFst CEArray (AVar "ti"))
-          , SAssign "tb" (RPairSnd CEArray (AVar "ti"))
+        [ SAssign "tf" (RPairFst (CEArray CTDouble) (AVar "cur"))
+          , SAssign "ti" (RPairSnd (CEPair (CEArray CTDouble) (CEArray CTDouble)) (AVar "cur"))
+          , SAssign "ta" (RPairFst (CEArray CTDouble) (AVar "ti"))
+          , SAssign "tb" (RPairSnd (CEArray CTDouble) (AVar "ti"))
           , SLoop _ body'
-          , SAssign "q" (RPairMake CEArray CEArray (AVar "ta") (AVar "tb"))
-          , SAssign "cur" (RPairMake CEArray (CEPair CEArray CEArray) (AVar "tf") (AVar "q"))
+          , SAssign "q" (RPairMake (CEArray CTDouble) (CEArray CTDouble) (AVar "ta") (AVar "tb"))
+          , SAssign "cur" (RPairMake (CEArray CTDouble) (CEPair (CEArray CTDouble) (CEArray CTDouble)) (AVar "tf") (AVar "q"))
           ] -> do
             drop (length body' - 3) body'
               `shouldBe` [ SAssign "tf" (RAtom (AVar "x"))

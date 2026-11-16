@@ -1281,3 +1281,37 @@ spec = do
       csrc <- compileToCOptParallelIO True decs
       -- guard, output, block counts, block offsets; no array for the source
       length (filter ("hyd_array_alloc" `isInfixOf`) (lines csrc)) `shouldBe` 4
+
+  describe "iterate_until" $ do
+
+    it "stops as soon as the predicate holds, or after n steps" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a = iterate_until 100 0 (fn x => x + 1) (fn x => x >= 7)"
+        , "let b = iterate_until 5 0 (fn x => x + 1) (fn x => x >= 7)"
+        , "let c = iterate_until 5 9 (fn x => x + 1) (fn x => x >= 7)"
+        , "let d = iterate_until 0 3 (fn x => x + 1) (fn x => false)"
+        ]
+
+    it "carries array and nested-pair state" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a = iterate_until 1000 (generate [4] (fn [i] => i))"
+        , "  (fn xs => map (fn x => x * 2) xs) (fn xs => index [3] xs > 100)"
+        , "let b = fst (fst (iterate_until 50 ((generate [3] (fn [i] => i), fill [3] 1), 0)"
+        , "  (fn st => ((map (fn x => x + 1) (fst (fst st)), snd (fst st)), snd st + 1))"
+        , "  (fn st => snd st = 4)))"
+        ]
+
+    it "leaves the loop early instead of running out the count" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let main = iterate_until 1000000 0 (fn x => x + 1) (fn x => x >= 7)" ]
+      csrc <- compileToCOptIO False decs
+      csrc `shouldSatisfy` isInfixOf "break;"
+
+  describe "Pair-of-arrays loop state" $ do
+
+    it "iterate over a pair of int and bool arrays, one passed through" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a0 = generate [8] (let f [i] = i in f)"
+        , "let r = fst (iterate 3 (a0, generate [8] (let f [i] = i < 3 in f))"
+        , "  (fn st => (map (let f x = x + 1 in f) (fst st), snd st)))"
+        ]

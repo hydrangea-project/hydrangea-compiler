@@ -92,7 +92,8 @@ data CElemType
   | CEFloat
   | CEBool
   | CEPair CElemType CElemType
-  | CEArray
+  | CEArray CType  -- ^ always a @hyd_array_t*@ field; the element type is
+                   --   needed to load through a projected component
   deriving (Eq, Show, Ord)
 
 -- | Concrete C type for all values appearing in generated code.
@@ -117,7 +118,7 @@ elemTypeToCType CEInt            = CTInt64
 elemTypeToCType CEFloat          = CTDouble
 elemTypeToCType CEBool           = CTBool
 elemTypeToCType (CEPair ct1 ct2) = CTPair (elemTypeToCType ct1) (elemTypeToCType ct2)
-elemTypeToCType CEArray          = CTArray CTDouble
+elemTypeToCType (CEArray elt)    = CTArray elt
 
 -- | Project a 'CType' back to 'CElemType', if it is representable as one.
 -- Returns 'Nothing' for types that cannot appear as pair components
@@ -128,7 +129,8 @@ ctypeToElemType CTInt64           = Just CEInt
 ctypeToElemType CTDouble          = Just CEFloat
 ctypeToElemType CTBool            = Just CEBool
 ctypeToElemType (CTPair ct1 ct2)  = CEPair <$> ctypeToElemType ct1 <*> ctypeToElemType ct2
-ctypeToElemType (CTArray _)       = Just CEArray
+ctypeToElemType (CTArray CTUnknown) = Just (CEArray CTDouble)
+ctypeToElemType (CTArray elt)     = Just (CEArray elt)
 ctypeToElemType CTUnknown         = Nothing
 ctypeToElemType _                 = Nothing
 

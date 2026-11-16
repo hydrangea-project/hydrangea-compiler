@@ -851,11 +851,24 @@ lowerExp expr = case expr of
     t         <- freshIterVar "iter_t"
     curTy     <- ctypeOfAtom ai
     when (curTy /= CTUnknown) $ registerCType arr_cur curTy
-    stepStmts <- inlineScalarFn stepFnExp arr_cur arr_next
+    stepMaybeFn <- resolveUnaryFn stepFnExp
+    loopBody <- case stepMaybeFn of
+      -- A step @\s -> if stop s then s else step s@ (what @iterate_until@
+      -- desugars to) leaves the state unchanged once @stop@ holds, and so
+      -- does every later step: the loop can exit there.
+      Just (a, x, EIfThenElse _ stopE (EVar _ x') stepE) | x == x' -> do
+        let unary name body = ELetIn a (Dec a name [PVar a x] Nothing Nothing body) (EVar a name)
+        stopV     <- freshCVar "iter_stop"
+        stopFn    <- (\n -> unary n stopE) <$> freshCVar "__iter_stop_fn"
+        stepFn    <- (\n -> unary n stepE) <$> freshCVar "__iter_step_fn"
+        stopStmts <- inlineScalarFn stopFn arr_cur stopV
+        stepStmts <- inlineScalarFn stepFn arr_cur arr_next
+        pure (stopStmts ++ [SIf (AVar stopV) [SBreak] []] ++ stepStmts)
+      _ -> inlineScalarFn stepFnExp arr_cur arr_next
     pure ( sn ++ si
          ++ [ SAssign arr_cur (RAtom ai)
             , SLoop (LoopSpec [t] [atomToIndexExpr an] Serial Nothing LoopIterate [])
-                ( stepStmts
+                ( loopBody
                   ++ [SAssign arr_cur (RAtom (AVar arr_next))]
                 )
             ]
@@ -3876,7 +3889,7 @@ elemTypeToCTypeMaybe ceTy = case ceTy of
   CEFloat -> Just CTDouble
   CEBool -> Just CTBool
   CEPair ct1 ct2 -> Just (CTPair (elemTypeToCType ct1) (elemTypeToCType ct2))
-  CEArray -> Just (CTArray CTDouble)
+  CEArray elt -> Just (CTArray elt)
 
 lowerBinOp :: Operator a -> BinOp
 lowerBinOp (Plus _) = CAdd
@@ -4490,6 +4503,18 @@ inlineArrayFn1D fnExp paramVar resultVar = case fnExp of
             pure $ sf ++ partStmts
           Nothing -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
       _ -> pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
+
+-- | The parameter and body of a one-parameter function, written either as a
+-- lambda (@let f x = body in f@) or as the name of a known function.
+resolveUnaryFn :: Exp Range -> LowerM (Maybe (Range, Var, Exp Range))
+resolveUnaryFn fnExp = case fnExp of
+  ELetIn _ (Dec a f [PVar _ x] _ _ body) (EVar _ f') | f == f' -> pure (Just (a, x, body))
+  EVar a name -> do
+    mFn <- lookupFn name
+    pure $ case mFn of
+      Just ([PVar _ x], body) -> Just (a, x, body)
+      _ -> Nothing
+  _ -> pure Nothing
 
 inlineScalarFn :: Exp Range -> CVar -> CVar -> LowerM [Stmt]
 inlineScalarFn fnExp paramVar resultVar = case fnExp of

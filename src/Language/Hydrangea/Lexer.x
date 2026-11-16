@@ -92,6 +92,7 @@ tokens :-
 <0> scatter  { tok Scatter }
 <0> scatter_guarded { tok ScatterGuarded }
 <0> gather   { tok Gather }
+<0> iterate_until { tok IterateUntil }
 <0> iterate  { tok Iterate }
 <0> stencil  { tok Stencil }
 <0> reify    { tok Reify }
@@ -343,6 +344,7 @@ data Token
   | ScatterGuarded
   | Gather
   | Iterate
+  | IterateUntil
   | Stencil
   | Reify
   | Clamp
