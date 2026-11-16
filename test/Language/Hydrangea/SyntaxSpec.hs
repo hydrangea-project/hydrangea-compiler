@@ -39,6 +39,6 @@ spec = do
     it "extracts the declaration name and optional polytype" $ do
       let poly = Forall ["a"] [] TyInt
           dec :: Dec String
-          dec = Dec "ann" "main" [] Nothing (Just poly) (EInt "ann" 0)
+          dec = Dec "ann" "main" [] Nothing (DecAnn (Just poly) False) (EInt "ann" 0)
       decName dec `shouldBe` "main"
       decPolyTy dec `shouldBe` Just poly

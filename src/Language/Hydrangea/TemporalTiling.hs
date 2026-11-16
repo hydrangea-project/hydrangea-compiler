@@ -425,7 +425,7 @@ buildHaloRewrite a tripCount initArr stepFn split rightLen halo = do
 
 mkLet :: Range -> Var -> Exp Range -> Exp Range -> Exp Range
 mkLet a name rhs body =
-  ELetIn a (Dec a name [] Nothing Nothing rhs) body
+  ELetIn a (Dec a name [] Nothing noDecAnn rhs) body
 
 freshName :: Var -> RewriteM Var
 freshName prefix = do

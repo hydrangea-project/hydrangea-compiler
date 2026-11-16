@@ -555,7 +555,7 @@ substPat _ _ _ = Nothing
 bindArg :: AccumEnv -> Pat a -> Exp a -> Exp a -> Maybe (Exp a)
 bindArg env p arg body
   | dupSafePat env p arg body = substPat p arg body
-  | PVar pa v <- p = Just (ELetIn pa (Dec pa v [] Nothing Nothing arg) body)
+  | PVar pa v <- p = Just (ELetIn pa (Dec pa v [] Nothing noDecAnn arg) body)
   | otherwise = Nothing
 
 -- | True when an expression represents a function value (has remaining
@@ -642,10 +642,10 @@ mkLet _ = do
   pure (fn, x, y)
 
 mkDec1 :: a -> Var -> Var -> Exp a -> Dec a
-mkDec1 a fn x body = Dec a fn [PVar a x] Nothing Nothing body
+mkDec1 a fn x body = Dec a fn [PVar a x] Nothing noDecAnn body
 
 mkDec :: a -> Var -> Var -> Var -> Exp a -> Dec a
-mkDec a fn x y body = Dec a fn [PVar a x, PVar a y] Nothing Nothing body
+mkDec a fn x y body = Dec a fn [PVar a x, PVar a y] Nothing noDecAnn body
 
 -- | Small internal lambda-like kernel language with de Bruijn variables.
 --
@@ -1549,7 +1549,7 @@ fuseOnce expr =
                    Just body' ->
                      let inner = if null remainingPats
                                    then body'
-                                   else ELetIn da (Dec da name remainingPats Nothing Nothing body') (EVar da name)
+                                   else ELetIn da (Dec da name remainingPats Nothing noDecAnn body') (EVar da name)
                      in Just (foldl (EApp a) inner remainingArgs)
                    Nothing -> Nothing
             _ -> Nothing
@@ -2277,18 +2277,18 @@ fuseAppend ann x y =
           accV  <- freshVar "__app_acc"
           valV  <- freshVar "__app_x"
           let comb = ELetIn ann
-                (Dec ann combN [PVar ann accV, PVar ann valV] Nothing Nothing
+                (Dec ann combN [PVar ann accV, PVar ann valV] Nothing noDecAnn
                    (EVar ann valV))
                 (EVar ann combN)
           r1 <- freshVar "__app_r1"
           k1 <- freshVar "__app_k1"
           let route1 = ELetIn ann
-                (Dec ann r1 [PVec ann [PVar ann k1]] Nothing Nothing (EVar ann k1))
+                (Dec ann r1 [PVec ann [PVar ann k1]] Nothing noDecAnn (EVar ann k1))
                 (EVar ann r1)
           r2 <- freshVar "__app_r2"
           k2 <- freshVar "__app_k2"
           let route2 = ELetIn ann
-                (Dec ann r2 [PVec ann [PVar ann k2]] Nothing Nothing
+                (Dec ann r2 [PVec ann [PVar ann k2]] Nothing noDecAnn
                    (EBinOp ann len1 (Plus ann) (EVar ann k2)))
                 (EVar ann r2)
           let outLen = EBinOp ann len1 (Plus ann) len2

@@ -22,11 +22,12 @@ instance Pretty (Dec a) where
 
 -- | Render a declaration body without the leading @let@ keyword.
 prettyDecNoLet :: Dec a -> Doc
-prettyDecNoLet (Dec _ nam pats mwhere mty body) =
-  (text . unpack) nam
+prettyDecNoLet (Dec _ nam pats mwhere ann body) =
+  (if decAnnRegroup ann then text "regroup" else empty)
+    <+> (text . unpack) nam
     <+> sep (map pPrint pats)
     <+> prettyWhere mwhere
-    <+> prettyTy mty
+    <+> prettyTy (decAnnType ann)
     <+> text "="
     <+> pPrint body
 

@@ -4,11 +4,16 @@ module Language.Hydrangea.ParserSpec (spec) where
 
 import Test.Hspec
 import Language.Hydrangea.Lexer (runAlex)
-import Language.Hydrangea.Parser (parseMiniML, parsePolytype)
+import Language.Hydrangea.Parser (parseDecs, parseMiniML, parsePolytype)
 import Language.Hydrangea.Syntax
 
 spec :: Spec
 spec = describe "parser" $ do
+  it "parses a regroup declaration" $ do
+    case runAlex "let regroup f a b = a + b\nlet g a b = a + b" parseDecs of
+      Left err -> expectationFailure ("lexer/parser failed: " ++ err)
+      Right decs -> map decRegroup decs `shouldBe` [True, False]
+
   it "parses generate as a special form" $ do
     let res = runAlex "generate 3 f" parseMiniML
     case res of
@@ -144,7 +149,7 @@ spec = describe "parser" $ do
       Left err -> expectationFailure ("lexer/parser failed: " ++ err)
       Right ast ->
         fmap (const ()) ast `shouldBe`
-          ELetIn () (Dec () "__lambda_1_1" [PVar () "x"] Nothing Nothing (EVar () "x")) (EVar () "__lambda_1_1")
+          ELetIn () (Dec () "__lambda_1_1" [PVar () "x"] Nothing noDecAnn (EVar () "x")) (EVar () "__lambda_1_1")
 
   it "parses parenthesized anonymous functions in higher-order special forms" $ do
     let res = runAlex "map (fn x => x) arr" parseMiniML
@@ -153,7 +158,7 @@ spec = describe "parser" $ do
       Right ast ->
         fmap (const ()) ast `shouldBe`
           EMap ()
-            (ELetIn () (Dec () "__lambda_1_6" [PVar () "x"] Nothing Nothing (EVar () "x")) (EVar () "__lambda_1_6"))
+            (ELetIn () (Dec () "__lambda_1_6" [PVar () "x"] Nothing noDecAnn (EVar () "x")) (EVar () "__lambda_1_6"))
             (EVar () "arr")
 
   it "requires parentheses around anonymous functions in higher-order special forms" $ do

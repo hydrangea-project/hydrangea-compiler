@@ -1280,7 +1280,7 @@ spec = do
         `shouldBe` Right
           ( ELetIn
               ()
-              (Dec () "x" [] Nothing (Just (Forall [] [] TyInt)) (EInt () 10))
+              (Dec () "x" [] Nothing (DecAnn (Just (Forall [] [] TyInt)) False) (EInt () 10))
               (EInt () 1)
           )
       (readExp "let x : forall a . a = f y in x" >>= stripRange)
@@ -1292,7 +1292,7 @@ spec = do
                   "x"
                   []
                   Nothing
-                  (Just (Forall ["a"] [] (TyVar "a")))
+                  (DecAnn (Just (Forall ["a"] [] (TyVar "a"))) False)
                   (EApp () (EVar () "f") (EVar () "y"))
               )
               (EVar () ("x"))
@@ -1306,7 +1306,7 @@ spec = do
                   ("f")
                   [PVar () ("x")]
                   Nothing
-                  (Just (Forall [] [] (TyFun TyInt TyInt)))
+                  (DecAnn (Just (Forall [] [] (TyFun TyInt TyInt))) False)
                   (EBinOp () (EVar () ("x")) (Plus ()) (EInt () 1))
               )
               (EApp () (EVar () ("f")) (EInt () 10))
@@ -1320,7 +1320,7 @@ spec = do
                   ("f")
                   [PVar () ("a"), PVar () ("b")]
                   Nothing
-                  (Just (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt))))
+                  (DecAnn (Just (Forall [] [] (TyFun TyInt (TyFun TyInt TyInt)))) False)
                   (EBinOp () (EVar () ("a")) (Plus ()) (EVar () ("b")))
               )
               (EApp () (EApp () (EVar () ("f")) (EInt () 10)) (EInt () 11))
@@ -1334,13 +1334,13 @@ spec = do
                   "f"
                   [PVec () [PVar () "x", PVar () "y"]]
                   Nothing
-                  ( Just
+                  (DecAnn ( Just
                       ( Forall
                           []
                           []
                           (TyFun (TyCons TyInt (TyCons TyInt TyUnit)) TyInt)
                       )
-                  )
+                  ) False)
                   (EBinOp () (EVar () "x") (Plus ()) (EVar () "y"))
               )
               (EApp () (EVar () "f") (EVec () [EInt () 1, EInt () 2]))

@@ -2113,7 +2113,7 @@ infer (EStencil _ bnd fnExp arrExp) = do
 infer (ELetIn r dec e) = do
   let Dec rr v pats _mwhere mty body = dec
   bodyTy    <- fresh
-  skolemAnn <- mapM (skolemize . toUPolytype) mty
+  skolemAnn <- mapM (skolemize . toUPolytype) (decAnnType mty)
   (patBinds, funTy) <- buildPatFunType rr bodyTy pats skolemAnn
   -- Infer the RHS under the pattern bindings and a monomorphic self-reference,
   -- collecting refinement predicates emitted inside.  After generalization
@@ -2134,6 +2134,7 @@ infer (ELetIn r dec e) = do
   -- For polymorphic bindings (xs non-empty) the existing behaviour is correct:
   -- each instantiation renames the predicate variables to match the fresh type
   -- variable substitution, so re-emission is intentional.
+  checkRegroup rr mty rhsTy
   Forall xs _ ty <- generalize rhsTy
   sch <- case xs of
     [] -> tell rhsPreds >> return (Forall [] [] ty)
@@ -2442,11 +2443,20 @@ resolveRTFromTermMap env (RTSub l r) = TSub <$> resolveRTFromTermMap env l <*> r
 resolveRTFromTermMap env (RTMul n t) = TMul (TConst n) <$> resolveRTFromTermMap env t
 
 -- | Infer and generalize a sequence of declarations from left to right.
+-- | A regroupable function's tree-mode accumulations combine two partial
+-- results, so it must have type @t -> t -> t@.
+checkRegroup :: Range -> DecAnn -> UType -> Infer ()
+checkRegroup r ann ty
+  | decAnnRegroup ann = do
+      t <- fresh
+      void $ wrange r (ty =:= UTyFun t (UTyFun t t))
+  | otherwise = pure ()
+
 inferDecs :: [Dec Range] -> Infer [(Var, UPolytype)]
 inferDecs [] = return []
 inferDecs (Dec r var pats mwhere mty e : rest) = do
   bodyTy    <- fresh
-  skolemAnn <- mapM (skolemize . toUPolytype) mty
+  skolemAnn <- mapM (skolemize . toUPolytype) (decAnnType mty)
   (patBinds, funTy) <- buildPatFunType r bodyTy pats skolemAnn
   (inferredBodyTy, rhsPreds) <- censor (const []) $ listen $
     withBoundsFromPats pats $ bindPats patBinds $ do
@@ -2463,6 +2473,7 @@ inferDecs (Dec r var pats mwhere mty e : rest) = do
   -- For zero-pattern declarations we use inferredBodyTy directly (which still
   -- holds the wrapper); for function declarations funTy already tracks params.
   let rhsTy = if null pats then inferredBodyTy else funTy
+  checkRegroup r mty rhsTy
   boundTy <- generalizeWithPreds rhsPreds =<< applyBindings rhsTy
   -- Record the resolved type of monomorphic value bindings (no parameters)
   -- so the monomorphization pass can recover concrete per-binder types.

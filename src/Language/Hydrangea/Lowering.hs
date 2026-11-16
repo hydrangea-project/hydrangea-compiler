@@ -55,6 +55,9 @@ data LowerState = LowerState
     -- ^ Top-level declaration types from inference (@Var → CType@).
   , lsArrayRankEnv :: Map Var Int
     -- ^ Array rank (number of dimensions) for each top-level declaration.
+  , lsRegroupFns :: Set Var
+    -- ^ Functions declared @let regroup@: their accumulations may be grouped
+    --   in any way.
   , lsBinderTypeEnv :: Map Var CType
     -- ^ Concrete type for every source-level value binder (function/lambda
     --   parameters, pattern bindings, monomorphic let bindings), recovered by
@@ -78,6 +81,13 @@ freshIterVar prefix = do
   registerCType v CTInt64
   pure v
 
+-- | Register a function declaration, noting whether it is declared regroupable.
+registerFnDec :: Dec Range -> LowerM ()
+registerFnDec (Dec _ name pats _ ann body) = do
+  registerFn name pats body
+  when (decAnnRegroup ann) $
+    modify' $ \s -> s { lsRegroupFns = S.insert name (lsRegroupFns s) }
+
 registerFn :: Var -> [Pat Range] -> Exp Range -> LowerM ()
 registerFn name pats body =
   modify' $ \s -> s { lsFnEnv = M.insert name (pats, body) (lsFnEnv s) }
@@ -96,6 +106,7 @@ initState = LowerState
   , lsStencilFacts = M.empty
   , lsTopTypeEnv = M.empty
   , lsArrayRankEnv = M.empty
+  , lsRegroupFns = S.empty
   , lsBinderTypeEnv = M.empty
   }
 
@@ -116,8 +127,8 @@ initStateWithEnvs topEnv rankEnv binderEnv =
 preRegisterTopLevelFns :: [Dec Range] -> LowerM ()
 preRegisterTopLevelFns = mapM_ preRegister
   where
-    preRegister (Dec _ name pats _ _ body)
-      | not (null pats) = registerFn name pats body
+    preRegister dec@(Dec _ _ pats _ _ _)
+      | not (null pats) = registerFnDec dec
       | otherwise       = pure ()
 
 -- | Normalize @let f = (let g x… = body in g)@ — the desugaring of
@@ -255,7 +266,7 @@ collectLetEnv = go M.empty
   where
     go env (ELetIn _ dec body) = go (M.insert (decName dec) dec env) body
     go env (EBoundLetIn a v _ rhs body) =
-      go (M.insert v (Dec a v [] Nothing Nothing rhs) env) body
+      go (M.insert v (Dec a v [] Nothing noDecAnn rhs) env) body
     go env core = (env, core)
 
 -- | Resolve a variable bound in the let environment: a value binding is
@@ -750,7 +761,7 @@ lowerFusedGuardedScatter expr = do
         AVar target -> do
           oldVal <- freshCVar "old"
           newVal <- freshCVar "new"
-          combStmtsTemplate <- inlineBinaryFn combExp "__fuse_val" oldVal newVal
+          combStmtsTemplate <- inlineScatterCombine ad combExp "__fuse_val" oldVal newVal
           i <- freshIterVar "i"
           n <- freshCVar "n"
           fused <- flip runStateT initGuardedScatterFusionState $ do
@@ -999,9 +1010,9 @@ lowerExpDefault expr = case expr of
     when (rTy /= CTUnknown) $ registerCType r rTy
     pure (sc ++ [SIf ac (st ++ [SAssign r (RAtom at')]) (se ++ [SAssign r (RAtom ae)])], AVar r)
 
-  ELetIn _ (Dec _ name pats _ _ body) rest
+  ELetIn _ dec@(Dec _ name pats _ _ body) rest
     | not (null pats) -> do
-        registerFn name pats body
+        registerFnDec dec
         lowerExp rest
     | otherwise -> do
         noteLocalArrayRank name body
@@ -1327,16 +1338,25 @@ lowerExpDefault expr = case expr of
         elem' <- freshCVar "elem"
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
         let mReductionSpec = reductionSpecFor acc ai mRedop
+            loadAt i v = pure [SAssign v (RArrayLoad aa (AVar i))]
+        mBlocked <- case mRedop of
+          Nothing -> lowerBlockReduce1D fnExp ai (AVar redDim) loadAt acc
+          Just _ -> pure Nothing
+        let reduceStmts = case mBlocked of
+              Just blocked -> blocked
+              Nothing ->
+                [ SAssign acc (RAtom ai)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
+                    ( SAssign elem' (RArrayLoad aa (AVar k)) : bodyStmts )
+                ]
         pure ( si ++ sa
              ++ [ SAssign shp (RArrayShape aa)
                 , SAssign outShp (RShapeInit (AVar shp))
                 , SAssign redDim (RShapeLast (AVar shp))
                 , SAssign outArr (RArrayAlloc (AVar outShp))
-                , SAssign acc (RAtom ai)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
-                    ( SAssign elem' (RArrayLoad aa (AVar k)) : bodyStmts )
-                , SArrayWrite (AVar outArr) (AInt 0) (AVar acc)
                 ]
+             ++ reduceStmts
+             ++ [ SArrayWrite (AVar outArr) (AInt 0) (AVar acc) ]
              , AVar outArr
              )
       _ -> do
@@ -1398,17 +1418,23 @@ lowerExpDefault expr = case expr of
         genStmts <- inlineArrayFn1D genExp k elem'
         (bodyStmts, mRedop) <- lowerReductionStep fnExp acc elem'
         let mReductionSpec = reductionSpecFor acc ai mRedop
+        mBlocked <- case mRedop of
+          Nothing -> lowerBlockReduce1D fnExp ai (AVar redDim) (inlineArrayFn1D genExp) acc
+          Just _ -> pure Nothing
+        let reduceStmts = case mBlocked of
+              Just blocked -> blocked
+              Nothing ->
+                [ SAssign acc (RAtom ai)
+                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
+                    (genStmts ++ bodyStmts)
+                ]
         pure ( si ++ ss
              ++ [ SAssign outShp (RShapeInit as')
                 , SAssign redDim (RShapeLast as')
                 , SAssign outArr (RArrayAlloc (AVar outShp))
-                , SAssign acc (RAtom ai)
-                , SLoop (LoopSpec [k] [atomToIndexExpr (AVar redDim)] Serial mReductionSpec LoopReduction [])
-                    ( genStmts
-                      ++ bodyStmts
-                    )
-                , SArrayWrite (AVar outArr) (AInt 0) (AVar acc)
                 ]
+             ++ reduceStmts
+             ++ [ SArrayWrite (AVar outArr) (AInt 0) (AVar acc) ]
              , AVar outArr
              )
       _ -> do
@@ -1469,7 +1495,7 @@ lowerExpDefault expr = case expr of
       -- desugars to) leaves the state unchanged once @stop@ holds, and so
       -- does every later step: the loop can exit there.
       Just (a, x, EIfThenElse _ stopE (EVar _ x') stepE) | x == x' -> do
-        let unary name body = ELetIn a (Dec a name [PVar a x] Nothing Nothing body) (EVar a name)
+        let unary name body = ELetIn a (Dec a name [PVar a x] Nothing noDecAnn body) (EVar a name)
         stopV     <- freshCVar "iter_stop"
         stopFn    <- (\n -> unary n stopE) <$> freshCVar "__iter_stop_fn"
         stepFn    <- (\n -> unary n stepE) <$> freshCVar "__iter_step_fn"
@@ -2206,12 +2232,98 @@ lowerExpDefault expr = case expr of
          , AVar arr
          )
 
-  -- permute c d permFn arr  ≡  scatter c d (generate (shape arr) permFn) arr
-  -- (the same equivalence Fusion relies on; see Fusion.asScatter). Desugar and
-  -- reuse the scatter lowering rather than re-deriving the loop here.
-  EPermute ann combExp defaultsExp permFnExp srcExp ->
-    lowerExp (EScatter ann combExp defaultsExp
-                (EGenerate ann (EShapeOf ann srcExp) permFnExp) srcExp)
+  -- Each source element goes to the destination index that the permutation
+  -- function gives it, combined with the default there.  Targets outside the
+  -- destination are dropped, and when several sources reach one cell any of
+  -- them may win (here the last one in row-major order).
+  EPermute _ combExp defaultsExp permFnExp srcExp -> do
+    (sd, ad) <- lowerExp defaultsExp
+    (ss, as') <- lowerExp srcExp
+    let rankOf e = case e of
+          EFill _ shp _ -> shapeRankM shp
+          _ -> arrayRankM e
+    mRank <- (<|>) <$> rankOf defaultsExp <*> rankOf srcExp
+    shpSrc <- freshCVar "shp"
+    shpDst <- freshCVar "shp"
+    out <- freshCVar "out"
+    nDst <- freshCVar "n"
+    nSrc <- freshCVar "n"
+    j <- freshIterVar "j"
+    i <- freshIterVar "i"
+    elemD <- freshCVar "elem"
+    idx <- freshCVar "idx"
+    permIdx <- freshCVar "pidx"
+    flat <- freshCVar "fp"
+    srcElem <- freshCVar "se"
+    old <- freshCVar "old"
+    new <- freshCVar "new"
+    registerCType idx CTTuple
+    registerCType permIdx CTTuple
+    noteDenseLinearIndex idx i
+    permStmts <- inlineArrayFn permFnExp idx permIdx
+    -- The core has no tree-mode permute: collisions combine in order.
+    case ad of
+      AVar v -> recordArrayFact v $ \fact -> fact { afOrderedAccum = True }
+      _ -> pure ()
+    combStmts <- inlineBinaryFn combExp srcElem old new
+    -- The target is in bounds when every component is, or, when the rank is
+    -- not known statically, when its row-major offset is.
+    (checkStmts, inBounds) <- case mRank of
+      Just rank -> do
+        parts <- forM [0 .. rank - 1] $ \k -> do
+          c <- freshCVar "pc"
+          d <- freshCVar "pd"
+          lo <- freshCVar "plo"
+          hi <- freshCVar "phi"
+          ok <- freshCVar "pok"
+          pure ( [ SAssign c (RProj (fromIntegral k) (AVar permIdx))
+                 , SAssign d (RProj (fromIntegral k) (AVar shpDst))
+                 , SAssign lo (RBinOp CLe (AInt 0) (AVar c))
+                 , SAssign hi (RBinOp CLt (AVar c) (AVar d))
+                 , SAssign ok (RBinOp CAnd (AVar lo) (AVar hi))
+                 ]
+               , ok )
+        acc <- freshCVar "pin"
+        let conj = foldl (\(stmts, a) (_, ok) -> (stmts ++ [SAssign acc (RBinOp CAnd (AVar a) (AVar ok))], acc))
+                         ([SAssign acc (RAtom (ABool True))], acc) parts
+        pure (concatMap fst parts ++ fst conj, AVar acc)
+      Nothing -> do
+        lo <- freshCVar "plo"
+        hi <- freshCVar "phi"
+        ok <- freshCVar "pin"
+        pure ( [ SAssign flat (RNdToFlat (AVar permIdx) (AVar shpDst))
+               , SAssign lo (RBinOp CLe (AInt 0) (AVar flat))
+               , SAssign hi (RBinOp CLt (AVar flat) (AVar nDst))
+               , SAssign ok (RBinOp CAnd (AVar lo) (AVar hi))
+               ]
+             , AVar ok )
+    pure ( sd ++ ss
+         ++ [ SAssign shpDst (RArrayShape ad)
+            , SAssign out (RArrayAlloc (AVar shpDst))
+            , SAssign nDst (RShapeSize (AVar shpDst))
+            , SLoop (LoopSpec [j] [atomToIndexExpr (AVar nDst)] Serial Nothing LoopPlain [])
+                [SAssign elemD (RArrayLoad ad (AVar j)), SArrayWrite (AVar out) (AVar j) (AVar elemD)]
+            , SAssign shpSrc (RArrayShape as')
+            , SAssign nSrc (RShapeSize (AVar shpSrc))
+            , SLoop (LoopSpec [i] [atomToIndexExpr (AVar nSrc)] Serial Nothing LoopPlain [])
+                ( [ SAssign srcElem (RArrayLoad as' (AVar i))
+                  , SAssign idx (RFlatToNd (AVar i) (AVar shpSrc))
+                  ]
+                  ++ permStmts
+                  ++ checkStmts
+                  ++ [ SIf inBounds
+                         ( [ SAssign flat (RNdToFlat (AVar permIdx) (AVar shpDst))
+                           , SAssign old (RArrayLoad ad (AVar flat))
+                           ]
+                           ++ combStmts
+                           ++ [SArrayWrite (AVar out) (AVar flat) (AVar new)]
+                         )
+                         []
+                     ]
+                )
+            ]
+         , AVar out
+         )
 
   EScatter _ combExp defaultsExp idxArrExp valsExp -> do
     (sd, ad) <- lowerScatterTarget lowerExp defaultsExp
@@ -2224,7 +2336,7 @@ lowerExpDefault expr = case expr of
     oldVal <- freshCVar "old"
     newVal <- freshCVar "new"
     idx <- freshCVar "idx"
-    combStmts <- inlineBinaryFn combExp val oldVal newVal
+    combStmts <- inlineScatterCombine ad combExp val oldVal newVal
     (opnds, snapSetup) <- privatizeScatterOperands ad (sd ++ si ++ sv) [ai, av]
     let (aiP, avP) = case opnds of
           [x, y] -> (x, y)
@@ -2254,7 +2366,7 @@ lowerExpDefault expr = case expr of
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
-        combStmts <- inlineBinaryFn combExp val oldVal newVal
+        combStmts <- inlineScatterCombine ad combExp val oldVal newVal
         if shp1D
           then do
             routeStmts <- inlineArrayFn1D routeFn i idx
@@ -2317,7 +2429,7 @@ lowerExpDefault expr = case expr of
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
-        combStmts <- inlineBinaryFn combExp val oldVal newVal
+        combStmts <- inlineScatterCombine ad combExp val oldVal newVal
         (opnds, snapSetup) <- privatizeScatterOperands ad (sd ++ si ++ sv ++ sg) [ai, av, ag]
         let (aiP, avP, agP) = case opnds of
               [x, y, z] -> (x, y, z)
@@ -2351,7 +2463,7 @@ lowerExpDefault expr = case expr of
         oldVal <- freshCVar "old"
         newVal <- freshCVar "new"
         idx <- freshCVar "idx"
-        combStmts <- inlineBinaryFn combExp val oldVal newVal
+        combStmts <- inlineScatterCombine ad combExp val oldVal newVal
         if shp1D
           then do
             routeStmts <- inlineArrayFn1D routeFn i idx
@@ -2407,7 +2519,7 @@ lowerExpDefault expr = case expr of
         (hoistedCalls, kernelStmts0) <- hoistZeroArgValueProcCallsWith sd (routeStmts ++ valStmts)
         (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
         let kernelStmts = concat kernelGroups
-        combStmts <- inlineBinaryFn combExp val oldVal newVal
+        combStmts <- inlineScatterCombine ad combExp val oldVal newVal
         noteReadOnlyAtom asrc
         noteDenseReadAtom asrc
         pure ( sd ++ ssrc
@@ -2440,7 +2552,7 @@ lowerExpDefault expr = case expr of
         (hoistedCalls, kernelStmts0) <- hoistZeroArgValueProcCallsWith sd valStmts
         (kernelGroups, snapSetup) <- privatizeScatterStreams ad (sd ++ hoistedCalls) [kernelStmts0]
         let kernelStmts = concat kernelGroups
-        combStmts <- inlineBinaryFn combExp val oldVal newVal
+        combStmts <- inlineScatterCombine ad combExp val oldVal newVal
         pure ( sd ++ si
              ++ hoistedCalls
              ++ snapSetup
@@ -2468,7 +2580,7 @@ lowerExpDefault expr = case expr of
       oldVal <- freshCVar "old"
       newVal <- freshCVar "new"
       idx <- freshCVar "idx"
-      combStmts <- inlineBinaryFn combExp val oldVal newVal
+      combStmts <- inlineScatterCombine ad combExp val oldVal newVal
       case (idxArrExp, valsExp) of
         -- Fast path: idx and vals are both generates — inline their bodies
         -- directly into the scatter loop, avoiding intermediate array allocation.
@@ -2647,7 +2759,7 @@ lowerExpDefault expr = case expr of
       oldVal <- freshCVar "old"
       newVal <- freshCVar "new"
       idx <- freshCVar "idx"
-      combStmts <- inlineBinaryFn combExp val oldVal newVal
+      combStmts <- inlineScatterCombine ad combExp val oldVal newVal
       -- The guard is part of the stream block that is hoisted and privatized
       -- with the index and value; only its atom gates the accumulation.
       let accumStmts = scatterCombineWrite ad (AVar idx) oldVal newVal combStmts
@@ -4412,6 +4524,7 @@ emptyArrayFact = ArrayFact
   { afFreshAlloc = False
   , afWriteOnce = False
   , afReadOnly = False
+  , afOrderedAccum = False
   }
 
 recordArrayFact :: CVar -> (ArrayFact -> ArrayFact) -> LowerM ()
@@ -5027,85 +5140,139 @@ reductionSpecFor acc ai = fmap (ReductionSpec acc (atomToIndexExpr ai) . seeded)
     seeded RAddNeg0 | AFloat x <- ai, not (isNegativeZero x) = RAdd
     seeded op = op
 
-reductionRedopFromStmts :: [Stmt] -> Maybe Redop
-reductionRedopFromStmts [] = Nothing
-reductionRedopFromStmts (SAssign v (RBinOp bop (AVar v') _) : rest)
-  | v == v' = reductionRedopFromBinOp bop <|> reductionRedopFromStmts rest
-reductionRedopFromStmts (_ : rest) = reductionRedopFromStmts rest
-
--- | Attempt to infer the reduction operator from the output of
--- 'inlineBinaryFn' by following the copy chain that the complex-body path
--- always produces:
---
--- @
---   px  = acc          -- param-rename: copy acc into fresh var px
---   py  = elem'        -- param-rename: copy elem into fresh var py
---   ...                -- body computations using px and py (may copy px to x_1, x_1 to x_2, …)
---   t   = x_n op ...   -- accumulation step: a copy-descendant of acc on left of op
---   acc = t            -- copy result back to accumulator
--- @
---
--- This handles fused functions such as
--- @__fusion_f0(x, y) = (+.) x (g y)@, where the accumulator parameter
--- propagates through a chain of copy bindings before reaching the final
--- binop, and the right-hand side is a non-trivial transform of the element.
-inferReductionRedopFromInlined :: CVar -> [Stmt] -> Maybe Redop
-inferReductionRedopFromInlined acc stmts = do
-  tFinal <- findFinalCopyTarget acc stmts
-  bop    <- findBinOpUsingCopyChain acc tFinal stmts
-  reductionRedopFromBinOp bop
-
--- | Build the transitive closure of variables that are direct or indirect
--- copies (via 'RAtom') of @src@ within @stmts@, in a single forward pass.
--- Only 'RAtom' copies are followed; binop results are not.
-accCopyChain :: CVar -> [Stmt] -> S.Set CVar
-accCopyChain src stmts = foldl step (S.singleton src) stmts
-  where
-    step seen (SAssign dst (RAtom (AVar v)))
-      | S.member v seen = S.insert dst seen
-    step seen _ = seen
-
--- | @findFinalCopyTarget dst stmts@ returns @Just src@ when the last
--- statement is @dst = src@ (an 'RAtom' copy).
-findFinalCopyTarget :: CVar -> [Stmt] -> Maybe CVar
-findFinalCopyTarget dst stmts
-  | not (null stmts)
-  , SAssign dst' (RAtom (AVar src)) <- last stmts
-  , dst == dst' = Just src
-  | otherwise = Nothing
-
--- | @findBinOpUsingCopyChain acc result stmts@ searches @stmts@ for the
--- first statement of the form @result = a op ...@ where @a@ is in the
--- transitive copy chain of @acc@, and returns the 'BinOp'.
-findBinOpUsingCopyChain :: CVar -> CVar -> [Stmt] -> Maybe BinOp
-findBinOpUsingCopyChain acc result stmts = listToMaybe
-  [ bop
-  | SAssign r (RBinOp bop (AVar a) _) <- stmts
-  , r == result
-  , S.member a chain
-  ]
-  where
-    chain = accCopyChain acc stmts
-
+-- | Lower one reduction step.  The step carries a 'Redop' (licensing
+-- privatised and SIMD partial results) only when the combine is a
+-- primitive operator, directly or through a binding @f x y = x op y@
+-- ('combineOperator').  Any other combine is a fold in order, even when its
+-- inlined body ends in @acc + e@ ('lowerBlockReduce1D' handles combines
+-- declared regroupable).
 lowerReductionStep :: Exp Range -> CVar -> CVar -> LowerM ([Stmt], Maybe Redop)
-lowerReductionStep fnExp acc elem' = case fnExp of
-  EOp _ op ->
-    let bop = lowerBinOp op
-    in pure ([SAssign acc (RBinOp bop (AVar acc) (AVar elem'))], reductionRedopFromBinOp bop)
-  EVar _ name -> do
-    mFn <- lookupFn name
-    case mFn of
-      Just ([PVar _ x, PVar _ y], EBinOp _ (EVar _ bx) op' (EVar _ by)) | bx == x, by == y ->
-        let bop = lowerBinOp op'
-        in pure ([SAssign acc (RBinOp bop (AVar acc) (AVar elem'))], reductionRedopFromBinOp bop)
-      _ -> do
-        stmts <- inlineBinaryFn fnExp acc elem' acc
-        pure (stmts, reductionRedopFromStmts stmts
-                       <|> inferReductionRedopFromInlined acc stmts)
-  _ -> do
-    stmts <- inlineBinaryFn fnExp acc elem' acc
-    pure (stmts, reductionRedopFromStmts stmts
-                   <|> inferReductionRedopFromInlined acc stmts)
+lowerReductionStep fnExp acc elem' = do
+  mOp <- combineOperator fnExp
+  case mOp of
+    Just op ->
+      let bop = lowerBinOp op
+      in pure ([SAssign acc (RBinOp bop (AVar acc) (AVar elem'))], reductionRedopFromBinOp bop)
+    Nothing -> do
+      stmts <- inlineBinaryFn fnExp acc elem' acc
+      pure (stmts, Nothing)
+
+-- | Whether a combine is declared regroupable (@let regroup f x y = ...@),
+-- named or written in place.
+combineDeclaredRegroup :: Exp Range -> LowerM Bool
+combineDeclaredRegroup fnExp = case fnExp of
+  EVar _ name -> gets (S.member name . lsRegroupFns)
+  ELetIn _ (Dec _ n _ _ ann _) (EVar _ n') | n == n' -> pure (decAnnRegroup ann)
+  _ -> pure False
+
+-- | A 1-D reduction of @n@ elements whose combine is declared regroupable but
+-- is not a primitive operator, so it has no OpenMP reduction.  Blocks of
+-- 'reduceBlock' elements are folded in parallel, each starting from its own
+-- first element (no identity is needed), and the partial results are then
+-- folded into the initial value in block order.  A regroupable combine may
+-- group its contributions in any way, so this is one of the reduction's
+-- results.  @elemAt i v@ computes element @i@ into @v@.  Leaves the result in
+-- @acc@; 'Nothing' when the combine is not regroupable or the accumulator is
+-- not a scalar.
+lowerBlockReduce1D
+  :: Exp Range -> Atom -> Atom -> (CVar -> CVar -> LowerM [Stmt]) -> CVar
+  -> LowerM (Maybe [Stmt])
+lowerBlockReduce1D fnExp initAtom n elemAt acc = do
+  regroup <- combineDeclaredRegroup fnExp
+  accTy <- ctypeOfAtom initAtom
+  if not regroup || accTy `notElem` [CTInt64, CTDouble, CTBool]
+    then pure Nothing
+    else do
+      let int64Var name = do
+            v <- freshCVar name
+            registerCType v CTInt64
+            pure v
+      nb <- int64Var "red_nb"
+      nbNum <- int64Var "red_nbnum"
+      b <- int64Var "red_b"
+      lo <- int64Var "red_lo"
+      hi0 <- int64Var "red_hi0"
+      hi <- int64Var "red_hi"
+      len <- int64Var "red_len"
+      rest <- int64Var "red_rest"
+      start <- int64Var "red_start"
+      k <- int64Var "red_k"
+      i <- int64Var "red_i"
+      sb <- int64Var "red_sb"
+      nbShp <- freshCVar "red_nbshp"
+      parts <- freshCVar "red_parts"
+      hiLt <- freshCVar "red_hilt"
+      part <- freshCVar "red_part"
+      e0 <- freshCVar "red_e0"
+      e <- freshCVar "red_e"
+      p <- freshCVar "red_p"
+      registerCType nbShp CTTuple
+      registerCType parts (CTArray accTy)
+      registerCType hiLt CTBool
+      mapM_ (`registerCType` accTy) [part, e0, e, p, acc]
+      firstStmts <- elemAt lo e0
+      elemStmts <- elemAt i e
+      foldStmts <- inlineBinaryFn fnExp part e part
+      combineStmts <- inlineBinaryFn fnExp acc p acc
+      let blk = AInt reduceBlock
+          serial bound iter body = SLoop (LoopSpec [iter] [atomToIndexExpr (AVar bound)] Serial Nothing LoopFold []) body
+          par = Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
+      pure $ Just
+        [ SAssign nbNum (RBinOp CAdd n (AInt (reduceBlock - 1)))
+        , SAssign nb (RBinOp CDiv (AVar nbNum) blk)
+        , SAssign nbShp (RTuple [AVar nb])
+        , SAssign parts (RArrayAlloc (AVar nbShp))
+        , SLoop (LoopSpec [b] [IVar nb] par Nothing LoopPlain [])
+            ( [ SAssign lo (RBinOp CMul (AVar b) blk)
+              , SAssign hi0 (RBinOp CAdd (AVar lo) blk)
+              , SAssign hiLt (RBinOp CLt (AVar hi0) n)
+              , SIf (AVar hiLt) [SAssign hi (RAtom (AVar hi0))] [SAssign hi (RAtom n)]
+              , SAssign len (RBinOp CSub (AVar hi) (AVar lo))
+              , SAssign rest (RBinOp CSub (AVar len) (AInt 1))
+              , SAssign start (RBinOp CAdd (AVar lo) (AInt 1))
+              ]
+              ++ firstStmts
+              ++ [ SAssign part (RAtom (AVar e0))
+                 , serial rest k
+                     ( SAssign i (RBinOp CAdd (AVar start) (AVar k))
+                         : elemStmts ++ foldStmts )
+                 , SArrayWrite (AVar parts) (AVar b) (AVar part)
+                 ] )
+        , SAssign acc (RAtom initAtom)
+        , serial nb sb
+            ( SAssign p (RArrayLoad (AVar parts) (AVar sb)) : combineStmts )
+        ]
+
+-- | Elements per block in the parallel lowering of a regroupable reduction.
+reduceBlock :: Integer
+reduceBlock = 4096
+
+-- | The primitive operator a combine denotes: the operator itself, or a
+-- binding @f x y = x op y@ of it (named, or written in place as
+-- @let f x y = x op y in f@).  These accumulations may be regrouped.
+combineOperator :: Exp Range -> LowerM (Maybe (Operator Range))
+combineOperator fnExp = case fnExp of
+  EOp _ op -> pure (Just op)
+  EVar _ name -> maybe Nothing (uncurry operatorBinding) <$> lookupFn name
+  ELetIn _ (Dec _ n ps _ _ b) (EVar _ n') | n == n' -> pure (operatorBinding ps b)
+  _ -> pure Nothing
+  where
+    operatorBinding ps b = case (ps, b) of
+      ([PVar _ x, PVar _ y], EBinOp _ (EVar _ bx) op (EVar _ by)) | bx == x, by == y -> Just op
+      _ -> Nothing
+
+-- | Inline a scatter combine into @target@'s update.  Unless the combine is
+-- a regroupable operator, the target is marked 'afOrderedAccum' so the
+-- parallelizer keeps its updates in order (atomically or by compare and
+-- swap) instead of privatising partial results.
+inlineScatterCombine :: Atom -> Exp Range -> CVar -> CVar -> CVar -> LowerM [Stmt]
+inlineScatterCombine target combExp val oldVal newVal = do
+  mOp <- combineOperator combExp
+  let regroupable = maybe False (\op -> reductionRedopFromBinOp (lowerBinOp op) /= Nothing) mOp
+  case target of
+    AVar v | not regroupable -> recordArrayFact v $ \fact -> fact { afOrderedAccum = True }
+    _ -> pure ()
+  inlineBinaryFn combExp val oldVal newVal
 
 -- | Returns True when the given shape expression is a 1-element vector,
 -- meaning the array is 1-dimensional. Used to skip hyd_flat_to_nd in scatter

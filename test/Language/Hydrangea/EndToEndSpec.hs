@@ -1653,6 +1653,36 @@ spec = do
       lines csrc `shouldSatisfy`
         any (\l -> "omp parallel for" `isInfixOf` l && "reduction(+:" `isInfixOf` l)
 
+  -- A combine declared with @let regroup@ may group its contributions in any
+  -- way, so a reduction with it runs over blocks in parallel even without an
+  -- OpenMP operator.
+  describe "regroup reductions" $ do
+
+    it "runs a reduction with a regroup-declared combine in parallel" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let regroup mx a b = if a < b then b else a"
+        , "let main = reduce_generate mx 0 [4000000] (fn [i] => (i * 7919) % 1000003)" ]
+      csrc <- compileToCOptParallelIO False decs
+      csrc `shouldSatisfy` isInfixOf "omp parallel for"
+
+    it "keeps a reduction with an undeclared combine serial" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let mx a b = if a < b then b else a"
+        , "let main = reduce_generate mx 0 [4000000] (fn [i] => (i * 7919) % 1000003)" ]
+      csrc <- compileToCOptParallelIO False decs
+      csrc `shouldNotSatisfy` isInfixOf "omp parallel for"
+
+    it "computes regroup reductions over empty, short and multi-block inputs" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let regroup mx a b = if a < b then b else a"
+        , "let regroup mnf a b = if a <. b then a else b"
+        , "let e = reduce_generate mx 7 [0] (fn [i] => i)"
+        , "let one = reduce_generate mx 0 [1] (fn [i] => i + 5)"
+        , "let xs = generate [4097] (fn [i] => (i * 37) % 4099)"
+        , "let big = reduce mx 0 xs"
+        , "let f = reduce_generate mnf 1000.0 [10000] (fn [i] => float_of ((i * 31) % 997) *. 0.5)"
+        ]
+
 -- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
 checkWithRcCheck :: BS.ByteString -> IO ()
 checkWithRcCheck src =

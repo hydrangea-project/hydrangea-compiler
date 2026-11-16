@@ -184,9 +184,23 @@ data Name a = Name a ByteString
 unName :: Name a -> Var
 unName (Name _ bs) = bs
 
+-- | Annotations a declaration carries besides its refinement: an optional
+-- type, and whether the function is declared regroupable
+-- (@let regroup f x y = ...@).  An accumulation whose combining function is
+-- regroupable may group its contributions in any way.  The built-in @+@ and
+-- @*@ are regroupable.
+data DecAnn = DecAnn
+  { decAnnType    :: Maybe Polytype
+  , decAnnRegroup :: Bool
+  } deriving (Eq, Show, Ord)
+
+-- | No type annotation, not regroupable.
+noDecAnn :: DecAnn
+noDecAnn = DecAnn Nothing False
+
 -- | Top-level or local value/function declaration.
 data Dec a
-  = Dec a Var [Pat a] (Maybe RefinePred) (Maybe Polytype) (Exp a)
+  = Dec a Var [Pat a] (Maybe RefinePred) DecAnn (Exp a)
   deriving (Functor, Foldable)
 
 deriving instance (Show a) => Show (Dec a)
@@ -201,7 +215,11 @@ decName (Dec _ name _ _ _ _) = name
 
 -- | Extract an optional user-supplied polytype annotation from a declaration.
 decPolyTy :: Dec a -> Maybe Polytype
-decPolyTy (Dec _ _ _ _ polyty _) = polyty
+decPolyTy (Dec _ _ _ _ ann _) = decAnnType ann
+
+-- | Whether a declaration is declared regroupable.
+decRegroup :: Dec a -> Bool
+decRegroup (Dec _ _ _ _ ann _) = decAnnRegroup ann
 
 -- | A single phase of a scatter chain.
 -- Each phase contributes to the same output buffer using the chain's combine function.

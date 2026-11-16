@@ -96,6 +96,7 @@ tokens :-
 <0> iterate  { tok Iterate }
 <0> stencil  { tok Stencil }
 <0> reify    { tok Reify }
+<0> regroup  { tok Regroup }
 <0> clamp    { tok Clamp }
 <0> wrap     { tok Wrap }
 <0> mirror   { tok Mirror }
@@ -347,6 +348,7 @@ data Token
   | IterateUntil
   | Stencil
   | Reify
+  | Regroup
   | Clamp
   | Wrap
   | Mirror

@@ -83,6 +83,7 @@ import Language.Hydrangea.Syntax
   iterate_until { L.RangedToken L.IterateUntil _ }
   stencil    { L.RangedToken L.Stencil _ }
   reify      { L.RangedToken L.Reify _ }
+  regroup    { L.RangedToken L.Regroup _ }
   clamp      { L.RangedToken L.Clamp _ }
   wrap       { L.RangedToken L.Wrap _ }
   mirror     { L.RangedToken L.Mirror _ }
@@ -199,7 +200,9 @@ typeAnnotation :: { Polytype }
 
 dec :: { Dec L.Range }
   : let name many(pat) optional(whereClause) optional(typeAnnotation) '=' exp
-      { Dec (L.rtRange $1 <-> info $7) (unName $2) $3 $4 $5 $7 }
+      { Dec (L.rtRange $1 <-> info $7) (unName $2) $3 $4 (DecAnn $5 False) $7 }
+  | let regroup name many(pat) optional(whereClause) optional(typeAnnotation) '=' exp
+      { Dec (L.rtRange $1 <-> info $8) (unName $3) $4 $5 (DecAnn $6 True) $8 }
 
 -- | A where clause on a declaration: @where refinePred@.
 -- Provides a precondition on the (single pair/record) argument.
@@ -268,7 +271,7 @@ exp :: { Exp L.Range }
   | exp '>=.' exp            { EBinOp (info $1 <-> info $3) $1 (GeF (L.rtRange $2)) $3 }
   -- Lambda: fn pat1 pat2 ... => body  desugars to  let __lambda_L_C pat1 pat2 ... = body in __lambda_L_C
   | fn pat many(pat) '=>' exp
-      { ELetIn (L.rtRange $1 <-> info $5) (Dec (L.rtRange $1 <-> info $5) (mkLambdaName $1) ($2 : $3) Nothing Nothing $5) (EVar (L.rtRange $1 <-> info $5) (mkLambdaName $1)) }
+      { ELetIn (L.rtRange $1 <-> info $5) (Dec (L.rtRange $1 <-> info $5) (mkLambdaName $1) ($2 : $3) Nothing noDecAnn $5) (EVar (L.rtRange $1 <-> info $5) (mkLambdaName $1)) }
   -- Binding
   | dec in exp               { ELetIn (info $1 <-> info $3) $1 $3 }
   -- Bound-annotated binding: let x bound E = rhs in body
@@ -520,7 +523,7 @@ mkIterateUntil r tok n initE stepE stopE =
       fnName = BS.pack ("__until_" ++ suffix)
       st = BS.pack ("__until_state_" ++ suffix)
       body = EIfThenElse r (EApp r stopE (EVar r st)) (EVar r st) (EApp r stepE (EVar r st))
-  in EIterate r n initE (ELetIn r (Dec r fnName [PVar r st] Nothing Nothing body) (EVar r fnName))
+  in EIterate r n initE (ELetIn r (Dec r fnName [PVar r st] Nothing noDecAnn body) (EVar r fnName))
 
 -- | Generate a fresh lambda name from the source position of the 'fn' token.
 -- Uses line and column so every lambda in the source gets a unique name.

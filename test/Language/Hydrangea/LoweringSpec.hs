@@ -437,7 +437,7 @@ spec = do
       prog <- lowerFromSource "let mapped xs = map (let inc x = x + 1 in inc) xs"
       let Program procs = prog
       let proc = head [p | p@Proc { procName = name } <- procs, name == "mapped"]
-      lookupArrayFact "xs" proc `shouldBe` Just (ArrayFact False False True)
+      lookupArrayFact "xs" proc `shouldBe` Just (ArrayFact False False True False)
       case returnedVar proc >>= (`lookupArrayFact` proc) of
         Just fact -> do
           afFreshAlloc fact `shouldBe` True
@@ -448,15 +448,15 @@ spec = do
       prog <- lowerFromSource "let zipped xs ys = zipwith (+) xs ys"
       let Program procs = prog
       let proc = head [p | p@Proc { procName = name } <- procs, name == "zipped"]
-      lookupArrayFact "xs" proc `shouldBe` Just (ArrayFact False False True)
-      lookupArrayFact "ys" proc `shouldBe` Just (ArrayFact False False True)
+      lookupArrayFact "xs" proc `shouldBe` Just (ArrayFact False False True False)
+      lookupArrayFact "ys" proc `shouldBe` Just (ArrayFact False False True False)
 
     it "marks gather index/source inputs read-only and output fresh/write-once" $ do
       prog <- lowerFromSource "let gathered idx src = gather idx src"
       let Program procs = prog
       let proc = head [p | p@Proc { procName = name } <- procs, name == "gathered"]
-      lookupArrayFact "idx" proc `shouldBe` Just (ArrayFact False False True)
-      lookupArrayFact "src" proc `shouldBe` Just (ArrayFact False False True)
+      lookupArrayFact "idx" proc `shouldBe` Just (ArrayFact False False True False)
+      lookupArrayFact "src" proc `shouldBe` Just (ArrayFact False False True False)
       case returnedVar proc >>= (`lookupArrayFact` proc) of
         Just fact -> do
           afFreshAlloc fact `shouldBe` True

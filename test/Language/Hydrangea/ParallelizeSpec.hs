@@ -51,8 +51,8 @@ spec = describe "Parallelize" $ do
           (mkProc "p" ["src"] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("src", ArrayFact False False True)
-                  , ("out", ArrayFact True True False)
+                  [ ("src", ArrayFact False False True False)
+                  , ("out", ArrayFact True True False False)
                   ]
             }
     case parallelizeStmts [loop] of
@@ -73,8 +73,8 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("src", ArrayFact False False True)
-                  , ("out", ArrayFact True True False)
+                  [ ("src", ArrayFact False False True False)
+                  , ("out", ArrayFact True True False False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -98,7 +98,7 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [("out", ArrayFact True True False)]
+                  [("out", ArrayFact True True False False)]
             }
     case procBody (parallelizeProc proc) of
       [SLoop spec' _] -> lsExec spec' `shouldBe` Serial
@@ -133,8 +133,8 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("vals", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("vals", ArrayFact False False True False)
                   ]
             }
     case procBody (parallelizeProc proc) of
@@ -158,9 +158,9 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("routes", ArrayFact False False True)
-                  , ("vals", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("routes", ArrayFact False False True False)
+                  , ("vals", ArrayFact False False True False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -193,9 +193,9 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("routes", ArrayFact False False True)
-                  , ("vals", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("routes", ArrayFact False False True False)
+                  , ("vals", ArrayFact False False True False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -220,9 +220,9 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("routes", ArrayFact False False True)
-                  , ("vals", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("routes", ArrayFact False False True False)
+                  , ("vals", ArrayFact False False True False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -255,10 +255,10 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("routes", ArrayFact False False True)
-                  , ("vals", ArrayFact False False True)
-                  , ("guards", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("routes", ArrayFact False False True False)
+                  , ("vals", ArrayFact False False True False)
+                  , ("guards", ArrayFact False False True False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -287,9 +287,9 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("routes", ArrayFact False False True)
-                  , ("vals", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("routes", ArrayFact False False True False)
+                  , ("vals", ArrayFact False False True False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -318,9 +318,9 @@ spec = describe "Parallelize" $ do
           (mkProc "p" [] [SAssign "shp" (RTuple [AInt 8]), SAssign "out" (RArrayAlloc (AVar "shp")), loop])
             { procArrayFacts =
                 Map.fromList
-                  [ ("out", ArrayFact True True False)
-                  , ("routes", ArrayFact False False True)
-                  , ("vals", ArrayFact False False True)
+                  [ ("out", ArrayFact True True False False)
+                  , ("routes", ArrayFact False False True False)
+                  , ("vals", ArrayFact False False True False)
                   ]
             , procTypeEnv =
                 Map.fromList
@@ -360,7 +360,7 @@ spec = describe "Parallelize" $ do
             ]
         proc =
           (mkProc "p" [] [outer])
-            { procArrayFacts = Map.fromList [("out", ArrayFact True True False)]
+            { procArrayFacts = Map.fromList [("out", ArrayFact True True False False)]
             , procTypeEnv =
                 Map.fromList
                   [ ("out", CTArray CTInt64)

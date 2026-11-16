@@ -329,6 +329,9 @@ data ArrayFact = ArrayFact
   { afFreshAlloc :: Bool  -- ^ Buffer was freshly allocated in this procedure.
   , afWriteOnce  :: Bool  -- ^ Each element is written exactly once by a map-like kernel.
   , afReadOnly   :: Bool  -- ^ Buffer is only read within the relevant kernel context.
+  , afOrderedAccum :: Bool
+    -- ^ Buffer is accumulated by a combine the semantics folds in order, so
+    --   its updates may not be regrouped (no privatised partial results).
   }
   deriving (Eq, Show)
 

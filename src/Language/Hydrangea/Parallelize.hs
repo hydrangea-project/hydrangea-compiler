@@ -498,6 +498,7 @@ factsPermitPrivatizedScatterLoop arrayFacts typeEnv allocSizes spec body =
               , lauReads u
               , lauWrites u
               , afFreshAlloc fact
+              , not (afOrderedAccum fact)
               , afWriteOnce fact
               , profitable dest
               , all (safeNonDest dest) (M.toList usage) -> Just ty

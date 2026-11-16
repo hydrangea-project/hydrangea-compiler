@@ -3438,6 +3438,7 @@ buildBlockedMapReductionScop scheduled = do
             { afFreshAlloc = True
             , afWriteOnce = False
             , afReadOnly = False
+            , afOrderedAccum = False
             }
   pure
     scheduled
