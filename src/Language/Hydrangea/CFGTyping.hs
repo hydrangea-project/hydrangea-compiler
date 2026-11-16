@@ -262,6 +262,12 @@ inferAssignTypes callTypes callParamTypes typeEnv v rhs = case rhs of
     bindVarType v CTTuple typeEnv
   C.RShapeLast _ ->
     bindVarType v CTInt64 typeEnv
+  -- Returns its argument, or a copy of it.
+  C.RCall "hyd_array_own" [a] ->
+    inferAssignTypes callTypes callParamTypes typeEnv v (C.RAtom a)
+  -- A new reference to its argument's storage.
+  C.RCall "hyd_array_retain" [a] ->
+    inferAssignTypes callTypes callParamTypes typeEnv v (C.RAtom a)
   C.RCall fn args ->
     let typeEnv1 = maybe typeEnv (\ct -> bindVarType v ct typeEnv) (inferCallType callTypes fn)
         mParamTypes = M.findWithDefault [] fn callParamTypes

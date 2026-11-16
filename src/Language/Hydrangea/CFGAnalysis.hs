@@ -31,13 +31,18 @@ module Language.Hydrangea.CFGAnalysis
   , usedVarsStmt
   , usedVarsStmts
   , usedVarsIndexExpr
+    -- * Arrays of arrays
+  , hasArrayLeaves
+  , storesArrays
   ) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
-import Language.Hydrangea.CFGCore (Atom(..), RHS(..), rhsAtoms)
+import Language.Hydrangea.CFGCore (Atom(..), CType(..), RHS(..), rhsAtoms)
 import Language.Hydrangea.CFG
 
 -- | Classification of a loop bound extracted from an @IndexExpr@.
@@ -213,6 +218,35 @@ usedVarsStmt stmt = case stmt of
 -- | Variables referenced across a sequence of statements.
 usedVarsStmts :: [Stmt] -> Set ByteString
 usedVarsStmts = S.unions . map usedVarsStmt
+
+-- | Does a value of this type hold any arrays?
+hasArrayLeaves :: CType -> Bool
+hasArrayLeaves ct = case ct of
+  CTArray _ -> True
+  CTPair a b -> hasArrayLeaves a || hasArrayLeaves b
+  CTRecord fs -> any (hasArrayLeaves . snd) fs
+  _ -> False
+
+-- | Do these statements, or any nested in them, store an array into an
+-- element of another array?  Each such store hands the outer array a
+-- reference that the ownership pass has to count, so loops that make one
+-- stay serial and scalar.
+storesArrays :: Map ByteString CType -> [Stmt] -> Bool
+storesArrays types = any go
+  where
+    holdsArrays a = case a of
+      AVar v -> maybe False hasArrayLeaves (M.lookup v types)
+      _ -> False
+    go stmt = case stmt of
+      SArrayWrite (AVar arr) _ val ->
+        holdsArrays val || case M.lookup arr types of
+          Just (CTArray t) -> hasArrayLeaves t
+          _ -> False
+      SArrayWrite {} -> False
+      SLoop _ body -> any go body
+      SParallelRegion body -> any go body
+      SIf _ thn els -> any go thn || any go els
+      _ -> False
 
 -- | Analyse a single @SLoop@ statement and return a @LoopInfo@ summary.
 -- Returns @Nothing@ for non-loop statements.

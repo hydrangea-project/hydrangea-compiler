@@ -85,7 +85,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsIndexExpr, usedVarsStmt, usedVarsStmts)
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), Redop(..))
-import Language.Hydrangea.CFGOpt (substStmts)
+import Language.Hydrangea.CFGOpt (splitBufferSwap, substStmts)
 import Language.Hydrangea.Util (unsnoc, freshUnusedName)
 
 type StmtId = [Int]
@@ -105,7 +105,6 @@ wavefrontKernelToPlan kernel =
     , wfpNextArray = wfkNextArray kernel
     , wfpAllocShape = wfkAllocShape kernel
     , wfpPreallocatedNext = wfkPreallocatedNext kernel
-    , wfpInitTracker = wfkInitTracker kernel
     , wfpHoistedPrefix = wfkHoistedPrefix kernel
     , wfpStageSuffix = wfkStageSuffix kernel
     , wfpInnerSpec = wfkInnerSpec kernel
@@ -137,7 +136,6 @@ diamondPlanFromKernel scheduled kernel = do
       , dpNextArray = wfkNextArray kernel
       , dpAllocShape = wfkAllocShape kernel
       , dpPreallocatedNext = wfkPreallocatedNext kernel
-      , dpInitTracker = wfkInitTracker kernel
       , dpTimeTileDepth = wfkStageWidth kernel
       , dpFrontierExec = wfkStageExec kernel
       }
@@ -369,7 +367,6 @@ data WavefrontPlan = WavefrontPlan
   , wfpNextArray :: CVar
   , wfpAllocShape :: Atom
   , wfpPreallocatedNext :: Bool
-  , wfpInitTracker :: Maybe CVar
   , wfpHoistedPrefix :: [Stmt]
   , wfpStageSuffix :: [Stmt]
   , wfpInnerSpec :: LoopSpec
@@ -403,7 +400,6 @@ data DiamondPlan = DiamondPlan
   , dpNextArray :: CVar
   , dpAllocShape :: Atom
   , dpPreallocatedNext :: Bool
-  , dpInitTracker :: Maybe CVar
   , dpTimeTileDepth :: Integer
   , dpFrontierExec :: ExecPolicy
   }
@@ -437,7 +433,6 @@ data WavefrontKernel = WavefrontKernel
   , wfkNextArray :: CVar
   , wfkAllocShape :: Atom
   , wfkPreallocatedNext :: Bool
-  , wfkInitTracker :: Maybe CVar
   , wfkHoistedPrefix :: [Stmt]
   , wfkStageSuffix :: [Stmt]
   , wfkInnerSpec :: LoopSpec
@@ -1302,7 +1297,7 @@ outerIterateInfo sched = case sched of
 
 -- | Detect temporal alias at the end of a @LoopIterate@ body.
 -- Supports both the simple tail swap @cur = next@ and the hoisted ping-pong
--- suffix @cur = next; next = tmp; tmp = cur@.
+-- suffix @tmp = cur; cur = next; next = tmp@.
 detectTemporalAlias :: [Stmt] -> Maybe (CVar, CVar)
 detectTemporalAlias = listToMaybe . detectTemporalAliases
 
@@ -1312,15 +1307,9 @@ detectTemporalAlias = listToMaybe . detectTemporalAliases
 -- target is actually read earlier in the body qualify — a trailing copy of a
 -- variable the loop never reads is not loop-carried state.
 detectTemporalAliases :: [Stmt] -> [(CVar, CVar)]
-detectTemporalAliases stmts = case reverse stmts of
-  ( SAssign _tmpOut (RAtom (AVar cur2))
-    : SAssign next1 (RAtom (AVar _tmpIn))
-    : SAssign cur1 (RAtom (AVar next))
-    : _
-    )
-      | cur1 == cur2, next1 == next ->
-          [(cur1, next1)]
-  rev ->
+detectTemporalAliases stmts = case (splitBufferSwap stmts, reverse stmts) of
+  (Just (_, cur, next), _) -> [(cur, next)]
+  (Nothing, rev) ->
     let swaps = trailingCopies rev
         prefix = take (length stmts - length swaps) stmts
     in [ (cur, next) | (cur, next) <- reverse swaps, usesVar cur prefix ]
@@ -2835,10 +2824,6 @@ matchWavefrontKernel scheduled = do
        , wfkNextArray = nextVar
        , wfkAllocShape = allocShape
        , wfkPreallocatedNext = preallocatedNext
-       , wfkInitTracker =
-           if preallocatedNext
-             then Just (curVar <> "__iter_init_track")
-             else Nothing
        , wfkHoistedPrefix = prefixWithoutAlloc
        , wfkStageSuffix = stageSuffix
        , wfkInnerSpec = innerSpec
@@ -3060,10 +3045,6 @@ buildWavefrontBody kernel = do
           (wfkInnerSpec kernel)
           (substStmts substEnv (wfkInnerBody kernel))
       suffixBody = substStmts substEnv (wfkStageSuffix kernel)
-      cleanupTargets =
-        if wfkPreallocatedNext kernel
-          then extraBuffers
-          else drop 1 stageBuffers
   guardedInner0 <- buildWavefrontInnerGuard kernel absDiag stageTimeVar innerBody
   let guardedInner =
         SAssign absDiag (RBinOp CAdd (AVar diagIter) (AVar diagBase)) : guardedInner0
@@ -3105,8 +3086,14 @@ buildWavefrontBody kernel = do
               ++ [stageLoop]
               ++ rotations
           )
-  cleanup <- fmap concat (mapM (buildWavefrontCleanup kernel) cleanupTargets)
-  pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
+  -- The ring writes into every buffer, including the one the initial state
+  -- came in, so that one must not be shared.  (A preallocated ping-pong
+  -- already took ownership of it before its loop.)  The reference-count
+  -- pass releases the ring buffers that are dead after the loop.
+  let own
+        | wfkPreallocatedNext kernel = []
+        | otherwise = [SAssign (wfkCurArray kernel) (RCall "hyd_array_own" [AVar (wfkCurArray kernel)])]
+  pure (wfkHoistedPrefix kernel ++ allocs ++ own ++ [blockLoop])
 
 buildSingleAxisDiamondBody :: Integer -> WavefrontKernel -> TileM [Stmt]
 buildSingleAxisDiamondBody _radiusCoeff kernel = do
@@ -3150,10 +3137,6 @@ buildSingleAxisDiamondBody _radiusCoeff kernel = do
           (wfkInnerSpec kernel)
           (substStmts substEnv (wfkInnerBody kernel))
       suffixBody = substStmts substEnv (wfkStageSuffix kernel)
-      cleanupTargets =
-        if wfkPreallocatedNext kernel
-          then extraBuffers
-          else drop 1 stageBuffers
       frontierLoop =
         SLoop
           LoopSpec
@@ -3195,38 +3178,20 @@ buildSingleAxisDiamondBody _radiusCoeff kernel = do
               ++ [stageLoop]
               ++ rotations
           )
-  cleanup <- fmap concat (mapM (buildWavefrontCleanup kernel) cleanupTargets)
-  pure (wfkHoistedPrefix kernel ++ allocs ++ [blockLoop] ++ cleanup)
-
-buildWavefrontCleanup :: WavefrontKernel -> CVar -> TileM [Stmt]
-buildWavefrontCleanup kernel arr = do
-  notCurVar <- freshLike arr "__wf_free_not_cur"
-  case wfkInitTracker kernel of
-    Nothing ->
-      pure
-        [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
-        , SIf (AVar notCurVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
-        ]
-    Just initTrackerVar -> do
-      notInitVar <- freshLike arr "__wf_free_not_init"
-      freeVar <- freshLike arr "__wf_free"
-      pure
-        [ SAssign notCurVar (RBinOp CNeq (AVar arr) (AVar (wfkCurArray kernel)))
-        , SAssign notInitVar (RBinOp CNeq (AVar arr) (AVar initTrackerVar))
-        , SAssign freeVar (RBinOp CAnd (AVar notCurVar) (AVar notInitVar))
-        , SIf (AVar freeVar) [SAssign "__hyd_discard" (RArrayFree (AVar arr))] []
-        ]
+  -- The ring writes into every buffer, including the one the initial state
+  -- came in, so that one must not be shared.  (A preallocated ping-pong
+  -- already took ownership of it before its loop.)  The reference-count
+  -- pass releases the ring buffers that are dead after the loop.
+  let own
+        | wfkPreallocatedNext kernel = []
+        | otherwise = [SAssign (wfkCurArray kernel) (RCall "hyd_array_own" [AVar (wfkCurArray kernel)])]
+  pure (wfkHoistedPrefix kernel ++ allocs ++ own ++ [blockLoop])
 
 matchWavefrontTail :: [Stmt] -> Maybe ([Stmt], CVar, CVar, Bool)
-matchWavefrontTail suffix = case reverse suffix of
-  ( SAssign _tmpOut (RAtom (AVar cur2))
-    : SAssign next1 (RAtom (AVar _tmpIn))
-    : SAssign cur1 (RAtom (AVar next))
-    : restRev
-    )
-      | cur1 == cur2, next1 == next ->
-          Just (reverse restRev, cur1, next1, True)
-  (SAssign cur (RAtom (AVar next)) : restRev) ->
+matchWavefrontTail suffix = case (splitBufferSwap suffix, reverse suffix) of
+  (Just (rest, cur, next), _) ->
+    Just (rest, cur, next, True)
+  (Nothing, SAssign cur (RAtom (AVar next)) : restRev) ->
     Just (reverse restRev, cur, next, False)
   _ ->
     Nothing
@@ -3251,23 +3216,25 @@ buildWavefrontStageSelection kernel stageIter stageBuffers stageTimeVars = do
   curStageBuf <- freshLike (wfkCurArray kernel) "__wf_stage_cur"
   nextStageBuf <- freshLike (wfkNextArray kernel) "__wf_stage_next"
   stageTimeVar <- freshLike (wfkIterT kernel) "__wf_stage_time"
-  let buildOne (slotIx, curBuf, timeVar) =
-        case atMay stageBuffers (fromIntegral slotIx + 1) of
-          Nothing ->
-            pure []
-          Just nextBuf -> do
-            eqVar <- freshLike stageIter ("__eq_" <> BS.pack (show slotIx))
-            pure
-              [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
-              , SIf
-                  (AVar eqVar)
-                  [ SAssign curStageBuf (RAtom (AVar curBuf))
-                  , SAssign nextStageBuf (RAtom (AVar nextBuf))
-                  , SAssign stageTimeVar (RAtom (AVar timeVar))
-                  ]
-                  []
-              ]
-  selection <- fmap concat (mapM buildOne (zip3 [0 :: Integer ..] stageBuffers stageTimeVars))
+  -- One slot per stage, chosen by an if/else chain whose last slot is the
+  -- final else, so every path assigns the stage buffers: the reference-count
+  -- pass needs their old values dead before the selection.
+  let slots = zip3 [0 :: Integer ..] (zip stageBuffers (drop 1 stageBuffers)) stageTimeVars
+      assignSlot (curBuf, nextBuf) timeVar =
+        [ SAssign curStageBuf (RAtom (AVar curBuf))
+        , SAssign nextStageBuf (RAtom (AVar nextBuf))
+        , SAssign stageTimeVar (RAtom (AVar timeVar))
+        ]
+      chain [] = pure []
+      chain [(_, bufs, timeVar)] = pure (assignSlot bufs timeVar)
+      chain ((slotIx, bufs, timeVar) : rest) = do
+        eqVar <- freshLike stageIter ("__eq_" <> BS.pack (show slotIx))
+        restStmts <- chain rest
+        pure
+          [ SAssign eqVar (RBinOp CEq (AVar stageIter) (AInt slotIx))
+          , SIf (AVar eqVar) (assignSlot bufs timeVar) restStmts
+          ]
+  selection <- chain slots
   pure (selection, curStageBuf, nextStageBuf, stageTimeVar)
 
 buildWavefrontInnerGuard :: WavefrontKernel -> CVar -> CVar -> [Stmt] -> TileM [Stmt]
@@ -3304,16 +3271,18 @@ buildWavefrontRotation ringVars blockLenVar = do
         | (tmp, ring) <- zip tempVars ringVars
         ]
       ringCount = length ringVars
-      oneRotation shift eqVar =
-        [ SAssign eqVar (RBinOp CEq (AVar blockLenVar) (AInt (fromIntegral shift)))
-        , SIf
-            (AVar eqVar)
-            [ SAssign ring (RAtom (AVar (tempVars !! ((ix + shift) `mod` ringCount))))
-            | (ix, ring) <- zip [0 :: Int ..] ringVars
-            ]
-            []
+      rotateBy shift =
+        [ SAssign ring (RAtom (AVar (tempVars !! ((ix + shift) `mod` ringCount))))
+        | (ix, ring) <- zip [0 :: Int ..] ringVars
         ]
-  pure (saved ++ concat (zipWith oneRotation [1 .. ringCount - 1] eqVars))
+      -- An if/else chain ending in the identity rotation, so that every path
+      -- reassigns every ring buffer and each saved buffer moves exactly once.
+      chain [] = rotateBy 0
+      chain ((shift, eqVar) : rest) =
+        [ SAssign eqVar (RBinOp CEq (AVar blockLenVar) (AInt (fromIntegral shift)))
+        , SIf (AVar eqVar) (rotateBy shift) (chain rest)
+        ]
+  pure (saved ++ chain (zip [1 .. ringCount - 1] eqVars))
 
 wavefrontFrontierOuterExec :: WavefrontKernel -> ExecPolicy
 wavefrontFrontierOuterExec kernel =

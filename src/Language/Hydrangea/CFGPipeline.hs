@@ -26,8 +26,10 @@ module Language.Hydrangea.CFGPipeline
   , metalPipelineWithTiling
   ) where
 
-
+import Data.ByteString.Lazy.Char8 qualified as BS
+import Data.Map.Strict qualified as M
 import Language.Hydrangea.CFG
+import Language.Hydrangea.CFGCore (Atom (..), CType (..), RHS (..))
 import Language.Hydrangea.CFGOpt
 import Language.Hydrangea.Parallelize
 import Language.Hydrangea.Polyhedral
@@ -161,14 +163,13 @@ preparePolyhedralProgramWithOptions :: PipelineOptions -> Program -> Program
 preparePolyhedralProgramWithOptions _opts (Program procs) =
   Program [proc { procBody = prepare proc } | proc <- procs]
   where
-    -- Loop scratch buffers are hoisted (or freed each trip) here because
-    -- hoisting needs the procedure's array facts.
+    -- Loop scratch buffers are hoisted here because it needs the procedure's
+    -- array facts.
     prepare proc =
       normalizeIterateBodies
         (optimizeStmts
-          (freeLoopArrayTemps
-            (hoistLoopArrayTemps (procArrayFacts proc)
-              (optimizePipelineWithTiling False (procBody proc)))))
+          (hoistLoopArrayTemps (procArrayFacts proc)
+            (optimizePipelineWithTiling False (procBody proc))))
 
 -- | Run optimization followed by vectorization using explicit pipeline options.
 vectorizePipelineWithOptions :: PipelineOptions -> Program -> Program
@@ -231,5 +232,73 @@ metalPipeline = metalPipelineWithTiling True
 
 -- | Optimize and parallelize without SIMD vectorization with optional tiling.
 metalPipelineWithTiling :: Bool -> Program -> Program
-metalPipelineWithTiling enableTiling =
-  parallelizeProgram . mapProcBodies (optimizePipelineWithTiling enableTiling)
+metalPipelineWithTiling enableTiling (Program procs) =
+  let optimized =
+        [ proc' { procBody = optimizePipelineWithTiling enableTiling (procBody proc') }
+        | proc <- procs
+        , let proc' = copyScatterTargets proc ]
+  in  parallelizeProgram (Program optimized)
+
+-- | Replace each scatter target @dst = hyd_array_own(t)@ with an explicit
+-- copy of @t@.
+--
+-- The Metal backend manages its buffers itself and has no reference counts,
+-- so a scatter there always writes into a fresh copy of its defaults.  An
+-- iterate's @cur = hyd_array_own(cur)@ is left alone.  A stream snapshot of
+-- @dst@ (see 'Language.Hydrangea.Lowering.privatizeScatterStreams') is taken
+-- from @t@ instead: the two hold the same contents there, and the Metal host
+-- harness expects the snapshot to read an array defined outside it.
+copyScatterTargets :: Proc -> Proc
+copyScatterTargets proc =
+  proc { procBody = go (procBody proc), procTypeEnv = M.union newTypes (procTypeEnv proc) }
+  where
+    sources = M.fromList [(dst, t) | (dst, t) <- ownPairs (procBody proc)]
+    ownPairs = concatMap $ \stmt -> case stmt of
+      SAssign dst (RCall "hyd_array_own" [AVar t]) | dst /= t -> [(dst, t)]
+      SLoop _ b -> ownPairs b
+      SParallelRegion b -> ownPairs b
+      SIf _ thn els -> ownPairs thn ++ ownPairs els
+      _ -> []
+    fromSource a = case a of
+      AVar v | Just t <- M.lookup v sources -> AVar t
+      _ -> a
+    snapshotFromSource stmt = case stmt of
+      SAssign v (RArrayShape a) -> SAssign v (RArrayShape (fromSource a))
+      SLoop spec@LoopSpec {lsRole = LoopCopy} b ->
+        SLoop spec [ case st of
+                       SAssign e (RArrayLoad a k) -> SAssign e (RArrayLoad (fromSource a) k)
+                       _ -> st
+                   | st <- b ]
+      _ -> stmt
+    types = procTypeEnv proc
+    elemTyOf dst = case M.lookup dst types of
+      Just (CTArray et) -> et
+      _ -> CTInt64
+    names dst = (dst <> BS.pack "_shp", dst <> BS.pack "_n", dst <> BS.pack "_k", dst <> BS.pack "_e")
+    owns = collect (procBody proc)
+    collect = concatMap $ \stmt -> case stmt of
+      SAssign dst (RCall "hyd_array_own" [AVar t]) | dst /= t -> [dst]
+      SLoop _ b -> collect b
+      SParallelRegion b -> collect b
+      SIf _ thn els -> collect thn ++ collect els
+      _ -> []
+    newTypes = M.fromList $ concat
+      [ [(shp, CTTuple), (n, CTInt64), (k, CTInt64), (e, elemTyOf dst)]
+      | dst <- owns, let (shp, n, k, e) = names dst ]
+    go = concatMap $ \stmt -> case stmt of
+      SAssign dst (RCall "hyd_array_own" [src@(AVar t)]) | dst /= t ->
+        let (shp, n, k, e) = names dst
+        in [ SAssign shp (RArrayShape src)
+           , SAssign dst (RArrayAlloc (AVar shp))
+           , SAssign n (RShapeSize (AVar shp))
+           , SLoop (LoopSpec [k] [IVar n] Serial Nothing LoopCopy [])
+               [ SAssign e (RArrayLoad src (AVar k))
+               , SArrayWrite (AVar dst) (AVar k) (AVar e)
+               ]
+           ]
+      SLoop LoopSpec {lsRole = LoopCopy} _ -> [snapshotFromSource stmt]
+      SLoop spec b -> [SLoop spec (go b)]
+      SParallelRegion b -> [SParallelRegion (go b)]
+      SIf c thn els -> [SIf c (go thn) (go els)]
+      SAssign _ (RArrayShape _) -> [snapshotFromSource stmt]
+      _ -> [stmt]

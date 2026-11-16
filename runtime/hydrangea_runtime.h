@@ -225,14 +225,183 @@ typedef struct {
 typedef struct {
     unsigned char* data;
     HYD_ATOMIC_INT64 refcount;
+    /* The elements are arrays (hyd_array_t*, NULL when unset), each holding
+     * a reference of its own, released with the storage. */
+    int nested;
+#ifdef HYD_RC_CHECK
+    size_t bytes;
+    int rooted;
+#endif
 } hyd_array_storage_t;
 
-typedef struct {
+typedef struct hyd_array_s {
     hyd_array_storage_t* storage;
     unsigned char* data;
     size_t elem_size;
     hyd_tuple_t shape;
+#ifdef HYD_RC_CHECK
+    uint64_t rc_magic;
+    int rc_root;
+    struct hyd_array_s* rc_prev;
+    struct hyd_array_s* rc_next;
+#endif
 } hyd_array_t;
+
+/* Reference-count checker, enabled by compiling with -DHYD_RC_CHECK (the
+ * compiler's --cflags=-DHYD_RC_CHECK).  It tracks every live array header
+ * and storage, and at exit reports:
+ *   - headers and storages still live that no root holds (leaks).  Roots are
+ *     the memoised caches and the printed result of main, which generated
+ *     code marks with HYD_RC_ROOT, and the arrays held by the elements of a
+ *     reachable array of arrays;
+ *   - reference-count operations (alloc, view, free) made inside an OpenMP
+ *     parallel region.
+ * A freed header is poisoned (data and storage set to NULL) and never
+ * returned to malloc, so freeing it again aborts and reading through it
+ * faults. */
+#ifdef HYD_RC_CHECK
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define HYD_RC_LIVE 0x4859444c49564521ULL
+#define HYD_RC_DEAD 0x48594444454144ULL
+
+static int hyd_rc_lock_flag = 0;
+
+static void hyd_rc_lock(void) {
+    while (__atomic_exchange_n(&hyd_rc_lock_flag, 1, __ATOMIC_ACQUIRE)) {
+    }
+}
+
+static void hyd_rc_unlock(void) {
+    __atomic_store_n(&hyd_rc_lock_flag, 0, __ATOMIC_RELEASE);
+}
+static hyd_array_t* hyd_rc_headers = NULL;
+static int64_t hyd_rc_header_allocs = 0;
+static int64_t hyd_rc_header_frees = 0;
+static int64_t hyd_rc_storage_allocs = 0;
+static int64_t hyd_rc_storage_frees = 0;
+static int64_t hyd_rc_parallel_ops = 0;
+
+static int64_t hyd_shape_size(hyd_tuple_t shape);
+
+static void hyd_rc_report(void) {
+    int64_t live = 0, leaked = 0, rooted_storages = 0, leaked_storages = 0;
+    size_t leaked_bytes = 0;
+    for (hyd_array_t* h = hyd_rc_headers; h != NULL; h = h->rc_next) h->storage->rooted = 0;
+    for (hyd_array_t* h = hyd_rc_headers; h != NULL; h = h->rc_next) {
+        if (h->rc_root && !h->storage->rooted) {
+            h->storage->rooted = 1;
+            rooted_storages++;
+        }
+    }
+    /* The arrays a rooted array of arrays holds are reachable too. */
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (hyd_array_t* h = hyd_rc_headers; h != NULL; h = h->rc_next) {
+            if (h->storage->rooted != 1 || !h->storage->nested) continue;
+            hyd_array_t** elems = (hyd_array_t**)(void*)h->data;
+            int64_t n = hyd_shape_size(h->shape);
+            for (int64_t i = 0; i < n; i++) {
+                hyd_array_t* e = elems[i];
+                if (e == NULL || e->rc_root) continue;
+                e->rc_root = 1;
+                changed = 1;
+                if (!e->storage->rooted) {
+                    e->storage->rooted = 1;
+                    rooted_storages++;
+                }
+            }
+        }
+    }
+    for (hyd_array_t* h = hyd_rc_headers; h != NULL; h = h->rc_next) {
+        live++;
+        if (!h->rc_root) leaked++;
+        if (!h->storage->rooted) {
+            h->storage->rooted = 2; /* count each leaked storage once */
+            leaked_storages++;
+            leaked_bytes += h->storage->bytes;
+        }
+    }
+    int64_t live_storages = hyd_rc_storage_allocs - hyd_rc_storage_frees;
+    fprintf(stderr,
+            "hyd-rc-check: headers alloc=%lld free=%lld live=%lld leaked=%lld; "
+            "storages alloc=%lld free=%lld live=%lld leaked=%lld (%zu bytes); "
+            "parallel-ops=%lld\n",
+            (long long)hyd_rc_header_allocs, (long long)hyd_rc_header_frees,
+            (long long)live, (long long)leaked,
+            (long long)hyd_rc_storage_allocs, (long long)hyd_rc_storage_frees,
+            (long long)live_storages, (long long)leaked_storages, leaked_bytes,
+            (long long)hyd_rc_parallel_ops);
+    if (live_storages != rooted_storages + leaked_storages) {
+        fprintf(stderr, "hyd-rc-check: %lld live storage(s) have no live header\n",
+                (long long)(live_storages - rooted_storages - leaked_storages));
+    }
+}
+
+#ifndef HYD_RC_NO_REPORT
+__attribute__((constructor)) static void hyd_rc_register(void) {
+    atexit(hyd_rc_report);
+}
+#endif
+
+static void hyd_rc_fail(const char* what, hyd_array_t* arr) {
+    fprintf(stderr, "hyd-rc-check: %s (header %p)\n", what, (void*)arr);
+    abort();
+}
+
+static void hyd_rc_note_op(void) {
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+        __atomic_fetch_add(&hyd_rc_parallel_ops, 1, __ATOMIC_RELAXED);
+    }
+#endif
+}
+
+static void hyd_rc_check_live(hyd_array_t* arr, const char* what) {
+    if (arr->rc_magic == HYD_RC_DEAD) hyd_rc_fail(what, arr);
+    if (arr->rc_magic != HYD_RC_LIVE) hyd_rc_fail("not an array header", arr);
+}
+
+static void hyd_rc_track(hyd_array_t* arr, int new_storage) {
+    hyd_rc_note_op();
+    hyd_rc_lock();
+    arr->rc_magic = HYD_RC_LIVE;
+    arr->rc_root = 0;
+    arr->rc_prev = NULL;
+    arr->rc_next = hyd_rc_headers;
+    if (hyd_rc_headers != NULL) hyd_rc_headers->rc_prev = arr;
+    hyd_rc_headers = arr;
+    hyd_rc_header_allocs++;
+    if (new_storage) hyd_rc_storage_allocs++;
+    hyd_rc_unlock();
+}
+
+static void hyd_rc_untrack(hyd_array_t* arr, int storage_freed) {
+    hyd_rc_note_op();
+    hyd_rc_lock();
+    hyd_rc_check_live(arr, "header freed twice");
+    if (arr->rc_prev != NULL) arr->rc_prev->rc_next = arr->rc_next;
+    else hyd_rc_headers = arr->rc_next;
+    if (arr->rc_next != NULL) arr->rc_next->rc_prev = arr->rc_prev;
+    hyd_rc_header_frees++;
+    if (storage_freed) hyd_rc_storage_frees++;
+    arr->rc_magic = HYD_RC_DEAD;
+    arr->storage = NULL;
+    arr->data = NULL;
+    hyd_rc_unlock();
+}
+
+static void hyd_rc_root(hyd_array_t* arr) {
+    if (arr == NULL) return;
+    hyd_rc_check_live(arr, "rooting a freed header");
+    arr->rc_root = 1;
+}
+#define HYD_RC_ROOT(arr) hyd_rc_root(arr)
+#else
+#define HYD_RC_ROOT(arr) ((void)0)
+#endif
 
 static hyd_tuple_t hyd_tuple_make(int n, ...) {
     hyd_tuple_t t;
@@ -298,25 +467,51 @@ static hyd_array_t* hyd_array_make_header(hyd_array_storage_t* storage, hyd_tupl
     return arr;
 }
 
+/* Allocate an array with uninitialised contents, for a caller that
+ * overwrites every element before anything reads it. */
+static hyd_array_t* hyd_array_alloc_bytes_uninit(hyd_tuple_t shape, size_t elem_size) {
+    int64_t size = hyd_shape_size(shape);
+    hyd_array_storage_t* storage = (hyd_array_storage_t*)malloc(sizeof(hyd_array_storage_t));
+    storage->data = (unsigned char*)malloc((size_t)size * elem_size);
+    storage->refcount = 1;
+    storage->nested = 0;
+    hyd_array_t* arr = hyd_array_make_header(storage, shape, elem_size);
+#ifdef HYD_RC_CHECK
+    storage->bytes = (size_t)size * elem_size;
+    hyd_rc_track(arr, 1);
+#endif
+    return arr;
+}
+
 static hyd_array_t* hyd_array_alloc_bytes(hyd_tuple_t shape, size_t elem_size) {
     int64_t size = hyd_shape_size(shape);
     hyd_array_storage_t* storage = (hyd_array_storage_t*)malloc(sizeof(hyd_array_storage_t));
     storage->data = (unsigned char*)calloc((size_t)size, elem_size);
     storage->refcount = 1;
-    return hyd_array_make_header(storage, shape, elem_size);
-}
-
-static hyd_array_t* hyd_array_alloc_copy(const hyd_array_t* src) {
-    hyd_array_t* dst = hyd_array_alloc_bytes(src->shape, src->elem_size);
-    memcpy(dst->data, src->data, (size_t)hyd_shape_size(src->shape) * src->elem_size);
-    return dst;
+    storage->nested = 0;
+    hyd_array_t* arr = hyd_array_make_header(storage, shape, elem_size);
+#ifdef HYD_RC_CHECK
+    storage->bytes = (size_t)size * elem_size;
+    hyd_rc_track(arr, 1);
+#endif
+    return arr;
 }
 
 static hyd_array_t* hyd_array_alloc(hyd_tuple_t shape) {
     return hyd_array_alloc_bytes(shape, sizeof(int64_t));
 }
 
+/* An array of arrays, every element unset (NULL). */
+static hyd_array_t* hyd_array_alloc_nested(hyd_tuple_t shape) {
+    hyd_array_t* arr = hyd_array_alloc_bytes(shape, sizeof(hyd_array_t*));
+    arr->storage->nested = 1;
+    return arr;
+}
+
 static hyd_array_t* hyd_array_reshape_view(hyd_array_t* arr, hyd_tuple_t shape) {
+#ifdef HYD_RC_CHECK
+    hyd_rc_check_live(arr, "view of a freed header");
+#endif
     int64_t srcSize = hyd_shape_size(arr->shape);
     int64_t dstSize = hyd_shape_size(shape);
     if (srcSize != dstSize) {
@@ -327,19 +522,84 @@ static hyd_array_t* hyd_array_reshape_view(hyd_array_t* arr, hyd_tuple_t shape) 
         exit(1);
     }
     arr->storage->refcount += 1;
-    return hyd_array_make_header(arr->storage, shape, arr->elem_size);
+    hyd_array_t* view = hyd_array_make_header(arr->storage, shape, arr->elem_size);
+#ifdef HYD_RC_CHECK
+    hyd_rc_track(view, 0);
+#endif
+    return view;
+}
+
+/* A new reference to arr's storage, with a header of its own: every
+ * reference owns a header, and hyd_array_free drops one. */
+static hyd_array_t* hyd_array_retain(hyd_array_t* arr) {
+    return hyd_array_reshape_view(arr, arr->shape);
+}
+
+/* A new array holding a copy of src's elements.  The elements of an array of
+ * arrays are retained: each copy is a reference of its own. */
+static hyd_array_t* hyd_array_alloc_copy(const hyd_array_t* src) {
+    hyd_array_t* dst = hyd_array_alloc_bytes_uninit(src->shape, src->elem_size);
+    memcpy(dst->data, src->data, (size_t)hyd_shape_size(src->shape) * src->elem_size);
+    if (src->storage->nested) {
+        dst->storage->nested = 1;
+        hyd_array_t** elems = (hyd_array_t**)(void*)dst->data;
+        int64_t n = hyd_shape_size(dst->shape);
+        for (int64_t i = 0; i < n; i++) {
+            if (elems[i] != NULL) elems[i] = hyd_array_retain(elems[i]);
+        }
+    }
+    return dst;
 }
 
 static void hyd_array_free(hyd_array_t* arr) {
     if (arr == NULL) {
         return;
     }
+#ifdef HYD_RC_CHECK
+    hyd_rc_check_live(arr, "header freed twice");
+#endif
     arr->storage->refcount -= 1;
-    if (arr->storage->refcount == 0) {
+    int storage_freed = arr->storage->refcount == 0;
+    if (storage_freed) {
+        if (arr->storage->nested) {
+            hyd_array_t** elems = (hyd_array_t**)(void*)arr->storage->data;
+            int64_t n = hyd_shape_size(arr->shape);
+            for (int64_t i = 0; i < n; i++) hyd_array_free(elems[i]);
+        }
         free(arr->storage->data);
         free(arr->storage);
     }
+#ifdef HYD_RC_CHECK
+    hyd_rc_untrack(arr, storage_freed);
+#else
+    (void)storage_freed;
     free(arr);
+#endif
+}
+
+/* Take ownership of arr's contents: arr itself when no other reference
+ * shares its storage, otherwise a private copy (and arr's reference is
+ * dropped).  Consumes arr.  Used before a loop writes into a buffer that
+ * came from elsewhere, such as an iterate's initial state. */
+static hyd_array_t* hyd_array_own(hyd_array_t* arr) {
+#ifdef HYD_RC_CHECK
+    hyd_rc_check_live(arr, "own of a freed header");
+#endif
+    if (arr->storage->refcount == 1) {
+        return arr;
+    }
+    hyd_array_t* copy = hyd_array_alloc_copy(arr);
+    hyd_array_free(arr);
+    return copy;
+}
+
+/* Store v, a reference the element takes over, into element idx of an
+ * array of arrays, releasing the array the element held before. */
+static void hyd_array_set_array(hyd_array_t* arr, int64_t idx, hyd_array_t* v) {
+    hyd_array_t** elems = (hyd_array_t**)(void*)arr->data;
+    hyd_array_t* old = elems[idx];
+    elems[idx] = v;
+    hyd_array_free(old);
 }
 
 static int64_t hyd_array_length(hyd_array_t* arr) {
@@ -475,6 +735,16 @@ static void hyd_print_double(double v) {
     printf("\n");
 }
 
+static void hyd_print_shape_suffix(hyd_array_t* arr) {
+    printf(" (shape: [");
+    for (int i = 0; i < arr->shape.ndims; i++) {
+        if (i > 0) printf(", ");
+        printf("%lld", (long long)arr->shape.elems[i]);
+    }
+    printf("])");
+}
+
+/* Print an array without the trailing newline, e.g. inside a pair. */
 static void hyd_print_array_inline(hyd_array_t* arr) {
     int64_t size = hyd_shape_size(arr->shape);
     int64_t* data = (int64_t*)(void*)arr->data;
@@ -483,12 +753,8 @@ static void hyd_print_array_inline(hyd_array_t* arr) {
         if (i > 0) printf(", ");
         printf("%lld", (long long)data[i]);
     }
-    printf("] (shape: [");
-    for (int i = 0; i < arr->shape.ndims; i++) {
-        if (i > 0) printf(", ");
-        printf("%lld", (long long)arr->shape.elems[i]);
-    }
-    printf("])");
+    printf("]");
+    hyd_print_shape_suffix(arr);
 }
 
 static void hyd_print_array(hyd_array_t* arr) {
@@ -524,27 +790,14 @@ static void hyd_print_float_array_inline(hyd_array_t* arr) {
         memcpy(&v, arr->data + ((size_t)i * arr->elem_size), sizeof(double));
         printf("%.17g", v);
     }
-    printf("] (shape: [");
-    for (int i = 0; i < arr->shape.ndims; i++) {
-        if (i > 0) printf(", ");
-        printf("%lld", (long long)arr->shape.elems[i]);
-    }
-    printf("])");
+    printf("]");
+    hyd_print_shape_suffix(arr);
 }
 
 static void hyd_print_float_array(hyd_array_t* arr) {
     hyd_print_float_array_inline(arr);
     printf("\n");
 }
-
-/* Generic pair printing using _Generic (C11). */
-#define _hyd_print_val(x) _Generic((x), \
-    double: printf("%.17g", (double)(x)), \
-    float:  printf("%.17g", (double)(x)), \
-    default: printf("%lld", (long long)(x)))
-#define hyd_print_pair(a, b) do { \
-    printf("("); _hyd_print_val(a); printf(", "); _hyd_print_val(b); printf(")\n"); \
-} while(0)
 
 static hyd_array_t* hyd_read_float_array_csv(const char* filename, hyd_tuple_t shape) {
     hyd_array_t* arr = hyd_array_alloc(shape);

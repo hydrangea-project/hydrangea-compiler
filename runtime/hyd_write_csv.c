@@ -1,6 +1,9 @@
 // Small runtime helpers for writing arrays to CSV used by lowering.
 #include <stdio.h>
 #include <stdlib.h>
+/* The generated program's own copy of the runtime reports; this one would
+   only report its empty counters. */
+#define HYD_RC_NO_REPORT
 #include "hydrangea_runtime.h"
 
 static void hyd_write_row_int(FILE* f, hyd_array_t* arr, int64_t start, int64_t count) {

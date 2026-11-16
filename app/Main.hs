@@ -121,6 +121,7 @@ usage = unwords
   , "[--keep-c]"
   , "[--compile-only]"
   , "[--cc=<compiler>]"
+  , "[--cflags=<flags>]"
   , "[--benchmark=<name>]"
   , "[--bench-warmup=<n>]"
   , "[--bench-iters=<n>]"
@@ -192,6 +193,7 @@ main = do
   (input, mpath) <- readInput paths
 
   let ccFlag = flagValue "--cc=" flags
+      cFlags = maybe [] words (flagValue "--cflags=" flags)
       exportCodegenOptions =
         (case exportKernelFlag of
           Nothing -> defaultCodegenOptions { codegenBenchmark = benchmarkConfig }
@@ -418,7 +420,7 @@ main = do
               Just _ -> do
                 artifacts <- generatedArtifactsOrDie decs
                 pure (codegenSource artifacts)
-            ec <- compileAndRunC ccFlag csrc keepC compileOnly parallel
+            ec <- compileAndRunC ccFlag cFlags csrc keepC compileOnly parallel
             case ec of
               ExitSuccess -> pure ()
               ExitFailure _ -> exitWith ec

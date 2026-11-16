@@ -4,6 +4,8 @@ module Language.Hydrangea.CFGOptSpec (spec) where
 
 import Test.Hspec
 import Test.QuickCheck
+import Data.Maybe (isJust)
+import qualified Data.Map.Strict as M
 
 import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG
@@ -297,26 +299,70 @@ spec = do
       -- Should converge to minimal form (1-2 statements)
       length result `shouldSatisfy` (<= 2)
 
+    it "double-buffers an iterate that allocates its next state, owning the initial state first" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
+          body =
+            [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
+            , SAssign "arr_next" (RArrayAlloc (AVar "shp"))
+            , SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+            , SAssign "arr_cur" (RAtom (AVar "arr_next"))
+            ]
+      hoistIterateAllocs [SLoop loopSpec body]
+        `shouldBe` [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
+                   , SAssign "arr_next" (RArrayCopy (AVar "arr_cur"))
+                   , SAssign "arr_cur" (RCall "hyd_array_own" [AVar "arr_cur"])
+                   , SLoop loopSpec
+                       ( SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+                           : bufferSwap "arr_cur" "arr_next" "arr_next__iter_tmp"
+                       )
+                   ]
+
     it "preserves hoisted iterate ping-pong swaps under optimization" $ do
       let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
           stmts =
             [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
             , SAssign "arr_next" (RArrayAlloc (AVar "shp"))
-            , SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_cur"))
+            , SAssign "arr_cur" (RCall "hyd_array_own" [AVar "arr_cur"])
             , SLoop loopSpec
-                [ SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
-                , SAssign "arr_cur" (RAtom (AVar "arr_next"))
-                , SAssign "arr_next" (RAtom (AVar "arr_next__iter_tmp"))
-                , SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_cur"))
-                ]
+                ( SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+                    : bufferSwap "arr_cur" "arr_next" "arr_next__iter_tmp"
+                )
+            , SReturn (AVar "arr_cur")
             ]
           result = optimizeStmts stmts
+          swapKept stmt = case stmt of
+            SLoop _ body -> isJust (splitBufferSwap body)
+            _ -> False
           hasBadSelfAssign stmt = case stmt of
             SAssign "arr_next__iter_tmp" (RAtom (AVar "arr_next__iter_tmp")) -> True
             SLoop _ body -> any hasBadSelfAssign body
             SIf _ thn els -> any hasBadSelfAssign thn || any hasBadSelfAssign els
             _ -> False
       any hasBadSelfAssign result `shouldBe` False
+      any swapKept result `shouldBe` True
+
+    it "hoists an iterate scratch buffer shaped like one it has just hoisted" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
+          fill arr = SLoop (LoopSpec ["i"] [IVar "n"] Serial Nothing LoopMap [])
+                       [SArrayWrite (AVar arr) (AVar "i") (AVar "i")]
+          fresh = ArrayFact {afFreshAlloc = True, afWriteOnce = True, afReadOnly = False}
+          facts = M.fromList [("a", fresh), ("b", fresh)]
+          body =
+            [ SAssign "a" (RArrayAlloc (AVar "shp"))
+            , fill "a"
+            , SAssign "shp_b" (RArrayShape (AVar "a"))
+            , SAssign "b" (RArrayAlloc (AVar "shp_b"))
+            , fill "b"
+            , SAssign "x" (RArrayLoad (AVar "b") (AInt 0))
+            ]
+      -- a is filled in the loop, but its shape never changes, so b (shaped
+      -- like a) is as loop-invariant as a.
+      hoistLoopArrayTemps facts [SLoop loopSpec body]
+        `shouldBe` [ SAssign "a" (RArrayAlloc (AVar "shp"))
+                   , SAssign "shp_b" (RArrayShape (AVar "a"))
+                   , SAssign "b" (RArrayAlloc (AVar "shp_b"))
+                   , SLoop loopSpec [fill "a", fill "b", SAssign "x" (RArrayLoad (AVar "b") (AInt 0))]
+                   ]
 
     it "eliminates duplicate pure math unary ops" $ do
       let stmts = [ SAssign "x" (RUnOp CSqrt (AVar "t"))

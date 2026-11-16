@@ -45,6 +45,7 @@ library
                    , Language.Hydrangea.Tile
                    , Language.Hydrangea.Polyhedral
                    , Language.Hydrangea.Vectorize
+                   , Language.Hydrangea.Ownership
                    , Language.Hydrangea.Parallelize
                    , Language.Hydrangea.CFGPipeline
                    , Language.Hydrangea.CodegenC
@@ -97,6 +98,7 @@ test-suite hydrangea-test
        , Language.Hydrangea.CLISpec
        , Language.Hydrangea.LexerSpec
        , Language.Hydrangea.LoweringSpec
+       , Language.Hydrangea.OwnershipSpec
        , Language.Hydrangea.ReduceLoweringSpec
        , Language.Hydrangea.ParserSpec
        , Language.Hydrangea.InterpreterSpec

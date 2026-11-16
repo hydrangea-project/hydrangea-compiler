@@ -34,7 +34,8 @@ module Language.Hydrangea.CFGOpt
   , hoistIterateAllocs
   , hoistLoopArrayTemps
   , scalarizeIteratePairs
-  , freeLoopArrayTemps
+  , bufferSwap
+  , splitBufferSwap
     -- * Atom/statement substitution utilities
   , substAtom
   , substRHS
@@ -648,36 +649,8 @@ unswitchLoopInvariantIf = concatMap goStmt
                 Nothing
 
 ------------------------------------------------------------------------
--- No-op cleanup
+-- Iterate pair-state scalarization
 ------------------------------------------------------------------------
-
-
-------------------------------------------------------------------------
--- Iterate-loop allocation hoisting
-------------------------------------------------------------------------
-
--- | Hoist @RArrayAlloc@ out of @LoopIterate@ bodies, replacing the
--- allocate-each-iteration pattern with a pre-allocated ping-pong between
--- two buffers.  The pattern detected is:
---
--- > for iter_t:
--- >   arr_next = alloc(shp)
--- >   shp = shape(arr_cur)
--- >   ...compute...
--- >   arr_cur = arr_next
---
--- which is rewritten to:
---
--- > shp = shape(arr_cur)
--- > arr_next = alloc(shp)
--- > tmp = arr_cur
--- > for iter_t:
--- >   ...compute...
--- >   arr_cur = arr_next
--- >   arr_next = tmp
--- >   tmp = arr_cur
---
--- This avoids re-allocating every temporal iteration.
 
 -- | Split a @LoopIterate@ whose loop-carried state is a (possibly nested)
 -- pair into one carried variable per component, so downstream passes (and in
@@ -794,6 +767,38 @@ scalarizeIteratePairs = go
         , post
         )
 
+------------------------------------------------------------------------
+-- Iterate-loop allocation hoisting
+------------------------------------------------------------------------
+
+-- | Hoist @RArrayAlloc@ out of @LoopIterate@ bodies, replacing the
+-- allocate-each-iteration pattern with a pre-allocated ping-pong between
+-- two buffers.  The pattern detected is:
+--
+-- > for iter_t:
+-- >   arr_next = alloc(shp)
+-- >   shp = shape(arr_cur)
+-- >   ...compute...
+-- >   arr_cur = arr_next
+--
+-- which is rewritten to:
+--
+-- > shp = shape(arr_cur)
+-- > arr_next = alloc(shp)
+-- > arr_cur = hyd_array_own(arr_cur)
+-- > for iter_t:
+-- >   ...compute...
+-- >   tmp = arr_cur
+-- >   arr_cur = arr_next
+-- >   arr_next = tmp
+--
+-- This avoids re-allocating every temporal iteration.  From the second trip
+-- on, the loop writes into the buffer the initial state came in, so that
+-- buffer must not be shared: @hyd_array_own@ copies it first if another
+-- reference to its storage exists (a memoised top-level array, or an
+-- initial state still used after the loop).  The swap only moves
+-- references, and the reference-count pass ('Language.Hydrangea.Ownership')
+-- releases whichever buffers are dead after the loop.
 hoistIterateAllocs :: [Stmt] -> [Stmt]
 hoistIterateAllocs = go
   where
@@ -810,13 +815,10 @@ hoistIterateAllocs = go
     go (s : rest) = s : go rest
 
 -- | Given a @LoopIterate@ body, try to hoist the initial @alloc+shape@
--- out and replace the epilogue swap with a ping-pong three-way swap over
--- two private copies of the init buffer. The init buffer itself is never
--- written or freed — it may be shared (cached proc results, other
--- consumers). Post-loop, the private buffer(s) the result did not land in
--- are freed. Returns the full replacement statement list.
+-- out and replace the epilogue @cur = next@ with a buffer swap.  Returns the
+-- full replacement statement list.
 --
--- The expected body ends with a swap:
+-- The expected body ends with:
 --
 -- > ...compute...
 -- > SAssign cur (RAtom (AVar next))
@@ -851,44 +853,10 @@ restructureIterateBody spec body = do
   let mkResult skip hoistedExtra =
         let computeBody = [s | (i, s) <- zip [0..] prefix, i `S.notMember` skip]
             tmpVar = nextVar <> "__iter_tmp"
-            initTrackerVar = curVar <> "__iter_init_track"
-            nextNotCurVar = nextVar <> "__iter_cleanup_not_cur"
-            nextNotInitVar = nextVar <> "__iter_cleanup_not_init"
-            nextFreeVar = nextVar <> "__iter_cleanup_cond"
-            tmpNotCurVar = tmpVar <> "__iter_cleanup_not_cur"
-            tmpNotInitVar = tmpVar <> "__iter_cleanup_not_init"
-            tmpFreeVar = tmpVar <> "__iter_cleanup_cond"
-            -- The tmp buffer is a private copy, NOT an alias of the init
-            -- buffer: the init array may be shared (cached proc result, other
-            -- consumers), so the ping-pong must never write into or free it.
-            initSave = SAssign tmpVar (RArrayCopy (AVar curVar))
-            -- Track the init pointer so downstream cleanup (here and in the
-            -- wavefront transform, which rotates the init pointer through the
-            -- ring variables) can avoid freeing it: the proc-level cleanup
-            -- frees it when it owns it.
-            initTracker = SAssign initTrackerVar (RAtom (AVar curVar))
-            pingSwap =
-              [ SAssign curVar (RAtom (AVar nextVar))
-              , SAssign nextVar (RAtom (AVar tmpVar))
-              , SAssign tmpVar (RAtom (AVar curVar))
-              ]
-            -- Free whichever private buffers the result did not land in.
-            -- The init buffer is never freed here: ownership is unknown, so
-            -- it leaks (once per call site) when it was a genuinely fresh
-            -- temp. ponytail: leak; free-if-afFreshAlloc if it ever matters.
-            condFree =
-              [ SAssign nextNotCurVar (RBinOp CNeq (AVar nextVar) (AVar curVar))
-              , SAssign nextNotInitVar (RBinOp CNeq (AVar nextVar) (AVar initTrackerVar))
-              , SAssign nextFreeVar (RBinOp CAnd (AVar nextNotCurVar) (AVar nextNotInitVar))
-              , SIf (AVar nextFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar nextVar))] []
-              , SAssign tmpNotCurVar (RBinOp CNeq (AVar tmpVar) (AVar curVar))
-              , SAssign tmpNotInitVar (RBinOp CNeq (AVar tmpVar) (AVar initTrackerVar))
-              , SAssign tmpFreeVar (RBinOp CAnd (AVar tmpNotCurVar) (AVar tmpNotInitVar))
-              , SIf (AVar tmpFreeVar) [SAssign "__hyd_discard" (RArrayFree (AVar tmpVar))] []
-              ]
-            newBody = computeBody ++ pingSwap
+            own = SAssign curVar (RCall "hyd_array_own" [AVar curVar])
+            newBody = computeBody ++ bufferSwap curVar nextVar tmpVar
             newLoop = SLoop spec newBody
-        in Just (hoistedExtra ++ [initSave, initTracker, newLoop] ++ condFree)
+        in Just (hoistedExtra ++ [own, newLoop])
 
   -- Need at least one of shape or alloc to match the swap variables
   case (listToMaybe shapeCandidates, listToMaybe allocCandidates) of
@@ -907,6 +875,27 @@ restructureIterateBody spec body = do
           mkResult (S.singleton allocIdx) [SAssign nextVar (RArrayCopy (AVar curVar))]
 
     _ -> Nothing
+
+-- | The swap that ends a double-buffered iterate body:
+-- @tmp = cur; cur = next; next = tmp@.
+bufferSwap :: CVar -> CVar -> CVar -> [Stmt]
+bufferSwap cur next tmp =
+  [ SAssign tmp (RAtom (AVar cur))
+  , SAssign cur (RAtom (AVar next))
+  , SAssign next (RAtom (AVar tmp))
+  ]
+
+-- | Split a double-buffered iterate body into the part before its trailing
+-- 'bufferSwap' and the swapped @(cur, next)@.
+splitBufferSwap :: [Stmt] -> Maybe ([Stmt], CVar, CVar)
+splitBufferSwap body = case splitAt (length body - 3) body of
+  ( prefix
+    , [ SAssign t (RAtom (AVar c))
+      , SAssign c' (RAtom (AVar n))
+      , SAssign n' (RAtom (AVar t'))
+      ] )
+    | c == c', n == n', t == t', "__iter_tmp" `BS.isSuffixOf` t -> Just (prefix, c, n)
+  _ -> Nothing
 
 ------------------------------------------------------------------------
 -- Loop-invariant array temporary hoisting
@@ -955,12 +944,17 @@ hoistLoopArrayTemps facts = go
   where
     go [] = []
     go (SLoop spec body : rest) =
-      let body' = go body
-          (hoisted, kept) = hoistScratchAllocs spec body'
+      let (hoisted, kept) = hoistAll spec (go body)
       in hoisted ++ (SLoop spec kept : go rest)
     go (SParallelRegion body : rest) = SParallelRegion (go body) : go rest
     go (SIf c thn els : rest) = SIf c (go thn) (go els) : go rest
     go (s : rest) = s : go rest
+
+    -- Hoisting one buffer can make another's shape loop-invariant (a scratch
+    -- array shaped like a hoisted one), so repeat until nothing moves.
+    hoistAll spec body = case hoistScratchAllocs spec body of
+      ([], kept) -> ([], kept)
+      (hoisted, kept) -> let (more, kept') = hoistAll spec kept in (hoisted ++ more, kept')
 
     hoistScratchAllocs :: LoopSpec -> [Stmt] -> ([Stmt], [Stmt])
     hoistScratchAllocs spec body =
@@ -969,9 +963,17 @@ hoistLoopArrayTemps facts = go
           partition (hoistableAlloc spec body) body
         pairs ->
           let hoistedIdxs = S.fromList (concatMap (\(si, ai) -> [si, ai]) pairs)
-              hoisted = concatMap (\(si, ai) -> [body !! si, body !! ai]) pairs
+              hoisted = concatMap (\(si, ai) -> [stateShape (body !! si), body !! ai]) pairs
               kept = [stmt | (ix, stmt) <- zip [0 ..] body, ix `S.notMember` hoistedIdxs]
           in (hoisted, kept)
+      where
+        -- A shape read through @own(state)@ is the state's shape, and is
+        -- read from the state itself once hoisted above the @own@.
+        stateShape stmt = case stmt of
+          SAssign shp (RArrayShape (AVar src))
+            | src `S.member` ownedStateIn body ->
+                SAssign shp (RArrayShape (AVar (iterateStateVar body)))
+          _ -> stmt
 
     hoistableShapeAllocs :: LoopSpec -> [Stmt] -> [(Int, Int)]
     hoistableShapeAllocs spec body
@@ -980,19 +982,38 @@ hoistLoopArrayTemps facts = go
           [ (shapeIx, allocIx)
           | (allocIx, SAssign arr (RArrayAlloc (AVar shp))) <- zip [0 ..] body
           , Just shapeIx <- [lookupShapeDef shp]
-          , iterateShapeSource (body !! shapeIx)
+          , invariantShapeSource (body !! shapeIx)
           , hoistableAllocFromIterateShape body shapeIx arr
           ]
       where
+        -- The shape variable's only definition in the body.
         lookupShapeDef shp =
-          fst <$> listToMaybe
-            [ (ix, ())
-            | (ix, SAssign shp' (RArrayShape _)) <- zip [0 ..] body
-            , shp' == shp
-            ]
-        iterateShapeSource stmt = case stmt of
-          SAssign _ (RArrayShape (AVar src)) -> src == iterateStateVar body
+          case [ix | (ix, SAssign shp' _) <- zip [0 ..] body, shp' == shp] of
+            [ix] | SAssign _ (RArrayShape _) <- body !! ix -> Just ix
+            _ -> Nothing
+        state = iterateStateVar body
+        -- Variables the loop assigns.  Writing an array's elements doesn't
+        -- change its shape, so element writes don't count.
+        loopAssigned = assigned body
+        assigned = foldMap $ \st -> case st of
+          SAssign v _ -> S.singleton v
+          SLoop _ b -> assigned b
+          SParallelRegion b -> assigned b
+          SIf _ thn els -> assigned thn <> assigned els
+          _ -> S.empty
+        -- The shape of the iterate state (which keeps its shape from trip to
+        -- trip), of the state through @own@, or of an array the loop never
+        -- assigns.
+        invariantShapeSource stmt = case stmt of
+          SAssign _ (RArrayShape (AVar src)) ->
+            src == state || src `S.member` ownedStateIn body || src `S.notMember` loopAssigned
           _ -> False
+
+    -- @own@ returns its argument or a copy of it, so its result has the
+    -- iterate state's shape.
+    ownedStateIn :: [Stmt] -> Set CVar
+    ownedStateIn body =
+      S.fromList [v | SAssign v (RCall "hyd_array_own" [AVar src]) <- body, src == iterateStateVar body]
 
     hoistableAllocFromIterateShape :: [Stmt] -> Int -> CVar -> Bool
     hoistableAllocFromIterateShape body shapeIx v =
@@ -1006,8 +1027,9 @@ hoistLoopArrayTemps facts = go
           False
 
     iterateStateVar :: [Stmt] -> CVar
-    iterateStateVar stmts = case reverse stmts of
-      (SAssign cur (RAtom (AVar _)) : _) -> cur
+    iterateStateVar stmts = case (splitBufferSwap stmts, reverse stmts) of
+      (Just (_, cur, _), _) -> cur
+      (_, SAssign cur (RAtom (AVar _)) : _) -> cur
       _ -> BS.pack "__no_iter_state"
 
     -- Only @LoopIterate@ loops qualify.  Sharing one buffer across iterations
@@ -1027,41 +1049,6 @@ hoistLoopArrayTemps facts = go
                  && not (arrayPointerEscapes v body)
              Nothing -> False
       _ -> False
-
--- | Free a loop-local array temporary at the end of each iteration.
---
--- The companion to 'hoistLoopArrayTemps', for buffers that pass its escape
--- test but not its loop-invariant-shape test, such as a privatization
--- snapshot shaped by the array it copies.  Those cannot share one allocation
--- across trips, and the procedure-exit cleanup only frees the last one.
--- Applied after hoisting, so hoistable buffers are already gone from the body.
-freeLoopArrayTemps :: [Stmt] -> [Stmt]
-freeLoopArrayTemps = go
-  where
-    go [] = []
-    go (SLoop spec body : rest) =
-      let body' = go body
-          rest' = go rest
-          liveLater = usedVarsStmts rest'
-          freeable =
-            [ v
-            | SAssign v (RArrayAlloc _) <- body'
-            , not (arrayPointerEscapes v body')
-            , not (S.member v liveLater)
-            ]
-          frees = [SAssign "__hyd_discard" (RArrayFree (AVar v)) | v <- freeable]
-          -- A break would jump past the frees; leave those bodies alone.
-          body'' = if bodyHasBreak body' then body' else body' ++ frees
-      in SLoop spec body'' : rest'
-    go (SParallelRegion body : rest) = SParallelRegion (go body) : go rest
-    go (SIf c thn els : rest) = SIf c (go thn) (go els) : go rest
-    go (s : rest) = s : go rest
-
-    bodyHasBreak = any hasBreak
-    hasBreak SBreak = True
-    hasBreak (SIf _ t e) = any hasBreak t || any hasBreak e
-    hasBreak (SParallelRegion b) = any hasBreak b
-    hasBreak _ = False
 
 ------------------------------------------------------------------------
 -- Common subexpression elimination (CSE)

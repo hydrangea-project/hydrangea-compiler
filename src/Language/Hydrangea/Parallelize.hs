@@ -29,10 +29,9 @@ module Language.Hydrangea.Parallelize
   , parallelizeStmts
   ) where
 
-import Data.ByteString.Lazy.Char8 qualified as BS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), RHS(..), rhsAtoms)
@@ -40,12 +39,14 @@ import Language.Hydrangea.CFG
 import Language.Hydrangea.CFGTyping (recoverProcTypeEnv)
 import Language.Hydrangea.CFGAnalysis
   ( definedVarsStmts
+  , storesArrays
   , isParallelTripCount
   , loopTripCount
   , tripCountValue
   , usedVarsAtom
   , usedVarsStmts
   )
+import Language.Hydrangea.CFGOpt (splitBufferSwap)
 import Language.Hydrangea.Dependence
   ( findDependences
   , ArrayAccess(..)
@@ -537,18 +538,11 @@ collectDefEnv = go M.empty
       SIf _ thn els         -> go (go acc thn) els
       _                     -> acc
 
--- | Strip the trailing @cur = next; next = tmp; tmp = cur@ swap that
+-- | Strip the trailing @tmp = cur; cur = next; next = tmp@ swap that
 -- 'Language.Hydrangea.CFGOpt.hoistIterateAllocs' appends to a
 -- double-buffered iterate body.
 dropBufferSwap :: [Stmt] -> [Stmt]
-dropBufferSwap body = case splitAt (length body - 3) body of
-  ( prefix
-    , [ SAssign c (RAtom (AVar n))
-      , SAssign n' (RAtom (AVar t))
-      , SAssign t' (RAtom (AVar c'))
-      ] )
-    | n == n', t == t', c == c', "__iter_tmp" `BS.isSuffixOf` t -> prefix
-  _ -> body
+dropBufferSwap body = maybe body (\(prefix, _, _) -> prefix) (splitBufferSwap body)
 
 -- | Does the value of this atom depend, through the definitions in @defs@, on
 -- the contents of array @arr@?  A variable with no definition (a parameter)
@@ -678,10 +672,67 @@ bufferOrigins defEnv v =
   where
     originOf a rhs = case rhs of
       RArrayAlloc _ -> Just (OLocal a)
+      -- A scatter's target: its argument's buffer only when no other
+      -- reference to that storage exists (the reference-count pass retains
+      -- the argument whenever anything read later could reach it), a fresh
+      -- copy otherwise.  Either way no other live array is that buffer.
+      RCall "hyd_array_own" _ -> Just (OLocal a)
       RCall f []    -> Just (OCall f)
       RCall _ _     -> Just OUnknown
       RAtom _       -> Nothing  -- a copy, followed by 'copyAliases'
       _             -> Just OUnknown
+
+-- | The definition environment to use when asking whether a loop's inputs
+-- depend on its destination @dest@, cut at an @iterate@ back edge where that
+-- is sound.
+--
+-- A value carried round an @iterate@ reaches the next trip through the
+-- assignment that ends the body (@cur = next@).  If @dest@ is allocated afresh
+-- inside that body, before the loop, and nowhere else, then whatever the
+-- carried state holds was built in an earlier trip -- from an earlier
+-- allocation, a different buffer -- so the back edge links no input to the
+-- buffer this loop writes and is left out.  (When @dest@ is instead the loop
+-- state itself, updated in place, it has no allocation of its own and the
+-- back edge is kept: there it is a genuine alias.)
+--
+-- A scatter target made by @hyd_array_own@ in that body counts as allocated
+-- afresh: it may be the previous trip's buffer, updated in place, but only
+-- when nothing read after the @own@ can reach that buffer any more.
+perIterationDefEnv :: DefEnv -> CVar -> [Stmt] -> [Stmt] -> DefEnv
+perIterationDefEnv defEnv dest procStmts loopBody
+  | Just [rhs] <- M.lookup dest defEnv
+  , freshBuffer rhs
+  , Just iterBody <- listToMaybe
+      [ b | SLoop spec b <- allLoopsIn procStmts
+          , lsRole spec == LoopIterate
+          , any isAllocOfDest b
+          , any (containsLoop loopBody) b ]
+  , SAssign cur (RAtom _) <- last iterBody
+  = M.adjust (filter (/= lastRhs iterBody)) cur defEnv
+  | otherwise = defEnv
+  where
+    freshBuffer rhs = case rhs of
+      RArrayAlloc _ -> True
+      RCall "hyd_array_own" _ -> True
+      _ -> False
+    isAllocOfDest st = case st of
+      SAssign v rhs -> v == dest && freshBuffer rhs
+      _ -> False
+    lastRhs b = case last b of
+      SAssign _ rhs -> rhs
+      _ -> RAtom AUnit
+    containsLoop target st = case st of
+      SLoop _ b -> b == target || any (containsLoop target) b
+      SIf _ t e -> any (containsLoop target) (t ++ e)
+      SParallelRegion b -> any (containsLoop target) b
+      _ -> False
+    allLoopsIn = concatMap go
+      where
+        go st = case st of
+          SLoop _ b -> st : allLoopsIn b
+          SIf _ t e -> allLoopsIn (t ++ e)
+          SParallelRegion b -> allLoopsIn b
+          _ -> []
 
 -- | The element type of a read-modify-write scatter loop that may run in
 -- parallel as a CAS loop.  The streams (index, guard, value and combine
@@ -707,7 +758,8 @@ factsPermitRMWScatterLoop arrayFacts defEnv typeEnv procStmts spec body = do
         , usedVarsStmts (rmwCombine rmw) `S.difference` definedVarsStmts (rmwCombine rmw)
         ]
         `S.difference` S.singleton old
-      independent = not (any (atomDependsOnArray defEnv dest S.empty . AVar) (S.toList inputs))
+      perTripDefs = perIterationDefEnv defEnv dest procStmts body
+      independent = not (any (atomDependsOnArray perTripDefs dest S.empty . AVar) (S.toList inputs))
       usage = collectLoopArrayUsage body
       destOrigins = bufferOrigins defEnv dest
       readsCannotAlias = and
@@ -773,6 +825,9 @@ parallelizeLoop arrayFacts defEnv typeEnv allocSizes procStmts insideLoop spec b
   | execIsUnsupported                          = Nothing
   | not (shouldParallelizeLoop insideLoop spec) = Nothing
   | bodyContainsBreak body                     = Nothing
+  -- Storing an array into an element passes a reference the ownership
+  -- pass counts with serial retains (see 'storesArrays').
+  | storesArrays typeEnv body                  = Nothing
   | not eligible                               = Nothing
   | otherwise = Just (spec { lsExec = Parallel (ParallelSpec strategy Nothing simdLen) }, body)
   where

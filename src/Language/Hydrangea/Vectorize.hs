@@ -51,7 +51,7 @@ import Data.Set qualified as S
 import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CType(..), rhsAtoms, mapRHSAtoms)
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
-import Language.Hydrangea.CFGAnalysis (LoopBound(..), analyzeLoop, isVectorizableLoop)
+import Language.Hydrangea.CFGAnalysis (LoopBound(..), analyzeLoop, isVectorizableLoop, storesArrays)
 import Language.Hydrangea.CFGTyping (TypeEnv, inferProgramReturnTypes, lookupArrayElemType, recoverProcTypeEnv)
 import Language.Hydrangea.Dependence
   ( AccessType(..)
@@ -547,11 +547,12 @@ vectorizeProcWithCalls w allowExplicit callTypes proc =
     rewriteStmt ctx stmt = case stmt of
       SLoop spec body ->
         case vectorCandidate w ctx spec body of
-          Just vectorSpec ->
+          Just vectorSpec
+            | not (storesArrays typeEnv body) ->
             case planVectorLoop allowExplicit typeEnv accessFacts vectorSpec body of
               VectorExplicit lowered -> lowered
               VectorHintOnly -> [SLoop vectorSpec body]
-          Nothing ->
+          _ ->
             [SLoop spec body]
       stmt' ->
         [stmt']

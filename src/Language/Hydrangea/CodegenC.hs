@@ -43,9 +43,10 @@ import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFG qualified as CFG
 import Language.Hydrangea.CFGAnalysis (definedVarsStmts, usedVarsAtom, usedVarsStmts)
-import Language.Hydrangea.CFGCore (Atom (..), BinOp (..), CElemType (..), CType (..), CVar, RHS (..), Redop (..), UnOp (..), ctypeToElemType)
+import Language.Hydrangea.CFGCore (Atom (..), BinOp (..), CElemType (..), CType (..), CVar, RHS (..), Redop (..), UnOp (..), ctypeToElemType, elemTypeToCType)
 import Language.Hydrangea.CFGTyping (CallParamTypes, TypeEnv, buildCallParamTypes, inferProgramReturnTypes, recoverProcTypeEnv)
 import Language.Hydrangea.GuardBounds qualified as GB
+import Language.Hydrangea.Ownership (OwnershipResult (..), insertOwnership)
 import Language.Hydrangea.Vectorize (defaultVectorWidth)
 import Text.PrettyPrint.HughesPJClass
 import Prelude hiding ((<>))
@@ -265,9 +266,22 @@ stripBenchmarkIOStmts = mapMaybe stripStmt
     rhsIsBenchmarkIO _ = False
 
 genProgram :: CodegenOptions -> CFG.Program -> Either String CodegenArtifacts
-genProgram opts prog@(CFG.Program procs) = do
-  let retKinds = procReturnKinds prog
-      retTypes = inferProgramReturnTypes prog
+genProgram opts prog0@(CFG.Program procs0) = do
+  let retKinds = procReturnKinds prog0
+      retTypes = inferProgramReturnTypes prog0
+      -- Insert reference-count operations (retains and releases) into every
+      -- procedure first, so the rest of codegen sees them as ordinary
+      -- statements.
+      callParamTypes0 = buildCallParamTypes retTypes procs0
+      owned =
+        [ insertOwnership
+            (isMemoizedZeroArgArrayCall retKinds retTypes)
+            (recoverProcTypeEnv retTypes callParamTypes0 p)
+            p
+        | p <- procs0
+        ]
+      procs = map orProc owned
+      prog = CFG.Program procs
       callParamTypes = buildCallParamTypes retTypes procs
       missingArrayElemVars = collectMissingArrayElemVars retTypes callParamTypes procs
       needsOmp = any (\(CFG.Proc {CFG.procBody = body}) -> hasParallelStmt body) procs
@@ -509,14 +523,24 @@ genMain mBench retKinds retTypes procs =
             KFloat -> text "volatile double __bench_sink_f = 0.0;"
             KScalar -> text "volatile int64_t __bench_sink_i = 0;"
             _ -> empty
-          benchInvoke = case retKind of
-            KFloat -> text ("__bench_sink_f += " ++ cName ++ "();")
-            KScalar -> text ("__bench_sink_i += " ++ cName ++ "();")
-            _ -> text ("(void) " ++ cName ++ "();")
+          -- An array result is freed after the clock stops, so each call
+          -- doesn't leak its result.
+          benchInvoke
+            | isArrayRet = text ("hyd_array_t* __bench_r = " ++ cName ++ "();")
+            | otherwise = case retKind of
+                KFloat -> text ("__bench_sink_f += " ++ cName ++ "();")
+                KScalar -> text ("__bench_sink_i += " ++ cName ++ "();")
+                _ -> text ("(void) " ++ cName ++ "();")
+          benchRelease
+            | isArrayRet = text "hyd_array_free(__bench_r);"
+            | otherwise = empty
+          warmupInvoke
+            | isArrayRet = text ("hyd_array_free(" ++ cName ++ "());")
+            | otherwise = text ("(void) " ++ cName ++ "();")
        in -- Warmup loop
           benchSinkDecl
             $$ text ("for (int __bench_w = 0; __bench_w < " ++ warmupStr ++ "; __bench_w++) {")
-            $$ nest 4 (resetBenchCache $$ text ("(void) " ++ cName ++ "();"))
+            $$ nest 4 (resetBenchCache $$ warmupInvoke)
             $$ text "}"
             -- Measurement loop
             $$ text ("double __bench_times[" ++ itersStr ++ "];")
@@ -530,6 +554,7 @@ genMain mBench retKinds retTypes procs =
                   $$ text "clock_gettime(CLOCK_MONOTONIC, &__ts1);"
                   $$ text ("__bench_times[__bench_i] = (double)(__ts1.tv_sec - __ts0.tv_sec) * 1.0e9")
                   $$ text "    + (double)(__ts1.tv_nsec - __ts0.tv_nsec);"
+                  $$ benchRelease
               )
             $$ text "}"
             -- Stats report
@@ -560,6 +585,7 @@ genMain mBench retKinds retTypes procs =
         <+> text "="
         <+> text cName
         <> text "();"
+        $$ text ("HYD_RC_ROOT(" ++ benchCacheVar ++ ");")
         $$ arrayPrintCall benchCacheVar mtype kind
 
     -- Print an array variable given its type/kind (no declaration).
@@ -589,7 +615,23 @@ genMain mBench retKinds retTypes procs =
               <+> text cName
               <> text "();"
               $$ printStmt
-          printFn fn = invoke "hyd_array_t*" (text fn <> parens (text result) <> text ";")
+          rootResult = text ("HYD_RC_ROOT(" ++ result ++ ");")
+          -- The arrays inside a pair or record result are roots too.
+          rootLeaves ce = vcat [text ("HYD_RC_ROOT(" ++ result ++ path ++ ");") | path <- elemLeaves ce]
+          rootLeaves' base ft = case ctypeToElemType ft of
+            Just ce -> vcat [text ("HYD_RC_ROOT(" ++ base ++ path ++ ");") | path <- elemLeaves ce]
+            Nothing -> empty
+          elemLeaves ce = case ce of
+            CEArray _ -> [""]
+            CEPair a b -> map (".fst" ++) (elemLeaves a) ++ map (".snd" ++) (elemLeaves b)
+            _ -> []
+          printFn fn = invoke "hyd_array_t*" (rootResult $$ text fn <> parens (text result) <> text ";")
+          printPair et1 et2 =
+            invoke
+              (pairStructName et1 et2)
+              ( rootLeaves (CEPair et1 et2)
+                  $$ printPairValue (elemTypeToCType (CEPair et1 et2)) (text result)
+              )
        in case Map.lookup name retTypes of
             Just (CTArray CTDouble) -> printFn "hyd_print_float_array"
             Just (CTArray CTInt64) -> printFn "hyd_print_array"
@@ -597,27 +639,31 @@ genMain mBench retKinds retTypes procs =
             Just (CTArray CTUnit) -> printFn "hyd_print_array"
             Just (CTArray eltTy)
               | isStructuredPrintableArrayElem eltTy ->
-                  invoke "hyd_array_t*" (text (structuredArrayPrintName eltTy) <> parens (text result) <> text ";")
+                  invoke "hyd_array_t*" (rootResult $$ text (structuredArrayPrintName eltTy) <> parens (text result) <> text ";")
               | otherwise ->
-                  invoke "hyd_array_t*" (text "(void)" <> parens (text result) <> text ";")
+                  invoke "hyd_array_t*" (rootResult $$ text "(void)" <> parens (text result) <> text ";")
             -- Print a pair using the recovered component types.  This is the
             -- accurate path: unlike 'KPair' (which collapses any array component
             -- to an array type and loses nested component types), the
             -- return type carries each component's full 'CType', which is needed
             -- to print, e.g., a pair of reduce results (each a 0-D array).
-            Just ty@(CTPair c1 c2)
+            Just (CTPair c1 c2)
               | Just (et1, et2) <- (,) <$> ctypeToElemType c1 <*> ctypeToElemType c2 ->
-                  invoke (pairStructName et1 et2) (printPairValue ty (text result))
+                  printPair et1 et2
             _ -> case kind of
               KFloatArray -> printFn "hyd_print_float_array"
               KArray -> printFn "hyd_print_array"
               KTuple -> invoke "hyd_tuple_t" (text "hyd_print_tuple" <> parens (text result) <> text ";")
-              KPair cty1 cty2 ->
-                invoke
-                  (pairStructName cty1 cty2)
-                  (text "hyd_print_pair(" <> text result <> text ".fst, " <> text result <> text ".snd);")
+              KPair cty1 cty2 -> printPair cty1 cty2
               KRecord fields ->
-                invoke (recordStructName fields) (text "(void)" <> parens (text result) <> text ";")
+                invoke
+                  (recordStructName fields)
+                  ( vcat
+                      [ rootLeaves' (result ++ "." ++ sanitizeFieldName f) ft
+                      | (f, ft) <- fields
+                      ]
+                      $$ text "(void)" <> parens (text result) <> text ";"
+                  )
               KFloat -> invoke "double" (text "hyd_print_double" <> parens (text result) <> text ";")
               KScalar -> invoke "int64_t" (text "hyd_print_int" <> parens (text result) <> text ";")
 
@@ -688,7 +734,6 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
       benchCacheVar = text "__bench_cache_" <> text cName
       benchmarkBody = if isBenchKernel then stripBenchmarkIOStmts body else body
       (bodyWithoutReturn, finalReturn) = splitFinalReturn benchmarkBody
-      localArrayVars = localArrayVarsProc typeEnv proc
       vecVars = classifyVecVars (codegenSimdWidth opts) body
       tupleDefs = collectTupleDefs body
       env =
@@ -708,45 +753,16 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
             ceInsideParallelRegion = False,
             ceRaggedLoops = raggedLoopMap
           }
-      returnedArrayVars retAtom =
-        case retAtom of
-          AVar v -> case Map.lookup v typeEnv of
-            Just (CTArray _) -> S.singleton v
-            _ -> S.empty
-          _ -> S.empty
-      cleanupDoc retAtom =
-        let returnedVars = returnedArrayVars retAtom
-            aliasedToReturn = case retAtom of
-              AVar retVar -> S.fromList
-                [ src
-                | CFG.SAssign tgt (RAtom (AVar src)) <- bodyWithoutReturn
-                , tgt == retVar
-                , case Map.lookup src typeEnv of
-                    Just (CTArray _) -> True
-                    _ -> False
-                ]
-              _ -> S.empty
-            varsToFree =
-              case procRetKind of
-                KArray -> localArrayVars `S.difference` returnedVars `S.difference` aliasedToReturn
-                KFloatArray -> localArrayVars `S.difference` returnedVars `S.difference` aliasedToReturn
-                KPair _ _ -> S.empty
-                KRecord _ -> S.empty
-                _ -> localArrayVars
-            -- Free the non-returned component of any pair-of-arrays accumulator.
-            discardedPairDoc =
-              discardedArrayPairComponentDoc bodyWithoutReturn retAtom pairVars
-         in cleanupArrayVarsDoc varsToFree $$ discardedPairDoc
       returnDoc retAtom = text "return" <+> genAtom retAtom <> text ";"
       procBodyMemo =
         case finalReturn of
           Just retAtom ->
             genStmts env S.empty (usedVarsAtom retAtom) bodyWithoutReturn
-              $$ cleanupDoc retAtom
               $$ cacheVar
               <+> text "="
               <+> genAtom retAtom
               <> text ";"
+              $$ text "HYD_RC_ROOT(" <> cacheVar <> text ");"
           Nothing ->
             genStmts env S.empty S.empty body
       -- Body for scalar-memoized proc: compute once, cache in static variable.
@@ -754,7 +770,6 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
         case finalReturn of
           Just retAtom ->
             genStmts env S.empty (usedVarsAtom retAtom) bodyWithoutReturn
-              $$ cleanupDoc retAtom
               $$ scalarCacheVar <+> text "=" <+> genAtom retAtom <> text ";"
           Nothing ->
             genStmts env S.empty S.empty body
@@ -762,7 +777,6 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
         case finalReturn of
           Just retAtom ->
             genStmts env S.empty (usedVarsAtom retAtom) bodyWithoutReturn
-              $$ cleanupDoc retAtom
               $$ returnDoc retAtom
           Nothing ->
             genStmts env S.empty S.empty body
@@ -881,29 +895,7 @@ genStmt env declared liveAfter stmt = case stmt of
      in genRHS (ceArrayElemTypes env) (ceFloatArrVars env) mw (ceTupleDefs env) rhs <> text ";"
   CFG.SAssign v rhs
     | v `S.member` declared ->
-        -- When a declared pair-of-arrays variable is overwritten, free the old
-        -- array components the new value no longer holds.  A loop step may
-        -- pass a component through unchanged, so the pairs can share arrays.
-        let cv = text (sanitize v)
-            newV = text (sanitize v ++ "__new")
-            arrFields = case Map.lookup v (cePairVars env) of
-              Just (ct1, ct2) -> [f | (f, ct) <- [("fst", ct1), ("snd", ct2)], isArrayElem ct]
-              Nothing -> []
-            freeIfDropped f =
-              text "if ("
-                <> hsep (punctuate (text " &&")
-                     [cv <> text ("." ++ f) <+> text "!=" <+> newV <> text ("." ++ g) | g <- arrFields])
-                <> text ") hyd_array_free(" <> cv <> text ("." ++ f) <> text ");"
-         in if null arrFields
-              then cv <+> text "=" <+> genAssignRHS rhs <> text ";"
-              else
-                text "{"
-                  $+$ nest 4
-                    ( varDecl env v rhs <+> newV <+> text "=" <+> genAssignRHS rhs <> text ";"
-                        $$ vcat (map freeIfDropped arrFields)
-                        $$ cv <+> text "=" <+> newV <> text ";"
-                    )
-                  $+$ text "}"
+        text (sanitize v) <+> text "=" <+> genAssignRHS rhs <> text ";"
     | otherwise ->
         let cv = sanitize v
             decl = varDecl env v rhs
@@ -932,6 +924,10 @@ genStmt env declared liveAfter stmt = case stmt of
                 <> text "}"
         _ -> genRHS (ceArrayElemTypes env) (ceFloatArrVars env) (Map.lookup v (ceVecVars env)) (ceTupleDefs env) assignedRhs
   CFG.SArrayWrite arr idx val
+    | AVar arrV <- arr,
+      Just (CTArray _) <- Map.lookup arrV (ceArrayElemTypes env) ->
+        -- The element takes over val's reference and drops its old one.
+        text "hyd_array_set_array(" <> genAtom arr <> text "," <+> genAtom idx <> text "," <+> genAtom val <> text ");"
     | AVar arrV <- arr,
       Just eltTy <- Map.lookup arrV (ceArrayElemTypes env) ->
         genArrayAccess eltTy arr idx <+> text "=" <+> genAtom val <> text ";"
@@ -1828,68 +1824,6 @@ isDirectFloatReturn stmts = case stmts of
 arrayVarsProc :: CFG.Proc -> Set CVar
 arrayVarsProc (CFG.Proc {CFG.procBody = body}) = arrayVarsStmts body
 
-localArrayVarsProc :: Map CVar CType -> CFG.Proc -> Set CVar
-localArrayVarsProc typeEnv (CFG.Proc {CFG.procBody = body}) =
-  rawLocals `S.difference` consumedByArrayPair `S.difference` explicitlyFreedLocals
-  where
-    rawLocals =
-      S.fromList
-        [v | CFG.SAssign v rhs <- body, isLocalArray v, ownsArrayHeader rhs]
-    isLocalArray v = case Map.lookup v typeEnv of
-      Just (CTArray _) -> True
-      _ -> False
-    ownsArrayHeader rhs = case rhs of
-      RArrayAlloc {} -> True
-      RArrayCopy {} -> True
-      RCall {} -> True
-      _ -> False
-    -- Arrays passed as CEArray components to RPairMake are owned by the
-    -- resulting pair and freed during pair-update in the enclosing loop.
-    -- Excluding them here prevents a double-free at the post-return cleanup.
-    consumedByArrayPair =
-      S.fromList
-        [ v
-        | CFG.SAssign _ (RPairMake ct1 ct2 a1 a2) <- body,
-          (ct, a) <- [(ct1, a1), (ct2, a2)],
-          isArrayElem ct,
-          AVar v <- [a]
-        ]
-    explicitlyFreedLocals =
-      rawLocals `S.intersection` explicitlyFreedArrayVarsStmts body
-
-explicitlyFreedArrayVarsStmts :: [CFG.Stmt] -> Set CVar
-explicitlyFreedArrayVarsStmts = foldMap go
-  where
-    go stmt = case stmt of
-      CFG.SAssign "__hyd_discard" (RArrayFree (AVar v)) -> S.singleton v
-      CFG.SLoop _ inner -> explicitlyFreedArrayVarsStmts inner
-      CFG.SIf _ thn els -> explicitlyFreedArrayVarsStmts thn `S.union` explicitlyFreedArrayVarsStmts els
-      _ -> S.empty
-
--- | Emit frees for the non-returned array component(s) of any pair-of-arrays
--- variable whose one component is the returned atom.  This handles the case
--- where a foldl accumulator of type (Array, Array) has its snd (or fst)
--- extracted as the return value — the other component must be freed to avoid
--- a post-loop heap leak.
-discardedArrayPairComponentDoc :: [CFG.Stmt] -> Atom -> Map CVar (CElemType, CElemType) -> Doc
-discardedArrayPairComponentDoc stmts retAtom pairVars =
-  case retAtom of
-    AVar retVar -> vcat (fstFrees ++ sndFrees)
-      where
-        fstFrees =
-          [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".fst);"
-          | CFG.SAssign rv (RPairSnd _ (AVar pairVar)) <- stmts,
-            rv == retVar,
-            Just (CEArray _, _) <- [Map.lookup pairVar pairVars]
-          ]
-        sndFrees =
-          [ text "hyd_array_free(" <> text (sanitize pairVar) <> text ".snd);"
-          | CFG.SAssign rv (RPairFst _ (AVar pairVar)) <- stmts,
-            rv == retVar,
-            Just (_, CEArray _) <- [Map.lookup pairVar pairVars]
-          ]
-    _ -> empty
-
 arrayVarsStmts :: [CFG.Stmt] -> Set CVar
 arrayVarsStmts = foldMap arrayVarsStmt
 
@@ -1904,10 +1838,6 @@ arrayVarsStmt st = case st of
   CFG.SLoop _ body -> arrayVarsStmts body
   CFG.SIf _ thn els -> arrayVarsStmts thn `S.union` arrayVarsStmts els
   _ -> S.empty
-
-cleanupArrayVarsDoc :: Set CVar -> Doc
-cleanupArrayVarsDoc vars =
-  vcat [text "hyd_array_free(" <> text (sanitize v) <> text ");" | v <- S.toList vars]
 
 tupleVarsProc :: CFG.Proc -> Set CVar
 tupleVarsProc (CFG.Proc {CFG.procBody = body}) = tupleVarsStmts body
@@ -2551,6 +2481,8 @@ genRHS _ _ _ _ (RArrayFree a) = text "hyd_array_free(" <> genAtom a <> text ")"
 genArrayAllocExpr :: Map CVar CType -> CVar -> Atom -> Doc
 genArrayAllocExpr arrayElemTypes arrVar shp =
   case Map.lookup arrVar arrayElemTypes of
+    Just (CTArray _) ->
+      text "hyd_array_alloc_nested(" <> genAtom shp <> text ")"
     Just eltTy ->
       text "hyd_array_alloc_bytes(" <> genAtom shp <> text ", sizeof(" <> text (cTypeName eltTy) <> text "))"
     Nothing ->

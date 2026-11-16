@@ -34,7 +34,7 @@ import Data.Set (Set)
 import Data.Set qualified as S
 import Language.Hydrangea.CFGCore
 import Language.Hydrangea.CFG hiding (CVar)
-import Language.Hydrangea.CFGAnalysis (usedVarsStmts)
+import Language.Hydrangea.CFGAnalysis (definedVarsStmt, hasArrayLeaves, usedVarsStmt, usedVarsStmts)
 import Language.Hydrangea.Lexer (Range, noRange)
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.Util (stripStringQuotes, unsnoc)
@@ -199,7 +199,7 @@ lowerDec (Dec _ name pats _ _ body) = do
   pure Proc
     { procName    = name
     , procParams  = params
-    , procBody    = stmts ++ [SReturn result]
+    , procBody    = sinkScatterOwns (stmts ++ [SReturn result])
     , procTypeEnv = typeEnv
     , procArrayFacts = arrayFacts
     , procVectorAccessFacts = vectorAccessFacts
@@ -1956,7 +1956,10 @@ lowerExpDefault expr = case expr of
     registerCType cnt (CTArray CTInt64)
     registerCType off (CTArray CTInt64)
     when (elemTy /= CTUnknown) $ registerCType out (CTArray elemTy)
-    let par = Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
+    -- Compacting arrays of arrays stays serial (see 'storesArrays').
+    let par
+          | hasArrayLeaves elemTy = Serial
+          | otherwise = Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
         blk = AInt compactBlock
         -- [lo, hi) of block bv, clamped to n.
         bounds bv lov hi0v hiLtv hiv lenv =
@@ -4783,56 +4786,79 @@ snapshotArray src = do
 -- | Lower a scatter's defaults to a buffer the scatter may write in place.
 --
 -- A scatter builds a new array, but its lowering writes straight into the
--- defaults buffer.  That is only faithful when nothing else can observe the
--- buffer afterwards.  An expression that allocates its result (a @fill@, a
--- @generate@, another scatter, ...) hands over a buffer nobody else names.
--- Anything else -- a variable, a pair projection, a top-level value (whose
--- buffer is cached and shared), a loop's state -- may still be read after the
--- scatter, so the scatter writes into a copy.  Its streams keep reading the
--- original, which the copy leaves untouched, so no stream snapshot is needed.
+-- defaults buffer, which is only faithful when nothing else can observe that
+-- buffer afterwards.  So the scatter writes into @hyd_array_own(t)@: @t@
+-- itself when its storage is unshared, and a private copy otherwise.
+-- 'Language.Hydrangea.Ownership'
+-- resolves it at codegen: when @t@ dies at the scatter the reference moves
+-- in, and the runtime count decides between writing in place and copying;
+-- when @t@ is still read afterwards (by the program, or by the scatter's own
+-- streams) it is retained first, so the count is at least 2 and the scatter
+-- gets a copy.  A top-level value's cache and a view each hold a reference
+-- too, so neither is ever written in place.
+--
+-- A target the defaults expression has just allocated (or owned) is
+-- unshared by construction, so it is used as is: that keeps the allocation
+-- facts later passes key on the variable.
 lowerScatterTarget :: (Exp Range -> LowerM ([Stmt], Atom)) -> Exp Range -> LowerM ([Stmt], Atom)
 lowerScatterTarget lower defaultsExp = do
   (sd, ad) <- lower defaultsExp
-  if allocatesResult defaultsExp
-    then pure (sd, ad)
-    else case ad of
-      AVar _ -> do
-        (copyV, copyStmts) <- snapshotArray ad
-        pure (sd ++ copyStmts, AVar copyV)
-      _ -> pure (sd, ad)
+  case ad of
+    AVar t | not (freshlyOwned t sd) -> do
+      dst <- freshCVar "own"
+      -- A target is an array even where its own type is still unknown (an
+      -- unannotated parameter); CFGTyping carries this back to @t@.
+      ty <- ctypeOfAtom ad
+      registerCType dst $ case ty of
+        CTArray _ -> ty
+        _         -> CTArray CTInt64
+      -- No other live array is this buffer (see 'Language.Hydrangea.Ownership'),
+      -- which is what Parallelize reads these facts as: the scatter loop has
+      -- its destination to itself, as it had the copy this replaces.
+      markArrayFreshWriteOnce dst
+      pure (sd ++ [SAssign dst (RCall "hyd_array_own" [ad])], AVar dst)
+    _ -> pure (sd, ad)
+  where
+    freshlyOwned t sd =
+      not (null [() | SAssign v rhs <- sd, v == t, ownsResult rhs])
+        && length [() | SAssign v _ <- sd, v == t] == 1
+    ownsResult rhs = case rhs of
+      RArrayAlloc _ -> True
+      RCall "hyd_array_own" _ -> True
+      _ -> False
 
--- | Does this expression's lowering always return a buffer it just allocated?
--- Conservative: views ('ESlice', 'EReshape') and anything that can return an
--- existing buffer ('EVar', projections, 'EIf', 'EIterate' of zero steps, ...)
--- answer 'False'.
-allocatesResult :: Exp a -> Bool
-allocatesResult e = case e of
-  EGenerate {}         -> True
-  EMap {}              -> True
-  EZipWith {}          -> True
-  EAppend {}           -> True
-  EScan {}             -> True
-  EScanInclusive {}    -> True
-  EScanR {}            -> True
-  EScanRInclusive {}   -> True
-  ESegmentedReduce {}  -> True
-  ESortIndices {}      -> True
-  EIota {}             -> True
-  EPermute {}          -> True
-  EScatter {}          -> True
-  EScatterGuarded {}   -> True
-  EScatterGenerate {}  -> True
-  EScatterChain {}     -> True
-  EScatterGen {}       -> True
-  EGather {}           -> True
-  ECompact {}          -> True
-  EFill {}             -> True
-  EReplicate {}        -> True
-  EReadArray {}        -> True
-  EReadArrayFloat {}   -> True
-  EStencil {}          -> True
-  EReify _ inner       -> allocatesResult inner
-  _                    -> False
+-- | Move each scatter's @dst = hyd_array_own(t)@ down to the first statement
+-- that uses @dst@, normally the scatter loop itself.
+--
+-- 'lowerScatterTarget' emits the @own@ right after the defaults, but the
+-- scatter's operands are lowered after that, and materialised streams (a
+-- @gather@ of the target, say) read @t@.  A read of @t@ after the @own@ keeps
+-- @t@ alive there, so the target would be copied.  Past those reads, @t@ can
+-- die at the @own@ and the scatter writes in place, after every stream has
+-- been computed.  The move stops early at anything that assigns @t@ or
+-- leaves the block.
+sinkScatterOwns :: [Stmt] -> [Stmt]
+sinkScatterOwns = foldr step []
+  where
+    step stmt rest = case stmt of
+      SAssign x (RCall "hyd_array_own" [AVar t]) -> place x t stmt rest
+      SLoop spec body -> SLoop spec (sinkScatterOwns body) : rest
+      SParallelRegion body -> SParallelRegion (sinkScatterOwns body) : rest
+      SIf c thn els -> SIf c (sinkScatterOwns thn) (sinkScatterOwns els) : rest
+      _ -> stmt : rest
+
+    place x t own rest = case rest of
+      next : more
+        | passable next,
+          x `S.notMember` usedVarsStmt next,
+          S.null (S.fromList [x, t] `S.intersection` definedVarsStmt next) ->
+            next : place x t own more
+      _ -> own : rest
+
+    passable stmt = case stmt of
+      SReturn _ -> False
+      SBreak -> False
+      _ -> True
 
 -- | Break a read-write aliasing hazard inside a scatter.
 --
@@ -4869,15 +4895,21 @@ privatizeScatterStreams target defs groups = case target of
 -- | Names that certainly denote the same buffer as @target@ here: the target
 -- itself, anything copied from it, and any other call to the same zero-argument
 -- value proc (those are cached, so every call returns one shared buffer).
+--
+-- A target made by 'lowerScatterTarget' as @hyd_array_own(t)@ may be @t@'s
+-- own buffer, so @t@'s aliases count too.  Redirecting the streams' reads of
+-- @t@ to a snapshot also keeps @t@ from being read after the scatter starts,
+-- which is what lets it die at the @own@ and be written in place.
 targetAliases :: Atom -> [Stmt] -> Set CVar
 targetAliases target defs = case target of
   AVar t ->
     let viaCall = case listToMaybe [f | SAssign w (RCall f []) <- defs, w == t] of
           Just fn -> S.fromList [w | SAssign w (RCall f' []) <- defs, f' == fn]
           Nothing -> S.empty
+        viaOwn = S.unions [targetAliases src defs | SAssign w (RCall "hyd_array_own" [src]) <- defs, w == t]
         direct = S.insert t viaCall
         viaCopy = S.fromList [w | SAssign w (RAtom (AVar v)) <- defs, v `S.member` direct]
-    in direct `S.union` viaCopy
+    in direct `S.union` viaCopy `S.union` viaOwn
   _ -> S.empty
 
 -- | 'privatizeScatterStreams' for scatters whose streams are already

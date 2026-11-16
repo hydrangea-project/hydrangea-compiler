@@ -13,6 +13,7 @@ import Language.Hydrangea.CFGPipeline
   , preparePolyhedralProgramWithOptions
   )
 import Language.Hydrangea.CFGCore qualified as C
+import Language.Hydrangea.CFGOpt (bufferSwap)
 import Language.Hydrangea.Frontend (lowerToCFGWithTypesWithOptions, readDecs)
 import Language.Hydrangea.Infer (defaultInferOptions)
 import Language.Hydrangea.Polyhedral
@@ -1637,7 +1638,10 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
         countWavefrontRingAllocsInStmts (procBody rewritten) `shouldBe` 1
-        countArrayFreesInStmts (procBody rewritten) `shouldSatisfy` (>= 1)
+        -- The reference-count pass frees the ring at codegen; the rewrite
+        -- only takes ownership of the incoming state.
+        countArrayFreesInStmts (procBody rewritten) `shouldBe` 0
+        countOwnsInStmts (procBody rewritten) `shouldBe` 1
       other ->
         expectationFailure ("expected one proc, got: " <> show other)
 
@@ -1672,32 +1676,23 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             ]
         outerLoop =
           SLoop (LoopSpec ["iter_t"] [IVar "T"] Serial Nothing LoopIterate [])
-            [ innerLoop
-            , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
-            , SAssign "arr_next" (C.RAtom (C.AVar "arr_next__iter_tmp"))
-            , SAssign "arr_next__iter_tmp" (C.RAtom (C.AVar "arr_cur"))
-            ]
+            ([innerLoop] ++ bufferSwap "arr_cur" "arr_next" "arr_next__iter_tmp")
         proc =
           mkProc
             "p"
             ["T", "n", "arr_cur"]
             [ SAssign "shp" (C.RArrayShape (C.AVar "arr_cur"))
             , SAssign "arr_next" (C.RArrayAlloc (C.AVar "shp"))
-            , SAssign "arr_next__iter_tmp" (C.RAtom (C.AVar "arr_cur"))
-            , SAssign "arr_cur__iter_init_track" (C.RAtom (C.AVar "arr_cur"))
+            , SAssign "arr_cur" (C.RCall "hyd_array_own" [C.AVar "arr_cur"])
             , outerLoop
-            , SAssign "arr_cur__iter_cond" (C.RBinOp C.CNeq (C.AVar "arr_cur") (C.AVar "arr_cur__iter_init_track"))
-            , SIf
-                (C.AVar "arr_cur__iter_cond")
-                [SAssign "__hyd_discard" (C.RArrayFree (C.AVar "arr_cur__iter_init_track"))]
-                []
             ]
     case polyhedralProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
-        countArrayFreesInStmts (procBody rewritten) `shouldSatisfy` (>= 1)
-        countNamedArrayFreesInStmts "arr_next" (procBody rewritten) `shouldBe` 0
+        countArrayFreesInStmts (procBody rewritten) `shouldBe` 0
+        -- The ping-pong already took ownership of the incoming state.
+        countOwnsInStmts (procBody rewritten) `shouldBe` 1
       other ->
         expectationFailure ("expected one proc, got: " <> show other)
 
@@ -1811,18 +1806,12 @@ countArrayFreesInStmts = sum . map go
       SIf _ thn els -> countArrayFreesInStmts thn + countArrayFreesInStmts els
       _ -> 0
 
-countNamedArrayFreesInStmts :: C.CVar -> [Stmt] -> Int
-countNamedArrayFreesInStmts target = sum . map go
+countOwnsInStmts :: [Stmt] -> Int
+countOwnsInStmts = sum . map go
   where
     go stmt = case stmt of
-      SAssign "__hyd_discard" (C.RArrayFree (C.AVar v))
-        | v == target ->
-            1
-      SLoop _ body ->
-        countNamedArrayFreesInStmts target body
-      SParallelRegion body ->
-        countNamedArrayFreesInStmts target body
-      SIf _ thn els ->
-        countNamedArrayFreesInStmts target thn + countNamedArrayFreesInStmts target els
-      _ ->
-        0
+      SAssign _ (C.RCall "hyd_array_own" _) -> 1
+      SLoop _ body -> countOwnsInStmts body
+      SParallelRegion body -> countOwnsInStmts body
+      SIf _ thn els -> countOwnsInStmts thn + countOwnsInStmts els
+      _ -> 0

@@ -48,14 +48,18 @@ import Control.Monad (forM_, when)
 
 -- | Compile and run a C source string; optionally keep artifacts.
 compileAndRunC :: String -> Bool -> Bool -> Bool -> IO ExitCode
-compileAndRunC src keepC compileOnly isParallel =
+compileAndRunC = compileAndRunCWithFlags []
+
+-- | 'compileAndRunC' with extra C compiler flags.
+compileAndRunCWithFlags :: [String] -> String -> Bool -> Bool -> Bool -> IO ExitCode
+compileAndRunCWithFlags extraFlags src keepC compileOnly isParallel =
   withSystemTempDirectory "hydrangea-test" $ \dir -> do
     let cpath = dir </> "out.c"
         exe = dir </> "hydrangea_out"
     writeFile cpath src
     let cc = "cc"
         ompFlags = if isParallel then ["-fopenmp"] else []
-        flags = ["-O2", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
+        flags = ["-O2", "-std=c99"] ++ ompFlags ++ extraFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
     (cExit, _cout, cerr) <- readProcessWithExitCode cc flags ""
     case cExit of
       ExitFailure {} -> do
@@ -133,7 +137,13 @@ checkInlineSrcWithOptions inferOpts pipelineOpts src =
 -- agree.  Lets a test hand the backend a term the surface syntax cannot write.
 checkDecsWithOptions
   :: FrontendOptions -> InferOptions -> PipelineOptions -> [Dec Range] -> IO ()
-checkDecsWithOptions frontOpts inferOpts pipelineOpts decs = do
+checkDecsWithOptions = checkDecsWithCFlags []
+
+-- | 'checkDecsWithOptions' with extra C compiler flags.  With
+-- @-DHYD_RC_CHECK@ the program must also leak no array.
+checkDecsWithCFlags
+  :: [String] -> FrontendOptions -> InferOptions -> PipelineOptions -> [Dec Range] -> IO ()
+checkDecsWithCFlags cflags frontOpts inferOpts pipelineOpts decs = do
   eres <- evalDecsFrontend decs
   case eres of
     Left err -> expectationFailure $ "Interpreter error: " ++ show err
@@ -144,6 +154,7 @@ checkDecsWithOptions frontOpts inferOpts pipelineOpts decs = do
           formatElem (VFloat f)  = stripTrailingZerosG (printf "%.17g" f)
           formatElem (VString s) = BS.unpack s
           formatElem (VPair a b) = "(" ++ formatElem a ++ ", " ++ formatElem b ++ ")"
+          formatElem (VBool b)   = if b then "1" else "0"
           formatElem (VArray shape vals) =
             case traverse formatArrayElem vals of
               Just elems ->
@@ -199,15 +210,18 @@ checkDecsWithOptions frontOpts inferOpts pipelineOpts decs = do
           defaultCodegenOptions
           False
           decs
-      ec <- compileAndRunC csrc True False False
+      ec <- compileAndRunCWithFlags cflags csrc True False False
       case ec of
         ExitFailure _ -> expectationFailure "C compilation or execution failed"
         ExitSuccess -> do
-          (exit, out, _) <- readProcessWithExitCode "./hydrangea_out" [] ""
+          (exit, out, err) <- readProcessWithExitCode "./hydrangea_out" [] ""
           case exit of
             ExitFailure _ -> expectationFailure "Running generated executable failed"
-            ExitSuccess   ->
+            ExitSuccess   -> do
               normalizeFloatTokens out `shouldBe` normalizeFloatTokens expected
+              when ("-DHYD_RC_CHECK" `elem` cflags) $
+                filter ("hyd-rc-check" `isInfixOf`) (lines err)
+                  `shouldSatisfy` all (\l -> "leaked=0;" `isInfixOf` l && "leaked=0 (" `isInfixOf` l)
 
 -- | C's printf("%.17g") and Haskell's printf "%.17g" can render the same
 -- double as different digit strings (C converts the exact binary value;
@@ -1405,6 +1419,213 @@ spec = do
       csrc <- compileToCOptIO False decs
       csrc `shouldSatisfy` isInfixOf "break;"
 
+    it "frees per-step temporaries allocated after the stop test" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let step st ="
+        , "  let xs = fst st in"
+        , "  let ks = compact_stable 0 (generate [300] (fn [i] => index [i] xs % 3 = 0)) xs in"
+        , "  let k = index [0] ks + 1 in"
+        , "  (map (fn x => x + k) xs, snd st + 1)"
+        , "let main = fst (iterate_until 100 (generate [300] (fn [i] => i), 0) step"
+        , "  (fn st => snd st = 6))" ]
+      csrc <- compileToCOptIO False decs
+      csrc `shouldSatisfy` isInfixOf "hyd_array_free(cmp_out"
+
+    it "an early-stopping loop with per-step temporaries computes the same result" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let step st ="
+        , "  let xs = fst st in"
+        , "  let ks = compact_stable 0 (generate [300] (fn [i] => index [i] xs % 3 = 0)) xs in"
+        , "  let k = index [0] ks + 1 in"
+        , "  (map (fn x => x + k) xs, snd st + 1)"
+        , "let main = fst (iterate_until 100 (generate [300] (fn [i] => i), 0) step"
+        , "  (fn st => snd st = 6))" ]
+
+  describe "iterate buffer ownership" $ do
+
+    -- The double-buffered iterate writes into the buffer its initial state
+    -- came in from the second trip on, so a shared initial state is copied
+    -- first.
+    it "leaves a shared initial state intact" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a0 = generate [8] (fn [i] => i)"
+        , "let step a = generate [8] (fn [i] => index [i] a + 1)"
+        , "let r = zipwith (fn x y => x * 100 + y) (iterate 3 a0 step) a0"
+        , "let again = reduce (fn x y => x + y) 0 a0"
+        ]
+
+    it "returns the initial state from an iterate of zero steps" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a0 = generate [8] (fn [i] => i * 2)"
+        , "let step a = generate [8] (fn [i] => index [i] a + 1)"
+        , "let r = iterate 0 a0 step"
+        , "let s = reduce (fn x y => x + y) 0 a0"
+        ]
+
+    it "carries a pair state whose step passes one component through" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let a0 = generate [8] (fn [i] => i)"
+        , "let step st ="
+        , "  let x = fst st in"
+        , "  let y = snd st in"
+        , "  (generate [8] (fn [i] => index [i] x + index [i] y), x)"
+        , "let r = fst (iterate 5 (a0, a0) step)"
+        , "let s = reduce (fn x y => x + y) 0 a0"
+        ]
+
+  -- A scatter writes into hyd_array_own(target): the target itself when
+  -- nothing else references its storage, a copy otherwise.  Each program
+  -- below gives the target a second reference some other way.
+  describe "in-place scatter" $ do
+
+    it "copies a target shared with the other half of an iterate pair state" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let p0 = generate [8] (fn [i] => i)"
+        , "let step st ="
+        , "  let a = fst st in"
+        , "  let b = snd st in"
+        , "  (scatter (fn x y => x + y) a (generate [4] (fn [i] => i * 2))"
+        , "     (generate [4] (fn [i] => index [i] b + 100)), b)"
+        , "let r = fst (iterate 3 (p0, p0) step)"
+        , "let r2 = snd (iterate 3 (p0, p0) step)"
+        ]
+
+    it "leaves a top-level target intact for a second scatter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let h0 = generate [4] (fn [i] => i)"
+        , "let a = scatter (fn x y => x + y) h0 (generate [8] (fn [i] => i / 2)) (generate [8] (fn [i] => 1))"
+        , "let b = scatter (fn x y => x + y) h0 (generate [8] (fn [i] => i / 2)) (generate [8] (fn [i] => 10))"
+        , "let c = h0"
+        ]
+
+    it "copies a target read after the scatter" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let r ="
+        , "  let t = map (fn x => x + 1) (generate [4] (fn [i] => i * 3)) in"
+        , "  let s = scatter (fn x y => x + y) t (generate [4] (fn [i] => 3 - i)) (generate [4] (fn [i] => 1)) in"
+        , "  zipwith (fn x y => x * 100 + y) s t"
+        ]
+
+    it "keeps the streams reading the old target when writing in place" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let r ="
+        , "  let t = map (fn x => x + 1) (generate [6] (fn [i] => i)) in"
+        , "  scatter (fn x y => x + y) t (generate [6] (fn [i] => 5 - i)) (generate [6] (fn [i] => index [i] t))"
+        ]
+
+    it "copies a target that is a view of a live array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let r ="
+        , "  let a = generate [2, 3] (fn [i, j] => i * 3 + j) in"
+        , "  let v = reshape [6] a in"
+        , "  let s = scatter (fn x y => x + y) v (generate [6] (fn [i] => i)) (generate [6] (fn [i] => 10)) in"
+        , "  zipwith (fn x y => x * 100 + y) s (reshape [6] a)"
+        ]
+
+    it "copies a target passed into a function whose caller keeps it" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let bump xs = scatter (fn x y => x + y) xs (generate [2] (fn [i] => i)) (generate [2] (fn [i] => 100))"
+        , "let r ="
+        , "  let a = generate [4] (fn [i] => i) in"
+        , "  zipwith (fn x y => x * 1000 + y) (bump a) a"
+        ]
+
+    it "writes an iterate state that dies at the scatter in place" $ withCC $ do
+      let src = BS.pack $ unlines
+            [ "let r ="
+            , "  let step p = scatter (fn x y => x + y) p (generate [3] (fn [i] => i * 2)) (generate [3] (fn [i] => 1)) in"
+            , "  iterate 4 (generate [8] (fn [i] => 0)) step"
+            ]
+      checkInlineSrc src
+      csrc <- emitC src
+      csrc `shouldSatisfy` isInfixOf "hyd_array_own("
+      csrc `shouldSatisfy` not . isInfixOf "hyd_array_own(__rc"
+
+    it "copies, rather than moves, a target read after the scatter" $ withCC $ do
+      csrc <- emitC $ BS.pack $ unlines
+        [ "let r ="
+        , "  let t = map (fn x => x + 1) (generate [4] (fn [i] => i * 3)) in"
+        , "  let s = scatter (fn x y => x + y) t (generate [4] (fn [i] => 3 - i)) (generate [4] (fn [i] => 1)) in"
+        , "  zipwith (fn x y => x * 100 + y) s t"
+        ]
+      csrc `shouldSatisfy` isInfixOf "hyd_array_own(__rc"
+
+  -- An element of an array of arrays holds a reference of its own, released
+  -- with the outer array.  Under the reference-count checker a freed array's
+  -- data pointer is NULL, so a read through an element whose array was
+  -- released crashes, and the checker reports any array never released.
+  describe "arrays of arrays" $ do
+
+    it "keeps the arrays stored in elements alive" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let xs = generate [3] (fn [i] => generate [2] (fn [j] => i + j))"
+        , "let r = map (fn q => index [1] q) xs"
+        ]
+
+    it "retains an array stored in every element" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let a = generate [2] (fn [j] => j * 7)"
+        , "let xs = generate [3] (fn [i] => a)"
+        , "let r = map (fn q => index [1] q) xs"
+        , "let b = a"
+        ]
+
+    it "releases the arrays in an array of arrays that dies" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let mk n = generate [n] (fn [i] => generate [2] (fn [j] => i + j))"
+        , "let step xs = map (fn a => map (fn v => v + 1) a) xs"
+        , "let r = map (fn a => index [1] a) (iterate 3 (mk 3) step)"
+        ]
+
+    it "releases the arrays a scatter overwrites" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let mk n = generate [n] (fn [i] => generate [2] (fn [j] => i + j))"
+        , "let r ="
+        , "  let s = scatter (fn x y => map (fn v => v * 2) y) (mk 3) (generate [4] (fn [k] => k / 2))"
+        , "            (generate [4] (fn [k] => generate [2] (fn [j] => k))) in"
+        , "  map (fn a => index [1] a) s"
+        ]
+
+    it "retains the arrays in a copied scatter target" $ withCC $ do
+      let src = BS.pack $ unlines
+            [ "let mk n = generate [n] (fn [i] => generate [2] (fn [j] => i + j))"
+            , "let r ="
+            , "  let t = mk 3 in"
+            , "  let s = scatter (fn x y => x) t (generate [1] (fn [k] => 1))"
+            , "            (generate [1] (fn [k] => generate [2] (fn [j] => 100 + j))) in"
+            , "  zipwith (fn a b => index [1] a * 1000 + index [1] b) s t"
+            ]
+      checkWithRcCheck src
+      csrc <- emitC src
+      csrc `shouldSatisfy` isInfixOf "hyd_array_own(__rc"
+
+  describe "printing pairs" $ do
+
+    it "prints arrays, floats and nested pairs inside a pair" $ withCC $
+      checkWithRcCheck $ BS.pack $ unlines
+        [ "let two = let a = generate [2] (fn [j] => j * 7) in (generate [3] (fn [i] => 7), a)"
+        , "let mixed = (generate [2] (fn [i] => 0.5 *. 3.0), 4)"
+        , "let nested = (1, (2.5, generate [2, 2] (fn [i, j] => i + j)))"
+        , "let scalars = (1.5, 2)"
+        ]
+
+-- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
+checkWithRcCheck :: BS.ByteString -> IO ()
+checkWithRcCheck src =
+  case readDecs src of
+    Left perr -> expectationFailure $ "Parse error: " ++ perr
+    Right decs ->
+      checkDecsWithCFlags ["-DHYD_RC_CHECK"]
+        defaultFrontendOptions defaultInferOptions defaultPipelineOptions decs
+
+-- | The C a source program compiles to.
+emitC :: BS.ByteString -> IO String
+emitC src =
+  case readDecs src of
+    Left perr -> fail ("Parse error: " ++ perr)
+    Right decs ->
+      compileToCOptIOWithAllOptions defaultFrontendOptions defaultInferOptions defaultPipelineOptions defaultCodegenOptions False decs
+
 -- | Turn the nested scatter at the end of a declaration's let spine into an
 -- 'EScatterChain' with the same combine.
 chainDec :: Dec Range -> Dec Range
@@ -1416,3 +1637,4 @@ chainDec (Dec a v pats ty sch body) = Dec a v pats ty sch (go body)
       EScatter b c (EScatter _ _ d i1 v1) i2 v2 ->
         EScatterChain b c d [ScatterPhase i1 v1 Nothing, ScatterPhase i2 v2 Nothing]
       _ -> e
+

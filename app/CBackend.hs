@@ -75,8 +75,10 @@ keepBuiltArtifacts cpath exe = do
 -- directory as @hydrangea_out.c@ and @hydrangea_out@. If @compileOnly@ is
 -- true, stop after compilation. If @parallel@ is true, request OpenMP support
 -- and probe whether the selected compiler accepts the relevant flags.
-compileAndRunC :: Maybe String -> String -> Bool -> Bool -> Bool -> IO ExitCode
-compileAndRunC mcc src keepC compileOnly parallel =
+-- @extraFlags@ are passed to the C compiler before the sources (e.g.
+-- @-DHYD_RC_CHECK@ for the runtime's reference-count checker).
+compileAndRunC :: Maybe String -> [String] -> String -> Bool -> Bool -> Bool -> IO ExitCode
+compileAndRunC mcc extraFlags src keepC compileOnly parallel =
   withSystemTempDirectory "hydrangea" $ \dir -> do
     let cpath = dir </> "out.c"
         exe = dir </> "hydrangea_out"
@@ -86,7 +88,7 @@ compileAndRunC mcc src keepC compileOnly parallel =
     envCC <- lookupEnv "CC"
     let ccCmd = selectCompiler mcc envCC
         ompFlags = if parallel then ["-fopenmp"] else []
-        flags = ["-O3", "-march=native", "-std=c99"] ++ ompFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
+        flags = ["-O3", "-march=native", "-std=c99"] ++ ompFlags ++ extraFlags ++ ["-Iruntime", "-Ithird_party/simde", "-o", exe, cpath, "runtime/hyd_write_csv.c", "-lm"]
     when parallel $ do
       probeResult <- probeOpenMPSupport dir ccCmd
       case probeResult of
