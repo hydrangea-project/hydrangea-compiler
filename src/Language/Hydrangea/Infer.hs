@@ -869,7 +869,7 @@ inferBVal expr = case expr of
       mb1 <- inferBVal e1
       return $ case (mb1, e2) of
         (Just (ExactVal (TConst n)), EInt _ k) | k > 0 ->
-          Just (ExactVal (TConst (n `div` k)))
+          Just (ExactVal (TConst (n `quot` k)))
         (Just (BoundOf (TConst b)), EInt _ k) | k > 0 ->
           Just (BoundOf (TConst ((b - 1) `div` k + 1)))
         _ -> Nothing

@@ -99,7 +99,23 @@ preprocessDecsWithOptions opts decs =
   let u = uniquifyDecs decs
       n = normalizeShapesDecs u
       f = if frontendSkipFusion opts then n else fuseDecs n
-  in rewriteTemporalDecs f
+  in rewriteTemporalDecs (map uncurryLambdaDec f)
+
+-- | Turn a top-level value that is a lambda, @let f = fn a => fn b => e@
+-- (after uniquification, a chain of local functions each returning itself),
+-- into the function declaration @let f a b = e@, which lowering emits as a
+-- procedure.
+uncurryLambdaDec :: Dec Range -> Dec Range
+uncurryLambdaDec dec@(Dec a name [] mp mt body) =
+  case collect body of
+    ([], _) -> dec
+    (ps, e) -> Dec a name ps mp mt e
+  where
+    collect (ELetIn _ (Dec _ g ps Nothing (DecAnn Nothing False) inner) (EVar _ g'))
+      | g == g', not (null ps) =
+          let (ps', e) = collect inner in (ps ++ ps', e)
+    collect e = ([], e)
+uncurryLambdaDec dec = dec
 
 formatInferResult :: Either err a -> (err -> String) -> Either String a
 formatInferResult result formatErr =

@@ -102,7 +102,7 @@ tripCountFromIndexExpr = go . simplifyIndexExpr
       IAdd a b -> addTripCounts (go a) (go b)
       IDiv a b ->
         case (tripCountValue (go a), tripCountValue (go b)) of
-          (Just x, Just y) | y /= 0 -> TCConstant (x `div` y)
+          (Just x, Just y) | y /= 0 -> TCConstant (x `quot` y)
           -- Variable dividend divided by a positive constant (e.g. tile loop bounds
           -- like (n + 31) / 32): the quotient is still variable-sized.
           (Nothing, Just y) | y > 0, go a /= TCUnknown -> go a

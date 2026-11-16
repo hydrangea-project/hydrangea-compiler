@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- |
@@ -3078,8 +3079,8 @@ staticIntExp expr = case expr of
       Plus _   -> Just (x + y)
       Minus _  -> Just (x - y)
       Times _  -> Just (x * y)
-      Divide _ | y /= 0 -> Just (x `div` y)
-      Mod _    | y /= 0 -> Just (x `mod` y)
+      Divide _ | y /= 0 -> Just (x `quot` y)
+      Mod _    | y /= 0 -> Just (x `rem` y)
       _ -> Nothing
   _ ->
     Nothing
@@ -5659,8 +5660,39 @@ inlineScalarFn fnExp paramVar resultVar = case fnExp of
     registerFn name pats body
     inlineScalarFn rest paramVar resultVar
   _ -> do
-    (sf, af) <- lowerExp fnExp
-    pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
+    mEta <- etaExpandPartial 1 fnExp
+    case mEta of
+      Just lam -> inlineScalarFn lam paramVar resultVar
+      Nothing -> do
+        (sf, af) <- lowerExp fnExp
+        pure $ sf ++ [SAssign resultVar (RCall "__apply" [af, AVar paramVar])]
+
+-- | Eta-expand a partial application of a named function, @f a1 .. ak@, into
+-- @let g x1 .. xn = f a1 .. ak x1 .. xn in g@, so the inliners can treat it like
+-- any local function.  The arguments are re-evaluated at every call, so this
+-- is done only when that is harmless: each argument is a variable, a literal,
+-- or arithmetic on them.
+etaExpandPartial :: Int -> Exp Range -> LowerM (Maybe (Exp Range))
+etaExpandPartial arity fnExp = case collectApp fnExp [] of
+  (EVar r f, args@(_ : _))
+    | all simpleArg args -> do
+        g <- freshCVar "eta"
+        xs <- mapM (const (freshCVar "eta_x")) [1 .. arity]
+        let call = foldl (EApp r) (EVar r f) (args ++ map (EVar r) xs)
+        pure (Just (ELetIn r (Dec r g (map (PVar r) xs) Nothing noDecAnn call) (EVar r g)))
+  _ -> pure Nothing
+  where
+    collectApp (EApp _ g a) acc = collectApp g (a : acc)
+    collectApp e acc = (e, acc)
+    simpleArg e = case e of
+      EVar {} -> True
+      EInt {} -> True
+      EFloat {} -> True
+      EBool {} -> True
+      EUnit {} -> True
+      ENeg _ a -> simpleArg a
+      EBinOp _ a _ b -> simpleArg a && simpleArg b
+      _ -> False
 
 -- | Lower an array expression for use as a sequential input to a consumer loop.
 --
@@ -5743,7 +5775,9 @@ inlineBinaryFn fnExp param1 param2 resultVar = case fnExp of
   ELetIn _ (Dec _ name pats _ _ body) rest -> do
     registerFn name pats body
     inlineBinaryFn rest param1 param2 resultVar
-  _ -> do
+  _ -> etaExpandPartial 2 fnExp >>= \case
+   Just lam -> inlineBinaryFn lam param1 param2 resultVar
+   Nothing -> do
     (sf, af) <- lowerExp fnExp
     case af of
       AVar partialName -> do

@@ -140,6 +140,12 @@ spec = do
       expectEval "10 / 2" (VInt 5)
       expectEval "7 / 2" (VInt 3)
 
+    it "truncates division toward zero, as C does" $ do
+      expectEval "(0 - 7) / 2" (VInt (-3))
+      expectEval "7 / (0 - 2)" (VInt (-3))
+      expectEval "(0 - 7) % 2" (VInt (-1))
+      expectEval "7 % (0 - 2)" (VInt 1)
+
     it "evaluates modulo" $ do
       expectEval "10 % 3" (VInt 1)
       expectEval "9 % 3" (VInt 0)

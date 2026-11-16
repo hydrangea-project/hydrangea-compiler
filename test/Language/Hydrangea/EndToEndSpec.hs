@@ -1754,6 +1754,20 @@ spec = do
         , "let c = replicate [Any 2, All] (generate [3] (fn [i] => i))"
         ]
 
+  describe "function values" $ do
+
+    it "lowers top-level lambda values and partial applications" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let add = fn a => fn b => a + b"
+        , "let scale k x = x *. k"
+        , "let ys = map (scale 2.5) (generate [4] (fn [i] => float_of i))"
+        , "let zs = zipwith add (generate [3] (fn [i] => i)) (generate [3] (fn [i] => i * 2))"
+        , "let main = add 3 4"
+        ]
+
+    it "truncates integer division toward zero" $ withCC $
+      checkInlineSrc "let a = (0 - 7) / 2\nlet b = (0 - 7) % 2\n"
+
 -- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
 checkWithRcCheck :: BS.ByteString -> IO ()
 checkWithRcCheck src =

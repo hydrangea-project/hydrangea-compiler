@@ -971,9 +971,9 @@ evalBinOp (VInt a) (Plus _) (VInt b) = pure $ VInt (a + b)
 evalBinOp (VInt a) (Minus _) (VInt b) = pure $ VInt (a - b)
 evalBinOp (VInt a) (Times _) (VInt b) = pure $ VInt (a * b)
 evalBinOp (VInt a) (Divide _) (VInt b) =
-  if b == 0 then Left DivisionByZero else pure $ VInt (a `div` b)
+  if b == 0 then Left DivisionByZero else pure $ VInt (a `quot` b)
 evalBinOp (VInt a) (Mod _) (VInt b) =
-  if b == 0 then Left DivisionByZero else pure $ VInt (a `mod` b)
+  if b == 0 then Left DivisionByZero else pure $ VInt (a `rem` b)
 evalBinOp (VInt a) (Eq _) (VInt b) = pure $ VBool (a == b)
 evalBinOp (VInt a) (Neq _) (VInt b) = pure $ VBool (a /= b)
 evalBinOp (VInt a) (Lt _) (VInt b) = pure $ VBool (a < b)
