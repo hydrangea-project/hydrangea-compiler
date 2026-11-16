@@ -2067,6 +2067,20 @@ infer (ECheckIndex _ idx defVal arrExp) = do
   _ <- wrange (firstParam idx)    $ idxTy'    =:= sTy''
   _ <- wrange (firstParam defVal) $ defValTy' =:= eTy'
   return eTy'
+infer (ECompact _ _ z g xs) = do
+  -- z : a, g : Array[s, Bool], xs : Array[s, a]  gives  Array[s, a]
+  zTy <- infer z
+  gTy <- infer g
+  xsTy <- infer xs
+  (_mXsVar, sXs, eXs) <- asArrayType (firstParam xs) xsTy
+  (_mGVar, sG, eG) <- asArrayType (firstParam g) gTy
+  _ <- wrange (firstParam g) $ sG =:= sXs
+  _ <- wrange (firstParam g) $ eG =:= UTyBool
+  _ <- wrange (firstParam z) $ zTy =:= eXs
+  sXs' <- applyBindings sXs
+  eXs' <- applyBindings eXs
+  (_arrVar, arrTyOut) <- freshRefined (UTyArray sXs' eXs')
+  return arrTyOut
 infer (EStencil _ bnd fnExp arrExp) = do
   inferBnd bnd
   arrTy <- infer arrExp

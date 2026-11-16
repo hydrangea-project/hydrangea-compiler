@@ -212,6 +212,7 @@ normExp expr = case expr of
   EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
   EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
   ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr
+  ECompact a m idx def arr -> ECompact a m <$> normExp idx <*> normExp def <*> normExp arr
   EFill a sz v -> EFill a <$> normExp sz <*> normExp v
   EReplicate a dims arr -> EReplicate a <$> mapM normShapeDim dims <*> normExp arr
   EReshape a sz arr -> EReshape a <$> normExp sz <*> normExp arr

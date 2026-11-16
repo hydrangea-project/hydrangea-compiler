@@ -69,6 +69,8 @@ import Language.Hydrangea.Syntax
   index      { L.RangedToken L.Index _ }
   shape_of   { L.RangedToken L.ShapeOf _ }
   check_index { L.RangedToken L.CheckIndex _ }
+  compact_stable { L.RangedToken L.CompactStableTok _ }
+  compact_unordered { L.RangedToken L.CompactUnorderedTok _ }
   replicate  { L.RangedToken L.Replicate _ }
   slice      { L.RangedToken L.Slice _ }
   reshape    { L.RangedToken L.Reshape _ }
@@ -327,6 +329,8 @@ expspecial :: { Exp L.Range }
   | index atom atom            { EIndex (L.rtRange $1 <-> info $3) $2 $3 }
   | shape_of atom              { EShapeOf (L.rtRange $1 <-> info $2) $2 }
   | check_index atom atom atom { ECheckIndex (L.rtRange $1 <-> info $4) $2 $3 $4 }
+  | compact_stable atom atom atom { ECompact (L.rtRange $1 <-> info $4) CompactStable $2 $3 $4 }
+  | compact_unordered atom atom atom { ECompact (L.rtRange $1 <-> info $4) CompactUnordered $2 $3 $4 }
   | read_array atom atom       { EReadArray (L.rtRange $1 <-> info $3) $2 $3 }
   | read_array_float atom atom { EReadArrayFloat (L.rtRange $1 <-> info $3) $2 $3 }
   | write_array atom atom       { EWriteArray (L.rtRange $1 <-> info $3) $2 $3 }

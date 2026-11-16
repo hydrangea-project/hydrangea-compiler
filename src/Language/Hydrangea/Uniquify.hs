@@ -148,6 +148,7 @@ uniqExp expr =
     EGather a idx arr -> EGather a <$> uniqExp idx <*> uniqExp arr
     EIndex a idx arr -> EIndex a <$> uniqExp idx <*> uniqExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> uniqExp idx <*> uniqExp def <*> uniqExp arr
+    ECompact a m idx def arr -> ECompact a m <$> uniqExp idx <*> uniqExp def <*> uniqExp arr
     EFill a s v -> EFill a <$> uniqExp s <*> uniqExp v
     EShapeOf a arr -> EShapeOf a <$> uniqExp arr
     EReplicate a dims arr -> EReplicate a <$> mapM uniqShapeDim dims <*> uniqExp arr
@@ -314,6 +315,7 @@ collectVarsExp expr =
     EGather _ idx a -> collectVarsExp idx `S.union` collectVarsExp a
     EIndex _ i a -> collectVarsExp i `S.union` collectVarsExp a
     ECheckIndex _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a
+    ECompact _ _ i def a -> collectVarsExp i `S.union` collectVarsExp def `S.union` collectVarsExp a
     EFill _ s v -> collectVarsExp s `S.union` collectVarsExp v
     EShapeOf _ a -> collectVarsExp a
     EReplicate _ dims a -> S.unions (collectVarsShapeDim <$> dims) `S.union` collectVarsExp a

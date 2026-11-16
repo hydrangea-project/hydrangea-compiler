@@ -159,6 +159,7 @@ freeVarsExp expr =
     EGather _ idx a -> freeVarsExp idx `S.union` freeVarsExp a
     EIndex _ i a -> freeVarsExp i `S.union` freeVarsExp a
     ECheckIndex _ i def a -> freeVarsExp i `S.union` freeVarsExp def `S.union` freeVarsExp a
+    ECompact _ _ i def a -> freeVarsExp i `S.union` freeVarsExp def `S.union` freeVarsExp a
     EFill _ s v -> freeVarsExp s `S.union` freeVarsExp v
     EShapeOf _ a -> freeVarsExp a
     EReplicate _ dims a -> S.unions (map freeVarsShapeDim dims) `S.union` freeVarsExp a
@@ -261,6 +262,7 @@ boundVarsExp expr =
     EGather _ idx a -> boundVarsExp idx `S.union` boundVarsExp a
     EIndex _ i a -> boundVarsExp i `S.union` boundVarsExp a
     ECheckIndex _ i def a -> boundVarsExp i `S.union` boundVarsExp def `S.union` boundVarsExp a
+    ECompact _ _ i def a -> boundVarsExp i `S.union` boundVarsExp def `S.union` boundVarsExp a
     EFill _ s v -> boundVarsExp s `S.union` boundVarsExp v
     EShapeOf _ a -> boundVarsExp a
     EReplicate _ dims a -> S.unions (map boundVarsShapeDim dims) `S.union` boundVarsExp a
@@ -367,6 +369,7 @@ countVarExp v expr =
     EGather _ idx a -> countVarExp v idx + countVarExp v a
     EIndex _ i a -> countVarExp v i + countVarExp v a
     ECheckIndex _ i def a -> countVarExp v i + countVarExp v def + countVarExp v a
+    ECompact _ _ i def a -> countVarExp v i + countVarExp v def + countVarExp v a
     EFill _ s val -> countVarExp v s + countVarExp v val
     EShapeOf _ a -> countVarExp v a
     EReplicate _ dims a -> sum (map (countVarShapeDim v) dims) + countVarExp v a
@@ -485,6 +488,7 @@ substExp v replacement expr =
     EGather a idx arr -> EGather a (substExp v replacement idx) (substExp v replacement arr)
     EIndex a idx arr -> EIndex a (substExp v replacement idx) (substExp v replacement arr)
     ECheckIndex a idx def arr -> ECheckIndex a (substExp v replacement idx) (substExp v replacement def) (substExp v replacement arr)
+    ECompact a m idx def arr -> ECompact a m (substExp v replacement idx) (substExp v replacement def) (substExp v replacement arr)
     EFill a s val -> EFill a (substExp v replacement s) (substExp v replacement val)
     EShapeOf a arr -> EShapeOf a (substExp v replacement arr)
     EReplicate a dims arr -> EReplicate a (map (substShapeDim v replacement) dims) (substExp v replacement arr)
@@ -1186,6 +1190,7 @@ normExp expr =
     EGather a idx arr -> EGather a <$> normExp idx <*> normExp arr
     EIndex a idx arr -> EIndex a <$> normExp idx <*> normExp arr
     ECheckIndex a idx def arr -> ECheckIndex a <$> normExp idx <*> normExp def <*> normExp arr
+    ECompact a m idx def arr -> ECompact a m <$> normExp idx <*> normExp def <*> normExp arr
     EFill a s v -> EFill a <$> normExp s <*> normExp v
     EShapeOf a arr -> EShapeOf a <$> normExp arr
     EReplicate a dims arr -> EReplicate a <$> mapM normShapeDim dims <*> normExp arr
@@ -1454,6 +1459,7 @@ childExprs expr = case expr of
   EGather _ idx a -> [idx, a]
   EIndex _ i a -> [i, a]
   ECheckIndex _ i def a -> [i, def, a]
+  ECompact _ _ i def a -> [i, def, a]
   EFill _ s val -> [s, val]
   EShapeOf _ a -> [a]
   EReplicate _ _ a -> [a]
@@ -1713,6 +1719,7 @@ fuseOnce expr =
       arr' <- fuseOnce arr
       fuseIndex a idx' arr'
     ECheckIndex a idx def arr -> ECheckIndex a <$> fuseOnce idx <*> fuseOnce def <*> fuseOnce arr
+    ECompact a m idx def arr -> ECompact a m <$> fuseOnce idx <*> fuseOnce def <*> fuseOnce arr
     EFill a s v -> EFill a <$> fuseOnce s <*> fuseOnce v
     EShapeOf a arr -> do
       arr' <- fuseOnce arr

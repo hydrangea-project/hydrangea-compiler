@@ -188,6 +188,9 @@ instance Pretty (Exp a) where
   pPrint (EGather _ idxArr arr) = text "gather" <+> pPrint idxArr <+> pPrint arr
   pPrint (EIndex _ idx arr) = text "index" <+> pPrint idx <+> pPrint arr
   pPrint (ECheckIndex _ idx defVal arr) = text "check_index" <+> pPrint idx <+> pPrint defVal <+> pPrint arr
+  pPrint (ECompact _ m z g xs) =
+    text (case m of { CompactStable -> "compact_stable"; CompactUnordered -> "compact_unordered" })
+      <+> pPrint z <+> pPrint g <+> pPrint xs
   pPrint (EFill _ shape val) = text "fill" <+> pPrint shape <+> pPrint val
   pPrint (EShapeOf _ arr) = text "shape_of" <+> pPrint arr
   pPrint (EReplicate _ dims arr) = text "replicate" <+> brackets (sep (punctuate comma (map pPrint dims))) <+> pPrint arr

@@ -232,6 +232,10 @@ deriving instance (Show a) => Show (ScatterGenPhase a)
 deriving instance (Eq a)   => Eq   (ScatterGenPhase a)
 deriving instance (Ord a)  => Ord  (ScatterGenPhase a)
 
+-- | Result order of a compaction ('ECompact').
+data CompactMode = CompactStable | CompactUnordered
+  deriving (Eq, Ord, Show)
+
 -- | Expression AST parameterised by an annotation @a@ (typically a source 'Range').
 data Exp a
   = -- | Integer literal with its annotation and numeric value
@@ -367,6 +371,11 @@ data Exp a
     EIndex a (Exp a) (Exp a)
   | -- | Check index into an array with default value: index, default value, array
     ECheckIndex a (Exp a) (Exp a) (Exp a)
+  | -- | Compaction of a 1-D array: order mode, filler, guard array, source.
+    -- @compact_stable z g xs@ and @compact_unordered z g xs@ put the elements
+    -- of @xs@ whose guard is true first (in source order, or in any order),
+    -- and fill the remaining cells with @z@.
+    ECompact a CompactMode (Exp a) (Exp a) (Exp a)
   | -- | Fill an array of the given shape with a constant value
     EFill a (Exp a) (Exp a)
   | -- | Extract the shape of an array as a tuple of integers
@@ -494,6 +503,7 @@ firstParam = \case
   EGather a _ _ -> a
   EIndex a _ _ -> a
   ECheckIndex a _ _ _ -> a
+  ECompact a _ _ _ _ -> a
   EFill a _ _ -> a
   EShapeOf a _ -> a
   EReplicate a _ _ -> a

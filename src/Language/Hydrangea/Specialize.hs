@@ -228,6 +228,7 @@ rewriteExp path = go
       EGather a idx arr -> EGather a <$> go idx <*> go arr
       EIndex a idx arr -> EIndex a <$> go idx <*> go arr
       ECheckIndex a idx def arr -> ECheckIndex a <$> go idx <*> go def <*> go arr
+      ECompact a m idx def arr -> ECompact a m <$> go idx <*> go def <*> go arr
       EFill a s v -> EFill a <$> go s <*> go v
       EShapeOf a arr -> EShapeOf a <$> go arr
       EReplicate a dims arr -> EReplicate a <$> mapM (rewriteShapeDim path) dims <*> go arr

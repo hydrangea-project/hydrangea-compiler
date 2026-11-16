@@ -87,6 +87,7 @@ collectTopLevelRefs topNames expr bound =
     EGather _ idx a -> go idx bound `S.union` go a bound
     EIndex _ i a -> go i bound `S.union` go a bound
     ECheckIndex _ i def a -> go i bound `S.union` go def bound `S.union` go a bound
+    ECompact _ _ i def a -> go i bound `S.union` go def bound `S.union` go a bound
     EFill _ s v -> go s bound `S.union` go v bound
     EShapeOf _ a -> go a bound
 

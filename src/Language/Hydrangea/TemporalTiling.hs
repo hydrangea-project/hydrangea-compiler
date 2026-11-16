@@ -147,6 +147,8 @@ rewriteExp env expr = do
     EIndex a idx arr -> EIndex a <$> rewriteExp env idx <*> rewriteExp env arr
     ECheckIndex a idx def arr ->
       ECheckIndex a <$> rewriteExp env idx <*> rewriteExp env def <*> rewriteExp env arr
+    ECompact a m z g xs ->
+      ECompact a m <$> rewriteExp env z <*> rewriteExp env g <*> rewriteExp env xs
     EFill a s v -> EFill a <$> rewriteExp env s <*> rewriteExp env v
     EShapeOf a arr -> EShapeOf a <$> rewriteExp env arr
     EReplicate a dims arr -> EReplicate a <$> mapM (rewriteShapeDim env) dims <*> rewriteExp env arr
@@ -295,6 +297,7 @@ collectAccessorCalls accVar = go
       EGather _ idx arr -> (++) <$> go idx <*> go arr
       EIndex _ idx arr -> (++) <$> go idx <*> go arr
       ECheckIndex _ idx def arr -> (\x y z -> x ++ y ++ z) <$> go idx <*> go def <*> go arr
+      ECompact _ _ z g xs -> (\x y w -> x ++ y ++ w) <$> go z <*> go g <*> go xs
       EFill _ s v -> (++) <$> go s <*> go v
       EShapeOf _ arr -> go arr
       EReplicate _ dims arr -> (++) <$> (concat <$> mapM goShapeDim dims) <*> go arr

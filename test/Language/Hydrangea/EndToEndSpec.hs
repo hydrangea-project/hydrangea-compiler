@@ -21,6 +21,7 @@ import Text.Printf (printf)
 import Language.Hydrangea.Frontend
   ( readDecs
   , compileToCOptIO
+  , compileToCOptParallelIO
   , compileToCOptIOWithPipelineOptionsAndCodegenOptions
   , evalDecsFrontend
   )
@@ -1232,3 +1233,51 @@ spec = do
         [ "let a = generate [8] (fn [i] => float_of i)"
         , "let main = reduce (fn acc x => acc +. x) 0.0 (map (fn x => x *. x) a)"
         ]
+
+  describe "Compaction" $ do
+
+    it "compact_stable over several blocks keeps source order" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let xs = generate [20011] (let f [i] = float_of i *. 0.5 in f)"
+        , "let r = compact_stable (0.0 -. 1.0) (generate [20011] (let f [i] = ((i * 7919) % 101) < 37 in f)) xs"
+        ]
+
+    it "compact_unordered with keepers in different blocks" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let xs = generate [9000] (let f [i] = i * 3 in f)"
+        , "let r = compact_unordered 0 (generate [9000] (let f [i] = (i % 4097) = 4096 in f)) xs"
+        ]
+
+    it "compaction that keeps nothing is all filler" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let xs = generate [5000] (let f [i] = i in f)"
+        , "let r = compact_stable 7 (generate [5000] (let f [i] = false in f)) xs"
+        ]
+
+    it "compaction feeding a reduction" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let xs = generate [9000] (let f [i] = i * 3 in f)"
+        , "let r = reduce (+) 0 (compact_unordered 0 (map (let f x = x % 2 = 0 in f) xs) xs)"
+        ]
+
+    it "compact_stable of an inline generate" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let r = compact_stable 0 (generate [10007] (let f [i] = ((i * 31) % 17) < 5 in f))"
+        , "          (generate [10007] (fn [v] => v))"
+        ]
+
+    it "compact_unordered of an inline generate that reads another array" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let xs = generate [9001] (let f [i] = float_of i *. 0.25 in f)"
+        , "let r = compact_unordered 0.0 (generate [9001] (let f [i] = (i % 3) = 1 in f))"
+        , "          (generate [9001] (let h [i] = index [i] xs +. 1.0 in h))"
+        ]
+
+    it "does not materialize a generate source" $ do
+      decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+        [ "let main ="
+        , "  let g = reify (generate [50000] (fn [i] => (i % 7) = 0)) in"
+        , "  compact_stable 0 g (generate [50000] (fn [v] => v * 2))" ]
+      csrc <- compileToCOptParallelIO True decs
+      -- guard, output, block counts, block offsets; no array for the source
+      length (filter ("hyd_array_alloc" `isInfixOf`) (lines csrc)) `shouldBe` 4

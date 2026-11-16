@@ -1298,6 +1298,170 @@ lowerExp expr = case expr of
          , AVar val
          )
 
+  ECompact _ _ zExp gExp xsExp -> do
+    -- Stable parallel compaction in four phases over blocks of
+    -- 'compactBlock' elements:
+    --   1. (parallel over blocks) cnt[b] := number of kept elements in b
+    --   2. (serial over blocks)   off[b] := exclusive prefix sum of cnt
+    --   3. (parallel over blocks) copy b's kept elements to off[b].. in order
+    --   4. (parallel)             fill out[total..n) with the filler
+    -- Both modes lower this way, since source order is one of the orders an
+    -- unordered compaction may produce.
+    --
+    -- Only phase 3 reads the source, once per kept element, so a 1-D
+    -- generate source is inlined there rather than materialized.  The size
+    -- comes from the guard, which has the source's shape.
+    (sz, az) <- lowerExp zExp
+    (sg, ag) <- lowerExp gExp
+    i2 <- freshCVar "cmp_i2"
+    xi <- freshCVar "cmp_xi"
+    registerCType i2 CTInt64
+    mGenFn <- peelToGenerate1D xsExp
+    (sx, readXi) <- case mGenFn of
+      Just genFn -> do
+        stmts <- inlineArrayFn1D genFn i2 xi
+        hoistZeroArgValueProcCallsWith (sz ++ sg) stmts
+      Nothing -> do
+        (sxs, ax) <- lowerExp xsExp
+        xsTy <- ctypeOfAtom ax
+        case xsTy of
+          CTArray t -> registerCType xi t
+          _         -> pure ()
+        pure (sxs, [SAssign xi (RArrayLoad ax (AVar i2))])
+    elemTy <- ctypeOfAtom (AVar xi)
+    shp <- freshCVar "cmp_shp"
+    n <- freshCVar "cmp_n"
+    out <- freshCVar "cmp_out"
+    nbShp <- freshCVar "cmp_nbshp"
+    nbNum <- freshCVar "cmp_nbnum"
+    nbNum1 <- freshCVar "cmp_nbnum1"
+    nb <- freshCVar "cmp_nb"
+    cnt <- freshCVar "cmp_cnt"
+    off <- freshCVar "cmp_off"
+    b <- freshCVar "cmp_b"
+    lo <- freshCVar "cmp_lo"
+    hi0 <- freshCVar "cmp_hi0"
+    hiLt <- freshCVar "cmp_hilt"
+    hi <- freshCVar "cmp_hi"
+    len <- freshCVar "cmp_len"
+    k <- freshCVar "cmp_k"
+    i <- freshCVar "cmp_i"
+    gi <- freshCVar "cmp_gi"
+    c0 <- freshCVar "cmp_c0"
+    c1 <- freshCVar "cmp_c1"
+    b2 <- freshCVar "cmp_b2"
+    lo2 <- freshCVar "cmp_lo2"
+    hi02 <- freshCVar "cmp_hi02"
+    hiLt2 <- freshCVar "cmp_hilt2"
+    hi2 <- freshCVar "cmp_hi2"
+    len2 <- freshCVar "cmp_len2"
+    k2 <- freshCVar "cmp_k2"
+    gi2 <- freshCVar "cmp_gi2"
+    p0 <- freshCVar "cmp_p0"
+    p1 <- freshCVar "cmp_p1"
+    sb <- freshCVar "cmp_sb"
+    sbPrev <- freshCVar "cmp_sbprev"
+    offPrev <- freshCVar "cmp_offprev"
+    cntPrev <- freshCVar "cmp_cntprev"
+    offCur <- freshCVar "cmp_offcur"
+    hasBlocks <- freshCVar "cmp_hasblocks"
+    lastB <- freshCVar "cmp_lastb"
+    offLast <- freshCVar "cmp_offlast"
+    cntLast <- freshCVar "cmp_cntlast"
+    total <- freshCVar "cmp_total"
+    tailN <- freshCVar "cmp_tailn"
+    j <- freshCVar "cmp_j"
+    tj <- freshCVar "cmp_tj"
+    tailIx <- freshCVar "cmp_tailix"
+    mapM_ (`registerCType` CTInt64)
+      [ n, nbNum, nbNum1, nb, b, lo, hi0, hi, len, k, i, c0, c1, b2, lo2, hi02, hi2, len2, k2
+      , p0, p1, sb, sbPrev, offPrev, cntPrev, offCur, lastB, offLast, cntLast, total, tailN, j, tj, tailIx ]
+    mapM_ (`registerCType` CTBool) [hiLt, hiLt2, gi, gi2, hasBlocks]
+    registerCType shp CTTuple
+    registerCType nbShp CTTuple
+    registerCType cnt (CTArray CTInt64)
+    registerCType off (CTArray CTInt64)
+    when (elemTy /= CTUnknown) $ registerCType out (CTArray elemTy)
+    let par = Parallel (ParallelSpec ParallelGeneric Nothing Nothing)
+        blk = AInt compactBlock
+        -- [lo, hi) of block bv, clamped to n.
+        bounds bv lov hi0v hiLtv hiv lenv =
+          [ SAssign lov (RBinOp CMul (AVar bv) blk)
+          , SAssign hi0v (RBinOp CAdd (AVar lov) blk)
+          , SAssign hiLtv (RBinOp CLt (AVar hi0v) (AVar n))
+          , SIf (AVar hiLtv) [SAssign hiv (RAtom (AVar hi0v))] [SAssign hiv (RAtom (AVar n))]
+          , SAssign lenv (RBinOp CSub (AVar hiv) (AVar lov))
+          ]
+    pure
+      ( sz ++ sg ++ sx ++
+        [ SAssign shp (RArrayShape ag)
+        , SAssign n (RShapeSize (AVar shp))
+        , SAssign out (RArrayAlloc (AVar shp))
+        , SAssign nbNum (RBinOp CAdd (AVar n) (AInt (compactBlock - 1)))
+        , SAssign nb (RBinOp CDiv (AVar nbNum) blk)
+        , SAssign nbShp (RTuple [AVar nb])
+        , SAssign cnt (RArrayAlloc (AVar nbShp))
+        , SAssign off (RArrayAlloc (AVar nbShp))
+        -- 1. count per block
+        , SLoop (LoopSpec [b] [IVar nb] par Nothing LoopPlain [])
+            ( bounds b lo hi0 hiLt hi len ++
+              [ SArrayWrite (AVar cnt) (AVar b) (AInt 0)
+              , SLoop (LoopSpec [k] [IVar len] Serial Nothing LoopPlain [])
+                  [ SAssign i (RBinOp CAdd (AVar lo) (AVar k))
+                  , SAssign gi (RArrayLoad ag (AVar i))
+                  , SIf (AVar gi)
+                      [ SAssign c0 (RArrayLoad (AVar cnt) (AVar b))
+                      , SAssign c1 (RBinOp CAdd (AVar c0) (AInt 1))
+                      , SArrayWrite (AVar cnt) (AVar b) (AVar c1)
+                      ]
+                      []
+                  ]
+              ] )
+        -- 2. exclusive scan of the block counts, and the total
+        , SAssign hasBlocks (RBinOp CLt (AInt 0) (AVar nb))
+        , SIf (AVar hasBlocks)
+            [ SArrayWrite (AVar off) (AInt 0) (AInt 0)
+            , SAssign nbNum1 (RBinOp CSub (AVar nb) (AInt 1))
+            , SLoop (LoopSpec [sb] [IVar nbNum1] Serial Nothing LoopPlain [])
+                [ SAssign sbPrev (RAtom (AVar sb))
+                , SAssign offPrev (RArrayLoad (AVar off) (AVar sbPrev))
+                , SAssign cntPrev (RArrayLoad (AVar cnt) (AVar sbPrev))
+                , SAssign offCur (RBinOp CAdd (AVar offPrev) (AVar cntPrev))
+                , SAssign tj (RBinOp CAdd (AVar sb) (AInt 1))
+                , SArrayWrite (AVar off) (AVar tj) (AVar offCur)
+                ]
+            , SAssign lastB (RBinOp CSub (AVar nb) (AInt 1))
+            , SAssign offLast (RArrayLoad (AVar off) (AVar lastB))
+            , SAssign cntLast (RArrayLoad (AVar cnt) (AVar lastB))
+            , SAssign total (RBinOp CAdd (AVar offLast) (AVar cntLast))
+            ]
+            [ SAssign total (RAtom (AInt 0)) ]
+        -- 3. copy each block's kept elements, in order, to its offset
+        , SLoop (LoopSpec [b2] [IVar nb] par Nothing LoopPlain [])
+            ( bounds b2 lo2 hi02 hiLt2 hi2 len2 ++
+              [ SLoop (LoopSpec [k2] [IVar len2] Serial Nothing LoopPlain [])
+                  [ SAssign i2 (RBinOp CAdd (AVar lo2) (AVar k2))
+                  , SAssign gi2 (RArrayLoad ag (AVar i2))
+                  , SIf (AVar gi2)
+                      ( [ SAssign p0 (RArrayLoad (AVar off) (AVar b2)) ]
+                        ++ readXi ++
+                        [ SArrayWrite (AVar out) (AVar p0) (AVar xi)
+                        , SAssign p1 (RBinOp CAdd (AVar p0) (AInt 1))
+                        , SArrayWrite (AVar off) (AVar b2) (AVar p1)
+                        ] )
+                      []
+                  ]
+              ] )
+        -- 4. the filler tail
+        , SAssign tailN (RBinOp CSub (AVar n) (AVar total))
+        , SLoop (LoopSpec [j] [IVar tailN] par Nothing LoopPlain [])
+            [ SAssign tailIx (RBinOp CAdd (AVar total) (AVar j))
+            , SArrayWrite (AVar out) (AVar tailIx) az
+            ]
+        ]
+      , AVar out
+      )
+
   EShapeOf _ arrExp -> do
     (sa, aa) <- lowerExp arrExp
     t <- freshCVar "t"
@@ -3756,6 +3920,10 @@ binopResultCType op = case op of
   CGtF  -> Just CTBool;   CGeF  -> Just CTBool
 
 -- | Lower a unary math function (Float -> Float) to a CFG RUnOp.
+-- | Elements per block in the parallel compaction lowering.
+compactBlock :: Integer
+compactBlock = 4096
+
 lowerMathUnOp :: UnOp -> Exp Range -> LowerM ([Stmt], Atom)
 lowerMathUnOp op e = do
   (s, a) <- lowerExp e
@@ -3940,8 +4108,14 @@ renameVarInStmts :: CVar -> CVar -> [Stmt] -> [Stmt]
 renameVarInStmts old new = map (renameVarInStmt old new)
 
 hoistZeroArgValueProcCalls :: [Stmt] -> LowerM ([Stmt], [Stmt])
-hoistZeroArgValueProcCalls stmts = go M.empty M.empty [] [] stmts
+hoistZeroArgValueProcCalls = hoistZeroArgValueProcCallsWith []
+
+-- | 'hoistZeroArgValueProcCalls', reusing the calls already made in
+-- @priorStmts@ rather than calling those procedures again.
+hoistZeroArgValueProcCallsWith :: [Stmt] -> [Stmt] -> LowerM ([Stmt], [Stmt])
+hoistZeroArgValueProcCallsWith priorStmts stmts = go seedCache M.empty [] [] stmts
   where
+    seedCache = M.fromList [(f, v) | SAssign v (RCall f []) <- priorStmts]
     go _ _ hoisted acc [] = pure (reverse hoisted, reverse acc)
     go procCache subst hoisted acc (stmt:rest) = do
       let stmt' = foldl' (\s (old, new) -> renameVarInStmt old new s) stmt (M.toList subst)

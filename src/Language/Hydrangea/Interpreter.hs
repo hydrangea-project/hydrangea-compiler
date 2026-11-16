@@ -178,6 +178,17 @@ evalExp expr env = case expr of
           then throwError $ IndexOutOfBounds "Array index out of bounds"
           else pure $ vals !! offset
       _ -> throwError $ TypeError "Index operation requires an array"
+  ECompact _ _ zExpr gExpr xsExpr -> do
+    -- Source order is one of the orders an unordered compaction may produce.
+    vz <- evalExp zExpr env
+    vg <- evalExp gExpr env
+    vxs <- evalExp xsExpr env
+    case (vg, vxs) of
+      (VArray gShape gs, VArray xShape xs)
+        | gShape == xShape -> do
+            let kept = [x | (VBool True, x) <- zip gs xs]
+            pure $ VArray xShape (kept ++ replicate (length xs - length kept) vz)
+      _ -> throwError $ TypeError "compact requires a guard array and a source array of the same shape"
   ECheckIndex _ idxExpr defExpr arrExpr -> do
     vidx <- evalExp idxExpr env
     vidx_shape <- liftEither $ shapeFromValue vidx

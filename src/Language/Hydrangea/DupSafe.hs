@@ -3,7 +3,7 @@
 -- | When may a let-bound (or beta-bound) expression be substituted at its use
 -- sites?
 --
--- Scatters, reductions and permutes leave their contributor order
+-- Scatters, reductions, permutes and compactions leave their contributor order
 -- unspecified, so two evaluations of the same term may differ.  @let x = e in
 -- b@ evaluates @e@ once; substituting @e@ for @x@ is only sound when the
 -- copies cannot be evaluated more than once, or when @e@ cannot accumulate.
@@ -130,6 +130,7 @@ accumulatingNode = \case
   EScatterGenerate {}  -> True
   EScatterChain {}     -> True
   EScatterGen {}       -> True
+  ECompact {}          -> True
   EWriteArray {}       -> True
   EWriteArrayFloat {}  -> True
   _                    -> False
@@ -299,6 +300,7 @@ children = \case
   EGather _ i arr -> [i, arr]
   EIndex _ i arr -> [i, arr]
   ECheckIndex _ i d arr -> [i, d, arr]
+  ECompact _ _ i d arr -> [i, d, arr]
   EFill _ sz v -> [sz, v]
   EShapeOf _ arr -> [arr]
   EReplicate _ dims arr -> concatMap shapeDimExps dims ++ [arr]

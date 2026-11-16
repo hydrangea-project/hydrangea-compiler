@@ -76,6 +76,8 @@ tokens :-
 <0> index       { tok Index }
 <0> shape_of    { tok ShapeOf }
 <0> check_index { tok CheckIndex }
+<0> compact_stable { tok CompactStableTok }
+<0> compact_unordered { tok CompactUnorderedTok }
 <0> replicate   { tok Replicate }
 <0> slice       { tok Slice }
 <0> reshape     { tok Reshape }
@@ -330,6 +332,8 @@ data Token
   | Index
   | ShapeOf
   | CheckIndex
+  | CompactStableTok
+  | CompactUnorderedTok
   | Replicate
   | Slice
   | Reshape
