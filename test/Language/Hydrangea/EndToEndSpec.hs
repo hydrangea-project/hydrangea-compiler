@@ -30,8 +30,8 @@ import Language.Hydrangea.Frontend
   )
 import Language.Hydrangea.Interpreter (Value(..))
 import qualified Data.Map as Map
-import Data.Char (isDigit)
-import Data.List (intercalate, dropWhileEnd, isInfixOf)
+import Data.Char (isAlphaNum, isDigit)
+import Data.List (intercalate, dropWhileEnd, isInfixOf, isPrefixOf, stripPrefix)
 import Text.Read (readMaybe)
 import Language.Hydrangea.Syntax (Dec(..), Exp(..), ScatterPhase(..))
 import Language.Hydrangea.Lexer (Range)
@@ -222,6 +222,21 @@ checkDecsWithCFlags cflags frontOpts inferOpts pipelineOpts decs = do
               when ("-DHYD_RC_CHECK" `elem` cflags) $
                 filter ("hyd-rc-check" `isInfixOf`) (lines err)
                   `shouldSatisfy` all (\l -> "leaked=0;" `isInfixOf` l && "leaked=0 (" `isInfixOf` l)
+
+-- | Does the C source contain a tile variable derived from loop iterator
+-- @base@: an identifier @base@, then any fresh-name digits, then @_tile_@?
+-- Matches @i59_tile_start@ or @i_tile_len@ for @base = "i"@, but not
+-- @xi59_tile_start@.
+hasTiledIter :: String -> String -> Bool
+hasTiledIter base = go ' '
+  where
+    go _ [] = False
+    go prev s@(c : rest)
+      | not (isIdentChar prev)
+      , Just afterBase <- stripPrefix base s
+      , "_tile_" `isPrefixOf` dropWhile isDigit afterBase = True
+      | otherwise = go c rest
+    isIdentChar ch = isAlphaNum ch || ch == '_'
 
 -- | C's printf("%.17g") and Haskell's printf "%.17g" can render the same
 -- double as different digit strings (C converts the exact binary value;
@@ -623,12 +638,11 @@ spec = do
               defaultCodegenOptions
               False
               decs
-          legacyC `shouldSatisfy` isInfixOf "i59_tile_"
-          legacyC `shouldSatisfy` isInfixOf "j60_tile_"
-          legacyC `shouldSatisfy` isInfixOf "k91_tile_"
-          polyC `shouldSatisfy` isInfixOf "i59_tile_"
-          polyC `shouldSatisfy` isInfixOf "j60_tile_"
-          polyC `shouldSatisfy` isInfixOf "k91_tile_"
+          -- Each of the i, j and k loops is tiled, whatever fresh suffix
+          -- the pipeline happened to give its iterator.
+          forM_ ["i", "j", "k"] $ \iter -> do
+            legacyC `shouldSatisfy` hasTiledIter iter
+            polyC `shouldSatisfy` hasTiledIter iter
           legacyC `shouldSatisfy` not . isInfixOf "hyd_vec_loadu_f64x4"
           legacyC `shouldSatisfy` not . isInfixOf "hyd_vec_storeu_f64x4"
           polyC `shouldSatisfy` isInfixOf "hyd_vec_loadu_f64x4"

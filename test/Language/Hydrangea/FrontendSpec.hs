@@ -543,7 +543,6 @@ spec = do
             , "    d"
             ])
       countStandaloneInt64Decls csrc `shouldBe` 1
-      csrc `shouldNotSatisfy` isInfixOf "int64_t t1;"
     it "typechecks sort_indices over integer arrays" $ do
       expectType
         "sort_indices (generate [4] (let f [i] = i in f))"

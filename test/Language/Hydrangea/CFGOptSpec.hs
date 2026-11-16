@@ -307,15 +307,18 @@ spec = do
             , SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
             , SAssign "arr_cur" (RAtom (AVar "arr_next"))
             ]
-      hoistIterateAllocs [SLoop loopSpec body]
-        `shouldBe` [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
-                   , SAssign "arr_next" (RArrayCopy (AVar "arr_cur"))
-                   , SAssign "arr_cur" (RCall "hyd_array_own" [AVar "arr_cur"])
-                   , SLoop loopSpec
-                       ( SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
-                           : bufferSwap "arr_cur" "arr_next" "arr_next__iter_tmp"
-                       )
-                   ]
+      -- The swap's scratch variable is a fresh name, so recognise the swap
+      -- with 'splitBufferSwap' rather than spelling that name out.
+      case hoistIterateAllocs [SLoop loopSpec body] of
+        [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
+          , SAssign "arr_next" (RArrayCopy (AVar "arr_cur"))
+          , SAssign "arr_cur" (RCall "hyd_array_own" [AVar "arr_cur"])
+          , SLoop spec' body'
+          ] -> do
+            spec' `shouldBe` loopSpec
+            splitBufferSwap body'
+              `shouldBe` Just ([SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)], "arr_cur", "arr_next")
+        other -> expectationFailure ("unexpected shape: " ++ show other)
 
     it "preserves hoisted iterate ping-pong swaps under optimization" $ do
       let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []

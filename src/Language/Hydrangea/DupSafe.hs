@@ -20,6 +20,7 @@ module Language.Hydrangea.DupSafe
   , usedOnceOutsideLoops
   , dupSafe
   , dupSafePat
+  , universe
   ) where
 
 import Data.Map.Strict qualified as M
