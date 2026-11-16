@@ -237,20 +237,18 @@ pruneProgram opts True prog@(CFG.Program procs) =
                   new = succs `S.difference` visited'
                 in go (rest `S.union` new) visited'
 
-procUsesIO :: [CFG.Stmt] -> Bool
-procUsesIO = any stmtUsesIO
+-- | Does a procedure write a file?  Such a procedure has an effect beyond its
+-- result, so it is never memoized.  Reading a file does not count: an input
+-- file is a constant of the run, and memoizing the procedure that reads it
+-- is what keeps @--benchmark@ from re-parsing the CSV on every timed call.
+procWritesFile :: [CFG.Stmt] -> Bool
+procWritesFile = any writes
   where
-    stmtUsesIO st = case st of
-      CFG.SAssign _ rhs -> rhsUsesIO rhs
-      CFG.SLoop _ body' -> procUsesIO body'
-      CFG.SIf _ thn els -> procUsesIO thn || procUsesIO els
+    writes st = case st of
+      CFG.SAssign _ (RCall fn _) -> fn == "hyd_write_array_csv" || fn == "hyd_write_array_csv_float"
+      CFG.SLoop _ body' -> procWritesFile body'
+      CFG.SIf _ thn els -> procWritesFile thn || procWritesFile els
       _ -> False
-    rhsUsesIO (RCall fn _) =
-      fn == "hyd_read_array_csv"
-        || fn == "hyd_read_float_array_csv"
-        || fn == "hyd_write_array_csv"
-        || fn == "hyd_write_array_csv_float"
-    rhsUsesIO _ = False
 
 stripBenchmarkIOStmts :: [CFG.Stmt] -> [CFG.Stmt]
 stripBenchmarkIOStmts = mapMaybe stripStmt
@@ -719,7 +717,7 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
       isBenchKernel = case mBench of
         Just bc -> bcKernelName bc == name
         Nothing -> False
-      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel && not (procUsesIO body)
+      useMemo = null params && retType == "hyd_array_t*" && not isBenchKernel && not (procWritesFile body)
       -- Scalar zero-arg procs (e.g. getenv-based config procs like iters(), w_f()) are
       -- memoized with a static bool+value pair so callers inside hot loops don't re-invoke
       -- the body (which may call getenv) on every iteration.
@@ -727,7 +725,7 @@ genProc opts retKinds retTypes callParamTypes proc@(CFG.Proc {CFG.procName = nam
         null params
           && (procRetKind == KScalar || procRetKind == KFloat)
           && not isBenchKernel
-          && not (procUsesIO body)
+          && not (procWritesFile body)
       cacheVar = text "__cache_" <> text cName
       scalarComputedVar = text "__scalar_computed_" <> text cName
       scalarCacheVar = text "__scalar_cache_" <> text cName

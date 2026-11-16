@@ -163,7 +163,9 @@ main = do
       enableTiling = "--tiling" `elem` flags || enablePolyhedral
       enableExplicitVectorization = "--explicit-vectorization" `elem` flags
       solveRefinements = not ("--no-solver-check" `elem` flags)
-      pruneDead = "--prune-dead-procs" `elem` flags
+      -- A benchmark build's main only runs the kernel, so a procedure the
+      -- kernel does not reach is dead code there.
+      pruneDead = "--prune-dead-procs" `elem` flags || isJust benchmarkFlag
       outputCFile = flagValue "--output-c=" flags
       outputHFile = flagValue "--output-h=" flags
       kernelFlag = flagValue "--kernel=" flags

@@ -444,7 +444,9 @@ spec = describe "CodegenC" $ do
       Right CodegenArtifacts { codegenSource = c } ->
         c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
 
-  it "does not memoize benchmark-closure zero-arg array procs that perform IO" $ do
+  -- Input files are constants of the run: re-reading one on every timed call
+  -- would put CSV parsing inside the benchmark's measurement.
+  it "memoizes benchmark-closure zero-arg array procs that read a file" $ do
     let inputProc =
           (mkProc "input_data" []
              [ SAssign "arr" (C.RCall "hyd_read_array_csv" [C.AString "input.csv"])
@@ -468,7 +470,24 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldNotSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+        c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+
+  it "does not memoize zero-arg array procs that write a file" $ do
+    let outputProc =
+          (mkProc "output_data" []
+             [ SAssign "arr" (C.RArrayAlloc (C.AInt 8))
+             , SAssign "_" (C.RCall "hyd_write_array_csv" [C.AString "out.csv", C.AVar "arr"])
+             , SReturn (C.AVar "arr")
+             ])
+            { procTypeEnv = Map.fromList [("arr", C.CTArray C.CTInt64)] }
+        artifacts =
+          codegenProgramWithOptions
+            defaultCodegenOptions { codegenEmitMain = False }
+            (Program [outputProc])
+    case artifacts of
+      Left err -> expectationFailure err
+      Right CodegenArtifacts { codegenSource = c } ->
+        c `shouldNotSatisfy` isInfixOf "__cache_output_data"
 
   it "strips benchmark IO writes from benchmark kernel body only" $ do
     let kernelProc =
