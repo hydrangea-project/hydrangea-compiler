@@ -100,6 +100,7 @@ If no file is provided, Hydrangea reads from stdin.
 | `--output-c=<file>` | Write generated C code to a file |
 | `--output-h=<file>` | Write the generated export header to a file; requires `--export-kernel` |
 | `--compile-only` | Compile generated C to a binary, but do not execute it |
+| `--cflags=<flags>` | Extra flags for the C compiler, e.g. `--cflags=-DHYD_RC_CHECK` to enable the runtime's reference-count checker |
 | `--keep-c` | Keep intermediate `hydrangea_out.c` and `hydrangea_out` artifacts in the current directory |
 | `--keep-metal` | Keep intermediate Metal artifacts in the current directory as `hydrangea_out.metal` and `hydrangea_out.m` |
 
@@ -113,6 +114,8 @@ If no file is provided, Hydrangea reads from stdin.
 | `--tiling` | Opt in to loop-tiling in the CFG optimization pipeline via the polyhedral tiler; without `--polyhedral` this keeps identity loop order, while `--polyhedral --tiling` tiles the synthesized schedule (default: off) |
 | `--explicit-vectorization` | Opt in to explicit SIMD lowering (`RVec*` IR / intrinsic-based C emission) on the C backend (default: off) |
 | `--no-solver-check` | Skip static bounds checking |
+| `--materialize` | Skip fusion and write every intermediate array to memory, as a baseline for measuring fusion |
+| `--no-guard-bounds` | Run guarded loops over their full bounds instead of only the iterations their guard admits |
 | `--simd-width=<n>` | Select the SIMD vector width used by the C backend (default: `4`) |
 | `--prune-dead-procs` | Prune unused generated procedures during code generation |
 | `--kernel=<name>` | Assert that the named top-level kernel fully fused away references to other original top-level bindings; fail if fusion leaves dependencies behind |

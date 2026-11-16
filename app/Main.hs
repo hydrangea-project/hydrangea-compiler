@@ -110,6 +110,7 @@ usage = unwords
    , "[--no-parallel]"
    , "[--no-guard-bounds]"
    , "[--no-fusion]"
+   , "[--materialize]"
    , "[--tiling]"
    , "[--polyhedral]"
    , "[--explicit-vectorization]"
@@ -191,7 +192,10 @@ main = do
           , poEnableParallelization = parallel
           , poVectorWidth = simdWidth
           }
-      frontendOptions = defaultFrontendOptions { frontendSkipFusion = noFusion }
+      frontendOptions = defaultFrontendOptions
+        { frontendSkipFusion = noFusion
+        , frontendMaterialize = "--materialize" `elem` flags
+        }
   (input, mpath) <- readInput paths
 
   let ccFlag = flagValue "--cc=" flags

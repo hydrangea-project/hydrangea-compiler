@@ -84,10 +84,15 @@ data FrontendOptions = FrontendOptions
     -- ^ When 'True', skip the array-fusion pass entirely.  Intermediate
     --   arrays that would normally be fused away are materialised; useful
     --   for benchmarking the impact of fusion.
+  , frontendMaterialize :: Bool
+    -- ^ When 'True', skip fusion and materialise every producer operand (see
+    --   'materializeDec'): a baseline that measures what fusion and in-place
+    --   lowering together save.
   } deriving (Eq, Show)
 
 defaultFrontendOptions :: FrontendOptions
-defaultFrontendOptions = FrontendOptions { frontendSkipFusion = False }
+defaultFrontendOptions =
+  FrontendOptions { frontendSkipFusion = False, frontendMaterialize = False }
 
 -- | Normalize and fuse declarations before lowering or code generation.
 preprocessDecs :: [Dec Range] -> [Dec Range]
@@ -98,8 +103,42 @@ preprocessDecsWithOptions :: FrontendOptions -> [Dec Range] -> [Dec Range]
 preprocessDecsWithOptions opts decs =
   let u = uniquifyDecs decs
       n = normalizeShapesDecs u
-      f = if frontendSkipFusion opts then n else fuseDecs n
+      f | frontendMaterialize opts = map materializeDec n
+        | frontendSkipFusion opts = n
+        | otherwise = fuseDecs n
   in rewriteTemporalDecs (map uncurryLambdaDec f)
+
+-- | The materialising baseline: every producer that is the array operand of
+-- another array operation is wrapped in 'EReify', so lowering writes it to
+-- memory instead of reading it in place, and every array operation makes its
+-- own pass over memory.
+materializeDec :: Dec Range -> Dec Range
+materializeDec (Dec a name pats mp mt body) = Dec a name pats mp mt (materializeExp body)
+
+materializeExp :: Exp a -> Exp a
+materializeExp e = case mapSubExps materializeExp e of
+  EMap a f x -> EMap a f (m x)
+  EZipWith a f x y -> EZipWith a f (m x) (m y)
+  EReduce a f z x -> EReduce a f z (m x)
+  EScatter a c d i v -> EScatter a c (m d) (m i) (m v)
+  EScatterGuarded a c d i v g -> EScatterGuarded a c (m d) (m i) (m v) (m g)
+  EGather a i x -> EGather a (m i) (m x)
+  EIndex a i x -> EIndex a i (m x)
+  EAppend a x y -> EAppend a (m x) (m y)
+  e' -> e'
+  where
+    m x = if producer x then EReify (firstParam x) x else x
+    producer x = case x of
+      EGenerate {} -> True
+      EMap {} -> True
+      EZipWith {} -> True
+      EFill {} -> True
+      EGather {} -> True
+      EAppend {} -> True
+      EScatter {} -> True
+      EScatterGuarded {} -> True
+      EReduce {} -> True
+      _ -> False
 
 -- | Turn a top-level value that is a lambda, @let f = fn a => fn b => e@
 -- (after uniquification, a chain of local functions each returning itself),

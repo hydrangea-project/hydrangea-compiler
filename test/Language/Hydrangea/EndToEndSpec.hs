@@ -1811,6 +1811,18 @@ spec = do
     it "handles the nest over local-let arrays (no fusion)" $ withCC $
       check noFusion localLetNest
 
+  describe "materialized baseline" $ do
+
+    it "computes the same results with every intermediate array written out" $ withCC $
+      case readDecs $ BS.pack $ unlines
+             [ "let xs = generate [64] (fn [i] => i % 7)"
+             , "let h = scatter (+) (fill [7] 0) xs (map (fn x => x * 2) xs)"
+             , "let s = reduce (+) 0 (zipwith (fn a b => a * b) xs (gather (generate [64] (fn [i] => [63 - i])) xs))" ] of
+        Left perr -> expectationFailure ("Parse error: " ++ perr)
+        Right decs ->
+          checkDecsWithOptions defaultFrontendOptions { frontendMaterialize = True }
+            defaultInferOptions defaultPipelineOptions decs
+
 -- | 'checkInlineSrc' with the runtime's reference-count checker enabled.
 checkWithRcCheck :: BS.ByteString -> IO ()
 checkWithRcCheck src =

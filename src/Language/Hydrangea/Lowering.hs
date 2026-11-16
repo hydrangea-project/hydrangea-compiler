@@ -294,70 +294,7 @@ expandZeroArgLet env = go
         | Just (Dec _ _ pats _ _ rhs) <- M.lookup v env
         , null pats ->
             go rhs
-      EApp a f x -> EApp a (go f) (go x)
-      EIfThen a c t -> EIfThen a (go c) (go t)
-      EIfThenElse a c t e -> EIfThenElse a (go c) (go t) (go e)
-      ENeg a e -> ENeg a (go e)
-      EBinOp a l op r -> EBinOp a (go l) op (go r)
-      EUnOp a op e -> EUnOp a op (go e)
-      EVec a es -> EVec a (map go es)
-      EProj a i e -> EProj a i (go e)
-      EPair a l r -> EPair a (go l) (go r)
-      ERecord a fields -> ERecord a [(f, go e) | (f, e) <- fields]
-      ERecordProj a e f -> ERecordProj a (go e) f
-      EGenerate a shp fn -> EGenerate a (go shp) (go fn)
-      EMap a fn arr -> EMap a (go fn) (go arr)
-      EZipWith a fn x y -> EZipWith a (go fn) (go x) (go y)
-      EAppend a x y -> EAppend a (go x) (go y)
-      EReduce a fn z arr -> EReduce a (go fn) (go z) (go arr)
-      EReduceGenerate a fn z shp gen -> EReduceGenerate a (go fn) (go z) (go shp) (go gen)
-      EFoldl a fn z arr -> EFoldl a (go fn) (go z) (go arr)
-      EFoldlWhile a p fn z arr -> EFoldlWhile a (go p) (go fn) (go z) (go arr)
-      EScan a fn z arr -> EScan a (go fn) (go z) (go arr)
-      EScanInclusive a fn z arr -> EScanInclusive a (go fn) (go z) (go arr)
-      EScanR a fn z arr -> EScanR a (go fn) (go z) (go arr)
-      EScanRInclusive a fn z arr -> EScanRInclusive a (go fn) (go z) (go arr)
-      ESegmentedReduce a fn z offs vals -> ESegmentedReduce a (go fn) (go z) (go offs) (go vals)
-      ESortIndices a e -> ESortIndices a (go e)
-      EIota a e -> EIota a (go e)
-      EMakeIndex a n e -> EMakeIndex a (go n) (go e)
-      ECOOSumDuplicates a nrows ncols nnz rows cols vals ->
-        ECOOSumDuplicates a (go nrows) (go ncols) (go nnz) (go rows) (go cols) (go vals)
-      ECSRFromSortedCOO a nrows ncols nnz rows cols vals ->
-        ECSRFromSortedCOO a (go nrows) (go ncols) (go nnz) (go rows) (go cols) (go vals)
-      EPermute a fn d idx vals -> EPermute a (go fn) (go d) (go idx) (go vals)
-      EScatter a fn d idx vals -> EScatter a (go fn) (go d) (go idx) (go vals)
-      EScatterGuarded a fn d idx vals grd ->
-        EScatterGuarded a (go fn) (go d) (go idx) (go vals) (go grd)
-      EScatterGenerate a fn d idx valFn -> EScatterGenerate a (go fn) (go d) (go idx) (go valFn)
-      EScatterChain a fn d phases ->
-        EScatterChain a (go fn) (go d)
-          [ScatterPhase (go i) (go v) (go <$> mg) | ScatterPhase i v mg <- phases]
-      EScatterGen a fn d phases ->
-        EScatterGen a (go fn) (go d)
-          [ ScatterGenPhase (go shp) (go idxFn) (go valFn) (go <$> mg)
-          | ScatterGenPhase shp idxFn valFn mg <- phases
-          ]
-      EGather a idx arr -> EGather a (go idx) (go arr)
-      EIndex a idx arr -> EIndex a (go idx) (go arr)
-      ECheckIndex a idx def arr -> ECheckIndex a (go idx) (go def) (go arr)
-      ECompact a mode filler guardArr arr -> ECompact a mode (go filler) (go guardArr) (go arr)
-      EFill a shp val -> EFill a (go shp) (go val)
-      EStencil a bc fn arr -> EStencil a bc (go fn) (go arr)
-      EReplicate a dims arr -> EReplicate a dims (go arr)
-      ESlice a dims arr -> ESlice a dims (go arr)
-      EReshape a shp arr -> EReshape a (go shp) (go arr)
-      EIterate a n initExp step -> EIterate a (go n) (go initExp) (go step)
-      EBoundLetIn a v b rhs body -> EBoundLetIn a v (go b) (go rhs) (go body)
-      EShapeOf a e -> EShapeOf a (go e)
-      EReadArray a shp file -> EReadArray a (go shp) (go file)
-      EReadArrayFloat a shp file -> EReadArrayFloat a (go shp) (go file)
-      EWriteArray a arr path -> EWriteArray a (go arr) (go path)
-      EWriteArrayFloat a arr path -> EWriteArrayFloat a (go arr) (go path)
-      EGetEnvInt a e -> EGetEnvInt a (go e)
-      EGetEnvString a e -> EGetEnvString a (go e)
-      EReify a e -> EReify a (go e)
-      _ -> expr
+      _ -> mapSubExps go expr
 
 ------------------------------------------------------------------------
 -- Guarded scatter fusion
@@ -4849,35 +4786,7 @@ renameVarInIndexExpr old new ie = case ie of
   _ -> ie
 
 renameVarInRHS :: CVar -> CVar -> RHS -> RHS
-renameVarInRHS old new rhs =
-  case rhs of
-    RAtom a -> RAtom (renameVarInAtom old new a)
-    RBinOp op a b -> RBinOp op (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RUnOp op a -> RUnOp op (renameVarInAtom old new a)
-    RTuple as -> RTuple (map (renameVarInAtom old new) as)
-    RProj i a -> RProj i (renameVarInAtom old new a)
-    RRecord fields -> RRecord [(field, renameVarInAtom old new atom) | (field, atom) <- fields]
-    RRecordProj field a -> RRecordProj field (renameVarInAtom old new a)
-    RArrayAlloc a -> RArrayAlloc (renameVarInAtom old new a)
-    RArrayLoad a b -> RArrayLoad (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RArrayShape a -> RArrayShape (renameVarInAtom old new a)
-    RShapeSize a -> RShapeSize (renameVarInAtom old new a)
-    RShapeInit a -> RShapeInit (renameVarInAtom old new a)
-    RShapeLast a -> RShapeLast (renameVarInAtom old new a)
-    RFlatToNd a b -> RFlatToNd (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RNdToFlat a b -> RNdToFlat (renameVarInAtom old new a) (renameVarInAtom old new b)
-    R2DToFlat a b -> R2DToFlat (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RCall f args -> RCall f (map (renameVarInAtom old new) args)
-    RVecLoad a b -> RVecLoad (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RVecStore a b c -> RVecStore (renameVarInAtom old new a) (renameVarInAtom old new b) (renameVarInAtom old new c)
-    RVecBinOp op a b -> RVecBinOp op (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RVecUnOp op a -> RVecUnOp op (renameVarInAtom old new a)
-    RVecSplat a -> RVecSplat (renameVarInAtom old new a)
-    RVecReduce op a -> RVecReduce op (renameVarInAtom old new a)
-    RPairMake ct1 ct2 a b -> RPairMake ct1 ct2 (renameVarInAtom old new a) (renameVarInAtom old new b)
-    RPairFst ct a -> RPairFst ct (renameVarInAtom old new a)
-    RPairSnd ct a -> RPairSnd ct (renameVarInAtom old new a)
-    RArrayFree a -> RArrayFree (renameVarInAtom old new a)
+renameVarInRHS old new = mapRHSAtoms (renameVarInAtom old new)
 
 renameVarInReductionSpec :: CVar -> CVar -> ReductionSpec -> ReductionSpec
 renameVarInReductionSpec old new (ReductionSpec acc initE redop) =
@@ -5022,9 +4931,7 @@ lowerScatterTarget lower defaultsExp = do
 flattenTupleIndices :: Map CVar CType -> [Stmt] -> LowerM [Stmt]
 flattenTupleIndices typeEnv body = goBlock body
   where
-    tys = recoverProcTypeEnv M.empty M.empty
-            Proc { procName = "", procParams = [], procBody = body, procTypeEnv = typeEnv
-                 , procArrayFacts = M.empty, procVectorAccessFacts = M.empty }
+    tys = recoverProcTypeEnv M.empty M.empty (mkProc "" [] body) { procTypeEnv = typeEnv }
     isTuple v = M.lookup v tys == Just CTTuple
     goBlock = fmap concat . mapM goStmt
     goStmt stmt = case stmt of

@@ -633,3 +633,90 @@ instance (Ord a) => Ord (Pat a) where
   compare p1 p2 =
     compare (patConstructorRank p1) (patConstructorRank p2)
       <> compareSamePattern p1 p2
+
+-- | Apply a function to the immediate sub-expressions of an expression,
+-- including those inside its local declarations, patterns, shapes and
+-- boundary conditions.
+mapSubExps :: (Exp a -> Exp a) -> Exp a -> Exp a
+mapSubExps f e = case e of
+  EInt {}    -> e
+  EFloat {}  -> e
+  EVar {}    -> e
+  EString {} -> e
+  EUnit {}   -> e
+  EBool {}   -> e
+  EOp {}     -> e
+  EVec a es -> EVec a (map f es)
+  EApp a g x -> EApp a (f g) (f x)
+  EIfThen a c t -> EIfThen a (f c) (f t)
+  EIfThenElse a c t el -> EIfThenElse a (f c) (f t) (f el)
+  ENeg a x -> ENeg a (f x)
+  EBinOp a l op r -> EBinOp a (f l) op (f r)
+  EUnOp a op x -> EUnOp a op (f x)
+  ELetIn a (Dec da n ps w ann b) body -> ELetIn a (Dec da n (map pat ps) w ann (f b)) (f body)
+  EBoundLetIn a v bnd rhs body -> EBoundLetIn a v (f bnd) (f rhs) (f body)
+  EProj a i x -> EProj a i (f x)
+  EPair a x y -> EPair a (f x) (f y)
+  ERecord a fs -> ERecord a [(k, f v) | (k, v) <- fs]
+  ERecordProj a x k -> ERecordProj a (f x) k
+  EGenerate a sz g -> EGenerate a (f sz) (f g)
+  EMap a g arr -> EMap a (f g) (f arr)
+  EZipWith a g x y -> EZipWith a (f g) (f x) (f y)
+  EAppend a x y -> EAppend a (f x) (f y)
+  EReduce a g z arr -> EReduce a (f g) (f z) (f arr)
+  EReduceGenerate a g z sh gen -> EReduceGenerate a (f g) (f z) (f sh) (f gen)
+  EIterate a n i g -> EIterate a (f n) (f i) (f g)
+  EFoldl a g z arr -> EFoldl a (f g) (f z) (f arr)
+  EFoldlWhile a p g z arr -> EFoldlWhile a (f p) (f g) (f z) (f arr)
+  EScan a g z arr -> EScan a (f g) (f z) (f arr)
+  EScanInclusive a g z arr -> EScanInclusive a (f g) (f z) (f arr)
+  EScanR a g z arr -> EScanR a (f g) (f z) (f arr)
+  EScanRInclusive a g z arr -> EScanRInclusive a (f g) (f z) (f arr)
+  ESegmentedReduce a g z o vs -> ESegmentedReduce a (f g) (f z) (f o) (f vs)
+  ESortIndices a arr -> ESortIndices a (f arr)
+  EIota a n -> EIota a (f n)
+  EMakeIndex a n arr -> EMakeIndex a (f n) (f arr)
+  ECOOSumDuplicates a x1 x2 x3 x4 x5 x6 -> ECOOSumDuplicates a (f x1) (f x2) (f x3) (f x4) (f x5) (f x6)
+  ECSRFromSortedCOO a x1 x2 x3 x4 x5 x6 -> ECSRFromSortedCOO a (f x1) (f x2) (f x3) (f x4) (f x5) (f x6)
+  EPermute a c d p arr -> EPermute a (f c) (f d) (f p) (f arr)
+  EScatter a c d i x -> EScatter a (f c) (f d) (f i) (f x)
+  EScatterGuarded a c d i x g -> EScatterGuarded a (f c) (f d) (f i) (f x) (f g)
+  EScatterGenerate a c d i g -> EScatterGenerate a (f c) (f d) (f i) (f g)
+  EScatterChain a c d phases ->
+    EScatterChain a (f c) (f d) [ScatterPhase (f i) (f v) (f <$> mg) | ScatterPhase i v mg <- phases]
+  EScatterGen a c d phases ->
+    EScatterGen a (f c) (f d)
+      [ScatterGenPhase (f sh) (f i) (f v) (f <$> mg) | ScatterGenPhase sh i v mg <- phases]
+  EGather a i arr -> EGather a (f i) (f arr)
+  EIndex a i arr -> EIndex a (f i) (f arr)
+  ECheckIndex a i d arr -> ECheckIndex a (f i) (f d) (f arr)
+  ECompact a m z g xs -> ECompact a m (f z) (f g) (f xs)
+  EFill a sz v -> EFill a (f sz) (f v)
+  EShapeOf a arr -> EShapeOf a (f arr)
+  EReplicate a dims arr -> EReplicate a (map shapeDim dims) (f arr)
+  ESlice a dims arr -> ESlice a (map sliceDim dims) (f arr)
+  EReshape a sz arr -> EReshape a (f sz) (f arr)
+  EStencil a bc g arr -> EStencil a (boundary bc) (f g) (f arr)
+  EReify a arr -> EReify a (f arr)
+  EReadArray a sz p -> EReadArray a (f sz) (f p)
+  EReadArrayFloat a sz p -> EReadArrayFloat a (f sz) (f p)
+  EWriteArray a arr p -> EWriteArray a (f arr) (f p)
+  EWriteArrayFloat a arr p -> EWriteArrayFloat a (f arr) (f p)
+  EGetEnvInt a x -> EGetEnvInt a (f x)
+  EGetEnvString a x -> EGetEnvString a (f x)
+  where
+    pat p = case p of
+      PBound pa v x -> PBound pa v (f x)
+      PVec pa ps -> PVec pa (map pat ps)
+      PPair pa p1 p2 -> PPair pa (pat p1) (pat p2)
+      _ -> p
+    shapeDim d = case d of
+      ShapeAny a x -> ShapeAny a (f x)
+      ShapeDim a x -> ShapeDim a (f x)
+      _ -> d
+    sliceDim d = case d of
+      SliceRange a st l -> SliceRange a (f st) (f l)
+      _ -> d
+    boundary bc = case bc of
+      BConst x -> BConst (f x)
+      _ -> bc
