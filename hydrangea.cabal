@@ -101,6 +101,7 @@ test-suite hydrangea-test
        , Language.Hydrangea.OwnershipSpec
        , Language.Hydrangea.ReduceLoweringSpec
        , Language.Hydrangea.ParserSpec
+       , Language.Hydrangea.PrettySpec
        , Language.Hydrangea.InterpreterSpec
        , Language.Hydrangea.FusionSpec
        , Language.Hydrangea.DupSafeSpec
