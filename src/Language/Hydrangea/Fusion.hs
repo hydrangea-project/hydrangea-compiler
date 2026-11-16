@@ -57,6 +57,17 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Set (Set)
 import Data.Set qualified as S
+import Language.Hydrangea.DupSafe
+  ( AccumEnv
+  , accumEnvDecs
+  , accumEnvExp
+  , emptyAccumEnv
+  , dupSafe
+  , dupSafePat
+  , isValueExp
+  , mayAccumulate
+  , usedOnceOutsideLoops
+  )
 import Language.Hydrangea.Syntax
 import Language.Hydrangea.ShapeNormalize (normalizeShapesExp, sliceShape)
 import Language.Hydrangea.Uniquify (collectVarsExp, collectVarsDec)
@@ -66,6 +77,8 @@ import Language.Hydrangea.Util (freshUnusedName)
 data FusionState = FusionState
   { freshCounter :: Int
   , usedVars :: Set Var
+  , accumEnv :: AccumEnv
+    -- ^ Functions whose invocation may accumulate, for the 'dupSafe' checks.
   }
 
 newtype FusionM a = FusionM {runFusionM :: State FusionState a}
@@ -531,6 +544,15 @@ substPat (PVec pa ps) arg body =
   in foldl go (Just body) (zip ps [0..])
 -- Complex patterns (e.g. PPair) cannot be safely reduced here; refuse to inline.
 substPat _ _ _ = Nothing
+
+-- | Bind one beta argument.  Substitute when 'dupSafePat' allows it;
+-- otherwise keep call-by-value sharing with a @let@ under the parameter's own
+-- (unique) name, and give up on compound patterns.
+bindArg :: AccumEnv -> Pat a -> Exp a -> Exp a -> Maybe (Exp a)
+bindArg env p arg body
+  | dupSafePat env p arg body = substPat p arg body
+  | PVar pa v <- p = Just (ELetIn pa (Dec pa v [] Nothing Nothing arg) body)
+  | otherwise = Nothing
 
 -- | True when an expression represents a function value (has remaining
 -- parameters in a local let-binding), so that inlining it at application
@@ -1193,7 +1215,7 @@ normBndFusion (BConst e) = BConst <$> normExp e
 -- downstream lowering and code generation.
 fuseExp :: (Eq a) => Exp a -> Exp a
 fuseExp expr =
-  let initState = FusionState {freshCounter = 0, usedVars = collectVarsExp expr}
+  let initState = FusionState {freshCounter = 0, usedVars = collectVarsExp expr, accumEnv = emptyAccumEnv}
    in evalState (runFusionM (fuseFix expr)) initState
 
 -- | Run fusion over a single top-level declaration.
@@ -1202,7 +1224,7 @@ fuseExp expr =
 -- applies the fixed-point driver to the declaration body.
 fuseDec :: (Eq a) => Dec a -> Dec a
 fuseDec dec =
-  let initState = FusionState {freshCounter = 0, usedVars = collectVarsDec dec}
+  let initState = FusionState {freshCounter = 0, usedVars = collectVarsDec dec, accumEnv = emptyAccumEnv}
    in evalState (runFusionM (fuseDecM dec)) initState
 
 -- | Run fusion for a list of top-level declarations.
@@ -1219,13 +1241,21 @@ fuseDecs decs =
   -- pass has already converted the inner scatter to scatter_generate.
   let preInlined = inlineScatterArrayDecs decs
       -- First pass: fuse each declaration independently.
-      initState0 = FusionState {freshCounter = 0, usedVars = S.unions (map collectVarsDec preInlined)}
+      initState0 = FusionState
+        { freshCounter = 0
+        , usedVars = S.unions (map collectVarsDec preInlined)
+        , accumEnv = accumEnvDecs preInlined
+        }
       fused0 = evalState (runFusionM (mapM fuseDecM preInlined)) initState0
       -- Second pass: inline single-use function-valued (and other array-valued)
       -- declarations that are now visible as expressions after the first fusion round.
       inlined = inlineFnValueDecs fused0
       -- Third pass: fuse again to beta-reduce the newly inlined applications.
-      initState1 = FusionState {freshCounter = 0, usedVars = S.unions (map collectVarsDec inlined)}
+      initState1 = FusionState
+        { freshCounter = 0
+        , usedVars = S.unions (map collectVarsDec inlined)
+        , accumEnv = accumEnvDecs inlined
+        }
    in evalState (runFusionM (mapM fuseDecM inlined)) initState1
 
 -- | Pre-fusion pass: inline single-use top-level scatter/permute array
@@ -1287,9 +1317,11 @@ inlineScatterArrayDecs = go []
             _                  -> False
           -- Only inline when: (a) single-use, (b) every use is strictly the
           -- bottom of a scatter default chain (not a standalone alias, not in
-          -- index/values/guard, not in reduce/map/etc.)
+          -- index/values/guard, not in reduce/map/etc.), (c) the use is not in
+          -- a function body, which would re-evaluate the scatter on every call.
           eligible = isRawScatter && not isReify && totalUsage == 1
                        && not (any (appearsInNonScatterDefault name) restBodies)
+                       && not (any (usedInFunctionDec name) rest)
       in if eligible
            then go ((name, body') : env) rest
            else Dec a name [] mw poly body' : go env rest
@@ -1298,6 +1330,10 @@ inlineScatterArrayDecs = go []
       in Dec a name pats mw poly body' : go env rest
 
     applyEnv env e = foldl (\acc (v, r) -> substExp v r acc) e env
+
+-- | Does @name@ occur in the body of a declaration with parameters?
+usedInFunctionDec :: Var -> Dec a -> Bool
+usedInFunctionDec name (Dec _ _ ps _ _ b) = not (null ps) && countVarExp name b > 0
 
 -- | Inline function-valued top-level declarations into their single use sites.
 --
@@ -1308,8 +1344,17 @@ inlineScatterArrayDecs = go []
 -- the "cross-declaration closure" pattern that the per-declaration fusion pass
 -- cannot see through.
 inlineFnValueDecs :: (Eq a) => [Dec a] -> [Dec a]
-inlineFnValueDecs = go []
+inlineFnValueDecs decs0 = go [] decs0
   where
+    env0 = accumEnvDecs decs0
+    -- A function value with a non-value prefix (@let t = e in let g x = ...
+    -- in g@) evaluates @e@ where it is used, which is only sound once.
+    safeToMove name body rest =
+      isValueExp body
+        || not (mayAccumulate env0 body)
+        || all (\(Dec _ _ ps _ _ b) -> countVarExp name b == 0
+                                     || (null ps && usedOnceOutsideLoops name b)) rest
+
     go env [] = []
     go env (Dec a name [] mw poly body : rest) =
       let body' = applyEnv env body
@@ -1329,6 +1374,7 @@ inlineFnValueDecs = go []
             _ -> False
           eligible = (isFunctionExp body' || iterateInitInlinable)
                      && totalUsage == 1
+                     && safeToMove name body' rest
       in if eligible
            then go ((name, body') : env) rest
            else Dec a name [] mw poly body' : go env rest
@@ -1433,6 +1479,7 @@ fuseFixWithLimit iters0 e0 = go iters0 e0
   where
     go 0 e = pure e
     go n e = do
+      modify (\st -> st {accumEnv = accumEnvExp (accumEnv st) e})
       e' <- fuseOnce e
       let stable = e' == e || normalizeFusionInternalVars e' == normalizeFusionInternalVars e
       if stable
@@ -1456,8 +1503,9 @@ fuseOnce expr =
       -- → substitute arg for p in fbody, keeping remaining pats.
       case f' of
         ELetIn _ (Dec db fname (p:pats) mw poly fbody) (EVar _ fname')
-          | fname == fname' ->
-              case substPat p x' fbody of
+          | fname == fname' -> do
+              env <- gets accumEnv
+              case bindArg (accumEnvExp env f') p x' fbody of
                 Just fbody' ->
                   let reduced = if null pats
                         then fbody'
@@ -1474,6 +1522,7 @@ fuseOnce expr =
     ELetIn a d e -> do
       d'@(Dec da name pats _ _ body) <- fuseDecM d
       e' <- fuseOnce e
+      env <- (`accumEnvExp` ELetIn a d' e') <$> gets accumEnv
       -- Beta reduction: (let f p1...pn = body in f a1...am) where 1 ≤ m.
       -- Consume as many leading arguments as we have patterns, substituting each.
       let (retFn, retArgs) = peelApps e'
@@ -1482,7 +1531,7 @@ fuseOnce expr =
               let n = min (length pats) (length retArgs)
                   (consumedPats, remainingPats) = splitAt n pats
                   (consumedArgs, remainingArgs) = splitAt n retArgs
-                  applyPats acc (p, arg) = acc >>= substPat p arg
+                  applyPats acc (p, arg) = acc >>= bindArg env p arg
                   mbody' = foldl applyPats (Just body) (zip consumedPats consumedArgs)
               in case mbody' of
                    Just body' ->
@@ -1504,10 +1553,12 @@ fuseOnce expr =
               -- that appear exactly once (enables cross-binding beta reduction).
               -- Producer expressions (generate/fill) are pure and cheap to re-evaluate,
               -- so inline them even at multiple use sites to enable scatter fusion.
+              -- Never duplicate an evaluation the let performs once.
               shouldInline = inlineable && not captureRisk
                           && not isReify
                           && (isArrayExp body || isFunctionExp body)
                           && (usage == 1 || isProducerExp body)
+                          && dupSafe env name body e'
           in if shouldInline
                then fuseOnce (substExp name body e')
                else pure (ELetIn a d' e')
@@ -2288,10 +2339,13 @@ fuseIndex a idx arr =
             _ -> pure (EIndex a idx arr)
 
 fuseReplicate :: (Eq a) => a -> [ShapeDim a] -> Exp a -> FusionM (Exp a)
-fuseReplicate a dims arr =
+fuseReplicate a dims arr = do
+  env <- gets accumEnv
   case arr of
-    -- replicate dims (map f xs) => map f (replicate dims xs)
-    EMap _ f xs -> pure (EMap a f (EReplicate a dims xs))
+    -- replicate dims (map f xs) => map f (replicate dims xs).  This runs f
+    -- once per copy rather than once per element, so it is only sound when
+    -- f cannot accumulate.
+    EMap _ f xs | not (mayAccumulate env f) -> pure (EMap a f (EReplicate a dims xs))
     _ -> pure (EReplicate a dims arr)
 
 fuseSlice :: (Eq a) => a -> [SliceDim a] -> Exp a -> FusionM (Exp a)

@@ -28,6 +28,7 @@ library
                    , Language.Hydrangea.Infer
                    , Language.Hydrangea.Uniquify
                    , Language.Hydrangea.Specialize
+                   , Language.Hydrangea.DupSafe
                    , Language.Hydrangea.Fusion
                    , Language.Hydrangea.ShapeNormalize
                    , Language.Hydrangea.TemporalTiling
@@ -99,6 +100,7 @@ test-suite hydrangea-test
        , Language.Hydrangea.ParserSpec
        , Language.Hydrangea.InterpreterSpec
        , Language.Hydrangea.FusionSpec
+       , Language.Hydrangea.DupSafeSpec
        , Language.Hydrangea.CFGAnalysisSpec
        , Language.Hydrangea.CFGOptSpec
        , Language.Hydrangea.TileSpec
