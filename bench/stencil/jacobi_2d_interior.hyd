@@ -1,16 +1,27 @@
+(* 2D Jacobi iteration that updates only the interior and keeps the
+   boundary fixed.  Each step maps an h x w grid to an h x w grid, as an
+   iterate's step must for the state to make sense on every trip.
+
+   Environment variables:
+     JACOBI_H      -- grid height (rows)
+     JACOBI_W      -- grid width  (cols)
+     JACOBI_ITERS  -- number of time steps *)
 let h       = get_env_int "JACOBI_H"
 let w       = get_env_int "JACOBI_W"
 let n_iters = get_env_int "JACOBI_ITERS"
-let initial = generate [h, w] (fn [i, j] => 1.0)
+let initial = generate [h, w] (fn [i, j] => float_of ((i * 7 + j * 13) % 17))
 let step    = fn arr =>
-  generate [h-2, w-2]
+  generate [h, w]
     (let f [i, j] =
-      let ii = i+1 in
-      let jj = j+1 in
-      (index [ii-1, jj] arr +.
-       index [ii+1, jj] arr +.
-       index [ii, jj-1] arr +.
-       index [ii, jj+1] arr) /. 4.0
+      if i = 0 then index [i, j] arr
+      else if i = h - 1 then index [i, j] arr
+      else if j = 0 then index [i, j] arr
+      else if j = w - 1 then index [i, j] arr
+      else
+        (index [i-1, j] arr +.
+         index [i+1, j] arr +.
+         index [i, j-1] arr +.
+         index [i, j+1] arr) /. 4.0
     in f)
 let result  = iterate n_iters initial step
 let main    = write_array_float result "jacobi_out.csv"

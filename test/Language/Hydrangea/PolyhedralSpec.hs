@@ -224,7 +224,7 @@ spec = describe "Polyhedral" $ do
 
   it "collapses source-level 1D clamp iterate kernels into the wavefront path" $ do
     body <-
-      loadPolyhedralProcBodyFromSource
+      loadTiledProcBodyFromSource
         "result"
         (BS.pack $ unlines
           [ "let init = generate [5] (fn [i] => 1.0)"
@@ -235,9 +235,32 @@ spec = describe "Polyhedral" $ do
            ])
     hasParallelLoopInStmts body `shouldBe` True
 
+  -- The wavefront is a temporal tiling, so it is part of the tiling path:
+  -- the polyhedral path with tiling off reschedules the stencil but keeps
+  -- its time loop.
+  it "leaves iterate kernels' time loop alone when tiling is off" $ do
+    decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
+      [ "let step arr = stencil clamp"
+      , "  (let acc_fn acc = (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1) /. 4.0 in acc_fn)"
+      , "  arr"
+      , "let result = iterate 2 (generate [4, 4] (let f [i, j] = 1.0 in f)) step"
+      ]
+    prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
+    let opts = defaultPipelineOptions
+          { poEnableTiling = False
+          , poEnablePolyhedral = True
+          , poEnableParallelization = False
+          }
+        Program procs = polyhedralProgram (preparePolyhedralProgramWithOptions opts prog)
+    case [procBody p | p <- procs, Language.Hydrangea.CFG.procName p == "result"] of
+      [body] -> do
+        loopRolesInStmts body `shouldContain` [LoopIterate]
+        countWavefrontRingAllocsInStmts body `shouldBe` 0
+      other -> expectationFailure ("expected one result proc, got " <> show (length other))
+
   it "collapses source-level 2D clamp iterate kernels into the wavefront path" $ do
     body <-
-      loadPolyhedralProcBodyFromSource
+      loadTiledProcBodyFromSource
         "result"
         (BS.pack $ unlines
           [ "let step arr = stencil clamp"
@@ -250,7 +273,7 @@ spec = describe "Polyhedral" $ do
 
   it "collapses source-level 3D clamp iterate kernels into the wavefront path" $ do
     body <-
-      loadPolyhedralProcBodyFromSource
+      loadTiledProcBodyFromSource
         "result"
         (BS.pack $ unlines
           [ "let step arr = stencil clamp"
@@ -817,29 +840,6 @@ loadPreparedDiagnosticsFromSource src =
               }
       prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
       pure (collectProgramScopDiagnostics (preparePolyhedralProgramWithOptions pipelineOpts prog))
-
-loadPolyhedralProcBodyFromSource :: C.CVar -> BS.ByteString -> IO [Stmt]
-loadPolyhedralProcBodyFromSource procName src =
-  case readDecs src of
-    Left perr ->
-      expectationFailure ("Parse error: " ++ perr) >> pure []
-    Right decs -> do
-      let pipelineOpts =
-            defaultPipelineOptions
-              { poEnableTiling = True
-              , poEnablePolyhedral = True
-              , poEnableParallelization = False
-              }
-      prog <- lowerToCFGWithTypesWithOptions defaultInferOptions decs
-      let prepared = preparePolyhedralProgramWithOptions pipelineOpts prog
-          Program procs = polyhedralProgram prepared
-      case [procBody proc | proc <- procs, Language.Hydrangea.CFG.procName proc == procName] of
-        [body] ->
-          pure body
-        [] ->
-          expectationFailure ("missing proc: " <> show procName) >> pure []
-        _ ->
-          expectationFailure ("multiple procs named: " <> show procName) >> pure []
 
 loadTiledProcBodyFromSource :: C.CVar -> BS.ByteString -> IO [Stmt]
 loadTiledProcBodyFromSource procName src =
@@ -1633,7 +1633,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
             ]
         proc = mkProc "p" ["n", "arr_cur"] [outerLoop]
-    case polyhedralProgram (Program [proc]) of
+    case polyhedralTileProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
@@ -1660,7 +1660,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
             ]
         proc = mkProc "p" ["T", "n", "arr_cur"] [outerLoop]
-    case polyhedralProgram (Program [proc]) of
+    case polyhedralTileProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
@@ -1686,7 +1686,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RCall "hyd_array_own" [C.AVar "arr_cur"])
             , outerLoop
             ]
-    case polyhedralProgram (Program [proc]) of
+    case polyhedralTileProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldNotContain` [LoopIterate]
         hasParallelLoopInStmts (procBody rewritten) `shouldBe` True
@@ -1711,7 +1711,7 @@ wavefrontCollapseSpec = describe "wavefront collapse" $ do
             , SAssign "arr_cur" (C.RAtom (C.AVar "arr_next"))
             ]
         proc = mkProc "p" ["arr_cur"] [outerLoop]
-    case polyhedralProgram (Program [proc]) of
+    case polyhedralTileProgram (Program [proc]) of
       Program [rewritten] -> do
         loopRolesInStmts (procBody rewritten) `shouldContain` [LoopIterate]
       other ->

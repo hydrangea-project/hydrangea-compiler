@@ -320,6 +320,47 @@ spec = do
               `shouldBe` Just ([SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)], "arr_cur", "arr_next")
         other -> expectationFailure ("unexpected shape: " ++ show other)
 
+    -- Double-buffering reuses the initial state's buffer for later states, so
+    -- it is wrong for a step whose result has a different shape, even when
+    -- the body also reads the state's shape (here, to index it).
+    it "keeps the allocation of an iterate step that changes the state's shape" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
+          body =
+            [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
+            , SAssign "n" (RShapeSize (AVar "shp"))
+            , SAssign "m" (RBinOp CSub (AVar "n") (AInt 1))
+            , SAssign "next_shp" (RTuple [AVar "m"])
+            , SAssign "arr_next" (RArrayAlloc (AVar "next_shp"))
+            , SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+            , SAssign "arr_cur" (RAtom (AVar "arr_next"))
+            ]
+      hoistIterateAllocs [SLoop loopSpec body] `shouldBe` [SLoop loopSpec body]
+
+    -- The shape is computed before the loop, so nothing in the loop says it
+    -- is the state's shape.
+    it "keeps the allocation of an iterate step whose shape it cannot relate to the state" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
+          body =
+            [ SAssign "arr_next" (RArrayAlloc (AVar "outer_shp"))
+            , SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+            , SAssign "arr_cur" (RAtom (AVar "arr_next"))
+            ]
+      hoistIterateAllocs [SLoop loopSpec body] `shouldBe` [SLoop loopSpec body]
+
+    it "double-buffers an iterate whose allocation reads the state's shape through a copy" $ do
+      let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
+          body =
+            [ SAssign "shp" (RArrayShape (AVar "arr_cur"))
+            , SAssign "shp2" (RAtom (AVar "shp"))
+            , SAssign "arr_next" (RArrayAlloc (AVar "shp2"))
+            , SArrayWrite (AVar "arr_next") (AInt 0) (AFloat 1.0)
+            , SAssign "arr_cur" (RAtom (AVar "arr_next"))
+            ]
+      hoistIterateAllocs [SLoop loopSpec body]
+        `shouldSatisfy` any (\s -> case s of
+                                SAssign "arr_next" (RArrayCopy (AVar "arr_cur")) -> True
+                                _ -> False)
+
     it "preserves hoisted iterate ping-pong swaps under optimization" $ do
       let loopSpec = LoopSpec ["iter_t"] [IConst 3] Serial Nothing LoopIterate []
           stmts =

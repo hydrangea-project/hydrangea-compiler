@@ -25,19 +25,25 @@ import Language.Hydrangea.Frontend
   , compileToCOptIOWithPipelineOptionsAndCodegenOptions
   , compileToCOptParallelIO
   , evalDecsFrontend
+  , lowerToCFGWithTypes
+  , optimizeCFGWithPipelineOptions
+  , optimizeParallelCFG
   , FrontendOptions(..)
   , defaultFrontendOptions
   )
 import Language.Hydrangea.Interpreter (Value(..))
 import qualified Data.Map as Map
 import Data.Char (isAlphaNum, isDigit)
-import Data.List (intercalate, dropWhileEnd, isInfixOf, isPrefixOf, stripPrefix)
+import Data.List (intercalate, dropWhileEnd, isInfixOf, isPrefixOf, stripPrefix, tails)
 import Text.Read (readMaybe)
 import Language.Hydrangea.Syntax (Dec(..), Exp(..), ScatterPhase(..))
 import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Infer (InferOptions(..), defaultInferOptions)
 import Language.Hydrangea.CFGPipeline (PipelineOptions(..), defaultPipelineOptions)
-import Language.Hydrangea.CodegenC (defaultCodegenOptions)
+import Language.Hydrangea.CodegenC (CodegenOptions(..), defaultCodegenOptions)
+import Language.Hydrangea.CFG (ParallelStrategy(..), Proc(..), Program(..), Stmt(..))
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CVar, RHS(..))
+import Language.Hydrangea.TestUtil (loopsIn, parallelStrategies)
 import System.IO.Temp (withSystemTempDirectory)
 import System.FilePath ((</>))
 import Control.Monad (forM_, when)
@@ -466,107 +472,79 @@ spec = do
         , "let result = iterate 2 init step"
         ]
 
-    it "emits wavefront-tiled jacobi interior C and matches the untiled polyhedral path" $ withCC $
-      withSystemTempDirectory "hydrangea-jacobi" $ \tmp -> do
-        src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"
-        case readDecs src of
-          Left perr -> expectationFailure $ "Parse error: " ++ perr
-          Right decs -> do
-            let polyOpts =
-                  defaultPipelineOptions
-                    { poEnableTiling = True
-                    , poEnablePolyhedral = True
-                    , poEnableExplicitVectorization = False
-                    , poEnableParallelization = False
-                    }
-                untiledOpts = polyOpts { poEnableTiling = False }
-                jacobiEnv =
-                  [ ("JACOBI_H", "10")
-                  , ("JACOBI_W", "10")
-                  , ("JACOBI_ITERS", "4")
-                  ]
-                tiledDir = tmp </> "tiled"
-                untiledDir = tmp </> "untiled"
-            tiledC <-
-              compileToCOptIOWithPipelineOptionsAndCodegenOptions
-                defaultInferOptions
-                polyOpts
-                defaultCodegenOptions
-                False
-                decs
-            untiledC <-
-              compileToCOptIOWithPipelineOptionsAndCodegenOptions
-                defaultInferOptions
-                untiledOpts
-                defaultCodegenOptions
-                False
-                decs
-            -- The polyhedral tiling pass now uses a wavefront schedule with ring
-            -- buffers; check that the wavefront profitability guard and ring-buffer
-            -- allocations are present in the tiled C output.
-            tiledC `shouldSatisfy` isInfixOf "__wf_frontier_profitable"
-            tiledC `shouldSatisfy` isInfixOf "__wf_ring"
-            createDirectoryIfMissing True tiledDir
-            createDirectoryIfMissing True untiledDir
-            tiledExe <- compileCToExecutable tiledDir tiledC False
-            untiledExe <- compileCToExecutable untiledDir untiledC False
-            tiledExit <- runExecutableInDir tiledDir tiledExe jacobiEnv
-            untiledExit <- runExecutableInDir untiledDir untiledExe jacobiEnv
-            tiledExit `shouldBe` ExitSuccess
-            untiledExit `shouldBe` ExitSuccess
-            tiledOut <- readFile (tiledDir </> "jacobi_out.csv")
-            untiledOut <- readFile (untiledDir </> "jacobi_out.csv")
-            tiledOut `shouldBe` untiledOut
+    -- A 2-D Jacobi stencil over a fixed-shape state, so each step's result
+    -- has the state's shape.  The initial values vary from cell to cell, so a
+    -- schedule that reads the wrong cell or the wrong time step changes the
+    -- output.
+    let jacobi2d = BS.pack $ unlines
+          [ "let h       = get_env_int \"JACOBI_H\""
+          , "let w       = get_env_int \"JACOBI_W\""
+          , "let n_iters = get_env_int \"JACOBI_ITERS\""
+          , "let initial = generate [h, w] (fn [i, j] => float_of ((i * 7 + j * 13) % 17))"
+          , "let step    = fn arr => stencil clamp (fn acc => (acc (-1) 0 +. acc 1 0 +. acc 0 (-1) +. acc 0 1) /. 4.0) arr"
+          , "let result  = iterate n_iters initial step"
+          , "let main    = write_array_float result \"jacobi_out.csv\""
+          ]
+        serialOpts =
+          defaultPipelineOptions
+            { poEnableExplicitVectorization = False
+            , poEnableParallelization = False
+            }
+        polyTiledOpts = serialOpts { poEnableTiling = True, poEnablePolyhedral = True }
+        polyUntiledOpts = serialOpts { poEnableTiling = False, poEnablePolyhedral = True }
+        plainOpts = serialOpts { poEnableTiling = False, poEnablePolyhedral = False }
+        parseJacobi = either (fail . ("Parse error: " ++)) pure (readDecs jacobi2d)
+        -- Compile with the given pipeline, run on an n-by-n grid, and return
+        -- the CSV it writes.
+        jacobiOutput decs opts dir n iters = do
+          csrc <-
+            compileToCOptIOWithPipelineOptionsAndCodegenOptions
+              defaultInferOptions opts defaultCodegenOptions False decs
+          createDirectoryIfMissing True dir
+          exe <- compileCToExecutable dir csrc False
+          code <- runExecutableInDir dir exe
+            [("JACOBI_H", show n), ("JACOBI_W", show n), ("JACOBI_ITERS", show iters)]
+          code `shouldBe` ExitSuccess
+          readFile (dir </> "jacobi_out.csv")
 
-    it "wavefront-tiled jacobi is correct for large arrays (wavefront actually fires)" $ withCC $
-      withSystemTempDirectory "hydrangea-jacobi-large" $ \tmp -> do
-        src <- BS.readFile "bench/stencil/jacobi_2d_interior.hyd"
-        case readDecs src of
-          Left perr -> expectationFailure $ "Parse error: " ++ perr
-          Right decs -> do
-            let polyOpts =
-                  defaultPipelineOptions
-                    { poEnableTiling = True
-                    , poEnablePolyhedral = True
-                    , poEnableExplicitVectorization = False
-                    , poEnableParallelization = False
-                    }
-                untiledOpts = polyOpts { poEnableTiling = False }
-                -- 516x516 → interior width t25 = 514 ≥ 512, so the wavefront
-                -- profitability guard fires and the wavefront body actually runs.
-                -- 6 iterations > stage width 4 so the run spans two time tiles.
-                jacobiEnv =
-                  [ ("JACOBI_H", "516")
-                  , ("JACOBI_W", "516")
-                  , ("JACOBI_ITERS", "6")
-                  ]
-                tiledDir   = tmp </> "tiled"
-                untiledDir = tmp </> "untiled"
-            tiledC <-
-              compileToCOptIOWithPipelineOptionsAndCodegenOptions
-                defaultInferOptions
-                polyOpts
-                defaultCodegenOptions
-                False
-                decs
-            untiledC <-
-              compileToCOptIOWithPipelineOptionsAndCodegenOptions
-                defaultInferOptions
-                untiledOpts
-                defaultCodegenOptions
-                False
-                decs
-            createDirectoryIfMissing True tiledDir
-            createDirectoryIfMissing True untiledDir
-            tiledExe   <- compileCToExecutable tiledDir   tiledC   False
-            untiledExe <- compileCToExecutable untiledDir untiledC False
-            tiledExit   <- runExecutableInDir tiledDir   tiledExe   jacobiEnv
-            untiledExit <- runExecutableInDir untiledDir untiledExe jacobiEnv
-            tiledExit   `shouldBe` ExitSuccess
-            untiledExit `shouldBe` ExitSuccess
-            tiledOut   <- readFile (tiledDir   </> "jacobi_out.csv")
-            untiledOut <- readFile (untiledDir </> "jacobi_out.csv")
-            tiledOut `shouldBe` untiledOut
+    -- The wavefront is a temporal tiling, so only the tiling path uses it.
+    it "wavefront-tiles a 2-D Jacobi stencil on the tiled polyhedral path only" $ do
+      decs <- parseJacobi
+      cfg <- lowerToCFGWithTypes decs
+      let ringBuffersWith opts =
+            let Program procs =
+                  optimizeCFGWithPipelineOptions
+                    opts { poVectorWidth = codegenSimdWidth defaultCodegenOptions }
+                    cfg
+             in concatMap (wavefrontRingBuffers . procBody) procs
+      ringBuffersWith polyTiledOpts `shouldNotBe` []
+      ringBuffersWith polyUntiledOpts `shouldBe` []
+
+    -- The wavefront runs only when a frontier has at least 512 cells of
+    -- work; below that the guard takes the untiled fallback.  516 gives an
+    -- interior frontier of 514, and 6 steps span two 4-step time tiles.
+    forM_
+      [ ("below the frontier threshold, where it takes the fallback", 10 :: Int, 4 :: Int)
+      , ("above the frontier threshold, where the wavefront runs", 516, 6)
+      ] $ \(what, n, iters) ->
+        it ("computes a wavefront-tiled 2-D Jacobi like the plain pipeline " ++ what) $ withCC $
+          withSystemTempDirectory "hydrangea-jacobi" $ \tmp -> do
+            decs <- parseJacobi
+            tiledOut <- jacobiOutput decs polyTiledOpts (tmp </> "tiled") n iters
+            plainOut <- jacobiOutput decs plainOpts (tmp </> "plain") n iters
+            length (lines plainOut) `shouldBe` n
+            tiledOut `shouldBe` plainOut
+
+    -- Each step drops the last element.  Every step's result needs a buffer
+    -- of its own size, so the compiled loop must not reuse the initial
+    -- state's buffer for it.
+    it "runs an iterate whose step shrinks the state" $ withCC $
+      checkInlineSrc $ BS.pack $ unlines
+        [ "let step arr ="
+        , "  let n = proj 0 (shape_of arr) in"
+        , "  generate [n - 1] (fn [i] => index [i] arr + index [i + 1] arr)"
+        , "let r = iterate 3 (generate [8] (fn [i] => i * i)) step"
+        ]
 
     it "compiles a 1D index through a function parameter (Issue 3 fix)" $ withCC $
       checkInlineSrc $ BS.pack $ unlines
@@ -1552,8 +1530,9 @@ spec = do
             ]
       checkInlineSrc src
       csrc <- emitC src
-      csrc `shouldSatisfy` isInfixOf "hyd_array_own("
-      csrc `shouldSatisfy` not . isInfixOf "hyd_array_own(__rc"
+      -- The scatter takes the state itself, not a reference retained for it.
+      ownArguments csrc `shouldNotBe` []
+      [arg | (arg, True) <- ownArguments csrc] `shouldBe` []
 
     it "copies, rather than moves, a target read after the scatter" $ withCC $ do
       csrc <- emitC $ BS.pack $ unlines
@@ -1562,7 +1541,9 @@ spec = do
         , "  let s = scatter (fn x y => x + y) t (generate [4] (fn [i] => 3 - i)) (generate [4] (fn [i] => 1)) in"
         , "  zipwith (fn x y => x * 100 + y) s t"
         ]
-      csrc `shouldSatisfy` isInfixOf "hyd_array_own(__rc"
+      -- t stays live, so the scatter takes a reference retained for it,
+      -- which hyd_array_own sees as shared and copies.
+      ownArguments csrc `shouldSatisfy` any snd
 
   -- An element of an array of arrays holds a reference of its own, released
   -- with the outer array.  Under the reference-count checker a freed array's
@@ -1611,7 +1592,7 @@ spec = do
             ]
       checkWithRcCheck src
       csrc <- emitC src
-      csrc `shouldSatisfy` isInfixOf "hyd_array_own(__rc"
+      ownArguments csrc `shouldSatisfy` any snd
 
   describe "printing pairs" $ do
 
@@ -1655,8 +1636,10 @@ spec = do
         , "  let p2 = scatter_guarded mn (fst st) idx (fill [n] k) (generate [n] (fn [i] => i < k)) in"
         , "  (p2, index () (reduce_generate (+) 0 [n] (fn [i] => index [i] p2)) % 97)"
         , "let main = fst (iterate 3 (fill [n] 5000, 50) step)" ]
+      prog <- optimizeParallelCFG <$> lowerToCFGWithTypes decs
+      parallelStrategies prog `shouldContain` [ParallelScatterRMWInt]
       csrc <- compileToCOptParallelIO True decs
-      csrc `shouldSatisfy` isInfixOf "scatter-rmw-cas-int"
+      csrc `shouldSatisfy` isInfixOf "__atomic_compare_exchange"
 
     it "parallelizes a scalar sum over a local 1-D array" $ do
       decs <- either (fail . ("parse: " ++)) pure $ readDecs $ BS.pack $ unlines
@@ -1846,6 +1829,49 @@ checkWithRcCheck src =
       checkDecsWithCFlags ["-DHYD_RC_CHECK"]
         defaultFrontendOptions defaultInferOptions defaultPipelineOptions decs
 
+
+-- | For each @hyd_array_own(x)@ in the C, @x@ and whether @x@ is a
+-- reference taken for the call by @hyd_array_retain@.  @hyd_array_own@
+-- copies an array whose storage is shared, so a retained argument means the
+-- caller writes into a copy while the original stays live, and an
+-- unretained one means the original is moved and written in place.
+ownArguments :: String -> [(String, Bool)]
+ownArguments c =
+  [ (arg, arg `elem` retained)
+  | l <- lines c
+  , rest : _ <- [following "hyd_array_own(" l]
+  , let arg = takeWhile (/= ')') rest
+  ]
+  where
+    retained =
+      [ lhs
+      | l <- lines c
+      , lhsText : _ <- [upTo " = hyd_array_retain(" l]
+      , lhs : _ <- [reverse (words lhsText)]
+      ]
+    following needle hay = [drop (length needle) t | t <- tails hay, needle `isPrefixOf` t]
+    upTo needle hay = [take i hay | (i, t) <- zip [0 ..] (tails hay), needle `isPrefixOf` t]
+
+-- | The ring buffers of each wavefront schedule in a statement list (each
+-- list is non-empty).
+-- Polyhedral tiling guards a wavefront with a test that its frontier has
+-- enough work, @g = work >= threshold; if (g) {...} else {...}@, whose
+-- then-branch copies the iterate state into the extra stage buffers before
+-- the wavefront loop and whose else-branch keeps the untiled nest.
+wavefrontRingBuffers :: [Stmt] -> [[CVar]]
+wavefrontRingBuffers stmts =
+  [ rings
+  | block <- stmts : [body | (_, body) <- loopsIn stmts] ++ branches stmts
+  , SAssign g (RBinOp CGe _ _) <- block
+  , SIf (AVar g') thn els <- block
+  , g' == g
+  , let rings = [v | SAssign v (RArrayCopy _) <- thn]
+  , not (null rings)
+  , not (null (loopsIn thn))
+  , not (null (loopsIn els))
+  ]
+  where
+    branches ss = concat [[thn, els] ++ branches thn ++ branches els | SIf _ thn els <- ss]
 
 -- | The C a source program compiles to.
 emitC :: BS.ByteString -> IO String

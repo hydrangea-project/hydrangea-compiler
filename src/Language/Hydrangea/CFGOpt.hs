@@ -799,6 +799,13 @@ scalarizeIteratePairs = go
 -- initial state still used after the loop).  The swap only moves
 -- references, and the reference-count pass ('Language.Hydrangea.Ownership')
 -- releases whichever buffers are dead after the loop.
+--
+-- The rewrite is only sound when each step's result has the shape of the
+-- state it was computed from: the hoisted buffer is a copy of the initial
+-- state, and the loop reuses the initial state's buffer for later results.
+-- So it fires only when @arr_next@ is allocated with @shape(arr_cur)@.  A
+-- step that changes the shape (say, @generate [h-2, w-2]@ over an @[h, w]@
+-- state) keeps its per-iteration allocation.
 hoistIterateAllocs :: [Stmt] -> [Stmt]
 hoistIterateAllocs = go
   where
@@ -823,8 +830,8 @@ hoistIterateAllocs = go
 -- > ...compute...
 -- > SAssign cur (RAtom (AVar next))
 --
--- And contains at most one @RArrayAlloc@ and one @RArrayShape@ whose
--- variables match the swap.  Those two stmts are hoisted before the loop.
+-- And contains an @RArrayShape@ of @cur@ and an @RArrayAlloc@ of @next@ with
+-- that shape.  Those two stmts are hoisted before the loop.
 restructureIterateBody :: LoopSpec -> [Stmt] -> Maybe [Stmt]
 restructureIterateBody spec body = do
   guard (length body >= 2)
@@ -845,11 +852,10 @@ restructureIterateBody spec body = do
 
   -- Find the shape stmt in the prefix
   let shapeCandidates = [(i, sv, av) | (i, SAssign sv (RArrayShape (AVar av))) <- zip [0..] prefix]
-      allocCandidates = [(i, av) | (i, SAssign av (RArrayAlloc _)) <- zip [0..] prefix]
+      allocCandidates = [(i, av, shp) | (i, SAssign av (RArrayAlloc shp)) <- zip [0..] prefix]
 
-  -- Shared helper: given a set of stmt indices to skip (alloc + optionally
-  -- shape) and a list of stmts to hoist before the loop, build the
-  -- restructured program.
+  -- Given the stmt indices to drop from the body (the shape and the alloc)
+  -- and the stmts to hoist before the loop, build the restructured program.
   let mkResult skip hoistedExtra =
         let computeBody = [s | (i, s) <- zip [0..] prefix, i `S.notMember` skip]
             tmpVar = nextVar <> "__iter_tmp"
@@ -858,23 +864,26 @@ restructureIterateBody spec body = do
             newLoop = SLoop spec newBody
         in Just (hoistedExtra ++ [own, newLoop])
 
-  -- Need at least one of shape or alloc to match the swap variables
-  case (listToMaybe shapeCandidates, listToMaybe allocCandidates) of
-    (Just (shapeIdx, shpVar, shapeArrVar), Just (allocIdx, allocVar)) -> do
-      guard (shapeArrVar == curVar)   -- shape reads from the cur variable
-      guard (allocVar == nextVar)     -- alloc writes to the next variable
-      let shapeStmt = SAssign shpVar (RArrayShape (AVar curVar))
-          allocStmt = SAssign nextVar (RArrayCopy (AVar curVar))
-          skip = S.fromList [shapeIdx, allocIdx]
-      mkResult skip [shapeStmt, allocStmt]
+  -- Does a shape atom name @shape(cur)@, directly or through copies?
+  let defs = [(v, rhs) | SAssign v rhs <- prefix]
+      isShapeOfCur atom = case atom of
+        AVar v -> case lookup v defs of
+          Just (RAtom a) -> isShapeOfCur a
+          Just (RArrayShape (AVar arr)) -> arr == curVar
+          _ -> False
+        _ -> False
 
-    -- Fallback: only the alloc matches (shape is pre-computed outside loop).
-    -- Hoist just a copy; the original alloc stmt is replaced.
-    (_, Just (allocIdx, allocVar))
-      | allocVar == nextVar ->
-          mkResult (S.singleton allocIdx) [SAssign nextVar (RArrayCopy (AVar curVar))]
-
-    _ -> Nothing
+  (shapeIdx, shpVar, shapeArrVar) <- listToMaybe shapeCandidates
+  (allocIdx, allocVar, allocShape) <- listToMaybe allocCandidates
+  guard (shapeArrVar == curVar)   -- shape reads from the cur variable
+  guard (allocVar == nextVar)     -- alloc writes to the next variable
+  -- next is allocated with cur's shape, so the step preserves the shape
+  -- and a copy of cur can stand in for the allocation.
+  guard (isShapeOfCur allocShape)
+  let shapeStmt = SAssign shpVar (RArrayShape (AVar curVar))
+      allocStmt = SAssign nextVar (RArrayCopy (AVar curVar))
+      skip = S.fromList [shapeIdx, allocIdx]
+  mkResult skip [shapeStmt, allocStmt]
 
 -- | The swap that ends a double-buffered iterate body:
 -- @tmp = cur; cur = next; next = tmp@.

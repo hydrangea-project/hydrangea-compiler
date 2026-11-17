@@ -478,8 +478,11 @@ type AffineEnv = Map CVar AffineValue
 type TileM = State (Set CVar, Int)
 type ProfitabilityFacts = Map CVar IteratorProfitability
 
+-- | Reschedule each SCoP without tiling.  Temporal tiling (the wavefront and
+-- diamond schedules for iterate stencils) is a kind of tiling, so it runs
+-- only on the tiling path, 'polyhedralTileProgram'.
 polyhedralProgram :: Program -> Program
-polyhedralProgram = scheduleProgram (specializeScheduledScop . synthesizeScopSchedule)
+polyhedralProgram = scheduleProgram synthesizeScopSchedule
 
 polyhedralTileProgram :: Program -> Program
 polyhedralTileProgram = scheduleProgram tileScop
@@ -544,10 +547,6 @@ tileScheduledScop scheduled =
               (tileScheduleTree profitability relations 0 (ssSchedule specialized))
               (collectScopNames scop, 0)
         }
-
-specializeScheduledScop :: ScheduledScop -> ScheduledScop
-specializeScheduledScop scheduled =
-  fromMaybe scheduled (buildWavefrontScop scheduled)
 
 specializeTiledScheduledScop :: ScheduledScop -> ScheduledScop
 specializeTiledScheduledScop scheduled =
@@ -2632,9 +2631,6 @@ applyScheduledScopToProc scheduled proc
               M.union (ssArrayFactOverrides scheduled) (procArrayFacts proc)
           , procVectorAccessFacts = vectorFacts
           }
-
-buildWavefrontScop :: ScheduledScop -> Maybe ScheduledScop
-buildWavefrontScop = buildTiledWavefrontScop
 
 buildTiledWavefrontScop :: ScheduledScop -> Maybe ScheduledScop
 buildTiledWavefrontScop scheduled = do
