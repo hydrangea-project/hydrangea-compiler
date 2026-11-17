@@ -8,9 +8,18 @@ module Language.Hydrangea.FrontendSpec (spec) where
 
 import Data.ByteString.Lazy.Char8 (ByteString)
 import Data.ByteString.Lazy.Char8 qualified as BS
-import Data.List (isInfixOf, isPrefixOf, isSuffixOf, tails)
-import Language.Hydrangea.CFG (LoopRole(..), LoopSpec(..), Program(..), Proc(..), Stmt(..))
-import Language.Hydrangea.CFGCore (RHS(..))
+import Data.List (findIndex, isInfixOf, isPrefixOf, isSuffixOf, sort, tails)
+import Data.Maybe (listToMaybe)
+import Language.Hydrangea.CFG
+  ( ExecPolicy(..)
+  , LoopRole(..)
+  , LoopSpec(..)
+  , ParallelStrategy(..)
+  , Program(..)
+  , Proc(..)
+  , Stmt(..)
+  )
+import Language.Hydrangea.CFGCore (Atom(..), BinOp(..), CVar, RHS(..))
 import Language.Hydrangea.CodegenC
   ( CodegenArtifacts(..)
   , CodegenOptions(..)
@@ -21,7 +30,7 @@ import Language.Hydrangea.Frontend
 import Language.Hydrangea.Infer (defaultInferOptions, InferOptions(..))
 import Language.Hydrangea.Lexer (Range)
 import Language.Hydrangea.Syntax
-import Language.Hydrangea.TestUtil (containsAll)
+import Language.Hydrangea.TestUtil (lineWithAll, loopsIn, ompPragmas, parallelStrategies)
 import Test.Hspec
 
 parseExpOrFail :: ByteString -> IO (Exp Range)
@@ -175,6 +184,89 @@ countOccurrences :: String -> String -> Int
 countOccurrences needle haystack
   | null needle = 0
   | otherwise = length [() | suffix <- tails haystack, needle `isPrefixOf` suffix]
+
+-- | The strategies the parallelizer picked for a source program, and the C
+-- that program compiles to.  Tests read which scatter strategy was chosen
+-- from the first and how it was carried out from the second.
+parallelStrategiesAndC :: ByteString -> IO ([ParallelStrategy], String)
+parallelStrategiesAndC src = do
+  prog <- lowerParallelFromSource src
+  csrc <- emitParallelCFromSource src
+  pure (parallelStrategies prog, csrc)
+
+-- | Which way a scan loop walks its input.
+data ScanDir = ScanForward | ScanReverse
+  deriving (Eq, Show)
+
+-- | Whether a scan loop stores the running accumulator before folding in
+-- the current element (an exclusive scan) or after (an inclusive one).
+data ScanStore = StoreBeforeStep | StoreAfterStep
+  deriving (Eq, Show)
+
+-- | The shape of the scan loop in a proc: a serial fold loop over @k@ that
+-- stores its accumulator into an output array at @k@ (forward) or at
+-- @n - 1 - k@ (reverse).
+scanShape :: Proc -> Maybe (ScanDir, ScanStore)
+scanShape proc = listToMaybe
+  [ (dir, store)
+  | (loop, body) <- loopsIn (procBody proc)
+  , lsRole loop == LoopFold
+  , lsExec loop == Serial
+  , [k] <- [lsIters loop]
+  , (writePos, SArrayWrite _ (AVar ix) (AVar acc)) <- zip [0 :: Int ..] body
+  , Just dir <- [direction k ix body]
+  , Just stepPos <- [findIndex (assigns acc) body]
+  , let store = if writePos < stepPos then StoreBeforeStep else StoreAfterStep
+  ]
+  where
+    direction k ix body
+      | ix == k = Just ScanForward
+      | any (isReverseIndex k ix) body = Just ScanReverse
+      | otherwise = Nothing
+    isReverseIndex k ix stmt = case stmt of
+      SAssign v (RBinOp CSub _ (AVar k')) -> v == ix && k' == k
+      _ -> False
+    assigns acc stmt = case stmt of
+      SAssign v _ -> v == acc
+      _ -> False
+
+-- | The fields of the record a proc returns whose value is an array the
+-- proc itself allocates at its top level, sorted.
+allocatedRecordFields :: Proc -> [ByteString]
+allocatedRecordFields Proc { procBody = stmts } =
+  sort
+    [ field
+    | SReturn (AVar r) <- stmts
+    , SAssign r' (RRecord fields) <- stmts
+    , r' == r
+    , (field, AVar v) <- fields
+    , v `elem` allocs
+    ]
+  where
+    allocs = [v | SAssign v (RArrayAlloc _) <- stmts]
+
+-- | Each privatization snapshot in a proc, as (source, copy): a 'LoopCopy'
+-- loop that loads from the source and stores into the copy.
+snapshotCopies :: Proc -> [(CVar, CVar)]
+snapshotCopies proc =
+  [ (src, dst)
+  | (loop, body) <- loopsIn (procBody proc)
+  , lsRole loop == LoopCopy
+  , SAssign _ (RArrayLoad (AVar src) _) <- body
+  , SArrayWrite (AVar dst) _ _ <- body
+  ]
+
+-- | The arrays the non-copy loops of a proc read and write.
+loopArrayAccesses :: Proc -> ([CVar], [CVar])
+loopArrayAccesses proc =
+  ( [a | b <- bodies, SAssign _ (RArrayLoad (AVar a) _) <- flatten b]
+  , [a | b <- bodies, SArrayWrite (AVar a) _ _ <- flatten b]
+  )
+  where
+    bodies = [body | (loop, body) <- loopsIn (procBody proc), lsRole loop /= LoopCopy]
+    flatten = concatMap $ \stmt -> case stmt of
+      SIf _ thn els -> stmt : flatten thn ++ flatten els
+      _ -> [stmt]
 
 countStandaloneInt64Decls :: String -> Int
 countStandaloneInt64Decls src =
@@ -674,51 +766,52 @@ spec = do
         (const True)
 
   describe "optimized lowering" $ do
-    it "emits explicit scan loop structure for scan" $ do
-      c <- emitCFromSource $ BS.pack $ unlines
+    it "lowers scan to a serial forward loop that stores before each step" $ do
+      mainProc <- lookupProc "main" <$> lowerOptFromSource (BS.pack $ unlines
         [ "let main ="
         , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
         , "  scan (let add acc x = acc + x in add) 0 arr"
-        ]
-      c `shouldSatisfy` isInfixOf "scan_arr"
-      c `shouldSatisfy` isInfixOf "scan_k"
+        ])
+      scanShape mainProc `shouldBe` Just (ScanForward, StoreBeforeStep)
 
-    it "emits explicit scan loop structure for scan_inclusive" $ do
-      c <- emitCFromSource $ BS.pack $ unlines
+    it "lowers scan_inclusive to a serial forward loop that stores after each step" $ do
+      mainProc <- lookupProc "main" <$> lowerOptFromSource (BS.pack $ unlines
         [ "let main ="
         , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
         , "  scan_inclusive (let add acc x = acc + x in add) 0 arr"
-        ]
-      c `shouldSatisfy` isInfixOf "scan_incl_arr"
-      c `shouldSatisfy` isInfixOf "scan_incl_k"
+        ])
+      scanShape mainProc `shouldBe` Just (ScanForward, StoreAfterStep)
 
-    it "emits explicit scan loop structure for scanr" $ do
-      c <- emitCFromSource $ BS.pack $ unlines
+    it "lowers scanr to a serial reverse loop that stores before each step" $ do
+      mainProc <- lookupProc "main" <$> lowerOptFromSource (BS.pack $ unlines
         [ "let main ="
         , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
         , "  scanr (let add acc x = acc + x in add) 0 arr"
-        ]
-      c `shouldSatisfy` isInfixOf "scanr_arr"
-      c `shouldSatisfy` isInfixOf "scanr_ix"
+        ])
+      scanShape mainProc `shouldBe` Just (ScanReverse, StoreBeforeStep)
 
-    it "emits explicit scan loop structure for scanr_inclusive" $ do
-      c <- emitCFromSource $ BS.pack $ unlines
+    it "lowers scanr_inclusive to a serial reverse loop that stores after each step" $ do
+      mainProc <- lookupProc "main" <$> lowerOptFromSource (BS.pack $ unlines
         [ "let main ="
         , "  let arr = generate [4] (let f [i] = i + 1 in f) in"
         , "  scanr_inclusive (let add acc x = acc + x in add) 0 arr"
-        ]
-      c `shouldSatisfy` isInfixOf "scanr_incl_arr"
-      c `shouldSatisfy` isInfixOf "scanr_incl_ix"
+        ])
+      scanShape mainProc `shouldBe` Just (ScanReverse, StoreAfterStep)
 
-    it "emits explicit segment-bounded loop structure for segmented_reduce" $ do
-      c <- emitCFromSource $ BS.pack $ unlines
+    it "lowers segmented_reduce to a reduction loop inside a per-segment loop" $ do
+      mainProc <- lookupProc "main" <$> lowerOptFromSource (BS.pack $ unlines
         [ "let offsets = generate [4] (let f [i] = if i = 0 then 0 else if i = 1 then 2 else if i = 2 then 5 else 5 in f)"
         , "let vals = generate [5] (let f [i] = i + 1 in f)"
         , "let main = segmented_reduce (let add acc x = acc + x in add) 0 offsets vals"
-        ]
-      c `shouldSatisfy` isInfixOf "segred_out"
-      c `shouldSatisfy` isInfixOf "segred_start"
-      c `shouldSatisfy` isInfixOf "segred_len"
+        ])
+      -- One output array, filled by a segment loop whose body reduces that
+      -- segment's elements.
+      countArrayAllocs mainProc `shouldBe` 1
+      [ lsRole inner
+        | (outer, body) <- loopsIn (procBody mainProc)
+        , lsRole outer == LoopSegRedOuter
+        , (inner, _) <- loopsIn body
+        ] `shouldContain` [LoopReduction]
 
     it "emits the sort helper call for sort_indices" $ do
       c <- emitCFromSource $ BS.pack $ unlines
@@ -732,7 +825,7 @@ spec = do
       c `shouldSatisfy` isInfixOf "hyd_sort_indices("
 
     it "lowers COO duplicate reduction and CSR construction to explicit arrays" $ do
-      c <- emitCFromSource $ BS.pack $ unlines
+      prog <- lowerOptFromSource $ BS.pack $ unlines
         [ "let rows = generate [6] (let f [i] ="
         , "  if i = 0 then 0 else"
         , "  if i = 1 then 0 else"
@@ -754,9 +847,10 @@ spec = do
         , "let coo = coo_sum_duplicates 3 4 6 rows cols vals"
         , "let main = csr_from_sorted_coo coo.nrows coo.ncols coo.nnz coo.rows coo.cols coo.vals"
         ]
-      c `shouldSatisfy` isInfixOf "coo_rows"
-      c `shouldSatisfy` isInfixOf "csr_counts"
-      c `shouldSatisfy` isInfixOf "csr_row_ptr"
+      -- Each array in the returned COO and CSR records is one the proc
+      -- allocates and fills itself.
+      allocatedRecordFields (lookupProc "coo" prog) `shouldBe` ["cols", "rows", "vals"]
+      allocatedRecordFields (lookupProc "main" prog) `shouldBe` ["col_idx", "row_ptr", "vals"]
 
     it "uses fused lowering for scatter CFG inspection" $ do
       let src = BS.pack $ unlines
@@ -859,17 +953,29 @@ spec = do
           ]
 
     it "snapshots the scatter target when the guard reads it" $ do
-      csrc <- emitCFromSource guardReadsTarget
-      csrc `shouldSatisfy` isInfixOf "snap"
+      mainProc <- lookupProc "main" <$> lowerOptFromSource guardReadsTarget
+      let copies = snapshotCopies mainProc
+          (loopReads, loopWrites) = loopArrayAccesses mainProc
+      copies `shouldSatisfy` (not . null)
+      -- The scatter writes the target, and its guard reads the snapshot
+      -- instead of the target.
+      [ (target, snap)
+        | (target, snap) <- copies
+        , target `elem` loopWrites
+        , snap `elem` loopReads
+        , target `notElem` loopReads
+        ] `shouldSatisfy` (not . null)
 
     it "runs a row-bounded 2-D scatter as a dynamically scheduled ragged nest" $ do
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let lens = generate [100] (let f [j] = j % 17 in f)"
         , "let mn new_ old = if new_ < old then new_ else old"
         , "let main = scatter_guarded mn (fill [100] 999) (generate [100, 32] (let f [j, k] = (j + k) % 100 in f)) (generate [100, 32] (let f [j, k] = j * k in f)) (generate [100, 32] (let f [j, k] = k < index [j] lens in f))"
         ]
-      csrc `shouldSatisfy` isInfixOf "guard-bounded ragged loop"
-      csrc `shouldSatisfy` isInfixOf "schedule(dynamic, 64) /* scatter-rmw-cas-int */"
+      strategies `shouldContain` [ParallelScatterRMWInt]
+      -- Only a guard-bounded 2-D nest gets dynamic scheduling, to balance
+      -- its uneven rows.
+      ompPragmas csrc `shouldContain` ["#pragma omp parallel for schedule(dynamic, 64)"]
 
     it "emits OpenMP parallel loops for injective scatter kernels" $ do
       csrc <- emitParallelCFromSource $ BS.pack $ unlines
@@ -891,23 +997,26 @@ spec = do
       -- privatize by default, even when the destination shape is
       -- symbolic.  Atomic scatter is now a fallback for non-fresh /
       -- non-write-once destinations.
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let src = generate [8] (let f [i] = i in f)"
         , "let idx = map (let r x = x / 2 in r) src"
         , "let vals = map (let g x = (x * 3) + 1 in g) src"
         , "let main = scatter (+) (fill [4] 0) idx vals"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
-      csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic update"
+      strategies `shouldContain` [ParallelScatterPrivatizedIntAdd]
+      ompPragmas csrc `shouldContain` ["#pragma omp parallel"]
+      ompPragmas csrc `shouldNotContain` ["#pragma omp atomic update"]
 
     it "emits privatized parallel scatter code for dense small histograms" $ do
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let main = scatter (+) (fill [8] 0)"
         , "  (generate [64] (let bucket [i] = i / 8 in bucket))"
         , "  (generate [64] (let one [i] = 1 in one))"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
-      csrc `shouldSatisfy` isInfixOf "#pragma omp for"
+      strategies `shouldContain` [ParallelScatterPrivatizedIntAdd]
+      -- One parallel region: a worksharing loop scatters into per-thread
+      -- grids, then a second merges them over output cells.
+      ompPragmas csrc `shouldContain` ["#pragma omp parallel", "#pragma omp for", "#pragma omp for"]
       csrc `shouldSatisfy` isInfixOf "calloc((size_t)"
       -- Per-thread grids preallocated outside the parallel region.
       csrc `shouldSatisfy` isInfixOf "omp_get_max_threads()"
@@ -916,12 +1025,13 @@ spec = do
       -- Parallel merge over output cells: no atomics, no critical section.
       csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic"
       csrc `shouldNotSatisfy` isInfixOf "#pragma omp critical"
+      csrc `shouldNotSatisfy` isInfixOf "__atomic"
 
     it "emits privatized guarded parallel scatter code for masked weighted histogram" $ do
       -- Guarded scatter also flows through the privatized path; the
       -- guard is emitted inside the per-thread scatter loop, around
       -- the private-buffer update.
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let main ="
         , "  let src = generate [16] (let f [i] = i in f) in"
         , "  scatter_guarded (+) (fill [4] 0)"
@@ -929,50 +1039,57 @@ spec = do
         , "    (map (let g x = (x * 3) + 1 in g) src)"
         , "    (map (let keep x = ((x / 3) * 3) = x in keep) src)"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-int-add */"
+      strategies `shouldContain` [ParallelScatterPrivatizedIntAdd]
+      ompPragmas csrc `shouldContain` ["#pragma omp parallel"]
       csrc `shouldSatisfy` isInfixOf "if ("
       csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic"
 
     it "emits privatized parallel scatter code for floating-point weighted histogram" $ do
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let src = generate [8] (let f [i] = i in f)"
         , "let idx = map (let r x = x / 2 in r) src"
         , "let vals = map (let g x = float_of ((x * 3) + 1) /. 8.0 in g) src"
         , "let main = scatter (+.) (fill [4] 0.0) idx vals"
         ]
-      csrc `shouldSatisfy` isInfixOf "#pragma omp parallel /* scatter-privatized-float-add */"
-      csrc `shouldSatisfy` isInfixOf "double* __hyd_priv_grids_"
+      strategies `shouldContain` [ParallelScatterPrivatizedFloatAdd]
+      ompPragmas csrc `shouldContain` ["#pragma omp parallel"]
+      -- The per-thread grids hold doubles.
+      csrc `shouldSatisfy` lineWithAll ["calloc(", "sizeof(double)"]
       csrc `shouldNotSatisfy` isInfixOf "#pragma omp atomic update"
 
     it "runs a write-once scatter as a CAS loop, not an unprotected atomic store" $ do
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let dsts = generate [64] (let f [e] = e % 8 in f)"
         , "let vals = generate [64] (let f [e] = e in f)"
         , "let unset = generate [8] (let f [i] = 0 - 1 in f)"
         , "let keepFirst new_ old = if old = (0 - 1) then new_ else old"
         , "let main = scatter keepFirst unset dsts vals"
         ]
-      csrc `shouldSatisfy` containsAll ["scatter-rmw-cas-int", "__atomic_compare_exchange"]
-      csrc `shouldNotSatisfy` isInfixOf "scatter-atomic-write-int"
+      strategies `shouldContain` [ParallelScatterRMWInt]
+      strategies `shouldNotContain` [ParallelScatterAtomicWriteInt]
+      csrc `shouldSatisfy` isInfixOf "__atomic_compare_exchange"
+      ompPragmas csrc `shouldNotContain` ["#pragma omp atomic write"]
 
     it "runs a min scatter as a CAS loop" $ do
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let dsts = generate [64] (let f [e] = e % 8 in f)"
         , "let vals = generate [64] (let f [e] = (e * 7) % 13 in f)"
         , "let big = generate [8] (let f [i] = 1000 in f)"
         , "let mn new_ old = if new_ < old then new_ else old"
         , "let main = scatter mn big dsts vals"
         ]
-      csrc `shouldSatisfy` isInfixOf "scatter-rmw-cas-int"
+      strategies `shouldContain` [ParallelScatterRMWInt]
+      csrc `shouldSatisfy` isInfixOf "__atomic_compare_exchange"
 
     it "runs an overwrite scatter with an atomic store" $ do
-      csrc <- emitParallelCFromSource $ BS.pack $ unlines
+      (strategies, csrc) <- parallelStrategiesAndC $ BS.pack $ unlines
         [ "let dsts = generate [64] (let f [e] = e % 8 in f)"
         , "let vals = generate [64] (let f [e] = e in f)"
         , "let last new_ old = new_"
         , "let main = scatter last (fill [8] 0) dsts vals"
         ]
-      csrc `shouldSatisfy` containsAll ["scatter-atomic-write-int", "#pragma omp atomic write"]
+      strategies `shouldContain` [ParallelScatterAtomicWriteInt]
+      ompPragmas csrc `shouldContain` ["#pragma omp atomic write"]
 
     it "emits array-valued hyd_main with array return type" $ do
       csrc <- emitCFromSource "let main = fill [3] 1"

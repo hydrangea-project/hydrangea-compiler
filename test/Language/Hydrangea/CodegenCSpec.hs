@@ -2,9 +2,17 @@
 
 module Language.Hydrangea.CodegenCSpec (spec) where
 
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf, stripPrefix)
 import Data.Map qualified as Map
-import Language.Hydrangea.TestUtil (containsAll, containsNone, containsInOrder)
+import Language.Hydrangea.TestUtil
+  ( callsFunction
+  , cFunctionBody
+  , containsAll
+  , containsInOrder
+  , ompPragmas
+  , shouldBeMemoized
+  , shouldNotBeMemoized
+  )
 import Language.Hydrangea.CFGCore (Atom(..))
 import Language.Hydrangea.CFGCore qualified as C
 import Language.Hydrangea.CFG
@@ -93,11 +101,13 @@ spec = describe "CodegenC" $ do
     c `shouldSatisfy` isInfixOf "#pragma omp for schedule(static)"
     c `shouldSatisfy` (not . isInfixOf "#pragma omp parallel for schedule(static)")
 
-  it "emits role-aware comments for outer map-reduction loops" $ do
+  -- The reduction lives inside each element of an outer map-reduction loop,
+  -- so the outer loop is a plain parallel-for with no reduction clause.
+  it "emits a plain parallel-for for outer map-reduction loops" $ do
     let spec' = LoopSpec ["j"] [IConst 8] (Parallel (ParallelSpec ParallelGeneric Nothing Nothing)) Nothing LoopMapReduction []
         prog = Program [mkProc "p" [] [SLoop spec' [], SReturn (C.AInt 0)]]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "map-reduction outer loop"
+    ompPragmas c `shouldBe` ["#pragma omp parallel for"]
 
   it "emits ND reduction pragmas with collapse" $ do
     let body = [SAssign "acc" (C.RBinOp C.CMul (C.AVar "acc") (C.AInt 2))]
@@ -108,15 +118,25 @@ spec = describe "CodegenC" $ do
         c = codegenProgram prog
     c `shouldSatisfy` isInfixOf "#pragma omp parallel for collapse(2) reduction(*:acc)"
 
-  it "emits strategy comments for direct scatter parallel loops" $ do
-    let prog = Program
-          [ mkProc "p" []
-              [ SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)) Nothing LoopPlain []) []
+  -- A direct scatter writes each cell from one lane only, so its writes
+  -- need no synchronization.
+  it "emits a parallel-for with plain stores for direct scatter loops" $ do
+    let loopBody =
+          [ SAssign "idx" (C.RAtom (C.AVar "i"))
+          , SAssign "val" (C.RAtom (C.AInt 1))
+          , SArrayWrite (C.AVar "out") (C.AVar "idx") (C.AVar "val")
+          ]
+        prog = Program
+          [ (mkProc "p" []
+              [ SAssign "out" (C.RArrayAlloc (C.AInt 8))
+              , SLoop (LoopSpec ["i"] [IConst 8] (Parallel (ParallelSpec ParallelScatterDirect Nothing Nothing)) Nothing LoopPlain []) loopBody
               , SReturn (C.AInt 0)
-              ]
+              ])
+              { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` isInfixOf "#pragma omp parallel for /* scatter-direct */"
+    ompPragmas c `shouldBe` ["#pragma omp parallel for"]
+    c `shouldNotSatisfy` isInfixOf "__atomic"
 
   it "emits atomic update code for integer scatter-add loops" $ do
     let loopBody =
@@ -135,11 +155,8 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` containsAll
-      [ "#pragma omp parallel for /* scatter-atomic-add-int */"
-      , "#pragma omp atomic update"
-      , "+= val;"
-      ]
+    ompPragmas c `shouldBe` ["#pragma omp parallel for", "#pragma omp atomic update"]
+    c `shouldSatisfy` isInfixOf "+= val;"
 
   it "emits privatized scatter code for dense integer scatter-add loops" $ do
     let loopBody =
@@ -159,17 +176,17 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64), ("routes", C.CTArray C.CTInt64), ("vals", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
+    -- One parallel region: a worksharing loop scatters into per-thread
+    -- grids, then a second merges them over output cells.  No atomics and
+    -- no critical section.
+    ompPragmas c `shouldBe` ["#pragma omp parallel", "#pragma omp for", "#pragma omp for"]
     c `shouldSatisfy` containsAll
-      [ "#pragma omp parallel /* scatter-privatized-int-add */"
-      , "#pragma omp for"
-      , "calloc((size_t)"
+      [ "calloc((size_t)"
       -- Per-thread grids preallocated outside the parallel region.
       , "omp_get_max_threads()"
       , "omp_get_thread_num()"
       , "omp_get_num_threads()"
       ]
-    -- Parallel merge over output cells: no atomics, no critical section.
-    c `shouldSatisfy` containsNone ["#pragma omp atomic", "#pragma omp critical"]
 
   it "emits guarded atomic update code for guarded integer scatter-add loops" $ do
     let loopBody =
@@ -192,11 +209,8 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTInt64)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` containsAll
-      [ "#pragma omp parallel for /* scatter-atomic-add-int */"
-      , "if (guard)"
-      , "#pragma omp atomic update"
-      ]
+    ompPragmas c `shouldBe` ["#pragma omp parallel for", "#pragma omp atomic update"]
+    c `shouldSatisfy` containsInOrder ["if (guard)", "#pragma omp atomic update"]
 
   it "emits atomic update code for floating-point scatter-add loops" $ do
     let loopBody =
@@ -215,11 +229,8 @@ spec = describe "CodegenC" $ do
               { procTypeEnv = Map.fromList [("out", C.CTArray C.CTDouble)] }
           ]
         c = codegenProgram prog
-    c `shouldSatisfy` containsAll
-      [ "#pragma omp parallel for /* scatter-atomic-add-float */"
-      , "#pragma omp atomic update"
-      , "+= val;"
-      ]
+    ompPragmas c `shouldBe` ["#pragma omp parallel for", "#pragma omp atomic update"]
+    c `shouldSatisfy` isInfixOf "+= val;"
 
   it "emits serial 1D loop with correct bounds" $ do
     let prog = Program
@@ -281,8 +292,7 @@ spec = describe "CodegenC" $ do
             { codegenBenchmark = Just (BenchmarkConfig "main" 1 1)
             }
         c = either error codegenSource (codegenProgramWithOptions opts prog)
-    c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_arr = NULL;"
-    c `shouldSatisfy` isInfixOf "__cache_arr == NULL"
+    c `shouldBeMemoized` "arr"
 
   it "emits tuple construction from RTuple" $ do
     let prog = Program
@@ -442,7 +452,7 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+        c `shouldBeMemoized` "input_data"
 
   -- Input files are constants of the run: re-reading one on every timed call
   -- would put CSV parsing inside the benchmark's measurement.
@@ -470,7 +480,7 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldSatisfy` isInfixOf "static hyd_array_t* __cache_input_data = NULL;"
+        c `shouldBeMemoized` "input_data"
 
   it "does not memoize zero-arg array procs that write a file" $ do
     let outputProc =
@@ -487,7 +497,7 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldNotSatisfy` isInfixOf "__cache_output_data"
+        c `shouldNotBeMemoized` "output_data"
 
   it "strips benchmark IO writes from benchmark kernel body only" $ do
     let kernelProc =
@@ -537,7 +547,17 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } ->
-        c `shouldSatisfy` isInfixOf "__bench_cache_kernel = NULL;"
+        -- The kernel returns its cached result when it has one, so main
+        -- must clear that cache before each warmup and each timed call or
+        -- it would time a cache hit.
+        case (benchCacheSlot "kernel" c, cFunctionBody "main" c) of
+          (Nothing, _) -> expectationFailure "kernel() does not check a benchmark cache"
+          (_, Nothing) -> expectationFailure "no main() emitted"
+          (Just slot, Just mainBody) ->
+            unlines mainBody `shouldSatisfy` containsInOrder
+              [ slot ++ " = NULL;", "kernel()"   -- warmup
+              , slot ++ " = NULL;", "kernel()"   -- timed
+              ]
 
   it "benchmark mode main only runs the selected benchmark kernel" $ do
     let helperProc = mkProc "helper" [] [SReturn (C.AInt 7)]
@@ -552,7 +572,9 @@ spec = describe "CodegenC" $ do
     case artifacts of
       Left err -> expectationFailure err
       Right CodegenArtifacts { codegenSource = c } -> do
-        c `shouldNotSatisfy` isInfixOf "helper_result"
+        mainBody <- maybe (expectationFailure "no main() emitted" >> pure []) pure (cFunctionBody "main" c)
+        mainBody `shouldSatisfy` callsFunction "kernel"
+        mainBody `shouldNotSatisfy` callsFunction "helper"
         c `shouldSatisfy` isInfixOf "benchmark[kernel]"
 
   it "emits export wrapper and suppresses main in export mode" $ do
@@ -597,3 +619,13 @@ spec = describe "CodegenC" $ do
       Right CodegenArtifacts { codegenSource = c } -> do
         c `shouldSatisfy` isInfixOf "int64_t hyd_main(void)"
         c `shouldNotSatisfy` isInfixOf "dead(void)"
+
+-- | The variable a benchmark kernel's body checks first for a cached
+-- result: its body opens with @if (slot) return ...@.
+benchCacheSlot :: String -> String -> Maybe String
+benchCacheSlot name c = do
+  body <- cFunctionBody name c
+  firstLine : _ <- Just (dropWhile (all (== ' ')) body)
+  rest <- stripPrefix "if (" (dropWhile (== ' ') firstLine)
+  let (slot, afterSlot) = break (== ')') rest
+  if ") return " `isPrefixOf` afterSlot then Just slot else Nothing
